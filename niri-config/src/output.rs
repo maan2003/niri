@@ -76,6 +76,8 @@ pub struct Output {
     pub background_color: Option<Color>,
     #[knuffel(child)]
     pub backdrop_color: Option<Color>,
+    #[knuffel(property, str)]
+    pub ctm: Option<niri_ipc::CtmMatrix>,
     #[knuffel(child)]
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
@@ -112,6 +114,7 @@ impl Default for Output {
             variable_refresh_rate: None,
             background_color: None,
             backdrop_color: None,
+            ctm: None,
             hot_corners: None,
             layout: None,
         }

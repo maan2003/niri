@@ -495,6 +495,8 @@ pub struct OutputState {
     /// The blend-space image description last notified to color-management clients for this
     /// output, to avoid spurious `image_description_changed` events.
     pub blend_description: Option<ImageDescription>,
+    /// Color transform matrix for the output.
+    pub ctm: Option<niri_ipc::CtmMatrix>,
 }
 
 #[derive(Debug, Default)]
@@ -1788,6 +1790,22 @@ impl State {
                     state.backdrop_buffer.set_color(backdrop_color);
                     recolored_outputs.push(output.clone());
                 }
+
+                // Apply CTM configuration
+                let ctm = config.and_then(|c| c.ctm);
+                if state.ctm != ctm {
+                    state.ctm = ctm;
+                    self.niri.ipc_outputs_changed = true;
+
+                    // Apply CTM to hardware
+                    if let Some(tty) = self.backend.tty_checked() {
+                        if let Err(err) = tty.set_ctm(output, ctm.map(|m| m.0)) {
+                            warn!("error setting CTM for output {}: {err:?}", output.name());
+                        }
+                    }
+
+                    recolored_outputs.push(output.clone());
+                }
             }
 
             for mon in self.niri.layout.monitors_mut() {
@@ -1946,6 +1964,9 @@ impl State {
                 }
             }
             niri_ipc::OutputAction::MaxBpc { max_bpc } => config.max_bpc = Some(MaxBpc(max_bpc)),
+            niri_ipc::OutputAction::Ctm { matrix } => {
+                config.ctm = Some(matrix);
+            }
         });
 
         self.reload_output_config();
@@ -3098,6 +3119,7 @@ impl Niri {
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
             blend_description: None,
+            ctm: None,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");

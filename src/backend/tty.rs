@@ -424,8 +424,11 @@ struct Surface {
     last_blend: Option<Option<f64>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
+    ctm_props: Option<CtmProps>,
     /// Gamma change to apply upon session resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// CTM change to apply upon session resume.
+    pending_ctm_change: Option<Option<[f64; 9]>>,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -484,6 +487,12 @@ struct GammaProps {
 /// Read-only snapshot of a connector's DRM properties.
 struct ConnectorProperties {
     properties: Vec<(property::Info, property::RawValue)>,
+}
+
+struct CtmProps {
+    crtc: crtc::Handle,
+    ctm: property::Handle,
+    previous_blob: Option<NonZeroU64>,
 }
 
 impl Tty {
@@ -773,6 +782,22 @@ impl Tty {
                         } else if let Some(gamma_props) = &surface.gamma_props {
                             if let Err(err) = gamma_props.restore_gamma(&device.drm) {
                                 warn!("error restoring gamma: {err:?}");
+                            }
+                        }
+
+                        // Handle CTM restoration/changes
+                        if let Some(ctm) = surface.pending_ctm_change.take() {
+                            let res = if let Some(ctm_props) = &mut surface.ctm_props {
+                                ctm_props.set_ctm(&device.drm, ctm.as_ref())
+                            } else {
+                                Ok(())
+                            };
+                            if let Err(err) = res {
+                                warn!("error applying pending CTM change: {err:?}");
+                            }
+                        } else if let Some(ctm_props) = &surface.ctm_props {
+                            if let Err(err) = ctm_props.restore_ctm(&device.drm) {
+                                warn!("error restoring CTM: {err:?}");
                             }
                         }
                     }
@@ -1391,6 +1416,10 @@ impl Tty {
             .map_err(|err| debug!("couldn't get gamma properties: {err:?}"))
             .ok();
 
+        let mut ctm_props = CtmProps::new(&device.drm, crtc)
+            .map_err(|err| debug!("error getting CTM properties: {err:?}"))
+            .ok();
+
         // Reset gamma in case it was set before.
         let res = if let Some(gamma_props) = &mut gamma_props {
             gamma_props.set_gamma(&device.drm, None)
@@ -1399,6 +1428,13 @@ impl Tty {
         };
         if let Err(err) = res {
             debug!("couldn't reset gamma: {err:?}");
+        }
+
+        // Reset CTM in case it was set before.
+        if let Some(ctm_props) = &mut ctm_props {
+            if let Err(err) = ctm_props.set_ctm(&device.drm, None) {
+                debug!("error resetting CTM: {err:?}");
+            }
         }
 
         let surface = device
@@ -1857,7 +1893,9 @@ impl Tty {
             compositor,
             dmabuf_feedback,
             gamma_props,
+            ctm_props,
             pending_gamma_change: None,
+            pending_ctm_change: None,
             vblank_frame: None,
             vblank_frame_name,
             time_since_presentation_plot_name,
@@ -2532,6 +2570,30 @@ impl Tty {
         }
     }
 
+    pub fn set_ctm(&mut self, output: &Output, ctm: Option<[f64; 9]>) -> anyhow::Result<()> {
+        let tty_state = output.user_data().get::<TtyOutputState>().unwrap();
+        let crtc = tty_state.crtc;
+
+        let device = self
+            .devices
+            .get_mut(&tty_state.node)
+            .context("missing device")?;
+        let surface = device.surfaces.get_mut(&crtc).context("missing surface")?;
+
+        // Cannot change properties while the device is inactive.
+        if !self.session.is_active() {
+            surface.pending_ctm_change = Some(ctm);
+            return Ok(());
+        }
+
+        if let Some(ctm_props) = &mut surface.ctm_props {
+            ctm_props.set_ctm(&device.drm, ctm.as_ref())
+        } else {
+            // No CTM support
+            Ok(())
+        }
+    }
+
     fn refresh_ipc_outputs(&self, niri: &mut Niri) {
         let _span = tracy_client::span!("Tty::refresh_ipc_outputs");
 
@@ -3158,6 +3220,123 @@ impl GammaProps {
                 property::Value::Blob(blob).into(),
             )
             .context("error setting GAMMA_LUT")?;
+
+        Ok(())
+    }
+}
+
+impl CtmProps {
+    fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
+        let mut ctm = None;
+
+        let props = device
+            .get_properties(crtc)
+            .context("error getting properties")?;
+        for (prop, _) in props {
+            let Ok(info) = device.get_property(prop) else {
+                continue;
+            };
+
+            let Ok(name) = info.name().to_str() else {
+                continue;
+            };
+
+            if name == "CTM" {
+                ensure!(
+                    matches!(info.value_type(), property::ValueType::Blob),
+                    "wrong CTM value type"
+                );
+                ctm = Some(prop);
+                break;
+            }
+        }
+
+        let ctm = ctm.context("missing CTM property")?;
+
+        Ok(Self {
+            crtc,
+            ctm,
+            previous_blob: None,
+        })
+    }
+
+    fn set_ctm(&mut self, device: &DrmDevice, ctm: Option<&[f64; 9]>) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("CtmProps::set_ctm");
+
+        let blob = if let Some(matrix) = ctm {
+            // Convert f64 to S31.32 fixed point format
+            fn double_to_s3132_fixed(val: f64) -> u64 {
+                let result = (val.abs() * (1u64 << 32) as f64) as u64;
+                if val < 0.0 {
+                    result | (1u64 << 63)
+                } else {
+                    result
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            #[repr(C)]
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+            pub struct drm_color_ctm {
+                pub matrix: [u64; 9],
+            }
+
+            let mut ctm_data = drm_color_ctm {
+                matrix: [
+                    double_to_s3132_fixed(matrix[0]),
+                    double_to_s3132_fixed(matrix[1]),
+                    double_to_s3132_fixed(matrix[2]),
+                    double_to_s3132_fixed(matrix[3]),
+                    double_to_s3132_fixed(matrix[4]),
+                    double_to_s3132_fixed(matrix[5]),
+                    double_to_s3132_fixed(matrix[6]),
+                    double_to_s3132_fixed(matrix[7]),
+                    double_to_s3132_fixed(matrix[8]),
+                ],
+            };
+
+            let data = bytemuck::bytes_of_mut(&mut ctm_data);
+
+            let blob = drm_ffi::mode::create_property_blob(device.as_fd(), data)
+                .context("error creating CTM property blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        } else {
+            None
+        };
+
+        {
+            let _span = tracy_client::span!("set_property");
+
+            let blob = blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(self.crtc, self.ctm, property::Value::Blob(blob).into())
+                .context("error setting CTM")
+                .inspect_err(|_| {
+                    if blob != 0 {
+                        // Destroy the blob we just allocated.
+                        if let Err(err) = device.destroy_property_blob(blob) {
+                            warn!("error destroying CTM property blob: {err:?}");
+                        }
+                    }
+                })?;
+        }
+
+        if let Some(blob) = mem::replace(&mut self.previous_blob, blob) {
+            if let Err(err) = device.destroy_property_blob(blob.get()) {
+                warn!("error destroying previous CTM blob: {err:?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn restore_ctm(&self, device: &DrmDevice) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("CtmProps::restore_ctm");
+
+        let blob = self.previous_blob.map(NonZeroU64::get).unwrap_or(0);
+        device
+            .set_property(self.crtc, self.ctm, property::Value::Blob(blob).into())
+            .context("error restoring CTM")?;
 
         Ok(())
     }

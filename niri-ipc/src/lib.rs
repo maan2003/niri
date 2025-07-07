@@ -1103,6 +1103,16 @@ pub enum OutputAction {
         #[cfg_attr(feature = "clap", arg())]
         max_bpc: MaxBpc,
     },
+    /// Set the color transform matrix.
+    Ctm {
+        /// Color transform matrix to set.
+        ///
+        /// This is a 3x3 matrix in row-major order. The matrix is applied to the RGB values
+        /// of each pixel. Identity matrix [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        /// means no color transformation.
+        #[cfg_attr(feature = "clap", arg())]
+        matrix: CtmMatrix,
+    },
 }
 
 /// Output mode to set.
@@ -2015,6 +2025,27 @@ impl FromStr for ScaleToSet {
 
         let scale = s.parse().map_err(|_| "error parsing scale")?;
         Ok(Self::Specific(scale))
+    }
+}
+/// Color transform matrix (CTM) for output color correction.
+///
+/// This is a 3x3 matrix in row-major order that transforms RGB values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CtmMatrix(pub [f64; 9]);
+
+impl FromStr for CtmMatrix {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(
+            s.split_whitespace()
+                .map(|x| x.parse())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "invalid item in ctm matrix")?
+                .try_into()
+                .map_err(|_| "invalid length of matrix")?,
+        ))
     }
 }
 
