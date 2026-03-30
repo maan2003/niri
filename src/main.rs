@@ -193,9 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .unwrap();
 
     if experimental_headless {
-        state.backend.headless().add_renderer()?;
-
         let State { backend, niri } = &mut state;
+        backend.headless().add_renderer(niri)?;
+
         backend
             .headless()
             .add_output(niri, 1, DEFAULT_HEADLESS_OUTPUT_SIZE);

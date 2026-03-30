@@ -79,7 +79,12 @@ fn set_up() -> Fixture {
     config.animations.window_movement.0.kind = LINEAR;
 
     let mut f = Fixture::with_config(config);
-    f.niri_state().backend.headless().add_renderer().unwrap();
+    let state = f.niri_state();
+    state
+        .backend
+        .headless()
+        .add_renderer(&mut state.niri)
+        .unwrap();
     f.add_output(1, (1920, 1080));
 
     f
