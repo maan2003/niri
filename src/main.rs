@@ -32,6 +32,8 @@ use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LOG_FILTER: &str = "niri=debug,smithay::backend::renderer::gles=error";
+const EXPERIMENTAL_HEADLESS_ENV: &str = "NIRI_EXPERIMENTAL_HEADLESS";
+const DEFAULT_HEADLESS_OUTPUT_SIZE: (u16, u16) = (1920, 1080);
 
 #[cfg(feature = "profile-with-tracy-allocations")]
 #[global_allocator]
@@ -174,16 +176,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Increase the buffer size so that it's harder to crash a frozen client with a 1000 Hz mouse.
     set_default_max_buffer_size(&display, 1024 * 1024);
 
+    let experimental_headless = experimental_headless_enabled();
+    if experimental_headless {
+        info!("starting with experimental headless backend");
+    }
+
     let mut state = State::new(
         config,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        experimental_headless,
         true,
         cli.session,
     )
     .unwrap();
+
+    if experimental_headless {
+        state.backend.headless().add_renderer()?;
+
+        let State { backend, niri } = &mut state;
+        backend
+            .headless()
+            .add_output(niri, 1, DEFAULT_HEADLESS_OUTPUT_SIZE);
+        state.focus_default_monitor();
+    }
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();
@@ -322,6 +339,10 @@ fn import_environment() {
             warn!("error spawning shell to import environment: {err:?}");
         }
     }
+}
+
+fn experimental_headless_enabled() -> bool {
+    matches!(env::var(EXPERIMENTAL_HEADLESS_ENV).as_deref(), Ok("1"))
 }
 
 fn env_config_path() -> Option<PathBuf> {
