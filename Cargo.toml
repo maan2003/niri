@@ -186,8 +186,8 @@ assets = [
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
 
-# Local smithay with connector color state support (HDR) and the color-management
+# Smithay fork with connector color state support (HDR) and the color-management
 # protocol from Smithay PR #1143. To be removed once both are upstream.
 [patch."https://github.com/Smithay/smithay.git"]
-smithay = { path = "../smithay" }
-smithay-drm-extras = { path = "../smithay/smithay-drm-extras" }
+smithay = { git = "https://github.com/dividebysandwich/smithay.git", branch = "ds-hdr-master" }
+smithay-drm-extras = { git = "https://github.com/dividebysandwich/smithay.git", branch = "ds-hdr-master" }
