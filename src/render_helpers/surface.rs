@@ -9,7 +9,7 @@ use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
 use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 
-use super::blend::BlendSurfaceRenderElement;
+use super::blend::{BlendContent, BlendSurfaceRenderElement};
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
 
@@ -132,20 +132,22 @@ pub fn push_elements_from_surface_tree<R>(
                 };
 
                 if has_view {
-                    // Content carrying an HDR image description is already encoded in the
-                    // output blend space and must not be re-encoded when composited.
-                    let content_hdr = states
-                        .cached_state
-                        .get::<ColorManagementSurfaceCachedState>()
-                        .current()
-                        .description
-                        .is_some_and(|desc| desc.is_hdr());
+                    // Content carrying an image description matching the output blend space
+                    // is already encoded in it and must not be re-encoded when composited.
+                    let content = BlendContent::from_description(
+                        states
+                            .cached_state
+                            .get::<ColorManagementSurfaceCachedState>()
+                            .current()
+                            .description
+                            .as_ref(),
+                    );
 
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
                         Ok(Some(surface)) => {
-                            push(BlendSurfaceRenderElement::new(surface, content_hdr))
+                            push(BlendSurfaceRenderElement::new(surface, content))
                         }
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {

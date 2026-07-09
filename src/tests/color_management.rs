@@ -160,6 +160,97 @@ fn feedback_preferred_is_pq_with_mode_on() {
     assert_eq!(client.state.info_primaries, Some(Primaries::Bt2020));
 }
 
+/// A fixture whose config opts an output into wide-gamut Display P3 compositing (no HDR).
+fn fixture_with_wide_gamut_p3() -> Fixture {
+    let mut config = Config::default();
+    config.outputs.0.push(Output {
+        name: "headless-1".to_owned(),
+        wide_gamut_p3: true,
+        ..Default::default()
+    });
+    let mut f = Fixture::with_config(config);
+    f.add_output(1, (1920, 1080));
+    f
+}
+
+#[test]
+fn global_is_advertised_with_wide_gamut_p3() {
+    let mut f = fixture_with_wide_gamut_p3();
+
+    let id = f.add_client();
+    f.double_roundtrip(id);
+
+    assert!(
+        f.client(id).state.color_manager.is_some(),
+        "wp_color_manager_v1 must be advertised with a wide-gamut P3 output"
+    );
+}
+
+#[test]
+fn feedback_preferred_is_p3_with_wide_gamut_p3() {
+    let mut f = fixture_with_wide_gamut_p3();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    // Every window on a P3 output is told to prefer Display P3 upfront, so P3-capable clients
+    // switch to tagged wide-gamut output.
+    f.client(id).probe_surface_preferred(&surface);
+    f.double_roundtrip(id);
+
+    let client = f.client(id);
+    assert_eq!(client.state.info_tf, Some(TransferFunction::Srgb));
+    assert_eq!(client.state.info_primaries, Some(Primaries::DisplayP3));
+}
+
+#[test]
+fn p3_description_allows_scanout_engagement() {
+    // A fullscreen window tagging its surface Display P3 is detected, which lets the TTY
+    // backend re-allow direct scanout on wide-gamut P3 outputs.
+    let mut f = fixture_with_wide_gamut_p3();
+
+    let id = f.add_client();
+    let window = f.client(id).create_window();
+    let surface = window.surface.clone();
+    window.commit();
+    f.roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.attach_new_buffer();
+    window.set_fullscreen(None);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+    let window = f.client(id).window(&surface);
+    window.ack_last_and_commit();
+    f.double_roundtrip(id);
+
+    f.client(id).create_and_attach_hdr_description(
+        &surface,
+        TransferFunction::Srgb,
+        Primaries::DisplayP3,
+        RenderIntent::Perceptual,
+    );
+    f.roundtrip(id);
+    f.client(id).window(&surface).surface.commit();
+    f.double_roundtrip(id);
+
+    use smithay::wayland::color::management::Primaries as ServerPrimaries;
+    let output = f.niri_output(1);
+    let desc = f.niri().output_p3_image_description(&output);
+    assert!(
+        desc.is_some_and(|d| d.primaries == ServerPrimaries::DisplayP3),
+        "P3 description on a fullscreen surface must be detected, got {desc:?}"
+    );
+    // And it must not engage HDR.
+    assert_eq!(f.niri().output_hdr_image_description(&output), None);
+}
+
 #[test]
 fn preferred_identities_are_stable() {
     let mut f = fixture_with_hdr_mode_on();

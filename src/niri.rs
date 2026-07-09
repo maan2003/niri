@@ -2278,7 +2278,53 @@ impl Niri {
         if !window.sizing_mode().is_fullscreen() {
             return None;
         }
-        surface_tree_hdr_description(window.toplevel().wl_surface())
+        surface_tree_description(window.toplevel().wl_surface(), |desc| desc.is_hdr())
+    }
+
+    /// Like [`Self::output_hdr_image_description`], but looking for Display P3 (SDR) content;
+    /// the TTY backend uses this to allow direct scanout on wide-gamut P3 outputs.
+    pub fn output_p3_image_description(&self, output: &Output) -> Option<ImageDescription> {
+        let window = self
+            .layout
+            .monitor_for_output(output)
+            .and_then(|mon| mon.active_window())?;
+        if !window.sizing_mode().is_fullscreen() {
+            return None;
+        }
+        surface_tree_description(window.toplevel().wl_surface(), |desc| {
+            !desc.is_hdr() && desc.primaries == CmPrimaries::DisplayP3
+        })
+    }
+
+    /// Whether the output is configured for wide-gamut Display P3 compositing.
+    fn output_wide_gamut_p3(&self, output: &Output) -> bool {
+        let Some(name) = output.user_data().get::<OutputName>() else {
+            return false;
+        };
+        self.config
+            .borrow()
+            .outputs
+            .find(name)
+            .is_some_and(|o| o.wide_gamut_p3)
+    }
+
+    /// The Display P3 (SDR) image description describing a wide-gamut P3 output.
+    const DISPLAY_P3: ImageDescription = ImageDescription {
+        transfer: CmTransferFunction::Srgb,
+        primaries: CmPrimaries::DisplayP3,
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        luminances: None,
+    };
+
+    /// The SDR blend description of an output: Display P3 when configured, sRGB otherwise.
+    fn sdr_blend_description(&self, output: &Output) -> ImageDescription {
+        if self.output_wide_gamut_p3(output) {
+            Self::DISPLAY_P3
+        } else {
+            ImageDescription::SRGB
+        }
     }
 
     /// Returns the HDR config of an output, but only if the output can actually do HDR
@@ -2332,7 +2378,7 @@ impl Niri {
     /// so clients are never told the output is in HDR before the connector is.
     pub fn output_blend_description(&self, output: &Output) -> ImageDescription {
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
-            return ImageDescription::SRGB;
+            return self.sdr_blend_description(output);
         };
         match hdr.mode {
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
@@ -2340,7 +2386,7 @@ impl Niri {
                 if self.output_hdr_image_description(output).is_some() {
                     Self::hdr_blend_description(&hdr, caps)
                 } else {
-                    ImageDescription::SRGB
+                    self.sdr_blend_description(output)
                 }
             }
         }
@@ -2359,7 +2405,7 @@ impl Niri {
         output: &Output,
     ) -> ImageDescription {
         let Some((hdr, caps)) = self.output_hdr_config(output) else {
-            return ImageDescription::SRGB;
+            return self.sdr_blend_description(output);
         };
         match hdr.mode {
             HdrMode::On => Self::hdr_blend_description(&hdr, caps),
@@ -2373,7 +2419,7 @@ impl Niri {
                 if is_active_fullscreen {
                     Self::hdr_blend_description(&hdr, caps)
                 } else {
-                    ImageDescription::SRGB
+                    self.sdr_blend_description(output)
                 }
             }
         }
@@ -2567,12 +2613,18 @@ impl Niri {
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
-        // Advertise color management only when at least one output opts into HDR in the config. This
-        // keeps HDR fully opt-in and off by default — with no `hdr` config, niri behaves exactly as
-        // before. Actual HDR signalling is additionally restricted to the TTY backend (it lives in
-        // `Tty::render`), so advertising on winit/headless is harmless. (Snapshot taken at startup;
-        // toggling `hdr` in the config needs a restart to (un)advertise the global.)
-        let advertise_color_management = config.borrow().outputs.0.iter().any(|o| o.hdr.is_some());
+        // Advertise color management only when at least one output opts into HDR or wide-gamut
+        // P3 in the config. This keeps it fully opt-in and off by default — with no `hdr` or
+        // `wide-gamut-p3` config, niri behaves exactly as before. Actual HDR signalling is
+        // additionally restricted to the TTY backend (it lives in `Tty::render`), so advertising
+        // on winit/headless is harmless. (Snapshot taken at startup; toggling these in the
+        // config needs a restart to (un)advertise the global.)
+        let advertise_color_management = config
+            .borrow()
+            .outputs
+            .0
+            .iter()
+            .any(|o| o.hdr.is_some() || o.wide_gamut_p3);
         let color_management_state = ColorManagementState::new::<State, _>(
             &display_handle,
             [
@@ -2580,7 +2632,11 @@ impl Niri {
                 CmTransferFunction::Gamma22,
                 CmTransferFunction::St2084Pq,
             ],
-            [CmPrimaries::Srgb, CmPrimaries::Bt2020],
+            [
+                CmPrimaries::Srgb,
+                CmPrimaries::Bt2020,
+                CmPrimaries::DisplayP3,
+            ],
             // Mastering-metadata features so HDR clients can convey it without erroring.
             [
                 Feature::Parametric,
@@ -6731,7 +6787,10 @@ impl ClientData for ClientState {
 /// Clients differ in where they attach the description: mpv attaches it to the toplevel surface
 /// itself, while winewayland (Proton) presents Vulkan content on a subsurface and attaches it
 /// there.
-fn surface_tree_hdr_description(surface: &WlSurface) -> Option<ImageDescription> {
+fn surface_tree_description(
+    surface: &WlSurface,
+    matches: impl Fn(&ImageDescription) -> bool,
+) -> Option<ImageDescription> {
     let mut found = None;
     with_surface_tree_downward(
         surface,
@@ -6746,7 +6805,7 @@ fn surface_tree_hdr_description(surface: &WlSurface) -> Option<ImageDescription>
                     .cached_state
                     .get::<ColorManagementSurfaceCachedState>();
                 if let Some(desc) = guard.current().description {
-                    if desc.is_hdr() {
+                    if matches(&desc) {
                         found = Some(desc);
                     }
                 }

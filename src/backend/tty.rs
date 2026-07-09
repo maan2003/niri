@@ -71,7 +71,9 @@ use smithay::wayland::color::management::{
     ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
 };
 
-use crate::render_helpers::blend::{self, set_frame_blend, DEFAULT_REFERENCE_LUMINANCE};
+use crate::render_helpers::blend::{
+    self, set_frame_blend, BlendSpace, DEFAULT_REFERENCE_LUMINANCE,
+};
 
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
@@ -421,7 +423,7 @@ struct Surface {
     /// The blend space of the last rendered frame: `Some(reference luminance)` = HDR, `None`
     /// = SDR. Blend changes alter shader output without damaging anything, so a change forces
     /// a full redraw.
-    last_blend: Option<Option<f64>>,
+    last_blend: Option<Option<BlendSpace>>,
     dmabuf_feedback: Option<SurfaceDmabufFeedback>,
     gamma_props: Option<GammaProps>,
     ctm_props: Option<CtmProps>,
@@ -1590,7 +1592,10 @@ impl Tty {
         // driver that hangs on 10-bit scanout (set the var -> boots fine) from one that hangs on the
         // HDR infoframe commit itself (still hangs). Remove once HDR on nvidia is understood.
         let force_8bit = std::env::var_os("NIRI_HDR_FORCE_8BIT").is_some();
-        let mut using_10bit_formats = config.hdr.is_some() && hdr_supported && !force_8bit;
+        // Wide-gamut P3 compositing also benefits from 10 bits (the gamut remap stretches the
+        // 8-bit code points); it needs no sink HDR support since nothing is signalled.
+        let mut using_10bit_formats =
+            ((config.hdr.is_some() && hdr_supported) || config.wide_gamut_p3) && !force_8bit;
         let mut hdr_color_formats = Vec::new();
 
         if using_10bit_formats {
@@ -2243,11 +2248,12 @@ impl Tty {
         // The connector state is only *staged* here; smithay applies it inside its own commit
         // as a single atomic modeset together with mode, CRTC and plane state (committing
         // connector color properties standalone hangs some drivers, notably nvidia).
-        let (blend_hdr, hdr_content, reference_luminance) = {
+        let (blend_hdr, hdr_content, reference_luminance, wide_gamut_p3) = {
             let config = self.config.borrow();
             let output_config = config.outputs.find(&surface.name);
             let hdr_config = output_config.and_then(|o| o.hdr.clone());
             let hdr_allowed = hdr_config.is_some() && surface.hdr_supported;
+            let wide_gamut_p3 = output_config.is_some_and(|o| o.wide_gamut_p3);
             let max_bpc = output_config
                 .map(|o| effective_max_bpc(o, &surface.max_bpc_range))
                 .unwrap_or(None);
@@ -2306,12 +2312,21 @@ impl Tty {
                 }
             }
 
-            (blend_hdr, hdr_desc.is_some(), reference_luminance)
+            (blend_hdr, hdr_desc.is_some(), reference_luminance, wide_gamut_p3)
         };
 
         // A blend-space change alters what every shader outputs without any element damage;
         // force a full redraw.
-        let blend = blend_hdr.then_some(reference_luminance);
+        let blend = if blend_hdr {
+            Some(BlendSpace::HdrPq {
+                reference_luminance,
+            })
+        } else if wide_gamut_p3 {
+            // No connector signalling: the panel scans out in its native (P3) colorspace.
+            Some(BlendSpace::DisplayP3)
+        } else {
+            None
+        };
         if surface.last_blend != Some(blend) {
             surface.last_blend = Some(blend);
             surface.compositor.reset_buffers();
@@ -2372,12 +2387,21 @@ impl Tty {
                 }
             }
 
-            if blend_hdr {
+            if blend.is_some() {
                 // The cursor plane is filled without going through GLES, so its content would
                 // bypass the blend transform; render the cursor on the primary plane instead.
                 flags.remove(FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT);
                 flags.remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
-                if !hdr_content {
+
+                // Fullscreen content already encoded in the blend space may scan out directly.
+                let content_in_blend_space = match blend {
+                    Some(BlendSpace::HdrPq { .. }) => hdr_content,
+                    Some(BlendSpace::DisplayP3) => {
+                        niri.output_p3_image_description(output).is_some()
+                    }
+                    None => unreachable!(),
+                };
+                if !content_in_blend_space {
                     // SDR content must go through the blend shader.
                     flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT);
                     flags.remove(FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY);

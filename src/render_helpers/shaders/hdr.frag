@@ -1,9 +1,10 @@
-// Blend-space transform for HDR outputs: encodes electrical sRGB content into PQ/BT.2020.
+// Blend-space transform: encodes electrical sRGB content into the output blend space.
 //
-// niri_hdr_pq = 1.0 enables the transform, 0.0 passes through (SDR outputs; uniforms
-// default to 0). niri_ref_lum_scale = reference luminance / 10000 (PQ peak).
+// niri_blend_mode = 0.0 passes through (SDR outputs; uniforms default to 0), 1.0 encodes
+// into PQ/BT.2020 (HDR), 2.0 encodes into Display P3 (wide-gamut SDR).
+// niri_ref_lum_scale = reference luminance / 10000 (PQ peak), used in PQ mode only.
 
-uniform float niri_hdr_pq;
+uniform float niri_blend_mode;
 uniform float niri_ref_lum_scale;
 
 vec3 niri_pq_inv_eotf(vec3 lin) {
@@ -18,7 +19,7 @@ vec3 niri_pq_inv_eotf(vec3 lin) {
 
 // Premultiplied in, premultiplied out.
 vec4 niri_blend(vec4 color) {
-    if (niri_hdr_pq < 0.5)
+    if (niri_blend_mode < 0.5)
         return color;
 
     float a = color.a;
@@ -28,13 +29,26 @@ vec4 niri_blend(vec4 color) {
     // (the piecewise sRGB curve would lift shadows).
     rgb = pow(max(rgb, vec3(0.0)), vec3(2.2));
 
-    // BT.709 -> BT.2020 primaries, linear light, D65 (column-major).
-    const mat3 to_bt2020 = mat3(
-        0.627404, 0.069097, 0.016391,
-        0.329283, 0.919540, 0.088013,
-        0.043313, 0.011362, 0.895595);
-    rgb = to_bt2020 * rgb;
+    if (niri_blend_mode < 1.5) {
+        // BT.709 -> BT.2020 primaries, linear light, D65 (column-major).
+        const mat3 to_bt2020 = mat3(
+            0.627404, 0.069097, 0.016391,
+            0.329283, 0.919540, 0.088013,
+            0.043313, 0.011362, 0.895595);
+        rgb = to_bt2020 * rgb;
 
-    rgb = niri_pq_inv_eotf(rgb * niri_ref_lum_scale);
+        rgb = niri_pq_inv_eotf(rgb * niri_ref_lum_scale);
+    } else {
+        // BT.709 -> Display P3 primaries, linear light, D65 (column-major). Re-encoded with
+        // the same 2.2 power, so the transform is gamut-only and neutrals are untouched.
+        const mat3 to_p3 = mat3(
+            0.822462, 0.033194, 0.017083,
+            0.177538, 0.966806, 0.072397,
+            0.000000, 0.000000, 0.910520);
+        rgb = to_p3 * rgb;
+
+        rgb = pow(max(rgb, vec3(0.0)), vec3(1.0 / 2.2));
+    }
+
     return vec4(rgb * a, a);
 }

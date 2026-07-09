@@ -41,7 +41,7 @@ impl Shaders {
             .compile_custom_texture_shader(
                 concat!(include_str!("texture_hdr.frag"), include_str!("hdr.frag"),),
                 &[
-                    UniformName::new("niri_hdr_pq", UniformType::_1f),
+                    UniformName::new("niri_blend_mode", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
                 ],
             )
@@ -112,7 +112,7 @@ impl Shaders {
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
-                    UniformName::new("niri_hdr_pq", UniformType::_1f),
+                    UniformName::new("niri_blend_mode", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
                 ],
             )
@@ -137,7 +137,7 @@ impl Shaders {
                     UniformName::new("noise", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
                     UniformName::new("bg_color", UniformType::_4f),
-                    UniformName::new("niri_hdr_pq", UniformType::_1f),
+                    UniformName::new("niri_blend_mode", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
                 ],
             )
@@ -157,7 +157,7 @@ impl Shaders {
                 concat!(include_str!("gradient_fade.frag"), include_str!("hdr.frag")),
                 &[
                     UniformName::new("cutoff", UniformType::_2f),
-                    UniformName::new("niri_hdr_pq", UniformType::_1f),
+                    UniformName::new("niri_blend_mode", UniformType::_1f),
                     UniformName::new("niri_ref_lum_scale", UniformType::_1f),
                 ],
             )

@@ -63,6 +63,12 @@ pub struct Output {
     pub max_bpc: Option<MaxBpc>,
     #[knuffel(child)]
     pub hdr: Option<Hdr>,
+    /// Composite this output in Display P3: sRGB content is gamut-mapped in the shaders, and
+    /// clients tagging their surfaces with Display P3 pass through numerically. For wide-gamut
+    /// panels that scan out in their native colorspace (e.g. Apple panels on the Asahi DCP
+    /// driver).
+    #[knuffel(child)]
+    pub wide_gamut_p3: bool,
     #[knuffel(child)]
     pub mode: Option<Mode>,
     #[knuffel(child)]
@@ -109,6 +115,7 @@ impl Default for Output {
             position: None,
             max_bpc: None,
             hdr: None,
+            wide_gamut_p3: false,
             mode: None,
             modeline: None,
             variable_refresh_rate: None,

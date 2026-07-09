@@ -1,11 +1,13 @@
-//! Per-output blend space for windowed HDR support.
+//! Per-output blend space for windowed HDR and wide-gamut (Display P3) support.
 //!
-//! An output is either SDR (electrical sRGB, the default) or HDR (the framebuffer holds
-//! PQ/BT.2020 electrical values and the connector is signalled accordingly). On HDR outputs,
-//! SDR content is encoded into the blend space at draw time by the shaders' `niri_blend`
-//! stage; surfaces that already carry an HDR image description pass through numerically.
+//! An output is either SDR (electrical sRGB, the default), HDR (the framebuffer holds
+//! PQ/BT.2020 electrical values and the connector is signalled accordingly), or Display P3
+//! (the framebuffer holds P3 electrical values, for panels that scan out in their native
+//! wide gamut, like Apple panels on the Asahi DCP driver). On non-SDR outputs, sRGB content
+//! is encoded into the blend space at draw time by the shaders' `niri_blend` stage; surfaces
+//! that already carry a matching image description pass through numerically.
 //!
-//! Blending happens directly in PQ-encoded space. Alpha blending in an encoded space is an
+//! Blending happens directly in encoded space. Alpha blending in an encoded space is an
 //! approximation (the same class of error as regular sRGB-space blending).
 
 use std::cell::Cell;
@@ -19,6 +21,7 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Transform};
 
 use smithay::backend::renderer::{ImportAll, Renderer};
+use smithay::wayland::color::management::{ImageDescription, Primaries};
 
 use super::renderer::AsGlesFrame as _;
 use super::shaders::Shaders;
@@ -27,14 +30,57 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 /// Default SDR reference white in cd/m² (BT.2408).
 pub const DEFAULT_REFERENCE_LUMINANCE: f64 = 203.;
 
+/// The blend space an output is composited in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlendSpace {
+    /// PQ/BT.2020 with the given SDR reference luminance in cd/m².
+    HdrPq { reference_luminance: f64 },
+    /// Display P3 with an SDR (2.2) transfer.
+    DisplayP3,
+}
+
+/// What color encoding a surface's content carries, per its color-management image
+/// description. Content matching the frame's blend space passes through numerically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlendContent {
+    /// No image description, or an sRGB-like one: encode into the blend space.
+    #[default]
+    Sdr,
+    /// A Display P3 (SDR) image description.
+    DisplayP3,
+    /// An HDR (PQ and/or BT.2020) image description.
+    Hdr,
+}
+
+impl BlendContent {
+    /// Classifies a surface's image description (if any).
+    pub fn from_description(desc: Option<&ImageDescription>) -> Self {
+        match desc {
+            Some(desc) if desc.is_hdr() => BlendContent::Hdr,
+            Some(desc) if desc.primaries == Primaries::DisplayP3 => BlendContent::DisplayP3,
+            _ => BlendContent::Sdr,
+        }
+    }
+
+    fn in_blend_space(self, mode: f32) -> bool {
+        match self {
+            BlendContent::Sdr => false,
+            BlendContent::DisplayP3 => mode == 2.,
+            BlendContent::Hdr => mode == 1.,
+        }
+    }
+}
+
 /// The blend state of the frame currently being rendered, stored in the renderer's EGL user
 /// data (like [`super::shaders::Shaders`]).
 ///
-/// Shader uniform values persist in GL program objects across draws, so on HDR frames every
-/// draw sets the blend uniforms from this state, and on SDR frames sets them back to zero.
+/// Shader uniform values persist in GL program objects across draws, so on non-SDR frames
+/// every draw sets the blend uniforms from this state, and on SDR frames sets them back to
+/// zero.
 #[derive(Debug, Default)]
 pub struct FrameBlendState {
-    hdr_pq: Cell<bool>,
+    // The niri_blend_mode uniform value: 0 = SDR passthrough, 1 = PQ/BT.2020, 2 = Display P3.
+    mode: Cell<f32>,
     ref_lum_scale: Cell<f32>,
 }
 
@@ -52,26 +98,36 @@ impl FrameBlendState {
             .expect("FrameBlendState::init() must be called when creating the renderer")
     }
 
-    /// Marks the frames rendered from now on as HDR with the given SDR reference luminance,
-    /// or as SDR (`None`).
-    pub fn set(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
+    /// Marks the frames rendered from now on as being in the given blend space, or as SDR
+    /// (`None`).
+    pub fn set(renderer: &mut GlesRenderer, blend: Option<BlendSpace>) {
         let state = Self::get(renderer);
-        match reference_luminance {
-            Some(lum) => {
-                state.hdr_pq.set(true);
-                state.ref_lum_scale.set((lum / 10000.) as f32);
+        match blend {
+            Some(BlendSpace::HdrPq {
+                reference_luminance,
+            }) => {
+                state.mode.set(1.);
+                state.ref_lum_scale.set((reference_luminance / 10000.) as f32);
             }
-            None => state.hdr_pq.set(false),
+            Some(BlendSpace::DisplayP3) => state.mode.set(2.),
+            None => state.mode.set(0.),
         }
     }
 
-    fn values_from_frame(frame: &GlesFrame) -> (bool, f32) {
+    fn values_from_frame(frame: &GlesFrame) -> (f32, f32) {
         let state: &Self = frame
             .egl_context()
             .user_data()
             .get()
             .expect("FrameBlendState::init() must be called when creating the renderer");
-        (state.hdr_pq.get(), state.ref_lum_scale.get())
+        (state.mode.get(), state.ref_lum_scale.get())
+    }
+
+    /// Whether the given content encoding matches the blend space of this frame (and thus
+    /// passes through numerically).
+    pub fn content_in_blend_space(frame: &GlesFrame, content: BlendContent) -> bool {
+        let (mode, _) = Self::values_from_frame(frame);
+        content.in_blend_space(mode)
     }
 
     /// The `niri_blend` uniform values for a draw of SDR content in this frame.
@@ -79,45 +135,50 @@ impl FrameBlendState {
         Self::uniforms_for_content(frame, false)
     }
 
-    /// The `niri_blend` uniform values for a draw in this frame; `content_hdr` exempts
+    /// The `niri_blend` uniform values for a draw in this frame; `in_blend_space` exempts
     /// content already encoded in the blend space.
-    pub fn uniforms_for_content(frame: &GlesFrame, content_hdr: bool) -> [Uniform<'static>; 2] {
-        let (hdr_pq, scale) = Self::values_from_frame(frame);
-        let apply = hdr_pq && !content_hdr;
+    pub fn uniforms_for_content(frame: &GlesFrame, in_blend_space: bool) -> [Uniform<'static>; 2] {
+        let (mode, scale) = Self::values_from_frame(frame);
         [
-            Uniform::new("niri_hdr_pq", if apply { 1.0f32 } else { 0.0 }),
+            Uniform::new("niri_blend_mode", if in_blend_space { 0. } else { mode }),
             Uniform::new("niri_ref_lum_scale", scale),
         ]
     }
 }
 
-/// Configures the renderer for rendering frames in the given blend space: `Some(reference
-/// luminance)` = HDR (PQ/BT.2020), `None` = SDR.
+/// Configures the renderer for rendering frames in the given blend space, `None` = SDR.
 ///
-/// In HDR, texture draws using the default program go through the blend-space texture shader,
-/// solid colors are encoded on the CPU, and niri's own shader programs read the frame blend
-/// state for their `niri_blend` stage. Call with `None` after rendering the output so
-/// screencasts, screenshots and other outputs stay SDR.
-pub fn set_frame_blend(renderer: &mut GlesRenderer, reference_luminance: Option<f64>) {
-    FrameBlendState::set(renderer, reference_luminance);
+/// In a non-SDR blend space, texture draws using the default program go through the
+/// blend-space texture shader, solid colors are encoded on the CPU, and niri's own shader
+/// programs read the frame blend state for their `niri_blend` stage. Call with `None` after
+/// rendering the output so screencasts, screenshots and other outputs stay SDR.
+pub fn set_frame_blend(renderer: &mut GlesRenderer, blend: Option<BlendSpace>) {
+    FrameBlendState::set(renderer, blend);
 
-    match reference_luminance {
-        Some(lum) => {
-            let scale = (lum / 10000.) as f32;
+    match blend {
+        Some(space) => {
+            let (mode, scale) = match space {
+                BlendSpace::HdrPq {
+                    reference_luminance,
+                } => (1.0f32, (reference_luminance / 10000.) as f32),
+                BlendSpace::DisplayP3 => (2.0f32, 0.),
+            };
             let program = Shaders::get(renderer).texture_hdr.clone();
             if let Some(program) = program {
                 renderer.set_default_tex_program_override(Some((
                     program,
                     vec![
-                        Uniform::new("niri_hdr_pq", 1.0f32),
+                        Uniform::new("niri_blend_mode", mode),
                         Uniform::new("niri_ref_lum_scale", scale),
                     ],
                 )));
             } else {
-                warn!("HDR texture shader missing; SDR content will render raw");
+                warn!("blend-space texture shader missing; SDR content will render raw");
             }
-            renderer
-                .set_solid_color_transform(Some(Box::new(move |color| srgb_to_pq(color, scale))));
+            renderer.set_solid_color_transform(Some(Box::new(move |color| match space {
+                BlendSpace::HdrPq { .. } => srgb_to_pq(color, scale),
+                BlendSpace::DisplayP3 => srgb_to_p3(color),
+            })));
         }
         None => {
             renderer.set_default_tex_program_override(None);
@@ -159,21 +220,40 @@ pub fn srgb_to_pq(color: Color32F, ref_lum_scale: f32) -> Color32F {
     )
 }
 
-/// A surface-tree render element that knows whether its content is already encoded in an HDR
-/// blend space (carries an HDR image description).
+/// CPU counterpart of the shaders' `niri_blend` P3 mode: gamut-maps an electrical sRGB
+/// premultiplied color into Display P3 with the same 2.2 decode/encode.
+pub fn srgb_to_p3(color: Color32F) -> Color32F {
+    let a = color.a();
+    let unpremul = |c: f32| if a > 0. { c / a } else { c };
+
+    let r = unpremul(color.r()).max(0.).powf(2.2);
+    let g = unpremul(color.g()).max(0.).powf(2.2);
+    let b = unpremul(color.b()).max(0.).powf(2.2);
+
+    // BT.709 -> Display P3, linear light, D65.
+    let rp3 = 0.822462 * r + 0.177538 * g;
+    let gp3 = 0.033194 * r + 0.966806 * g;
+    let bp3 = 0.017083 * r + 0.072397 * g + 0.910520 * b;
+
+    let enc = |lin: f32| lin.max(0.).powf(1. / 2.2);
+    Color32F::new(enc(rp3) * a, enc(gp3) * a, enc(bp3) * a, a)
+}
+
+/// A surface-tree render element that knows what color encoding its content carries (from
+/// its image description).
 ///
-/// For HDR content the frame-wide blend-space texture program is suspended around the draw,
-/// so the client's PQ values pass through numerically. Underlying storage is delegated, so
-/// direct scanout keeps working.
+/// For content matching the frame's blend space, the frame-wide blend-space texture program
+/// is suspended around the draw, so the client's values pass through numerically. Underlying
+/// storage is delegated, so direct scanout keeps working.
 #[derive(Debug)]
 pub struct BlendSurfaceRenderElement<R: Renderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    content_hdr: bool,
+    content: BlendContent,
 }
 
 impl<R: Renderer> BlendSurfaceRenderElement<R> {
-    pub fn new(inner: WaylandSurfaceRenderElement<R>, content_hdr: bool) -> Self {
-        Self { inner, content_hdr }
+    pub fn new(inner: WaylandSurfaceRenderElement<R>, content: BlendContent) -> Self {
+        Self { inner, content }
     }
 
     pub fn inner(&self) -> &WaylandSurfaceRenderElement<R> {
@@ -184,8 +264,8 @@ impl<R: Renderer> BlendSurfaceRenderElement<R> {
         self.inner
     }
 
-    pub fn content_hdr(&self) -> bool {
-        self.content_hdr
+    pub fn content(&self) -> BlendContent {
+        self.content
     }
 }
 
@@ -248,7 +328,7 @@ impl RenderElement<GlesRenderer> for BlendSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        let saved = if self.content_hdr {
+        let saved = if FrameBlendState::content_in_blend_space(frame, self.content) {
             frame.take_tex_program_override()
         } else {
             None
@@ -286,7 +366,7 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
         let gles_frame = frame.as_gles_frame();
-        let saved = if self.content_hdr {
+        let saved = if FrameBlendState::content_in_blend_space(gles_frame, self.content) {
             gles_frame.take_tex_program_override()
         } else {
             None
@@ -330,5 +410,28 @@ mod tests {
         // the white point rescaled by alpha.
         let half = srgb_to_pq(Color32F::new(0.5, 0.5, 0.5, 0.5), scale);
         assert!((half.r() - white.r() * 0.5).abs() < 0.0005);
+    }
+
+    #[test]
+    fn srgb_to_p3_reference_values() {
+        // Neutrals are untouched: the matrix rows sum to 1 and decode/encode cancel out.
+        for v in [0., 0.25, 0.5, 1.] {
+            let c = srgb_to_p3(Color32F::new(v, v, v, 1.));
+            assert!((c.r() - v).abs() < 0.001, "got {} for {}", c.r(), v);
+            assert!((c.r() - c.g()).abs() < 0.001);
+            assert!((c.g() - c.b()).abs() < 0.001);
+        }
+
+        // Pure sRGB red is desaturated into P3: linear 0.822462 -> 0.9151 encoded, with a
+        // little green and blue mixed in.
+        let red = srgb_to_p3(Color32F::new(1., 0., 0., 1.));
+        assert!((red.r() - 0.9151).abs() < 0.001, "got {}", red.r());
+        assert!(red.g() > 0.1 && red.g() < 0.3, "got {}", red.g());
+        assert!(red.b() > 0.1 && red.b() < 0.3, "got {}", red.b());
+
+        // Alpha is preserved and premultiplication round-trips.
+        let half = srgb_to_p3(Color32F::new(0.5, 0.5, 0.5, 0.5));
+        assert!((half.r() - 0.5).abs() < 0.001, "got {}", half.r());
+        assert_eq!(half.a(), 0.5);
     }
 }
