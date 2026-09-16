@@ -24,9 +24,12 @@ use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::{Id, RenderElement, RenderElementStates};
-use smithay::backend::renderer::{Color32F, Frame as _, ImportDma as _, Renderer as _};
+use smithay::backend::renderer::element::{
+    Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
+    RenderElementStates,
+};
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::{Frame as _, ImportDma as _, Renderer as _};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -55,7 +58,8 @@ use crate::frame_clock::FrameClock;
 use crate::gpu::client::{GpuClient, Mode as GpuMode};
 use crate::gpu::convert;
 use crate::gpu::protocol::{
-    ConnectorInfo, Event, GpuEvent, ModeDesc, OutputGeometry, OutputRef, Request,
+    ConnectorInfo, ElementKind, ElementMeta, ElementState, Event, GpuEvent, ModeDesc,
+    OutputGeometry, OutputRef, Presentation, Request,
 };
 use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{Niri, RedrawState, State};
@@ -108,9 +112,11 @@ struct Surface {
     /// Gamma change requested while the session was inactive; applied on resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Recreated whenever the output geometry changes.
-    damage_tracker: Option<OutputDamageTracker>,
     /// Per-element state for framebuffer effects, keyed like smithay's damage tracker does it.
     effects_cache: HashMap<Id, UserDataMap>,
+    /// Elements sent to the GPU last frame, so we can send only their damage since then.
+    elements: HashMap<Id, ElementTrack>,
+    next_element_id: u64,
     /// Geometry the GPU process currently has for this output.
     geometry: Option<OutputGeometry>,
     vblank_frame: Option<tracy_client::Frame>,
@@ -730,13 +736,11 @@ impl Tty {
                 .collect();
             drop(config);
 
-            match self.request_ack(Request::CleanupDevice {
+            if let Err(err) = self.request_ack(Request::CleanupDevice {
                 dev: device_id,
                 off,
             }) {
-                // The GPU reset its compositors; our damage trackers no longer match them.
-                Ok(()) => self.reset_damage_trackers(Some(node)),
-                Err(err) => warn!("error cleaning up connectors: {err:?}"),
+                warn!("error cleaning up connectors: {err:?}");
             }
         }
 
@@ -930,8 +934,9 @@ impl Tty {
             vrr_enabled,
             vrr_supported,
             pending_gamma_change: None,
-            damage_tracker: None,
             effects_cache: HashMap::new(),
+            elements: HashMap::new(),
+            next_element_id: 1,
             geometry: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1185,10 +1190,10 @@ impl Tty {
             scale: output.current_scale().fractional_scale(),
             transform: convert::transform(output.current_transform()),
         };
-        if surface.geometry != Some(geometry) || surface.damage_tracker.is_none() {
+        if surface.geometry != Some(geometry) {
             surface.geometry = Some(geometry);
-            surface.damage_tracker = Some(OutputDamageTracker::from_output(output));
-            surface.effects_cache.clear();
+            // The GPU forgets its element history on geometry changes; start over too.
+            surface.elements.clear();
             if let Err(err) = self.request_ack(Request::SetOutputGeometry {
                 output: output_ref,
                 geometry,
@@ -1210,78 +1215,70 @@ impl Tty {
             draw_damage(&mut output_state.debug_damage_tracker, &mut elements);
         }
 
-        // Work out what changed since the last frame; that is the damage we report to the GPU
-        // process. The recording itself covers the whole scene, because the GPU's swapchain
-        // buffer may be several frames old and its own damage tracker clips the replay to
-        // everything that changed since that buffer was last drawn.
+        // Record every element with its damage and opaque regions. The GPU process feeds them
+        // to its DRM compositor, which does the damage tracking and culling.
+        let mode = output.current_mode().unwrap();
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let transform = output.current_transform();
         let surface = self.find_surface(output_ref).unwrap();
-        let damage_tracker = surface.damage_tracker.as_mut().unwrap();
-        let res = damage_tracker
-            .damage_output(1, &elements)
-            .map(|(damage, states)| (damage.cloned(), states));
-        let (damage, states) = match res {
-            Ok(res) => res,
-            Err(err) => {
-                warn!("error computing frame damage: {err}");
-                drop(surface.vblank_frame.take());
-                queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
-                return rv;
-            }
-        };
+        let mut effects_cache = mem::take(&mut surface.effects_cache);
+        let mut tracks = mem::take(&mut surface.elements);
+        let mut next_element_id = surface.next_element_id;
+        let res = record_frame(
+            &mut self.renderer,
+            output_ref,
+            mode.size,
+            transform,
+            scale,
+            &elements,
+            &mut effects_cache,
+            &mut tracks,
+            &mut next_element_id,
+        );
+        let surface = self.find_surface(output_ref).unwrap();
+        surface.effects_cache = effects_cache;
+        surface.elements = tracks;
+        surface.next_element_id = next_element_id;
+        if let Err(err) = res {
+            warn!("error recording frame: {err:?}");
+            // The GPU never saw this frame; resend everything next time.
+            surface.elements.clear();
+            drop(surface.vblank_frame.take());
+            queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+            return rv;
+        }
 
-        let damage = if let Some(damage) = damage {
-            let mut effects_cache = mem::take(&mut surface.effects_cache);
-            let mode = output.current_mode().unwrap();
-            let scale = Scale::from(output.current_scale().fractional_scale());
-            let transform = output.current_transform();
-            let res = record_frame(
-                &mut self.renderer,
-                output_ref,
-                mode.size,
-                transform,
-                scale,
-                &elements,
-                &states,
-                &mut effects_cache,
-            );
-            let surface = self.find_surface(output_ref).unwrap();
-            surface.effects_cache = effects_cache;
-            match res {
-                Ok(()) => Some(damage),
-                Err(err) => {
-                    warn!("error recording frame: {err:?}");
-                    // Whatever the GPU has is now out of sync; redraw everything next time.
-                    surface.damage_tracker = None;
-                    drop(surface.vblank_frame.take());
-                    queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
-                    return rv;
+        let frame_id = self.next_frame_id;
+        self.next_frame_id += 1;
+
+        let reply = self
+            .renderer
+            .flush()
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                match self.request(Request::Present {
+                    output: output_ref,
+                    frame: frame_id,
+                })? {
+                    Event::Presented { submitted, states } => Ok((submitted, states)),
+                    other => bail!("unexpected reply to Present: {other:?}"),
                 }
+            });
+        let (submitted, states) = match reply {
+            Ok((submitted, states)) => (Ok(submitted), states),
+            Err(err) => (Err(err), Vec::new()),
+        };
+        let states = {
+            let surface = self.find_surface(output_ref).unwrap();
+            if submitted.is_err() {
+                surface.elements.clear();
             }
-        } else {
-            None
+            element_states(&surface.elements, &states)
         };
 
         niri.update_primary_scanout_output(output, &states);
 
-        if let Some(damage) = damage {
-            let frame_id = self.next_frame_id;
-            self.next_frame_id += 1;
-
-            let submitted = self
-                .renderer
-                .flush()
-                .map_err(anyhow::Error::from)
-                .and_then(|()| {
-                    match self.request(Request::Present {
-                        output: output_ref,
-                        frame: frame_id,
-                        damage: convert::rects(&damage),
-                    })? {
-                        Event::Presented { submitted } => Ok(submitted),
-                        other => bail!("unexpected reply to Present: {other:?}"),
-                    }
-                });
-
+        {
             match submitted {
                 Ok(true) => {
                     let presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
@@ -1308,8 +1305,6 @@ impl Tty {
                 Ok(false) => rv = RenderResult::NoDamage,
                 Err(err) => warn!("error presenting frame: {err:?}"),
             }
-        } else {
-            rv = RenderResult::NoDamage;
         }
 
         if let Some(surface) = self.find_surface(output_ref) {
@@ -1488,23 +1483,8 @@ impl Tty {
         if active {
             return;
         }
-        match self.request_ack(Request::ClearOutputs) {
-            Ok(()) => self.reset_damage_trackers(None),
-            Err(err) => warn!("error clearing outputs: {err:?}"),
-        }
-    }
-
-    /// Forgets what the GPU has on screen so the next frame is recorded and presented in full.
-    fn reset_damage_trackers(&mut self, node: Option<DrmNode>) {
-        for (n, device) in &mut self.devices {
-            if node.is_some_and(|node| node != *n) {
-                continue;
-            }
-            for connector in device.connectors.values_mut() {
-                if let Some(surface) = &mut connector.surface {
-                    surface.damage_tracker = None;
-                }
-            }
+        if let Err(err) = self.request_ack(Request::ClearOutputs) {
+            warn!("error clearing outputs: {err:?}");
         }
     }
 
@@ -1940,8 +1920,14 @@ fn suspend() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Records the whole scene for one output, bottom to top, the way smithay's damage tracker
-/// would with a full-redraw age.
+struct ElementTrack {
+    remote_id: u64,
+    commit: CommitCounter,
+    seen: bool,
+}
+
+/// Records every element for one output, bottom to top, each wrapped in element markers with
+/// the damage since the last frame we sent it in.
 #[allow(clippy::too_many_arguments)]
 fn record_frame<E: RenderElement<RemoteRenderer>>(
     renderer: &mut RemoteRenderer,
@@ -1950,8 +1936,9 @@ fn record_frame<E: RenderElement<RemoteRenderer>>(
     transform: Transform,
     scale: Scale<f64>,
     elements: &[E],
-    states: &RenderElementStates,
     effects_cache: &mut HashMap<Id, UserDataMap>,
+    tracks: &mut HashMap<Id, ElementTrack>,
+    next_id: &mut u64,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!("record_frame");
 
@@ -1959,40 +1946,98 @@ fn record_frame<E: RenderElement<RemoteRenderer>>(
     let output_geo = Rectangle::from_size(transform.transform_size(mode_size));
     let mut target = renderer.output_target(output_ref, output_geo.size);
     let mut frame = renderer.render(&mut target, mode_size, transform.invert())?;
-    frame.clear(Color32F::TRANSPARENT, &[output_geo])?;
 
-    let mut used = HashSet::new();
     for element in elements.iter().rev() {
         let id = element.id();
         let geometry = element.geometry(scale);
-        let Some(mut damage) = geometry.intersection(output_geo) else {
-            continue;
-        };
-        damage.loc -= geometry.loc;
         let src = element.src();
+        let commit = element.current_commit();
+        let (remote_id, damage) = match tracks.get_mut(id) {
+            Some(track) => {
+                let damage = element.damage_since(scale, Some(track.commit));
+                track.commit = commit;
+                track.seen = true;
+                (track.remote_id, Some(convert::rects(&damage)))
+            }
+            None => {
+                let remote_id = *next_id;
+                *next_id += 1;
+                tracks.insert(
+                    id.clone(),
+                    ElementTrack {
+                        remote_id,
+                        commit,
+                        seen: true,
+                    },
+                );
+                (remote_id, None)
+            }
+        };
+        let framebuffer_effect = element.is_framebuffer_effect();
 
-        if states
-            .element_render_state(id.clone())
-            .is_some_and(|state| state.needs_capture)
-        {
+        frame.begin_element(ElementMeta {
+            id: remote_id,
+            src: convert::rect_f64(src),
+            geometry: convert::rect(geometry),
+            damage,
+            opaque: convert::rects(&element.opaque_regions(scale)),
+            kind: match element.kind() {
+                Kind::Cursor => ElementKind::Cursor,
+                Kind::ScanoutCandidate => ElementKind::ScanoutCandidate,
+                Kind::Unspecified => ElementKind::Unspecified,
+            },
+            framebuffer_effect,
+        });
+        if framebuffer_effect {
             let cache = effects_cache.entry(id.clone()).or_default();
             element.capture_framebuffer(&mut frame, src, geometry, cache)?;
         }
+        frame.begin_element_draw();
         element.draw(
             &mut frame,
             src,
             geometry,
-            &[damage],
+            &[Rectangle::from_size(geometry.size)],
             &[],
             effects_cache.get(id),
         )?;
-        used.insert(id.clone());
+        frame.end_element();
     }
-    effects_cache.retain(|id, _| used.contains(id));
+    tracks.retain(|_, t| mem::take(&mut t.seen));
+    effects_cache.retain(|id, _| tracks.contains_key(id));
 
     // No fence to wait on: the GPU process syncs when it replays.
     let _ = frame.finish()?;
     Ok(())
+}
+
+/// Maps the GPU's per-element results back onto smithay ids for presentation feedback.
+fn element_states(
+    tracks: &HashMap<Id, ElementTrack>,
+    states: &[ElementState],
+) -> RenderElementStates {
+    let by_remote: HashMap<u64, &ElementState> = states.iter().map(|s| (s.id, s)).collect();
+    let states = tracks
+        .iter()
+        .filter_map(|(id, track)| {
+            let s = by_remote.get(&track.remote_id)?;
+            Some((
+                id.clone(),
+                RenderElementState {
+                    visible_area: s.visible_area as usize,
+                    presentation_state: match s.presentation {
+                        Presentation::Rendering => {
+                            RenderElementPresentationState::Rendering { reason: None }
+                        }
+                        Presentation::ZeroCopy => RenderElementPresentationState::ZeroCopy,
+                        Presentation::Skipped => RenderElementPresentationState::Skipped,
+                    },
+                    needs_capture: false,
+                },
+            ))
+        })
+        .collect();
+    RenderElementStates { states }
 }
 
 fn queue_estimated_vblank_timer(

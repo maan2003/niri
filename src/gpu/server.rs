@@ -253,13 +253,10 @@ impl Server {
                 drm.set_debug_tint(enable);
                 Event::Ack
             }
-            Request::Present {
-                output,
-                frame,
-                damage,
-            } => Event::Presented {
-                submitted: drm.present(exec, output, frame, &damage)?,
-            },
+            Request::Present { output, frame } => {
+                let (submitted, states) = drm.present(exec, output, frame)?;
+                Event::Presented { submitted, states }
+            }
             Request::Shutdown => unreachable!(),
         })
     }

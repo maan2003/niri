@@ -540,6 +540,9 @@ pub fn run_frame(
                     .context("draw captured")?;
             }
             Command::Begin { .. } => bail!("nested Begin"),
+            Command::BeginElement(_) | Command::BeginElementDraw | Command::EndElement => {
+                bail!("element marker outside an output frame")
+            }
             cmd => {
                 // Texture management interleaved with drawing (e.g. a blur output created
                 // mid-frame): run it through the frame's renderer guard.

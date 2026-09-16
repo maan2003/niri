@@ -23,7 +23,9 @@ use smithay::backend::drm::{
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
-use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
+use smithay::backend::renderer::element::{
+    Element, Id, Kind, RenderElement, RenderElementPresentationState, UnderlyingStorage,
+};
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::DebugFlags;
@@ -44,7 +46,8 @@ use super::convert;
 use super::exec::{run_frame, Executor, Tables};
 use super::gl::{resources, shaders};
 use super::protocol::{
-    Command, ConnectorInfo, DevId, Event, ModeDesc, OutputGeometry, OutputRef, Rect,
+    Command, ConnectorInfo, DevId, ElementKind, ElementMeta, ElementState, Event, ModeDesc,
+    OutputGeometry, OutputRef, Presentation,
 };
 
 const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
@@ -83,11 +86,16 @@ struct Surface {
     gamma_props: Option<GammaProps>,
     max_bpc: Option<u8>,
     geometry: OutputGeometry,
-    /// Identity of the single "frame" element we feed the DRM compositor.
-    element_id: Id,
+    /// Damage tracking state per core element id, so the DRM compositor sees real elements.
+    elements: HashMap<u64, ElementTrack>,
+}
+
+struct ElementTrack {
+    id: Id,
     commit: CommitCounter,
-    /// Damage of recent frames, newest last.
-    damage_history: VecDeque<Vec<Rectangle<i32, Physical>>>,
+    /// Element-relative damage of recent commits, newest last.
+    history: VecDeque<Vec<Rectangle<i32, Physical>>>,
+    seen: bool,
 }
 
 struct GammaProps {
@@ -492,9 +500,7 @@ impl DrmState {
                 gamma_props,
                 max_bpc,
                 geometry,
-                element_id: Id::new(),
-                commit: CommitCounter::default(),
-                damage_history: VecDeque::new(),
+                elements: HashMap::new(),
             },
         );
 
@@ -575,7 +581,7 @@ impl DrmState {
                 .compositor
                 .set_output_mode_source(mode_source(&mode, geometry));
             // Everything moved; the old damage history is meaningless.
-            surface.damage_history.clear();
+            surface.elements.clear();
         }
         Ok(())
     }
@@ -612,14 +618,13 @@ impl DrmState {
     }
 
     /// Draws the frame the core recorded for `output` and queues it for scanout. Returns
-    /// whether anything was submitted.
+    /// whether anything was submitted plus what happened to each element.
     pub fn present(
         &mut self,
         exec: &mut Executor,
         output: OutputRef,
         frame: u64,
-        damage: &[Rect<i32>],
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<(bool, Vec<ElementState>)> {
         let _span = tracy_client::span!("DrmState::present");
         let (device, crtc) = self.surface(output)?;
         let surface = device.surfaces.get_mut(&crtc).unwrap();
@@ -629,33 +634,78 @@ impl DrmState {
             .output_frames
             .remove(&output)
             .context("no frame recorded for this output")?;
+        let segments = split_elements(&commands);
 
-        surface.commit.increment();
-        surface
-            .damage_history
-            .push_back(convert::to_rects::<Physical>(damage));
-        while surface.damage_history.len() > DAMAGE_HISTORY {
-            surface.damage_history.pop_front();
+        // Advance per-element commits by the damage the core reported.
+        for seg in &segments {
+            let track = surface
+                .elements
+                .entry(seg.meta.id)
+                .or_insert_with(|| ElementTrack {
+                    id: Id::new(),
+                    commit: CommitCounter::default(),
+                    history: VecDeque::new(),
+                    seen: false,
+                });
+            track.seen = true;
+            let damage = match &seg.meta.damage {
+                None => {
+                    let size = convert::to_rect::<Physical>(seg.meta.geometry).size;
+                    Some(vec![Rectangle::from_size(size)])
+                }
+                Some(d) if d.is_empty() => None,
+                Some(d) => Some(convert::to_rects(d)),
+            };
+            if let Some(damage) = damage {
+                track.commit.increment();
+                track.history.push_back(damage);
+                while track.history.len() > DAMAGE_HISTORY {
+                    track.history.pop_front();
+                }
+            }
         }
+        surface.elements.retain(|_, t| mem::take(&mut t.seen));
+        let id_map: HashMap<Id, u64> = surface
+            .elements
+            .iter()
+            .map(|(k, t)| (t.id.clone(), *k))
+            .collect();
 
-        let mode = surface.compositor.pending_mode();
-        let transform = convert::to_transform(surface.geometry.transform);
-        let size = transform.transform_size(mode_size(&mode));
+        // smithay wants elements top to bottom; the core recorded bottom to top.
+        let mut elements: Vec<SceneElement> = segments
+            .iter()
+            .map(|seg| SceneElement {
+                track: &surface.elements[&seg.meta.id],
+                meta: seg.meta,
+                capture: seg.capture,
+                draw: seg.draw,
+                tables: &exec.tables,
+            })
+            .collect();
+        elements.reverse();
 
-        let element = FrameElement {
-            id: &surface.element_id,
-            commit: surface.commit,
-            size,
-            history: &surface.damage_history,
-            commands: &commands,
-            tables: &exec.tables,
-        };
         let renderer = exec.renderer.as_mut().context("no renderer yet")?;
-        let elements = [element];
         let res = surface
             .compositor
             .render_frame(renderer, &elements, [0.; 4], FrameFlags::empty())
             .map_err(|err| anyhow!("error rendering frame: {err}"))?;
+
+        let states = res
+            .states
+            .states
+            .iter()
+            .filter_map(|(id, state)| {
+                Some(ElementState {
+                    id: *id_map.get(id)?,
+                    presentation: match state.presentation_state {
+                        RenderElementPresentationState::Rendering { .. } => Presentation::Rendering,
+                        RenderElementPresentationState::ZeroCopy => Presentation::ZeroCopy,
+                        RenderElementPresentationState::Skipped => Presentation::Skipped,
+                    },
+                    visible_area: state.visible_area as u64,
+                })
+            })
+            .collect();
 
         if res.needs_sync() {
             if let PrimaryPlaneElement::Swapchain(element) = &res.primary_element {
@@ -666,14 +716,14 @@ impl DrmState {
             }
         }
         if res.is_empty {
-            return Ok(false);
+            return Ok((false, states));
         }
         drop(res);
         surface
             .compositor
             .queue_frame(frame)
             .map_err(|err| anyhow!("error queueing frame: {err}"))?;
-        Ok(true)
+        Ok((true, states))
     }
 
     /// Returns the event to forward to the core.
@@ -876,50 +926,95 @@ impl Device {
     }
 }
 
-/// The whole recorded frame as one render element, so the DRM compositor can track damage per
-/// buffer age and we can clip the replay to what actually needs redrawing.
-struct FrameElement<'a> {
-    id: &'a Id,
-    commit: CommitCounter,
-    size: Size<i32, Physical>,
-    history: &'a VecDeque<Vec<Rectangle<i32, Physical>>>,
-    commands: &'a [Command],
+struct Segment<'a> {
+    meta: &'a ElementMeta,
+    capture: &'a [Command],
+    draw: &'a [Command],
+}
+
+/// Splits an output frame recording into its `BeginElement … EndElement` segments.
+fn split_elements(commands: &[Command]) -> Vec<Segment<'_>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < commands.len() {
+        let Command::BeginElement(meta) = &commands[i] else {
+            debug!("ignoring command outside an element: {:?}", commands[i]);
+            i += 1;
+            continue;
+        };
+        let start = i + 1;
+        let mut draw_start = None;
+        let mut j = start;
+        loop {
+            match commands.get(j) {
+                None => {
+                    warn!("unterminated element in frame recording");
+                    return out;
+                }
+                Some(Command::BeginElementDraw) => draw_start = Some(j),
+                Some(Command::EndElement) => break,
+                Some(_) => (),
+            }
+            j += 1;
+        }
+        let (capture, draw) = match draw_start {
+            Some(k) => (&commands[start..k], &commands[k + 1..j]),
+            None => (&commands[start..start], &commands[start..j]),
+        };
+        out.push(Segment {
+            meta,
+            capture,
+            draw,
+        });
+        i = j + 1;
+    }
+    out
+}
+
+/// One core element, replayed from its recorded commands. Damage and opaque regions come from
+/// the core, so the DRM compositor tracks and culls exactly like in-process smithay would.
+struct SceneElement<'a> {
+    track: &'a ElementTrack,
+    meta: &'a ElementMeta,
+    capture: &'a [Command],
+    draw: &'a [Command],
     tables: &'a RefCell<Tables>,
 }
 
-impl Element for FrameElement<'_> {
+impl Element for SceneElement<'_> {
     fn id(&self) -> &Id {
-        self.id
+        &self.track.id
     }
 
     fn current_commit(&self) -> CommitCounter {
-        self.commit
+        self.track.commit
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        Rectangle::from_size(Size::<i32, Buffer>::from((self.size.w, self.size.h)).to_f64())
+        convert::to_rect_f64(self.meta.src)
     }
 
     fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        Rectangle::from_size(self.size)
+        convert::to_rect(self.meta.geometry)
     }
 
     fn damage_since(
         &self,
-        _scale: Scale<f64>,
+        scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        let full = || DamageSet::from_slice(&[Rectangle::from_size(self.size)]);
-        let Some(distance) = self.commit.distance(commit) else {
+        let full = || DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]);
+        let Some(distance) = self.track.commit.distance(commit) else {
             return full();
         };
         if distance == 0 {
             return DamageSet::default();
         }
-        if distance > self.history.len() {
+        if distance > self.track.history.len() {
             return full();
         }
         let rects: Vec<_> = self
+            .track
             .history
             .iter()
             .rev()
@@ -931,32 +1026,66 @@ impl Element for FrameElement<'_> {
     }
 
     fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        // The core cleared and painted every damaged pixel; nothing shows through.
-        OpaqueRegions::from_slice(&[Rectangle::from_size(self.size)])
+        OpaqueRegions::from_slice(&convert::to_rects(&self.meta.opaque))
     }
 
     fn kind(&self) -> Kind {
-        Kind::Unspecified
+        match self.meta.kind {
+            ElementKind::Cursor => Kind::Cursor,
+            ElementKind::ScanoutCandidate => Kind::ScanoutCandidate,
+            ElementKind::Unspecified => Kind::Unspecified,
+        }
+    }
+
+    fn is_framebuffer_effect(&self) -> bool {
+        self.meta.framebuffer_effect
     }
 }
 
-impl RenderElement<GlesRenderer> for FrameElement<'_> {
+impl RenderElement<GlesRenderer> for SceneElement<'_> {
     fn draw(
         &self,
         frame: &mut GlesFrame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
-        _dst: Rectangle<i32, Physical>,
+        dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        // The recording used output coordinates; damage arrives element-relative.
+        let clip: Vec<_> = damage
+            .iter()
+            .map(|d| {
+                let mut d = *d;
+                d.loc += dst.loc;
+                d
+            })
+            .collect();
         let mut iter = self
-            .commands
+            .draw
             .iter()
             .cloned()
             .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(frame, self.tables, &mut iter, Some(damage)) {
-            warn!("error replaying frame: {err:#}");
+        if let Err(err) = run_frame(frame, self.tables, &mut iter, Some(&clip)) {
+            warn!("error replaying element: {err:#}");
+        }
+        Ok(())
+    }
+
+    fn capture_framebuffer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        _src: Rectangle<f64, Buffer>,
+        _dst: Rectangle<i32, Physical>,
+        _cache: &UserDataMap,
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        let mut iter = self
+            .capture
+            .iter()
+            .cloned()
+            .chain(std::iter::once(Command::End));
+        if let Err(err) = run_frame(frame, self.tables, &mut iter, None) {
+            warn!("error replaying element capture: {err:#}");
         }
         Ok(())
     }

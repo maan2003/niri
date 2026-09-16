@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// `dev_t` of a DRM device node, as reported by udev.
 pub type DevId = u64;
@@ -189,6 +189,44 @@ pub struct ConnectorInfo {
     pub gamma_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementKind {
+    Cursor,
+    ScanoutCandidate,
+    Unspecified,
+}
+
+/// What the GPU-side damage tracker needs to know about one element.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElementMeta {
+    /// Stable across frames for the same element; chosen by the core.
+    pub id: u64,
+    pub src: Rect<f64>,
+    /// In output coordinates.
+    pub geometry: Rect<i32>,
+    /// Element-relative damage since the previous frame this id was sent in. `None` means
+    /// everything (new element or unknown).
+    pub damage: Option<Vec<Rect<i32>>>,
+    /// Element-relative.
+    pub opaque: Vec<Rect<i32>>,
+    pub kind: ElementKind,
+    pub framebuffer_effect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Presentation {
+    Rendering,
+    ZeroCopy,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementState {
+    pub id: u64,
+    pub presentation: Presentation,
+    pub visible_area: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct OutputGeometry {
     pub scale: f64,
@@ -289,6 +327,12 @@ pub enum Command {
         damage: Vec<Rect<i32>>,
         uniforms: Vec<Uniform>,
     },
+    /// Starts one scene element inside an output frame (`Begin { Target::Output }`). Commands
+    /// up to `BeginElementDraw` are its framebuffer capture, the rest up to `EndElement` its
+    /// draw. The GPU turns each element into a real smithay element for its DRM compositor.
+    BeginElement(ElementMeta),
+    BeginElementDraw,
+    EndElement,
     End,
 
     // Valid anywhere.
@@ -422,7 +466,6 @@ pub enum Request {
     Present {
         output: OutputRef,
         frame: u64,
-        damage: Vec<Rect<i32>>,
     },
     Shutdown,
 }
@@ -484,6 +527,8 @@ pub enum Event {
     },
     Presented {
         submitted: bool,
+        /// Per element, what the DRM compositor did with it (for presentation feedback).
+        states: Vec<ElementState>,
     },
     Notify(GpuEvent),
     Error {

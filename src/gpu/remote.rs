@@ -31,8 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlurParams, Caps, Command, DmabufDesc, OutputRef, PlaneDesc, ShaderKind, ShaderSupport, Target,
-    TexId, TexProgram,
+    BlurParams, Caps, Command, DmabufDesc, ElementMeta, OutputRef, PlaneDesc, ShaderKind,
+    ShaderSupport, Target, TexId, TexProgram,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -509,6 +509,18 @@ impl RemoteFrame<'_, '_> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn begin_element(&mut self, meta: ElementMeta) {
+        self.renderer.shared.push(Command::BeginElement(meta));
+    }
+
+    pub fn begin_element_draw(&mut self) {
+        self.renderer.shared.push(Command::BeginElementDraw);
+    }
+
+    pub fn end_element(&mut self) {
+        self.renderer.shared.push(Command::EndElement);
+    }
+
     pub fn draw_shader(
         &mut self,
         program: ShaderKind,
