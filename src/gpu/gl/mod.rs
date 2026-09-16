@@ -1,5 +1,6 @@
 //! GL code that only runs inside the GPU process.
 
+pub mod blend;
 pub mod blur;
 pub mod capture;
 pub mod resources;

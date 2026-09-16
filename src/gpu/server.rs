@@ -393,18 +393,18 @@ impl Server {
                 connector,
                 mode,
                 vrr,
-                max_bpc,
+                color,
                 clear,
-                allow_10bit,
+                prefer_10bit,
             } => drm.enable_output(
                 exec,
                 output,
                 connector,
                 &mode,
                 vrr,
-                max_bpc,
+                color,
                 clear,
-                allow_10bit,
+                prefer_10bit,
             )?,
             Request::DisableOutput { output } => {
                 drm.disable_output(output)?;
@@ -412,7 +412,11 @@ impl Server {
             }
             Request::SetMode { output, mode } => drm.set_mode(output, &mode)?,
             Request::SetVrr { output, enable } => drm.set_vrr(output, enable)?,
-            Request::SetMaxBpc { output, max_bpc } => drm.set_max_bpc(output, max_bpc)?,
+            Request::SetColorState { output, state } => drm.set_color_state(output, state)?,
+            Request::SetCtm { output, matrix } => {
+                drm.set_ctm(output, matrix)?;
+                Event::Ack
+            }
             Request::SetOutputGeometry { output, geometry } => {
                 drm.set_geometry(output, geometry)?;
                 Event::Ack

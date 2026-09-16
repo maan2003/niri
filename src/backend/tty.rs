@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure, Context};
 use drm_ffi::drm_mode_modeinfo;
 use libc::dev_t;
-use niri_config::output::Modeline;
+use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -43,22 +43,26 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Scale;
+use smithay::wayland::color::management::{
+    ImageDescription, Primaries as CmPrimaries, TransferFunction as CmTransferFunction,
+};
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
-use super::{IpcOutputMap, RenderResult};
+use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
 use crate::gpu::client::{GpuClient, Mode as GpuMode};
 use crate::gpu::convert;
 use crate::gpu::protocol::{
-    CastEvent, ConnectorInfo, ElementState, Event, GpuEvent, ModeDesc, OutputGeometry, OutputRef,
-    PresentFlags, Request,
+    CastEvent, ColorState, ConnectorInfo, ElementState, Event, GpuEvent, HdrCaps, HdrMetadataDesc,
+    ModeDesc, OutputGeometry, OutputRef, PresentFlags, Request,
 };
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{Niri, RedrawState, State};
+use crate::render_helpers::blend::{BlendSpace, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
@@ -108,6 +112,11 @@ struct Surface {
     vrr_supported: bool,
     /// Gamma change requested while the session was inactive; applied on resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
+    /// Connector color state currently staged in the GPU process (HDR signalling, max bpc).
+    color_state: ColorState,
+    /// The last color state the driver rejected, so it isn't re-tested every frame (each test
+    /// is an atomic TEST_ONLY commit). Cleared on config change and session resume.
+    failed_color_state: Option<ColorState>,
     /// Recreated whenever the output geometry changes.
     /// Element recording state (damage since last frame, effect caches).
     recorder: Recorder,
@@ -458,6 +467,8 @@ impl Tty {
                     let mut pending = Vec::new();
                     for (crtc, connector) in device.connectors.iter_mut() {
                         if let Some(surface) = &mut connector.surface {
+                            // Give a rejected HDR color state another chance after resume.
+                            surface.failed_color_state = None;
                             if let Some(ramp) = surface.pending_gamma_change.take() {
                                 pending.push((*crtc, ramp));
                             }
@@ -888,16 +899,34 @@ impl Tty {
         let orientation = info.panel_orientation.map(convert::to_transform);
         let physical_size = info.physical_size_mm.unwrap_or((0, 0));
         let connector_handle = info.connector;
-        let allow_10bit = !self.config.borrow().debug.disable_10bit_output;
+        let hdr_caps = info.hdr;
+        let max_bpc_range = info.max_bpc_range;
+        debug!(?hdr_caps, ?max_bpc_range, "connector color capabilities");
+        if config.hdr.is_some() && !hdr_caps.supported {
+            warn!(
+                "output {connector_name}: hdr is enabled in the config, but the driver or \
+                 display does not support it (needs Colorspace BT2020_RGB, HDR_OUTPUT_METADATA \
+                 and an EDID advertising PQ)"
+            );
+        }
+        // 10 bits only where they pay off: HDR (so the PQ signal isn't crushed) and wide-gamut
+        // P3 (the gamut remap stretches the 8-bit code points). SDR outputs stay 8-bit.
+        let prefer_10bit = ((config.hdr.is_some() && hdr_caps.supported) || config.wide_gamut_p3)
+            && !self.config.borrow().debug.disable_10bit_output;
+        // Start SDR with the configured max bpc; the render loop reconciles HDR from there.
+        let color_state = ColorState {
+            hdr: None,
+            max_bpc: effective_max_bpc(&config, max_bpc_range),
+        };
 
         let reply = self.request(Request::EnableOutput {
             output: output_ref,
             connector: connector_handle,
             mode: ModeDesc::from(mode),
             vrr: config.is_vrr_always_on(),
-            max_bpc: config.max_bpc.map(|b| b.0 as u8),
+            color: color_state,
             clear: !niri.monitors_active,
-            allow_10bit,
+            prefer_10bit,
         })?;
         let Event::OutputState {
             mode: mode_desc,
@@ -937,6 +966,12 @@ impl Tty {
             .user_data()
             .insert_if_missing(|| TtyOutputState(output_ref));
         output.user_data().insert_if_missing(|| output_name.clone());
+        output.user_data().insert_if_missing(|| OutputHdrCaps {
+            supported: hdr_caps.supported,
+            max_luminance: hdr_caps.max_luminance,
+            min_luminance: hdr_caps.min_luminance,
+            max_frame_avg_luminance: hdr_caps.max_frame_avg_luminance,
+        });
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
@@ -953,6 +988,8 @@ impl Tty {
             vrr_enabled,
             vrr_supported,
             pending_gamma_change: None,
+            color_state,
+            failed_color_state: None,
             recorder: Recorder::default(),
             geometry: None,
             vblank_frame: None,
@@ -1228,6 +1265,19 @@ impl Tty {
             }
         }
 
+        // Reconcile the output's blend space and HDR signalling with the config and content.
+        //
+        // With hdr mode="on", the connector stays in HDR (BT.2020 + PQ) and the desktop is
+        // composited into that blend space. In auto mode, HDR engages only while a fullscreen
+        // surface carries an HDR image description (passthrough), so the output is SDR
+        // otherwise.
+        //
+        // The connector state is only *staged* in the GPU process; smithay applies it inside
+        // its own commit as a single atomic modeset together with mode, CRTC and plane state
+        // (committing connector color properties standalone hangs some drivers, notably
+        // nvidia).
+        let (blend, content_in_blend_space) = self.reconcile_color_state(niri, output);
+
         let ctx = RenderCtx {
             renderer: &mut self.renderer,
             target: RenderTarget::Output,
@@ -1250,6 +1300,8 @@ impl Tty {
         let target = self
             .renderer
             .output_target(output_ref, transform.transform_size(mode.size));
+        // Only this output's frame is in the blend space; casts and screenshots stay SDR.
+        self.renderer.set_frame_blend(blend.map(BlendSpace::params));
         let res = recorder.record(
             &mut self.renderer,
             target,
@@ -1258,6 +1310,7 @@ impl Tty {
             scale,
             &elements,
         );
+        self.renderer.set_frame_blend(None);
         let surface = self.find_surface(output_ref).unwrap();
         surface.recorder = recorder;
         if let Err(err) = res {
@@ -1277,13 +1330,25 @@ impl Tty {
         let flags = {
             let debug = &self.config.borrow().debug;
             let vrr = niri.output_state.get(output).unwrap().frame_clock.vrr();
-            PresentFlags {
+            let mut flags = PresentFlags {
                 primary_scanout: !debug.disable_direct_scanout,
                 primary_scanout_any_format: !debug.restrict_primary_scanout_to_matching_format,
                 overlay_planes: debug.enable_overlay_planes && !debug.disable_direct_scanout,
                 cursor_plane: !debug.disable_cursor_plane,
                 skip_cursor_only_updates: debug.skip_cursor_only_updates_during_vrr && vrr,
+            };
+            if blend.is_some() {
+                // The cursor and overlay planes are filled without going through GLES, so
+                // their content would bypass the blend transform; composite them instead.
+                flags.cursor_plane = false;
+                flags.overlay_planes = false;
+                // Fullscreen content already encoded in the blend space may scan out directly;
+                // SDR content must go through the blend shader.
+                if !content_in_blend_space {
+                    flags.primary_scanout = false;
+                }
             }
+            flags
         };
 
         // Both are one-way: the outcome arrives as GpuEvent::Presented, then VBlank.
@@ -1461,6 +1526,121 @@ impl Tty {
             output: output_ref,
             ramp,
         })
+    }
+
+    pub fn set_ctm(&mut self, output: &Output, ctm: Option<[f64; 9]>) -> anyhow::Result<()> {
+        let output_ref = output_ref_of(output);
+        ensure!(self.find_surface(output_ref).is_some(), "missing surface");
+        // The GPU process applies it now, or on resume if the device is inactive.
+        self.request_ack(Request::SetCtm {
+            output: output_ref,
+            matrix: ctm,
+        })
+    }
+
+    /// Stages the connector color state matching the config and current content, and returns
+    /// the blend space to composite the frame in plus whether the fullscreen content is already
+    /// encoded in it.
+    fn reconcile_color_state(
+        &mut self,
+        niri: &Niri,
+        output: &Output,
+    ) -> (Option<BlendSpace>, bool) {
+        let output_ref = output_ref_of(output);
+        let (hdr_config, wide_gamut_p3, max_bpc, hdr_caps) = {
+            let Some(connector) = self.find_connector(output_ref) else {
+                return (None, false);
+            };
+            let hdr_caps = connector.info.hdr;
+            let max_bpc_range = connector.info.max_bpc_range;
+            let name = connector.name.clone();
+            let config = self.config.borrow();
+            let output_config = config.outputs.find(&name).cloned().unwrap_or_default();
+            (
+                output_config.hdr.clone(),
+                output_config.wide_gamut_p3,
+                effective_max_bpc(&output_config, max_bpc_range),
+                hdr_caps,
+            )
+        };
+
+        let hdr_allowed = hdr_config.is_some() && hdr_caps.supported;
+        let always_on = hdr_config.as_ref().is_some_and(|h| h.mode == HdrMode::On);
+        let reference_luminance = hdr_config
+            .as_ref()
+            .and_then(|h| h.reference_luminance)
+            .map(|v| v.0)
+            .unwrap_or(DEFAULT_REFERENCE_LUMINANCE);
+
+        let hdr_desc = hdr_allowed
+            .then(|| niri.output_hdr_image_description(output))
+            .flatten();
+        let blend_hdr = hdr_allowed && (always_on || hdr_desc.is_some());
+
+        let desired = if blend_hdr {
+            // Without fullscreen HDR content, the metadata comes from the sink's EDID.
+            let desc = hdr_desc.unwrap_or(ImageDescription {
+                transfer: CmTransferFunction::St2084Pq,
+                primaries: CmPrimaries::Bt2020,
+                max_cll: None,
+                max_fall: None,
+                mastering_luminance: None,
+                luminances: None,
+            });
+            ColorState {
+                hdr: Some(build_hdr_metadata(&desc, &hdr_caps)),
+                max_bpc,
+            }
+        } else {
+            ColorState { hdr: None, max_bpc }
+        };
+
+        let surface = self.find_surface(output_ref).unwrap();
+        if surface.color_state != desired && surface.failed_color_state != Some(desired) {
+            let name = output.name();
+            match self.request(Request::SetColorState {
+                output: output_ref,
+                state: desired,
+            }) {
+                Ok(Event::OutputState {
+                    max_bpc: committed, ..
+                }) => {
+                    let connector = self.find_connector(output_ref).unwrap();
+                    connector.info.max_bpc = committed;
+                    let surface = connector.surface.as_mut().unwrap();
+                    surface.color_state = desired;
+                    surface.failed_color_state = None;
+                    info!(
+                        output = name,
+                        hdr = desired.hdr.is_some(),
+                        "updated HDR signalling to match content"
+                    );
+                }
+                Ok(other) => warn!("unexpected reply to SetColorState: {other:?}"),
+                Err(err) => {
+                    let surface = self.find_surface(output_ref).unwrap();
+                    surface.failed_color_state = Some(desired);
+                    warn!("output {name:?}: failed to update HDR signalling: {err:?}");
+                }
+            }
+        }
+
+        // Blend in HDR only when the connector actually is in HDR; otherwise the PQ-encoded
+        // frame would be shown as SDR.
+        let surface = self.find_surface(output_ref).unwrap();
+        let hdr_active = surface.color_state.hdr.is_some();
+        if blend_hdr && hdr_active {
+            let blend = BlendSpace::HdrPq {
+                reference_luminance,
+            };
+            (Some(blend), hdr_desc.is_some())
+        } else if wide_gamut_p3 {
+            // No connector signalling: the panel scans out in its native (P3) colorspace.
+            let in_space = niri.output_p3_image_description(output).is_some();
+            (Some(BlendSpace::DisplayP3), in_space)
+        } else {
+            (None, false)
+        }
     }
 
     fn refresh_ipc_outputs(&self, niri: &mut Niri) {
@@ -1697,7 +1877,6 @@ impl Tty {
             output_ref: OutputRef,
             mode: Option<(DrmMode, bool)>,
             vrr: Option<bool>,
-            max_bpc: Option<u8>,
         }
         let mut changes: Vec<Change> = vec![];
 
@@ -1768,7 +1947,6 @@ impl Tty {
                     output_ref,
                     mode: change_mode.then_some((mode, fallback)),
                     vrr,
-                    max_bpc: config.max_bpc.map(|b| b.0 as u8),
                 });
             }
         }
@@ -1778,21 +1956,13 @@ impl Tty {
             let Some(surface) = self.find_surface(output_ref) else {
                 continue;
             };
+            // max-bpc and hdr changes flow through the render loop's color state
+            // reconciliation; give a previously rejected state another chance with the new
+            // config.
+            surface.failed_color_state = None;
             let output = surface.output.clone();
             let name = output.name();
-
-            match self.request(Request::SetMaxBpc {
-                output: output_ref,
-                max_bpc: change.max_bpc,
-            }) {
-                Ok(Event::OutputState { max_bpc, .. }) => {
-                    if let Some(connector) = self.find_connector(output_ref) {
-                        connector.info.max_bpc = max_bpc;
-                    }
-                }
-                Ok(other) => warn!("unexpected reply to SetMaxBpc: {other:?}"),
-                Err(err) => debug!("output {name:?}: failed to set max bpc: {err:?}"),
-            }
+            niri.queue_redraw(&output);
 
             if let Some(vrr) = change.vrr {
                 match self.set_vrr(output_ref, vrr) {
@@ -2316,6 +2486,58 @@ unsafe fn init_libinput_plugin_system(libinput: &Libinput) {
     let _ = libinput;
 }
 
+/// The `max bpc` to request for an output: the configured value, or 10 when HDR is enabled but
+/// no explicit value was given (HDR needs at least 10 bits per channel so the PQ signal isn't
+/// crushed). Clamped to the connector's supported range; `None` when the connector has no
+/// `max bpc` property at all.
+fn effective_max_bpc(output: &niri_config::Output, range: Option<(u32, u32)>) -> Option<u32> {
+    let (min, max) = range?;
+    let requested = output
+        .max_bpc
+        .map(|max_bpc| max_bpc.0 as u32)
+        .or_else(|| output.hdr.is_some().then_some(10))?;
+    Some(requested.clamp(min, max))
+}
+
+/// Builds the HDR static metadata to signal on the connector for a client's image description:
+/// a PQ infoframe with BT.2020 mastering primaries and D65 white point.
+///
+/// Luminance priority: what the client provided (clamped to the sink's EDID capabilities) >
+/// the sink's EDID desired-content values > conservative ~500 nit placeholders.
+fn build_hdr_metadata(desc: &ImageDescription, edid: &HdrCaps) -> HdrMetadataDesc {
+    let to_u16 = |v: u32| v.min(u16::MAX as u32) as u16;
+    // Clamps a client-provided value to the sink's EDID capability, when the EDID has one.
+    let clamp_to = |v: u16, edid_cap: u16| if edid_cap > 0 { v.min(edid_cap) } else { v };
+
+    let max_luminance = desc
+        .mastering_luminance
+        .map(|(_, max)| clamp_to(to_u16(max), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let min_luminance = desc
+        .mastering_luminance
+        .map(|(min, _)| to_u16(min).max(edid.min_luminance))
+        .or((edid.min_luminance > 0).then_some(edid.min_luminance))
+        .unwrap_or(50);
+    let max_cll = desc
+        .max_cll
+        .map(|v| clamp_to(to_u16(v), edid.max_luminance))
+        .or((edid.max_luminance > 0).then_some(edid.max_luminance))
+        .unwrap_or(500);
+    let max_fall = desc
+        .max_fall
+        .map(|v| clamp_to(to_u16(v), edid.max_frame_avg_luminance))
+        .or((edid.max_frame_avg_luminance > 0).then_some(edid.max_frame_avg_luminance))
+        .unwrap_or(500);
+
+    HdrMetadataDesc {
+        max_luminance,
+        min_luminance,
+        max_cll,
+        max_fall,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use insta::assert_debug_snapshot;
@@ -2323,6 +2545,68 @@ mod tests {
     use niri_ipc::{HSyncPolarity, VSyncPolarity};
 
     use crate::backend::tty::{calculate_drm_mode_from_modeline, calculate_mode_cvt};
+
+    #[test]
+    fn hdr_metadata_luminance_priorities() {
+        use smithay::wayland::color::management::{ImageDescription, Primaries, TransferFunction};
+
+        use crate::gpu::protocol::HdrCaps;
+
+        let pq_desc = ImageDescription {
+            transfer: TransferFunction::St2084Pq,
+            primaries: Primaries::Bt2020,
+            max_cll: None,
+            max_fall: None,
+            mastering_luminance: None,
+            luminances: None,
+        };
+        let edid = HdrCaps {
+            supported: true,
+            max_luminance: 800,
+            min_luminance: 100,
+            max_frame_avg_luminance: 600,
+        };
+
+        // No client data, no EDID data: conservative placeholders.
+        let meta = super::build_hdr_metadata(&pq_desc, &HdrCaps::default());
+        assert_eq!(meta.max_luminance, 500);
+        assert_eq!(meta.min_luminance, 50);
+        assert_eq!(meta.max_cll, 500);
+        assert_eq!(meta.max_fall, 500);
+
+        // No client data: EDID desired-content values win.
+        let meta = super::build_hdr_metadata(&pq_desc, &edid);
+        assert_eq!(meta.max_luminance, 800);
+        assert_eq!(meta.min_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+
+        // Client data within the sink's capabilities is used as-is.
+        let desc = ImageDescription {
+            mastering_luminance: Some((200, 700)),
+            max_cll: Some(650),
+            max_fall: Some(300),
+            ..pq_desc
+        };
+        let meta = super::build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_luminance, 700);
+        assert_eq!(meta.min_luminance, 200);
+        assert_eq!(meta.max_cll, 650);
+        assert_eq!(meta.max_fall, 300);
+
+        // Client data beyond the sink's capabilities is clamped to the EDID.
+        let desc = ImageDescription {
+            mastering_luminance: Some((1, 4000)),
+            max_cll: Some(4000),
+            max_fall: Some(2000),
+            ..pq_desc
+        };
+        let meta = super::build_hdr_metadata(&desc, &edid);
+        assert_eq!(meta.max_luminance, 800);
+        assert_eq!(meta.min_luminance, 100);
+        assert_eq!(meta.max_cll, 800);
+        assert_eq!(meta.max_fall, 600);
+    }
 
     #[test]
     fn test_calculate_drmmode_from_modeline() {

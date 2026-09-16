@@ -7,6 +7,7 @@ use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
+use super::blend::FrameBlendState;
 use super::shaders::{ProgramType, Shaders};
 use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
@@ -164,6 +165,10 @@ impl RenderElement<RemoteRenderer> for ShaderRenderElement {
             .iter()
             .map(|(name, tex)| (name.clone(), tex.clone()))
             .collect();
+        // Uniform values persist in the GPU-side program object, so the blend uniforms go
+        // with every draw.
+        let mut uniforms = self.additional_uniforms.to_vec();
+        uniforms.extend(FrameBlendState::uniforms(frame));
         frame.draw_shader(
             self.program.into(),
             src,
@@ -171,7 +176,7 @@ impl RenderElement<RemoteRenderer> for ShaderRenderElement {
             damage,
             self.scale,
             self.alpha,
-            &self.additional_uniforms,
+            &uniforms,
             &textures,
         );
         Ok(())

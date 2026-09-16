@@ -13,8 +13,8 @@ use smithay::render_elements;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::client::GpuClient;
-use super::protocol::GpuEvent;
-use super::remote::{RemoteRenderer, RemoteTexture};
+use super::protocol::{BlendParams, GpuEvent};
+use super::remote::{RemoteFrame, RemoteRenderer, RemoteTexture};
 
 pub fn pattern(width: i32, height: i32, left: [u8; 4], right: [u8; 4]) -> Vec<u8> {
     let mut data = Vec::with_capacity((width * height * 4) as usize);
@@ -137,6 +137,82 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     let out = render_to_vec(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
     assert_eq!(pixel(&out, 128, 40, 40), yellow, "after update");
     assert_eq!(pixel(&out, 128, 10, 10), green, "background after update");
+
+    // HDR blend space: solid colors are encoded on the CPU, default-program texture draws by
+    // the blend texture shader, and a suspended override passes content through raw.
+    if renderer.shaders().texture_hdr {
+        let ref_lum_scale = 203. / 10000.;
+        renderer.set_frame_blend(Some(BlendParams::HdrPq { ref_lum_scale }));
+        let out = {
+            let buffer_size = Size::<i32, Buffer>::from((128, 128));
+            let mut texture = renderer.create_buffer(Fourcc::Abgr8888, buffer_size)?;
+            {
+                let mut target = renderer.bind(&mut texture)?;
+                let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
+                let all = Rectangle::from_size(size);
+                frame.clear(Color32F::TRANSPARENT, &[all])?;
+                frame.draw_solid(all, &[all], Color32F::new(0., 1., 0., 1.))?;
+                let src = Rectangle::from_size(Size::<f64, Buffer>::from((64., 64.)));
+                let dst = Rectangle::from_size(Size::from((64, 64)));
+                let draw = |frame: &mut RemoteFrame<'_, '_>, dst: Rectangle<i32, Physical>| {
+                    let damage = Rectangle::from_size(dst.size);
+                    frame.render_texture_from_to(
+                        &tex,
+                        src,
+                        dst,
+                        &[damage],
+                        &[],
+                        Transform::Normal,
+                        1.,
+                        None,
+                        &[],
+                    )
+                };
+                frame.suspend_tex_program_override();
+                draw(&mut frame, dst)?;
+                frame.restore_tex_program_override();
+                draw(&mut frame, Rectangle::new((64, 64).into(), dst.size))?;
+                let _sync = frame.finish()?;
+            }
+            let mapping = renderer.copy_texture(
+                &texture,
+                Rectangle::from_size(buffer_size),
+                Fourcc::Abgr8888,
+            )?;
+            renderer.map_texture(&mapping)?.to_vec()
+        };
+        renderer.set_frame_blend(None);
+
+        let encode = |c: [u8; 4]| {
+            let c = Color32F::new(
+                c[0] as f32 / 255.,
+                c[1] as f32 / 255.,
+                c[2] as f32 / 255.,
+                c[3] as f32 / 255.,
+            );
+            let pq = crate::gpu::gl::blend::srgb_to_pq(c, ref_lum_scale);
+            [pq.r(), pq.g(), pq.b(), pq.a()].map(|v| (v * 255.).round() as u8)
+        };
+        let close = |got: [u8; 4], want: [u8; 4]| {
+            got.iter()
+                .zip(want)
+                .all(|(g, w)| (*g as i32 - w as i32).abs() <= 3)
+        };
+        let bg = pixel(&out, 128, 10, 120);
+        assert!(
+            close(bg, encode(green)),
+            "solid in PQ: {bg:?} vs {:?}",
+            encode(green)
+        );
+        let raw = pixel(&out, 128, 40, 40);
+        assert_eq!(raw, yellow, "suspended override passes content through");
+        let enc = pixel(&out, 128, 100, 100);
+        assert!(
+            close(enc, encode(yellow)),
+            "texture in PQ: {enc:?} vs {:?}",
+            encode(yellow)
+        );
+    }
 
     // Cursor loading happens GPU-side; a missing theme yields the built-in arrow.
     let gpu = renderer.gpu_handle();

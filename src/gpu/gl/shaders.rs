@@ -11,6 +11,9 @@ use super::shader::ShaderProgram;
 use crate::gpu::protocol::ShaderKind;
 
 pub struct Shaders {
+    /// Default texture shader plus the blend-space encode (frame-wide override on HDR / P3
+    /// outputs).
+    pub texture_hdr: Option<GlesTexProgram>,
     pub border: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
@@ -25,9 +28,30 @@ pub struct Shaders {
 
 pub type ProgramType = ShaderKind;
 
+/// Uniforms of the `niri_blend` stage (`shaders/hdr.frag`), present in every niri program.
+pub fn blend_uniforms() -> [UniformName<'static>; 2] {
+    [
+        UniformName::new("niri_blend_mode", UniformType::_1f),
+        UniformName::new("niri_ref_lum_scale", UniformType::_1f),
+    ]
+}
+
 impl Shaders {
     fn compile(renderer: &mut GlesRenderer) -> Self {
         let _span = tracy_client::span!("Shaders::compile");
+
+        let texture_hdr = renderer
+            .compile_custom_texture_shader(
+                concat!(
+                    include_str!("shaders/texture_hdr.frag"),
+                    include_str!("shaders/hdr.frag"),
+                ),
+                &blend_uniforms(),
+            )
+            .map_err(|err| {
+                warn!("error compiling HDR texture shader: {err:?}");
+            })
+            .ok();
 
         let border = ShaderProgram::compile(
             renderer,
@@ -83,6 +107,7 @@ impl Shaders {
                 concat!(
                     include_str!("shaders/clipped_surface.frag"),
                     include_str!("shaders/rounding_alpha.frag"),
+                    include_str!("shaders/hdr.frag"),
                     "\nvec4 postprocess(vec4 color) { return color; }",
                 ),
                 &[
@@ -90,6 +115,8 @@ impl Shaders {
                     UniformName::new("geo_size", UniformType::_2f),
                     UniformName::new("corner_radius", UniformType::_4f),
                     UniformName::new("input_to_geo", UniformType::Matrix3x3),
+                    blend_uniforms()[0].clone(),
+                    blend_uniforms()[1].clone(),
                 ],
             )
             .map_err(|err| {
@@ -103,6 +130,7 @@ impl Shaders {
                     include_str!("shaders/clipped_surface.frag"),
                     include_str!("shaders/rounding_alpha.frag"),
                     include_str!("shaders/postprocess.frag"),
+                    include_str!("shaders/hdr.frag"),
                 ),
                 &[
                     UniformName::new("niri_scale", UniformType::_1f),
@@ -112,6 +140,8 @@ impl Shaders {
                     UniformName::new("noise", UniformType::_1f),
                     UniformName::new("saturation", UniformType::_1f),
                     UniformName::new("bg_color", UniformType::_4f),
+                    blend_uniforms()[0].clone(),
+                    blend_uniforms()[1].clone(),
                 ],
             )
             .map_err(|err| {
@@ -127,8 +157,15 @@ impl Shaders {
 
         let gradient_fade = renderer
             .compile_custom_texture_shader(
-                include_str!("shaders/gradient_fade.frag"),
-                &[UniformName::new("cutoff", UniformType::_2f)],
+                concat!(
+                    include_str!("shaders/gradient_fade.frag"),
+                    include_str!("shaders/hdr.frag"),
+                ),
+                &[
+                    UniformName::new("cutoff", UniformType::_2f),
+                    blend_uniforms()[0].clone(),
+                    blend_uniforms()[1].clone(),
+                ],
             )
             .map_err(|err| {
                 warn!("error compiling gradient fade shader: {err:?}");
@@ -142,6 +179,7 @@ impl Shaders {
             .ok();
 
         Self {
+            texture_hdr,
             border,
             shadow,
             clipped_surface,

@@ -9,6 +9,7 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
 use crate::gpu::remote::{CaptureHandle, RemoteError, RemoteFrame, RemoteRenderer};
 use crate::render_helpers::background_effect::RenderParams;
+use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
@@ -226,7 +227,12 @@ impl RenderElement<RemoteRenderer> for FramebufferEffectElement {
         let has_program = Shaders::from_renderer(frame.renderer())
             .postprocess_and_clip
             .is_some();
-        let uniforms = has_program.then(|| self.compute_uniforms(crop, frame.transformation()));
+        let uniforms = has_program.then(|| {
+            let mut uniforms = self.compute_uniforms(crop, frame.transformation()).to_vec();
+            // The sampled framebuffer content is already in the output blend space.
+            uniforms.extend(FrameBlendState::uniforms_for_content(frame, true));
+            uniforms
+        });
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.draw_captured(handle, clamped_dst, &filtered, uniforms);

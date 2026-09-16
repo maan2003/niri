@@ -14,7 +14,7 @@ use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as 
 use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
 use niri_config::debug::PreviewRender;
-use niri_config::output::MaxBpc;
+use niri_config::output::{HdrMode, MaxBpc};
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
@@ -23,7 +23,6 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{InputTime, Keycode};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
     CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -71,8 +70,12 @@ use smithay::utils::{
     Rectangle, Scale, Size, Transform, SERIAL_COUNTER,
 };
 use smithay::wayland::background_effect::BackgroundEffectState;
+use smithay::wayland::color::management::{
+    ColorManagementState, ColorManagementSurfaceCachedState, Feature, ImageDescription,
+    Primaries as CmPrimaries, RenderIntent, TransferFunction as CmTransferFunction,
+};
 use smithay::wayland::compositor::{
-    with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
+    get_parent, with_states, with_surface_tree_downward, CompositorClientState, CompositorHandler,
     CompositorState, HookId, SurfaceData, TraversalAction,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
@@ -118,7 +121,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::Clock;
-use crate::backend::{Backend, Headless, RenderResult, Tty};
+use crate::backend::{Backend, Headless, OutputHdrCaps, RenderResult, Tty};
 use crate::cursor::{CursorManager, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -157,6 +160,7 @@ use crate::protocols::mutter_x11_interop::MutterX11InteropManagerState;
 use crate::protocols::output_management::OutputManagementManagerState;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
+use crate::render_helpers::blend::BlendSurfaceRenderElement;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -355,6 +359,7 @@ pub struct Niri {
     pub presentation_state: PresentationState,
     pub security_context_state: SecurityContextState,
     pub gamma_control_manager_state: GammaControlManagerState,
+    pub color_management_state: ColorManagementState,
     pub activation_state: XdgActivationState,
     pub mutter_x11_interop_state: MutterX11InteropManagerState,
 
@@ -535,6 +540,11 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// The blend-space image description last notified to color-management clients for this
+    /// output, to avoid spurious `image_description_changed` events.
+    pub blend_description: Option<ImageDescription>,
+    /// Color transform matrix for the output.
+    pub ctm: Option<niri_ipc::CtmMatrix>,
 }
 
 #[derive(Debug, Default)]
@@ -867,6 +877,7 @@ impl State {
         self.niri.refresh_pointer_outputs();
         self.niri.global_space.refresh();
         self.niri.refresh_idle_inhibit();
+        self.niri.refresh_color_management();
         self.refresh_pointer_contents();
         foreign_toplevel::refresh(self);
         ext_workspace::refresh(self);
@@ -1925,6 +1936,22 @@ impl State {
                     state.backdrop_buffer.set_color(backdrop_color);
                     recolored_outputs.push(output.clone());
                 }
+
+                // Apply CTM configuration
+                let ctm = config.and_then(|c| c.ctm);
+                if state.ctm != ctm {
+                    state.ctm = ctm;
+                    self.niri.ipc_outputs_changed = true;
+
+                    // Apply CTM to hardware
+                    if let Some(tty) = self.backend.tty_checked() {
+                        if let Err(err) = tty.set_ctm(output, ctm.map(|m| m.0)) {
+                            warn!("error setting CTM for output {}: {err:?}", output.name());
+                        }
+                    }
+
+                    recolored_outputs.push(output.clone());
+                }
             }
 
             for mon in self.niri.layout.monitors_mut() {
@@ -2083,6 +2110,9 @@ impl State {
                 }
             }
             niri_ipc::OutputAction::MaxBpc { max_bpc } => config.max_bpc = Some(MaxBpc(max_bpc)),
+            niri_ipc::OutputAction::Ctm { matrix } => {
+                config.ctm = Some(matrix);
+            }
         });
 
         self.reload_output_config();
@@ -2389,6 +2419,227 @@ impl State {
 }
 
 impl Niri {
+    /// For fullscreen HDR passthrough: if `output` is showing a fullscreen window whose surface
+    /// carries an HDR (PQ / BT.2020) image description, returns that description. The TTY backend
+    /// uses this to decide whether to signal HDR on the connector in auto mode, and which metadata
+    /// to attach.
+    ///
+    /// The whole surface tree is searched, not just the toplevel surface: winewayland (Proton)
+    /// presents Vulkan content on a subsurface of the toplevel and attaches the HDR image
+    /// description there.
+    pub fn output_hdr_image_description(&self, output: &Output) -> Option<ImageDescription> {
+        let window = self.layout.monitor_for_output(output)?.active_window()?;
+        if !window.sizing_mode().is_fullscreen() {
+            return None;
+        }
+        surface_tree_description(window.toplevel().wl_surface(), |desc| desc.is_hdr())
+    }
+
+    /// Like [`Self::output_hdr_image_description`], but looking for Display P3 (SDR) content;
+    /// the TTY backend uses this to allow direct scanout on wide-gamut P3 outputs.
+    pub fn output_p3_image_description(&self, output: &Output) -> Option<ImageDescription> {
+        let window = self
+            .layout
+            .monitor_for_output(output)
+            .and_then(|mon| mon.active_window())?;
+        if !window.sizing_mode().is_fullscreen() {
+            return None;
+        }
+        surface_tree_description(window.toplevel().wl_surface(), |desc| {
+            !desc.is_hdr() && desc.primaries == CmPrimaries::DisplayP3
+        })
+    }
+
+    /// Whether the output is configured for wide-gamut Display P3 compositing.
+    fn output_wide_gamut_p3(&self, output: &Output) -> bool {
+        let Some(name) = output.user_data().get::<OutputName>() else {
+            return false;
+        };
+        self.config
+            .borrow()
+            .outputs
+            .find(name)
+            .is_some_and(|o| o.wide_gamut_p3)
+    }
+
+    /// The Display P3 (SDR) image description describing a wide-gamut P3 output.
+    const DISPLAY_P3: ImageDescription = ImageDescription {
+        transfer: CmTransferFunction::Srgb,
+        primaries: CmPrimaries::DisplayP3,
+        max_cll: None,
+        max_fall: None,
+        mastering_luminance: None,
+        luminances: None,
+    };
+
+    /// The SDR blend description of an output: Display P3 when configured, sRGB otherwise.
+    fn sdr_blend_description(&self, output: &Output) -> ImageDescription {
+        if self.output_wide_gamut_p3(output) {
+            Self::DISPLAY_P3
+        } else {
+            ImageDescription::SRGB
+        }
+    }
+
+    /// Returns the HDR config of an output, but only if the output can actually do HDR
+    /// (driver + sink capabilities probed by the backend), together with those capabilities.
+    fn output_hdr_config(
+        &self,
+        output: &Output,
+    ) -> Option<(niri_config::output::Hdr, OutputHdrCaps)> {
+        let caps = *output.user_data().get::<OutputHdrCaps>()?;
+        if !caps.supported {
+            return None;
+        }
+        let name = output.user_data().get::<OutputName>()?;
+        let hdr = self.config.borrow().outputs.find(name)?.hdr.clone()?;
+        Some((hdr, caps))
+    }
+
+    /// The PQ/BT.2020 image description describing an HDR output, with luminances from the
+    /// sink's EDID and the configured SDR reference white.
+    fn hdr_blend_description(
+        hdr: &niri_config::output::Hdr,
+        caps: OutputHdrCaps,
+    ) -> ImageDescription {
+        // Same placeholder as build_hdr_metadata() in the TTY backend uses for sinks whose
+        // EDID doesn't provide luminance data.
+        let max_luminance = if caps.max_luminance > 0 {
+            u32::from(caps.max_luminance)
+        } else {
+            500
+        };
+        let reference_luminance = hdr.reference_luminance.map(|v| v.0).unwrap_or(203.) as u32;
+        ImageDescription {
+            transfer: CmTransferFunction::St2084Pq,
+            primaries: CmPrimaries::Bt2020,
+            max_cll: (caps.max_luminance > 0).then(|| u32::from(caps.max_luminance)),
+            max_fall: (caps.max_frame_avg_luminance > 0)
+                .then(|| u32::from(caps.max_frame_avg_luminance)),
+            mastering_luminance: None,
+            luminances: Some((
+                u32::from(caps.min_luminance),
+                max_luminance,
+                reference_luminance,
+            )),
+        }
+    }
+
+    /// The image description describing how this output is presented (its blend space).
+    ///
+    /// With `hdr mode="on"`, an HDR-capable output always reports its PQ/BT.2020 description.
+    /// In auto mode it reports PQ only while HDR is actually engaged (fullscreen HDR content),
+    /// so clients are never told the output is in HDR before the connector is.
+    pub fn output_blend_description(&self, output: &Output) -> ImageDescription {
+        let Some((hdr, caps)) = self.output_hdr_config(output) else {
+            return self.sdr_blend_description(output);
+        };
+        match hdr.mode {
+            HdrMode::On => Self::hdr_blend_description(&hdr, caps),
+            HdrMode::Auto => {
+                if self.output_hdr_image_description(output).is_some() {
+                    Self::hdr_blend_description(&hdr, caps)
+                } else {
+                    self.sdr_blend_description(output)
+                }
+            }
+        }
+    }
+
+    /// The image description we'd prefer a window to use, given the output it is on.
+    ///
+    /// With `hdr mode="on"`, every window on the output is told to prefer PQ upfront — this is
+    /// what lets applications that only probe HDR support once at startup (e.g. many SDL
+    /// games) detect it. In auto mode, only the active fullscreen window is told to prefer PQ
+    /// (even while its content is still SDR): clients that listen for `preferred_changed`
+    /// then switch to HDR output, which in turn engages HDR on the connector.
+    fn preferred_description_for_window(
+        &self,
+        window: &Mapped,
+        output: &Output,
+    ) -> ImageDescription {
+        let Some((hdr, caps)) = self.output_hdr_config(output) else {
+            return self.sdr_blend_description(output);
+        };
+        match hdr.mode {
+            HdrMode::On => Self::hdr_blend_description(&hdr, caps),
+            HdrMode::Auto => {
+                let is_active_fullscreen = window.sizing_mode().is_fullscreen()
+                    && self
+                        .layout
+                        .monitor_for_output(output)
+                        .and_then(|mon| mon.active_window())
+                        .is_some_and(|active| active.id() == window.id());
+                if is_active_fullscreen {
+                    Self::hdr_blend_description(&hdr, caps)
+                } else {
+                    self.sdr_blend_description(output)
+                }
+            }
+        }
+    }
+
+    /// The image description we'd prefer the given surface to use.
+    pub fn preferred_surface_description(&self, surface: &WlSurface) -> ImageDescription {
+        // Resolve subsurfaces to their root: winewayland presents Vulkan content on a
+        // subsurface of the toplevel and may query color feedback there.
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+
+        if let Some((window, Some(output))) = self.layout.find_window_and_output(&root) {
+            return self.preferred_description_for_window(window, output);
+        }
+        // Non-toplevel surfaces (e.g. layer shell): prefer the output's blend space.
+        if let Some(output) = self.output_for_root(&root) {
+            let output = output.clone();
+            return self.output_blend_description(&output);
+        }
+        ImageDescription::SRGB
+    }
+
+    /// Sends color-management change notifications for outputs and surfaces whose
+    /// blend/preferred image descriptions changed.
+    ///
+    /// Called from the refresh loop; the smithay-side notifications are deduplicated, and the
+    /// per-output cache below avoids spurious `image_description_changed` events.
+    pub fn refresh_color_management(&mut self) {
+        let _span = tracy_client::span!("Niri::refresh_color_management");
+
+        let outputs: Vec<Output> = self.global_space.outputs().cloned().collect();
+        for output in &outputs {
+            let desc = self.output_blend_description(output);
+            let Some(state) = self.output_state.get_mut(output) else {
+                continue;
+            };
+            if state.blend_description != Some(desc) {
+                state.blend_description = Some(desc);
+                self.color_management_state
+                    .output_description_changed(output);
+            }
+        }
+
+        let mut updates: Vec<(WlSurface, ImageDescription)> = Vec::new();
+        for (monitor, window) in self.layout.windows() {
+            let Some(output) = monitor.map(|mon| mon.output()) else {
+                continue;
+            };
+            let desc = self.preferred_description_for_window(window, output);
+            updates.push((window.toplevel().wl_surface().clone(), desc));
+        }
+        for output in &outputs {
+            let blend = self.output_blend_description(output);
+            for layer in layer_map_for_output(output).layers() {
+                updates.push((layer.wl_surface().clone(), blend));
+            }
+        }
+        for (surface, desc) in updates {
+            self.color_management_state
+                .preferred_changed(&surface, desc);
+        }
+    }
+
     pub fn new(
         config: Rc<RefCell<Config>>,
         event_loop: LoopHandle<'static, State>,
@@ -2525,6 +2776,39 @@ impl Niri {
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
                 is_tty && !client.get_data::<ClientState>().unwrap().restricted
             });
+        // Advertise color management only when at least one output opts into HDR or wide-gamut
+        // P3 in the config. This keeps it fully opt-in and off by default — with no `hdr` or
+        // `wide-gamut-p3` config, niri behaves exactly as before. Actual HDR signalling is
+        // additionally restricted to the TTY backend (it lives in `Tty::render`), so advertising
+        // on winit/headless is harmless. (Snapshot taken at startup; toggling these in the
+        // config needs a restart to (un)advertise the global.)
+        let advertise_color_management = config
+            .borrow()
+            .outputs
+            .0
+            .iter()
+            .any(|o| o.hdr.is_some() || o.wide_gamut_p3);
+        let color_management_state = ColorManagementState::new::<State, _>(
+            &display_handle,
+            [
+                CmTransferFunction::Srgb,
+                CmTransferFunction::Gamma22,
+                CmTransferFunction::St2084Pq,
+            ],
+            [
+                CmPrimaries::Srgb,
+                CmPrimaries::Bt2020,
+                CmPrimaries::DisplayP3,
+            ],
+            // Mastering-metadata features so HDR clients can convey it without erroring.
+            [
+                Feature::Parametric,
+                Feature::SetMasteringDisplayPrimaries,
+                Feature::SetLuminances,
+            ],
+            [RenderIntent::Perceptual],
+            move |_client| advertise_color_management,
+        );
         let activation_state = XdgActivationState::new::<State>(&display_handle);
         event_loop
             .insert_source(
@@ -2741,6 +3025,7 @@ impl Niri {
             presentation_state,
             security_context_state,
             gamma_control_manager_state,
+            color_management_state,
             activation_state,
             mutter_x11_interop_state,
             #[cfg(test)]
@@ -3061,6 +3346,8 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            blend_description: None,
+            ctm: None,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -6992,6 +7279,41 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// Searches a surface and its subsurfaces for a committed HDR image description, returning the
+/// first one found.
+///
+/// Clients differ in where they attach the description: mpv attaches it to the toplevel surface
+/// itself, while winewayland (Proton) presents Vulkan content on a subsurface and attaches it
+/// there.
+fn surface_tree_description(
+    surface: &WlSurface,
+    matches: impl Fn(&ImageDescription) -> bool,
+) -> Option<ImageDescription> {
+    let mut found = None;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, _| TraversalAction::DoChildren(()),
+        |_, states, _| {
+            if found.is_none() {
+                // The surface's states are already locked by the traversal, so read the cached
+                // state through them rather than via get_surface_description() (which would
+                // re-lock and deadlock).
+                let mut guard = states
+                    .cached_state
+                    .get::<ColorManagementSurfaceCachedState>();
+                if let Some(desc) = guard.current().description {
+                    if matches(&desc) {
+                        found = Some(desc);
+                    }
+                }
+            }
+        },
+        |_, _, _| true,
+    );
+    found
+}
+
 fn scale_relocate_crop<E: Element>(
     elem: E,
     output_scale: Scale<f64>,
@@ -7006,7 +7328,7 @@ fn scale_relocate_crop<E: Element>(
 
 niri_render_elements! {
     PointerRenderElements<R> => {
-        Wayland = WaylandSurfaceRenderElement<R>,
+        Wayland = BlendSurfaceRenderElement<R>,
         NamedPointer = PrimaryGpuTextureRenderElement,
     }
 }
@@ -7030,7 +7352,7 @@ niri_render_elements! {
             SolidColorRenderElement
         >>>,
         Pointer = PointerRenderElements<R>,
-        Wayland = WaylandSurfaceRenderElement<R>,
+        Wayland = BlendSurfaceRenderElement<R>,
         SolidColor = SolidColorRenderElement,
         ScreenshotUi = ScreenshotUiRenderElement,
         WindowMruUi = WindowMruUiRenderElement<R>,

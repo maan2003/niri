@@ -19,10 +19,12 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEventMetadata, DrmEventTime, DrmNode, VrrSupport,
+    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEventMetadata,
+    DrmEventTime, DrmNode, HdrOutputMetadata, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::RenderElementPresentationState;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::DebugFlags;
@@ -40,16 +42,20 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use super::convert;
 use super::exec::Executor;
-use super::gl::{resources, shaders};
+use super::gl::{blend, resources, shaders};
 use super::protocol::{
-    ConnectorInfo, DevId, ElementState, Event, ModeDesc, OutputGeometry, OutputRef, PresentFlags,
-    Presentation,
+    BlendParams, ColorState, ConnectorInfo, DevId, ElementState, Event, HdrCaps, ModeDesc,
+    OutputGeometry, OutputRef, PresentFlags, Presentation,
 };
 use super::scene::{self, split_elements, ElementTracks};
 
-const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
-    [Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Abgr8888];
-const SUPPORTED_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
+/// Scanout formats for SDR outputs: 8-bit only, like upstream niri. Asking for a 10-bit
+/// framebuffer isn't free (some drivers, notably nvidia, hang the initial modeset on 2101010),
+/// so outputs that did not opt into HDR / wide gamut stay 8-bit.
+const SDR_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
+/// 10-bit formats tried (each probed for renderability) on HDR / wide-gamut outputs, ahead of
+/// the 8-bit ones.
+const TEN_BIT_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
 
 type GbmDrmCompositor =
     DrmCompositor<GbmAllocator<DeviceFd>, GbmFramebufferExporter<DeviceFd>, u64, DeviceFd>;
@@ -78,7 +84,12 @@ struct Surface {
     connector: connector::Handle,
     compositor: GbmDrmCompositor,
     gamma_props: Option<GammaProps>,
-    max_bpc: Option<u8>,
+    ctm_props: Option<CtmProps>,
+    /// CTM to apply once the device is active again.
+    pending_ctm: Option<Option<[f64; 9]>>,
+    /// Blend space of the last presented frame. A change alters what every shader outputs
+    /// without any element damage, so it forces a full redraw.
+    last_blend: Option<Option<BlendParams>>,
     geometry: OutputGeometry,
     /// Damage tracking state per core element id, so the DRM compositor sees real elements.
     elements: ElementTracks,
@@ -91,12 +102,15 @@ struct GammaProps {
     previous_blob: Option<NonZeroU64>,
 }
 
-struct ConnectorProperties<'a> {
-    device: &'a DrmDevice,
-    connector: connector::Handle,
+/// Read-only snapshot of a connector's DRM properties.
+struct ConnectorProperties {
     properties: Vec<(property::Info, property::RawValue)>,
-    has_change: bool,
-    requests: AtomicModeReq,
+}
+
+struct CtmProps {
+    crtc: crtc::Handle,
+    ctm: property::Handle,
+    previous_blob: Option<NonZeroU64>,
 }
 
 pub struct AddedDevice {
@@ -252,13 +266,20 @@ impl DrmState {
                 warn!("error activating DRM device: {err:?}");
             }
             for surface in device.surfaces.values_mut() {
-                if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, surface.connector)
-                {
-                    set_connector_properties(&mut props, surface.max_bpc, true);
-                }
+                // The connector color state (max bpc, HDR signalling) re-asserts itself via the
+                // compositor's pending state on the next commit.
                 if let Some(gamma_props) = &surface.gamma_props {
                     if let Err(err) = gamma_props.restore_gamma(&device.drm) {
                         warn!("error restoring gamma: {err:?}");
+                    }
+                }
+                if let Some(ctm_props) = &mut surface.ctm_props {
+                    let res = match surface.pending_ctm.take() {
+                        Some(ctm) => ctm_props.set_ctm(&device.drm, ctm.as_ref()),
+                        None => ctm_props.restore_ctm(&device.drm),
+                    };
+                    if let Err(err) = res {
+                        warn!("error restoring CTM: {err:?}");
                     }
                 }
             }
@@ -335,9 +356,9 @@ impl DrmState {
         connector: u32,
         mode: &ModeDesc,
         vrr: bool,
-        max_bpc: Option<u8>,
+        color: ColorState,
         clear: bool,
-        allow_10bit: bool,
+        prefer_10bit: bool,
     ) -> anyhow::Result<Event> {
         let debug_tint = self.debug_tint;
         let crtc = crtc_handle(output.crtc)?;
@@ -353,11 +374,8 @@ impl DrmState {
         );
         let mode = DrmMode::from(mode);
 
-        if let Ok(mut props) = ConnectorProperties::try_new(&device.drm, connector) {
-            set_connector_properties(&mut props, max_bpc, true);
-        } else {
-            warn!("failed to get connector properties");
-        }
+        // The connector color state (HDR signalling, max bpc) is staged on the compositor
+        // below and rides the initial modeset; committing it standalone hangs some drivers.
 
         let mut gamma_props = GammaProps::new(&device.drm, crtc)
             .map_err(|err| debug!("couldn't get gamma properties: {err:?}"))
@@ -369,6 +387,15 @@ impl DrmState {
         };
         if let Err(err) = res {
             debug!("couldn't reset gamma: {err:?}");
+        }
+
+        let mut ctm_props = CtmProps::new(&device.drm, crtc)
+            .map_err(|err| debug!("couldn't get CTM properties: {err:?}"))
+            .ok();
+        if let Some(ctm_props) = &mut ctm_props {
+            if let Err(err) = ctm_props.set_ctm(&device.drm, None) {
+                debug!("couldn't reset CTM: {err:?}");
+            }
         }
 
         let surface = device
@@ -417,18 +444,55 @@ impl DrmState {
                 )
             })
             .collect::<FormatSet>();
-        let color_formats = if allow_10bit {
-            &SUPPORTED_COLOR_FORMATS_10BIT[..]
-        } else {
-            &SUPPORTED_COLOR_FORMATS[..]
-        }
-        .iter()
-        .copied();
-
         let geometry = OutputGeometry {
             scale: 1.,
             transform: convert::transform(Transform::Normal),
         };
+
+        // 10-bit formats are probed one by one with a throwaway compositor and render_frame:
+        // some drivers can render into AR30 but not AB30 (or vice versa), so treating 10-bit
+        // as a boolean would pick a broken format or fall back too far.
+        let mut color_formats = Vec::new();
+        if prefer_10bit {
+            for format in TEN_BIT_COLOR_FORMATS {
+                let surface = device
+                    .drm
+                    .create_surface(crtc, mode, &[connector])
+                    .context("error creating DRM surface")?;
+                let mut compositor: GbmDrmCompositor = match DrmCompositor::new(
+                    mode_source(&mode, geometry),
+                    surface,
+                    None,
+                    device.allocator.clone(),
+                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                    std::iter::once(format),
+                    render_formats.clone(),
+                    device.drm.cursor_size(),
+                    Some(device.gbm.clone()),
+                ) {
+                    Ok(x) => x,
+                    Err(err) => {
+                        debug!(?format, "10-bit format not usable for scanout: {err:?}");
+                        continue;
+                    }
+                };
+                let no_elements: [SolidColorRenderElement; 0] = [];
+                match compositor.render_frame(renderer, &no_elements, [0.; 4], FrameFlags::empty())
+                {
+                    Ok(_) => color_formats.push(format),
+                    Err(err) => warn!(?format, "10-bit format is not renderable: {err:?}"),
+                }
+                // The trial only rendered, never committed; drop what it left in the swapchain.
+                compositor.reset_buffers();
+            }
+            if color_formats.is_empty() {
+                warn!("no usable 10-bit scanout format; using an 8-bit framebuffer");
+            }
+        }
+        color_formats.extend(SDR_COLOR_FORMATS);
+        debug!(?color_formats, "creating DRM compositor");
+        let color_formats = color_formats.into_iter();
+
         let res = DrmCompositor::new(
             mode_source(&mode, geometry),
             surface,
@@ -468,6 +532,11 @@ impl DrmState {
             }
         };
 
+        // Stage the initial connector color state so it rides the initial modeset.
+        if let Err(err) = compositor.use_color_state(connector_color_state(color)) {
+            warn!("error staging initial connector color state: {err:?}");
+        }
+
         if debug_tint {
             compositor.set_debug_flags(DebugFlags::TINT);
         }
@@ -484,7 +553,9 @@ impl DrmState {
                 connector,
                 compositor,
                 gamma_props,
-                max_bpc,
+                ctm_props,
+                pending_ctm: None,
+                last_blend: None,
                 geometry,
                 elements: ElementTracks::default(),
             },
@@ -544,13 +615,38 @@ impl DrmState {
         Ok(Self::output_state(device, output, crtc))
     }
 
-    pub fn set_max_bpc(&mut self, output: OutputRef, max_bpc: Option<u8>) -> anyhow::Result<Event> {
+    /// Stages the connector color state for the next commit (smithay tests it with a
+    /// TEST_ONLY commit first, so a rejected state errors here).
+    pub fn set_color_state(
+        &mut self,
+        output: OutputRef,
+        state: ColorState,
+    ) -> anyhow::Result<Event> {
         let (device, crtc) = self.surface(output)?;
         let surface = device.surfaces.get_mut(&crtc).unwrap();
-        surface.max_bpc = max_bpc;
-        let mut props = ConnectorProperties::try_new(&device.drm, surface.connector)?;
-        set_connector_properties(&mut props, max_bpc, false);
+        let desired = connector_color_state(state);
+        if surface.compositor.pending_color_state() != desired {
+            surface
+                .compositor
+                .use_color_state(desired)
+                .map_err(|err| anyhow!("error setting connector color state: {err}"))?;
+            debug!(hdr = state.hdr.is_some(), max_bpc = ?state.max_bpc, "staged color state");
+        }
         Ok(Self::output_state(device, output, crtc))
+    }
+
+    pub fn set_ctm(&mut self, output: OutputRef, matrix: Option<[f64; 9]>) -> anyhow::Result<()> {
+        let (device, crtc) = self.surface(output)?;
+        let surface = device.surfaces.get_mut(&crtc).unwrap();
+        if !device.drm.is_active() {
+            surface.pending_ctm = Some(matrix);
+            return Ok(());
+        }
+        match &mut surface.ctm_props {
+            Some(ctm_props) => ctm_props.set_ctm(&device.drm, matrix.as_ref()),
+            // No CTM support on this CRTC.
+            None => Ok(()),
+        }
     }
 
     pub fn set_geometry(
@@ -636,10 +732,16 @@ impl DrmState {
         let surface = device.surfaces.get_mut(&crtc).unwrap();
         ensure!(device.drm.is_active(), "device is inactive");
 
-        let commands = exec
+        let frame_rec = exec
             .output_frames
             .remove(&output)
             .context("no frame recorded for this output")?;
+        let commands = frame_rec.commands;
+        let blend = frame_rec.blend;
+        if surface.last_blend != Some(blend) {
+            surface.last_blend = Some(blend);
+            surface.compositor.reset_buffers();
+        }
         let segments = split_elements(&commands);
 
         surface.elements.update(&segments);
@@ -667,10 +769,14 @@ impl DrmState {
         }
 
         let renderer = exec.renderer.as_mut().context("no renderer yet")?;
+        blend::apply(renderer, blend);
         let res = surface
             .compositor
-            .render_frame(renderer, &elements, [0.; 4], frame_flags)
-            .map_err(|err| anyhow!("error rendering frame: {err}"))?;
+            .render_frame(renderer, &elements, [0.; 4], frame_flags);
+        if blend.is_some() {
+            blend::apply(renderer, None);
+        }
+        let res = res.map_err(|err| anyhow!("error rendering frame: {err}"))?;
 
         let states = res
             .states
@@ -754,6 +860,8 @@ impl Device {
             .and_then(|p| p.get_panel_orientation().ok())
             .map(convert::transform);
         let max_bpc = read_max_bpc(&self.drm, connector.handle());
+        let max_bpc_range = props.as_ref().and_then(|p| p.max_bpc_range());
+        let hdr = hdr_caps(props.as_ref(), edid.as_ref());
         let non_desktop = find_drm_property(&self.drm, connector.handle(), "non-desktop")
             .and_then(|(_, info, value)| info.value_type().convert_value(value).as_boolean())
             .unwrap_or(false);
@@ -782,6 +890,8 @@ impl Device {
             non_desktop,
             panel_orientation,
             max_bpc,
+            max_bpc_range,
+            hdr,
             gamma_size,
         }
     }
@@ -1116,8 +1226,8 @@ fn get_edid_info(
     libdisplay_info::info::Info::parse_edid(&data).context("error parsing EDID")
 }
 
-impl<'a> ConnectorProperties<'a> {
-    fn try_new(device: &'a DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
+impl ConnectorProperties {
+    fn try_new(device: &DrmDevice, connector: connector::Handle) -> anyhow::Result<Self> {
         let prop_vals = device
             .get_properties(connector)
             .context("error getting properties")?;
@@ -1128,13 +1238,7 @@ impl<'a> ConnectorProperties<'a> {
                 .context("error getting property")?;
             properties.push((info, value));
         }
-        Ok(Self {
-            device,
-            connector,
-            properties,
-            has_change: false,
-            requests: AtomicModeReq::new(),
-        })
+        Ok(Self { properties })
     }
 
     fn find(&self, name: &std::ffi::CStr) -> anyhow::Result<&(property::Info, property::RawValue)> {
@@ -1158,81 +1262,165 @@ impl<'a> ConnectorProperties<'a> {
         }
     }
 
-    fn reset_hdr(&mut self) -> anyhow::Result<()> {
-        const DRM_MODE_COLORIMETRY_DEFAULT: u64 = 0;
-
-        let (info, value) = self.find(c"HDR_OUTPUT_METADATA")?;
-        let property::ValueType::Blob = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != 0 {
-            self.requests
-                .add_raw_property(self.connector.into(), info.handle(), 0);
-            self.has_change = true;
+    fn max_bpc_range(&self) -> Option<(u32, u32)> {
+        let (info, _) = self.find(c"max bpc").ok()?;
+        match info.value_type() {
+            property::ValueType::UnsignedRange(min, max) => Some((min as u32, max as u32)),
+            _ => None,
         }
-
-        let (info, value) = self.find(c"Colorspace")?;
-        let property::ValueType::Enum(_) = info.value_type() else {
-            bail!("wrong property type")
-        };
-        if *value != DRM_MODE_COLORIMETRY_DEFAULT {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                DRM_MODE_COLORIMETRY_DEFAULT,
-            );
-            self.has_change = true;
-        }
-        Ok(())
     }
 
-    fn set_max_bpc(&mut self, max_bpc: u8) -> anyhow::Result<u64> {
-        let (info, value) = self.find(c"max bpc")?;
-        let property::ValueType::UnsignedRange(min, max) = info.value_type() else {
-            bail!("wrong property type")
+    /// Whether the driver exposes `Colorspace` with a BT2020_RGB choice.
+    fn supports_bt2020_rgb(&self) -> bool {
+        let Ok((info, _)) = self.find(c"Colorspace") else {
+            return false;
         };
-        let max_bpc = max_bpc as u64;
-        if !(min..=max).contains(&max_bpc) {
-            bail!("max-bpc {max_bpc} outside valid range of [{min}, {max}]");
+        match info.value_type() {
+            property::ValueType::Enum(values) => values
+                .values()
+                .1
+                .iter()
+                .any(|v| v.name().to_bytes() == b"BT2020_RGB"),
+            _ => false,
         }
-        let property::Value::UnsignedRange(value) = info.value_type().convert_value(*value) else {
-            bail!("wrong property type")
-        };
-        if value != max_bpc {
-            self.requests.add_raw_property(
-                self.connector.into(),
-                info.handle(),
-                property::Value::UnsignedRange(max_bpc).into(),
-            );
-            self.has_change = true;
-        }
-        Ok(max_bpc)
     }
 
-    fn commit(&mut self) -> anyhow::Result<()> {
-        if self.has_change {
-            self.device.atomic_commit(
-                AtomicCommitFlags::ALLOW_MODESET,
-                std::mem::take(&mut self.requests),
-            )?;
-        }
-        Ok(())
+    fn supports_hdr_metadata(&self) -> bool {
+        matches!(
+            self.find(c"HDR_OUTPUT_METADATA")
+                .map(|(info, _)| info.value_type()),
+            Ok(property::ValueType::Blob)
+        )
     }
 }
 
-fn set_connector_properties(props: &mut ConnectorProperties, max_bpc: Option<u8>, reset_hdr: bool) {
-    if let Some(max_bpc) = max_bpc {
-        if let Err(err) = props.set_max_bpc(max_bpc) {
-            debug!("failed to set `max bpc` property: {err}");
-        }
+/// HDR signalling needs `Colorspace` (with BT2020_RGB) and `HDR_OUTPUT_METADATA` from the
+/// driver, plus a sink that accepts the PQ EOTF per its EDID.
+fn hdr_caps(
+    props: Option<&ConnectorProperties>,
+    edid: Option<&libdisplay_info::info::Info>,
+) -> HdrCaps {
+    let Some(edid) = edid else {
+        return HdrCaps::default();
+    };
+    let hdr = edid.hdr_static_metadata();
+    let lum_u16 = |v: f32| v.clamp(0.0, u16::MAX as f32).round() as u16;
+    let driver_ok = props.is_some_and(|p| p.supports_bt2020_rgb() && p.supports_hdr_metadata());
+    HdrCaps {
+        supported: driver_ok && hdr.pq,
+        max_luminance: lum_u16(hdr.desired_content_max_luminance),
+        // EDID reports cd/m²; the infoframe field is in 0.0001 cd/m² units.
+        min_luminance: lum_u16(hdr.desired_content_min_luminance * 10000.),
+        max_frame_avg_luminance: lum_u16(hdr.desired_content_max_frame_avg_luminance),
     }
-    if reset_hdr {
-        if let Err(err) = props.reset_hdr() {
-            debug!("failed to set HDR properties: {err}");
-        }
+}
+
+fn connector_color_state(state: ColorState) -> ConnectorColorState {
+    match state.hdr {
+        Some(meta) => ConnectorColorState {
+            colorspace: Colorspace::Bt2020Rgb,
+            hdr_metadata: Some(HdrOutputMetadata::pq_bt2020(
+                meta.max_luminance,
+                meta.min_luminance,
+                meta.max_cll,
+                meta.max_fall,
+            )),
+            max_bpc: state.max_bpc,
+        },
+        None => ConnectorColorState {
+            colorspace: Colorspace::Default,
+            hdr_metadata: None,
+            max_bpc: state.max_bpc,
+        },
     }
-    if let Err(err) = props.commit() {
-        warn!("failed to atomically commit properties: {err}");
+}
+
+impl CtmProps {
+    fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
+        let props = device
+            .get_properties(crtc)
+            .context("error getting properties")?;
+        let mut ctm = None;
+        for (prop, _) in props {
+            let Ok(info) = device.get_property(prop) else {
+                continue;
+            };
+            if info.name().to_bytes() == b"CTM" {
+                ensure!(
+                    matches!(info.value_type(), property::ValueType::Blob),
+                    "wrong CTM value type"
+                );
+                ctm = Some(prop);
+                break;
+            }
+        }
+        Ok(Self {
+            crtc,
+            ctm: ctm.context("missing CTM property")?,
+            previous_blob: None,
+        })
+    }
+
+    fn set_ctm(&mut self, device: &DrmDevice, ctm: Option<&[f64; 9]>) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("CtmProps::set_ctm");
+
+        let blob = if let Some(matrix) = ctm {
+            // The kernel wants S31.32 fixed point with a sign bit.
+            fn to_s3132(val: f64) -> u64 {
+                let magnitude = (val.abs() * (1u64 << 32) as f64) as u64;
+                if val < 0.0 {
+                    magnitude | (1u64 << 63)
+                } else {
+                    magnitude
+                }
+            }
+
+            #[allow(non_camel_case_types)]
+            #[repr(C)]
+            #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+            pub struct drm_color_ctm {
+                pub matrix: [u64; 9],
+            }
+
+            let mut data = drm_color_ctm {
+                matrix: matrix.map(to_s3132),
+            };
+            let blob = drm_ffi::mode::create_property_blob(
+                device.as_fd(),
+                bytemuck::bytes_of_mut(&mut data),
+            )
+            .context("error creating CTM property blob")?;
+            NonZeroU64::new(u64::from(blob.blob_id))
+        } else {
+            None
+        };
+
+        let blob_id = blob.map(NonZeroU64::get).unwrap_or(0);
+        device
+            .set_property(self.crtc, self.ctm, property::Value::Blob(blob_id).into())
+            .context("error setting CTM")
+            .inspect_err(|_| {
+                if blob_id != 0 {
+                    if let Err(err) = device.destroy_property_blob(blob_id) {
+                        warn!("error destroying CTM property blob: {err:?}");
+                    }
+                }
+            })?;
+
+        if let Some(blob) = mem::replace(&mut self.previous_blob, blob) {
+            if let Err(err) = device.destroy_property_blob(blob.get()) {
+                warn!("error destroying previous CTM blob: {err:?}");
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_ctm(&self, device: &DrmDevice) -> anyhow::Result<()> {
+        let blob = self.previous_blob.map(NonZeroU64::get).unwrap_or(0);
+        device
+            .set_property(self.crtc, self.ctm, property::Value::Blob(blob).into())
+            .context("error restoring CTM")?;
+        Ok(())
     }
 }
 

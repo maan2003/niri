@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -104,6 +104,69 @@ pub enum TexProgram {
     ClippedSurface,
     PostprocessAndClip,
     GradientFade,
+    /// The default texture shader plus the blend-space encode; installed frame-wide on HDR /
+    /// wide-gamut outputs.
+    TextureHdr,
+}
+
+/// The blend space a frame is composited in; `None` in `Begin` means SDR (electrical sRGB).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BlendParams {
+    /// PQ/BT.2020; `ref_lum_scale` is the SDR reference luminance / 10000.
+    HdrPq { ref_lum_scale: f32 },
+    /// Display P3 with a 2.2 transfer.
+    DisplayP3,
+}
+
+impl BlendParams {
+    /// The `niri_blend_mode` uniform value.
+    pub fn mode(self) -> f32 {
+        match self {
+            BlendParams::HdrPq { .. } => 1.,
+            BlendParams::DisplayP3 => 2.,
+        }
+    }
+
+    pub fn ref_lum_scale(self) -> f32 {
+        match self {
+            BlendParams::HdrPq { ref_lum_scale } => ref_lum_scale,
+            BlendParams::DisplayP3 => 0.,
+        }
+    }
+}
+
+/// HDR static metadata to signal on a connector (PQ, BT.2020 mastering primaries). Luminances
+/// in cd/m², except `min_luminance` in 0.0001 cd/m².
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HdrMetadataDesc {
+    pub max_luminance: u16,
+    pub min_luminance: u16,
+    pub max_cll: u16,
+    pub max_fall: u16,
+}
+
+/// Connector color state, staged so it rides the DRM compositor's next atomic commit.
+/// `hdr = Some` selects the BT2020_RGB colorspace with that infoframe; `None` is the default
+/// (SDR) colorspace with no metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColorState {
+    pub hdr: Option<HdrMetadataDesc>,
+    /// The `max bpc` to request; `None` leaves the property alone.
+    pub max_bpc: Option<u32>,
+}
+
+/// What the connector and its sink can do for HDR (from DRM properties and the EDID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HdrCaps {
+    /// The connector has `Colorspace` (with BT2020_RGB) and `HDR_OUTPUT_METADATA`, and the
+    /// sink accepts the PQ EOTF.
+    pub supported: bool,
+    /// EDID desired content max luminance, cd/m² (0 = not provided).
+    pub max_luminance: u16,
+    /// EDID desired content min luminance, 0.0001 cd/m² (0 = not provided).
+    pub min_luminance: u16,
+    /// EDID desired content max frame-average luminance, cd/m² (0 = not provided).
+    pub max_frame_avg_luminance: u16,
 }
 
 /// Pixel shader programs in the GPU process. Resize/Close/Open can be replaced by custom
@@ -214,6 +277,9 @@ pub struct ConnectorInfo {
     pub non_desktop: bool,
     pub panel_orientation: Option<Transform>,
     pub max_bpc: Option<u8>,
+    /// Valid range of the `max bpc` property, if the connector has one.
+    pub max_bpc_range: Option<(u32, u32)>,
+    pub hdr: HdrCaps,
     pub gamma_size: u32,
 }
 
@@ -327,6 +393,9 @@ pub enum Command {
         width: i32,
         height: i32,
         transform: Transform,
+        /// Blend space of this frame. When set, default-program texture draws go through
+        /// `TexProgram::TextureHdr` and solid colors are encoded on the CPU.
+        blend: Option<BlendParams>,
     },
     Clear {
         color: [f32; 4],
@@ -353,6 +422,10 @@ pub enum Command {
         uniforms: Vec<Uniform>,
     },
     ClearTexProgramOverride,
+    /// Temporarily drops the frame's tex program override (including the frame-wide blend
+    /// one) so content already encoded in the blend space passes through numerically.
+    SuspendTexProgramOverride,
+    RestoreTexProgramOverride,
     /// niri's custom pixel shaders (borders, shadows, resize/open/close animations).
     DrawShader {
         program: ShaderKind,
@@ -410,6 +483,7 @@ pub struct ShaderSupport {
     pub blur: bool,
     pub close: bool,
     pub open: bool,
+    pub texture_hdr: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -493,10 +567,13 @@ pub enum Request {
         connector: u32,
         mode: ModeDesc,
         vrr: bool,
-        max_bpc: Option<u8>,
+        /// Initial connector color state, staged to ride the modeset.
+        color: ColorState,
         /// Show black right away (monitors are "off").
         clear: bool,
-        allow_10bit: bool,
+        /// Offer 10-bit scanout formats (each probed for renderability) before 8-bit ones.
+        /// Off, the output stays 8-bit like upstream niri.
+        prefer_10bit: bool,
     },
     DisableOutput {
         output: OutputRef,
@@ -511,9 +588,16 @@ pub enum Request {
         output: OutputRef,
         enable: bool,
     },
-    SetMaxBpc {
+    /// Stages connector color state (HDR signalling, max bpc) for the next commit. Reply:
+    /// `OutputState`; fails if the driver rejects the state (TEST_ONLY commit).
+    SetColorState {
         output: OutputRef,
-        max_bpc: Option<u8>,
+        state: ColorState,
+    },
+    /// CRTC color transform matrix (row-major 3x3), `None` resets. Reply: Ack.
+    SetCtm {
+        output: OutputRef,
+        matrix: Option<[f64; 9]>,
     },
     /// Scale and transform the core renders the output with; must match before `Present`.
     SetOutputGeometry {

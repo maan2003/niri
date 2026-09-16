@@ -145,8 +145,14 @@ impl ShaderProgram {
         additional_uniforms: &[UniformName<'_>],
         texture_uniforms: &[&str],
     ) -> Result<Self, GlesError> {
+        // All niri shader programs get the blend-space transform (and its uniforms), so their
+        // output is right on HDR / wide-gamut outputs. The uniform values come with each draw.
+        let mut src = src.to_string();
+        src.push_str(include_str!("shaders/hdr.frag"));
+        let mut additional_uniforms = additional_uniforms.to_vec();
+        additional_uniforms.extend(super::shaders::blend_uniforms());
         renderer.with_context(move |gl| unsafe {
-            compile_program(gl, src, additional_uniforms, texture_uniforms)
+            compile_program(gl, &src, &additional_uniforms, texture_uniforms)
         })?
     }
 

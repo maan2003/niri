@@ -31,8 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlurParams, Caps, Command, CursorFrameDesc, CursorMeta, ElementMeta, OutputRef, Rect, Request,
-    ShaderKind, ShaderSupport, Target, TexId, TexProgram, MAX_CURSOR_FRAMES,
+    BlendParams, BlurParams, Caps, Command, CursorFrameDesc, CursorMeta, ElementMeta, OutputRef,
+    Rect, Request, ShaderKind, ShaderSupport, Target, TexId, TexProgram, MAX_CURSOR_FRAMES,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -329,6 +329,8 @@ impl TextureMapping for RemoteMapping {
 pub struct RemoteRenderer {
     shared: Arc<Shared>,
     debug_flags: DebugFlags,
+    /// Blend space for frames begun from now on (`None` = SDR); see `Command::Begin`.
+    frame_blend: Option<BlendParams>,
 }
 
 impl RemoteRenderer {
@@ -346,7 +348,18 @@ impl RemoteRenderer {
                 dmabuf_cache: Mutex::new(HashMap::new()),
             }),
             debug_flags: DebugFlags::empty(),
+            frame_blend: None,
         }
+    }
+
+    /// Sets the blend space of frames begun from now on. Set it around rendering an HDR /
+    /// wide-gamut output and reset to `None` after, so casts and screenshots stay SDR.
+    pub fn set_frame_blend(&mut self, blend: Option<BlendParams>) {
+        self.frame_blend = blend;
+    }
+
+    pub fn frame_blend(&self) -> Option<BlendParams> {
+        self.frame_blend
     }
 
     pub fn caps(&self) -> Caps {
@@ -510,6 +523,7 @@ impl RemoteRenderer {
             TexProgram::ClippedSurface => shaders.clipped_surface,
             TexProgram::PostprocessAndClip => shaders.postprocess_and_clip,
             TexProgram::GradientFade => shaders.gradient_fade,
+            TexProgram::TextureHdr => shaders.texture_hdr,
         };
         available.then_some(RemoteTexProgram(program))
     }
@@ -643,6 +657,25 @@ impl RemoteFrame<'_, '_> {
 
     pub fn clear_tex_program_override(&mut self) {
         self.renderer.shared.push(Command::ClearTexProgramOverride);
+    }
+
+    /// The blend space this frame is composited in (`None` = SDR).
+    pub fn blend(&self) -> Option<BlendParams> {
+        self.renderer.frame_blend
+    }
+
+    /// Drops the current tex program override (including the frame-wide blend one) until
+    /// `restore_tex_program_override`, so content already in the blend space passes through.
+    pub fn suspend_tex_program_override(&mut self) {
+        self.renderer
+            .shared
+            .push(Command::SuspendTexProgramOverride);
+    }
+
+    pub fn restore_tex_program_override(&mut self) {
+        self.renderer
+            .shared
+            .push(Command::RestoreTexProgramOverride);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -872,6 +905,7 @@ impl Renderer for RemoteRenderer {
             width: output_size.w,
             height: output_size.h,
             transform: convert::transform(dst_transform),
+            blend: self.frame_blend,
         });
         Ok(RemoteFrame {
             renderer: self,

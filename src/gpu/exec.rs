@@ -21,14 +21,15 @@ use smithay::utils::{Buffer, Physical, Rectangle, Size};
 use tracing::warn;
 
 use super::convert;
+use super::gl::blend;
 use super::gl::blur::Blur;
 use super::gl::capture::Capture;
 use super::gl::resources::Resources;
 use super::gl::shader::{self, DrawParams};
 use super::gl::shaders::Shaders;
 use super::protocol::{
-    Caps, Command, CursorFrameDesc, CursorMeta, DmabufDesc, Image, OutputRef, PlaneDesc, Rect,
-    ShaderKind, ShaderSupport, Target, TexId, TexProgram,
+    BlendParams, Caps, Command, CursorFrameDesc, CursorMeta, DmabufDesc, Image, OutputRef,
+    PlaneDesc, Rect, ShaderKind, ShaderSupport, Target, TexId, TexProgram,
 };
 
 /// Objects the core refers to by id.
@@ -152,7 +153,7 @@ pub struct Executor {
     pub(super) renderer: Option<GlesRenderer>,
     pub tables: RefCell<Tables>,
     /// Frames recorded for outputs, waiting for `Present`.
-    pub output_frames: HashMap<OutputRef, Vec<Command>>,
+    pub output_frames: HashMap<OutputRef, OutputFrame>,
     /// Screencast work found in the last `execute`, in order; the server hands it to the
     /// PipeWire side after the batch.
     pub deferred: Vec<Deferred>,
@@ -179,10 +180,17 @@ pub enum Deferred {
 }
 
 #[derive(Default)]
+/// A recorded output frame, replayed by the DRM compositor at `Present`.
+pub struct OutputFrame {
+    pub blend: Option<BlendParams>,
+    pub commands: Vec<Command>,
+}
+
 struct TexPrograms {
     clipped_surface: Option<GlesTexProgram>,
     postprocess_and_clip: Option<GlesTexProgram>,
     gradient_fade: Option<GlesTexProgram>,
+    texture_hdr: Option<GlesTexProgram>,
 }
 
 impl TexPrograms {
@@ -191,6 +199,7 @@ impl TexPrograms {
             TexProgram::ClippedSurface => self.clipped_surface.as_ref(),
             TexProgram::PostprocessAndClip => self.postprocess_and_clip.as_ref(),
             TexProgram::GradientFade => self.gradient_fade.as_ref(),
+            TexProgram::TextureHdr => self.texture_hdr.as_ref(),
         }
     }
 }
@@ -283,6 +292,7 @@ impl Executor {
             blur: s.blur.is_some(),
             close: s.program(ShaderKind::Close).is_some(),
             open: s.program(ShaderKind::Open).is_some(),
+            texture_hdr: s.texture_hdr.is_some(),
         };
         Ok(Caps {
             renderer: "gles".to_owned(),
@@ -408,11 +418,13 @@ impl Executor {
             match cmd {
                 Command::Begin {
                     target: Target::Output(output),
+                    blend,
                     ..
                 } => {
                     // Kept until Present; drawn by the DRM compositor with real damage.
-                    let frame = collect_frame(renderer, &self.tables, &mut iter, fds)?;
-                    self.output_frames.insert(output, frame);
+                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
+                    self.output_frames
+                        .insert(output, OutputFrame { blend, commands });
                 }
                 Command::Begin {
                     target: Target::Cast(stream),
@@ -456,6 +468,7 @@ impl Executor {
                     width,
                     height,
                     transform,
+                    blend,
                 } => {
                     let mut texture = self
                         .tables
@@ -464,16 +477,23 @@ impl Executor {
                         .get(&target)
                         .context("unknown target texture")?
                         .clone();
-                    let mut fb = renderer.bind(&mut texture).context("bind")?;
-                    let mut frame = renderer
-                        .render(
-                            &mut fb,
-                            Size::from((width, height)),
-                            convert::to_transform(transform),
-                        )
-                        .context("render")?;
-                    let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
-                    let _sync = frame.finish().context("finish")?;
+                    blend::apply(renderer, blend);
+                    let res = (|| {
+                        let mut fb = renderer.bind(&mut texture).context("bind")?;
+                        let mut frame = renderer
+                            .render(
+                                &mut fb,
+                                Size::from((width, height)),
+                                convert::to_transform(transform),
+                            )
+                            .context("render")?;
+                        let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
+                        let _sync = frame.finish().context("finish")?;
+                        res
+                    })();
+                    if blend.is_some() {
+                        blend::apply(renderer, None);
+                    }
                     res?;
                 }
                 Command::Begin {
@@ -481,6 +501,7 @@ impl Executor {
                     width,
                     height,
                     transform,
+                    blend,
                 } => {
                     // Bind the dmabuf itself rather than its imported texture: external
                     // (EGLImage) textures can't be framebuffer attachments.
@@ -491,17 +512,24 @@ impl Executor {
                         .get(&target)
                         .context("unknown target dmabuf")?
                         .clone();
-                    let mut fb = renderer.bind(&mut dmabuf).context("bind dmabuf")?;
-                    let mut frame = renderer
-                        .render(
-                            &mut fb,
-                            Size::from((width, height)),
-                            convert::to_transform(transform),
-                        )
-                        .context("render")?;
-                    let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
-                    let sync = frame.finish().context("finish")?;
-                    res?;
+                    blend::apply(renderer, blend);
+                    let res = (|| {
+                        let mut fb = renderer.bind(&mut dmabuf).context("bind dmabuf")?;
+                        let mut frame = renderer
+                            .render(
+                                &mut fb,
+                                Size::from((width, height)),
+                                convert::to_transform(transform),
+                            )
+                            .context("render")?;
+                        let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
+                        let sync = frame.finish().context("finish")?;
+                        res.map(|()| sync)
+                    })();
+                    if blend.is_some() {
+                        blend::apply(renderer, None);
+                    }
+                    let sync = res?;
                     // The buffer leaves for another process (PipeWire consumer, image-copy
                     // client) as soon as the core's Sync returns, so finish it here.
                     if let Err(err) = sync.wait() {
@@ -811,9 +839,13 @@ pub fn run_frame(
             clipped_surface: shaders.clipped_surface.clone(),
             postprocess_and_clip: shaders.postprocess_and_clip.clone(),
             gradient_fade: shaders.gradient_fade.clone(),
+            texture_hdr: shaders.texture_hdr.clone(),
         }
     };
     let resources = Resources::get(frame);
+    // Overrides replaced by OverrideTexProgram / SuspendTexProgramOverride, restored by the
+    // matching Clear / Restore, so the frame-wide blend override survives element overrides.
+    let mut override_stack = Vec::new();
 
     loop {
         let Some(cmd) = iter.next() else {
@@ -874,6 +906,7 @@ pub fn run_frame(
                     .context("render_texture_from_to")?;
             }
             Command::OverrideTexProgram { program, uniforms } => {
+                override_stack.push(frame.take_tex_program_override());
                 if let Some(program) = programs.get(program) {
                     frame.override_default_tex_program(
                         program.clone(),
@@ -881,7 +914,12 @@ pub fn run_frame(
                     );
                 }
             }
-            Command::ClearTexProgramOverride => frame.clear_tex_program_override(),
+            Command::ClearTexProgramOverride | Command::RestoreTexProgramOverride => {
+                frame.set_tex_program_override(override_stack.pop().flatten());
+            }
+            Command::SuspendTexProgramOverride => {
+                override_stack.push(frame.take_tex_program_override());
+            }
             Command::DrawShader {
                 program,
                 src,

@@ -4,6 +4,7 @@ use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions}
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
+use super::blend::FrameBlendState;
 use super::texture::TextureRenderElement;
 use crate::gpu::remote::{
     RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram, RemoteTexture,
@@ -98,9 +99,10 @@ impl RenderElement<RemoteRenderer> for GradientFadeTextureRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
-        let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
+        uniforms.extend(FrameBlendState::uniforms(frame));
         frame.override_default_tex_program(self.program.0.clone(), uniforms);
-        RenderElement::<RemoteRenderer>::draw(
+        let res = RenderElement::<RemoteRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -108,9 +110,9 @@ impl RenderElement<RemoteRenderer> for GradientFadeTextureRenderElement {
             damage,
             opaque_regions,
             cache,
-        )?;
+        );
         frame.clear_tex_program_override();
-        Ok(())
+        res
     }
 
     fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

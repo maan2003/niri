@@ -25,6 +25,7 @@ use crate::render_helpers::renderer::AsRemoteRenderer;
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
+pub mod blend;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;

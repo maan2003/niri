@@ -4,8 +4,10 @@ use smithay::backend::renderer::utils::{import_surface, RendererSurfaceStateUser
 use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Scale};
+use smithay::wayland::color::management::ColorManagementSurfaceCachedState;
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
+use super::blend::{BlendContent, BlendSurfaceRenderElement};
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
@@ -89,7 +91,7 @@ pub fn push_elements_from_surface_tree<R>(
     scale: Scale<f64>,
     alpha: f32,
     kind: Kind,
-    push: &mut dyn FnMut(WaylandSurfaceRenderElement<R>),
+    push: &mut dyn FnMut(BlendSurfaceRenderElement<R>),
 ) where
     R: Renderer + ImportAll,
     R::TextureId: Clone + 'static,
@@ -129,10 +131,21 @@ pub fn push_elements_from_surface_tree<R>(
                 };
 
                 if has_view {
+                    // Content carrying an image description matching the output blend space
+                    // is already encoded in it and must not be re-encoded when composited.
+                    let content = BlendContent::from_description(
+                        states
+                            .cached_state
+                            .get::<ColorManagementSurfaceCachedState>()
+                            .current()
+                            .description
+                            .as_ref(),
+                    );
+
                     match WaylandSurfaceRenderElement::from_surface(
                         renderer, surface, states, location, alpha, kind,
                     ) {
-                        Ok(Some(surface)) => push(surface),
+                        Ok(Some(surface)) => push(BlendSurfaceRenderElement::new(surface, content)),
                         Ok(None) => {} // surface is not mapped
                         Err(err) => {
                             warn!("failed to import surface: {}", err);
