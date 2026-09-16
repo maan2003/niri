@@ -77,6 +77,14 @@ impl Backend {
         }
     }
 
+    /// Handle to the GPU process, if this backend has one.
+    pub fn gpu_handle(&self) -> Option<crate::gpu::remote::GpuHandle> {
+        match self {
+            Backend::Tty(tty) => Some(tty.gpu_handle()),
+            Backend::Headless(headless) => headless.gpu_handle(),
+        }
+    }
+
     /// DRM render node of the primary renderer, if it has one.
     ///
     /// This is the node clients should allocate dma-bufs on for the primary renderer to import

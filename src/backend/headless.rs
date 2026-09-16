@@ -117,6 +117,10 @@ impl Headless {
         self.renderer.as_mut().map(f)
     }
 
+    pub fn gpu_handle(&self) -> Option<crate::gpu::remote::GpuHandle> {
+        self.renderer.as_ref().map(|r| r.gpu_handle())
+    }
+
     pub fn primary_render_node(&mut self) -> Option<DrmNode> {
         None
     }

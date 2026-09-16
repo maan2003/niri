@@ -277,24 +277,6 @@ pub fn render_and_download_with_damage(
     copy_framebuffer(renderer, &target, fourcc).context("error copying framebuffer")
 }
 
-pub fn render_to_vec(
-    renderer: &mut RemoteRenderer,
-    size: Size<i32, Physical>,
-    scale: Scale<f64>,
-    transform: Transform,
-    fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<RemoteRenderer>>,
-) -> anyhow::Result<Vec<u8>> {
-    let _span = tracy_client::span!();
-
-    let mapping = render_and_download(renderer, size, scale, transform, fourcc, elements)
-        .context("error rendering")?;
-    let copy = renderer
-        .map_texture(&mapping)
-        .context("error mapping texture")?;
-    Ok(copy.to_vec())
-}
-
 pub fn render_to_dmabuf(
     renderer: &mut RemoteRenderer,
     damage_tracker: &mut OutputDamageTracker,

@@ -7,12 +7,14 @@ use smithay::backend::renderer::element::{Id, Kind, RenderElement};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{
     Bind as _, Color32F, ExportMem as _, Frame as _, ImportMem as _, Offscreen as _, Renderer as _,
+    Texture as _,
 };
 use smithay::render_elements;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::client::GpuClient;
-use super::remote::RemoteRenderer;
+use super::protocol::GpuEvent;
+use super::remote::{RemoteRenderer, RemoteTexture};
 
 pub fn pattern(width: i32, height: i32, left: [u8; 4], right: [u8; 4]) -> Vec<u8> {
     let mut data = Vec::with_capacity((width * height * 4) as usize);
@@ -33,6 +35,19 @@ pub fn render_to_vec<E: RenderElement<RemoteRenderer>>(
     fourcc: Fourcc,
 ) -> anyhow::Result<Vec<u8>> {
     let buffer_size = Size::<i32, Buffer>::from((size.w, size.h));
+    let texture = render_to_texture(renderer, size, elements, fourcc)?;
+    let mapping = renderer.copy_texture(&texture, Rectangle::from_size(buffer_size), fourcc)?;
+    Ok(renderer.map_texture(&mapping)?.to_vec())
+}
+
+/// Renders `elements` (front to back) into a fresh texture.
+pub fn render_to_texture<E: RenderElement<RemoteRenderer>>(
+    renderer: &mut RemoteRenderer,
+    size: Size<i32, Physical>,
+    elements: &[E],
+    fourcc: Fourcc,
+) -> anyhow::Result<RemoteTexture> {
+    let buffer_size = Size::<i32, Buffer>::from((size.w, size.h));
     let mut texture = renderer.create_buffer(fourcc, buffer_size)?;
     {
         let mut target = renderer.bind(&mut texture)?;
@@ -46,8 +61,7 @@ pub fn render_to_vec<E: RenderElement<RemoteRenderer>>(
         }
         let _sync = frame.finish()?;
     }
-    let mapping = renderer.copy_texture(&texture, Rectangle::from_size(buffer_size), fourcc)?;
-    Ok(renderer.map_texture(&mapping)?.to_vec())
+    Ok(texture)
 }
 
 render_elements! {
@@ -123,6 +137,67 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     let out = render_to_vec(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
     assert_eq!(pixel(&out, 128, 40, 40), yellow, "after update");
     assert_eq!(pixel(&out, 128, 10, 10), green, "background after update");
+
+    // Cursor loading happens GPU-side; a missing theme yields the built-in arrow.
+    let gpu = renderer.gpu_handle();
+    let names = ["default".to_owned()];
+    let frames = gpu.load_cursor("niri-no-such-theme", &names, 24, true)?;
+    assert_eq!(frames.len(), 1, "fallback cursor has one frame");
+    let (desc, cursor_tex) = &frames[0];
+    assert_eq!(
+        (desc.width, desc.height, desc.xhot, desc.yhot),
+        (64, 64, 1, 1)
+    );
+    assert_eq!(cursor_tex.size(), Size::from((64, 64)));
+    assert!(
+        gpu.load_cursor("niri-no-such-theme", &names, 24, false)
+            .is_err(),
+        "no fallback requested"
+    );
+    // The fallback arrow is opaque at its hotspot corner region.
+    let cursor_px = renderer.copy_texture(
+        cursor_tex,
+        Rectangle::from_size((64, 64).into()),
+        Fourcc::Abgr8888,
+    )?;
+    let cursor_px = renderer.map_texture(&cursor_px)?.to_vec();
+    assert_eq!(cursor_px.len(), 64 * 64 * 4);
+    assert_ne!(
+        pixel(&cursor_px, 64, 2, 2)[3],
+        0,
+        "arrow tip is not transparent"
+    );
+
+    // PNG encoding happens GPU-side too; the bytes come back as an event.
+    let (surface, background) = make_elements(tex.clone());
+    let elements = [SmokeElement::from(surface), SmokeElement::from(background)];
+    let texture = render_to_texture(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
+    let region = Rectangle::from_size((128, 128).into());
+    renderer.encode_png(&texture, region, 7)?;
+    let png = loop {
+        let mut client = renderer.client();
+        let found = client
+            .take_events()
+            .into_iter()
+            .find_map(|event| match event {
+                GpuEvent::Png { token, data } => Some((token, data)),
+                _ => None,
+            });
+        if let Some((token, data)) = found {
+            assert_eq!(token, 7);
+            break data.expect("PNG encoding failed in the GPU process");
+        }
+        client.recv_event()?;
+    };
+    let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+    let mut reader = decoder.read_info()?;
+    let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut decoded)?;
+    assert_eq!((info.width, info.height), (128, 128));
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    decoded.truncate(info.buffer_size());
+    assert_eq!(pixel(&decoded, 128, 40, 40), yellow, "png left half");
+    assert_eq!(pixel(&decoded, 128, 10, 10), green, "png background");
 
     drop(tex);
     renderer.flush()?;

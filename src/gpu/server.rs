@@ -4,8 +4,10 @@ use std::collections::VecDeque;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use anyhow::Context as _;
+use calloop::channel::Sender;
 #[cfg(feature = "xdp-gnome-screencast")]
 use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::DrmEvent;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
@@ -22,6 +24,7 @@ use smithay::utils::Size;
 #[cfg(feature = "xdp-gnome-screencast")]
 use super::cast::{Casting, StartParams};
 use super::client::Mode;
+use super::cursor::CursorThemes;
 use super::drm::DrmState;
 use super::exec::Executor;
 use super::gl::{resources, shaders};
@@ -52,6 +55,9 @@ pub(super) struct Server {
     signal: LoopSignal,
     /// Fds to attach to the reply of the request being handled.
     reply_fds: Vec<OwnedFd>,
+    cursors: CursorThemes,
+    /// Events from worker threads (PNG encoding), forwarded to the core.
+    bg: Sender<GpuEvent>,
 }
 
 pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
@@ -80,6 +86,15 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
 
     // A dup of the socket for readiness polling; the Channel keeps the original.
     let poll_fd = chan.as_fd().try_clone_to_owned()?;
+    let (bg, bg_rx) = calloop::channel::channel::<GpuEvent>();
+    event_loop
+        .handle()
+        .insert_source(bg_rx, |event, _, server: &mut Server| {
+            if let calloop::channel::Event::Msg(event) = event {
+                server.notify(event);
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("error registering worker channel: {err}"))?;
     let mut server = Server {
         chan,
         exec,
@@ -89,6 +104,8 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
         loop_handle: event_loop.handle(),
         signal: event_loop.get_signal(),
         reply_fds: Vec::new(),
+        cursors: CursorThemes::default(),
+        bg,
     };
 
     event_loop
@@ -187,6 +204,48 @@ impl Server {
             }
             Request::ReadTexture { id, region, format } => {
                 Event::Image(exec.read_texture(id, region, format)?)
+            }
+            Request::LoadCursor {
+                theme,
+                names,
+                size,
+                fallback,
+                first_id,
+            } => {
+                let images = self.cursors.load(&theme, &names, size, fallback)?;
+                Event::Cursor {
+                    frames: exec.import_cursor(&images, first_id)?,
+                }
+            }
+            Request::EncodePng { token, id, region } => {
+                let image = match exec.read_texture(id, region, Fourcc::Abgr8888 as u32) {
+                    Ok(image) => image,
+                    Err(err) => {
+                        // The core is waiting for this token either way.
+                        self.notify(GpuEvent::Png { token, data: None });
+                        return Err(err);
+                    }
+                };
+                let tx = self.bg.clone();
+                // Encoding is slow; keep the loop free for frames.
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let res = write_png_rgba8(
+                        std::io::Cursor::new(&mut buf),
+                        image.width,
+                        image.height,
+                        &image.data,
+                    );
+                    let data = match res {
+                        Ok(()) => Some(buf),
+                        Err(err) => {
+                            warn!("error encoding PNG: {err:?}");
+                            None
+                        }
+                    };
+                    let _ = tx.send(GpuEvent::Png { token, data });
+                });
+                Event::Ack
             }
             // Requests are handled in order, and Execute runs to completion (dmabuf targets
             // wait for their fence), so reaching this point is the guarantee.
@@ -401,4 +460,18 @@ impl Server {
             Request::Shutdown => unreachable!(),
         })
     }
+}
+
+fn write_png_rgba8(
+    w: impl std::io::Write,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), png::EncodingError> {
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(pixels)
 }

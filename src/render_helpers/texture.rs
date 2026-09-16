@@ -118,6 +118,25 @@ impl<T: Texture> TextureBuffer<T> {
 }
 
 impl TextureBuffer<RemoteTexture> {
+    /// Like `from_texture`, for code that has a GPU handle but no renderer at hand.
+    pub fn from_remote_texture(
+        context_id: ContextId<RemoteTexture>,
+        texture: RemoteTexture,
+        scale: impl Into<Scale<f64>>,
+        transform: Transform,
+        opaque_regions: Vec<Rectangle<i32, Buffer>>,
+    ) -> Self {
+        TextureBuffer {
+            id: Id::new(),
+            commit_counter: CommitCounter::default(),
+            renderer_context_id: context_id,
+            texture,
+            scale: scale.into(),
+            transform,
+            opaque_regions,
+        }
+    }
+
     pub fn is_texture_reference_unique(&mut self) -> bool {
         self.texture.is_unique_reference()
     }

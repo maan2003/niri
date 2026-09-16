@@ -7,7 +7,10 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
+
+/// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
+pub const MAX_CURSOR_FRAMES: u64 = 256;
 
 /// `dev_t` of a DRM device node, as reported by udev.
 pub type DevId = u64;
@@ -429,6 +432,7 @@ impl Request {
                 | Request::Present { .. }
                 | Request::CastClear { .. }
                 | Request::CastStop { .. }
+                | Request::EncodePng { .. }
         )
     }
 }
@@ -562,6 +566,23 @@ pub enum Request {
     CastStop {
         stream: u64,
     },
+    /// Loads an Xcursor icon (first of `names` that exists in `theme`, closest to `size`) and
+    /// uploads its frames as Argb8888 textures `first_id`, `first_id + 1`, … Reply: `Cursor`.
+    /// With `fallback`, a built-in arrow is used when nothing loads.
+    LoadCursor {
+        theme: String,
+        names: Vec<String>,
+        size: i32,
+        fallback: bool,
+        first_id: TexId,
+    },
+    /// Encodes `region` of a texture as PNG (RGBA) on a GPU-process thread. One-way; the
+    /// result arrives as `GpuEvent::Png { token }`.
+    EncodePng {
+        token: u64,
+        id: TexId,
+        region: Rect<i32>,
+    },
     /// Allocates a GBM buffer on the primary device. Reply: `Dmabuf` with fds attached.
     AllocateDmabuf {
         width: u32,
@@ -620,6 +641,22 @@ pub enum GpuEvent {
         message: String,
     },
     Cast(CastEvent),
+    /// Result of `Request::EncodePng`; `None` if reading or encoding failed.
+    Png {
+        token: u64,
+        data: Option<Vec<u8>>,
+    },
+}
+
+/// One frame of an Xcursor animation; the texture id is `first_id + index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorFrameDesc {
+    pub width: u32,
+    pub height: u32,
+    pub xhot: u32,
+    pub yhot: u32,
+    /// Milliseconds this frame is shown.
+    pub delay: u32,
 }
 
 /// Screencast stream events from the GPU process, which owns PipeWire.
@@ -661,6 +698,9 @@ pub enum Event {
     Dmabuf(DmabufDesc),
     CastStarted {
         cursor_mode: CastCursorMode,
+    },
+    Cursor {
+        frames: Vec<CursorFrameDesc>,
     },
     ShaderSet {
         available: bool,

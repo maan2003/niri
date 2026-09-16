@@ -5,7 +5,6 @@ use std::f64::consts::TAU;
 use std::iter::zip;
 use std::rc::Rc;
 
-use anyhow::Context;
 use arrayvec::ArrayVec;
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
@@ -15,7 +14,7 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::{ExportMem, Texture as _};
+use smithay::backend::renderer::Texture as _;
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
@@ -694,10 +693,11 @@ impl ScreenshotUi {
         push(screenshot.buffer.clone().into());
     }
 
+    /// Returns the texture holding the screenshot and the region of it to save.
     pub fn capture(
         &self,
         renderer: &mut RemoteRenderer,
-    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+    ) -> anyhow::Result<(RemoteTexture, Rectangle<i32, Buffer>)> {
         let _span = tracy_client::span!("ScreenshotUi::capture");
 
         let Self::Open {
@@ -754,14 +754,7 @@ impl ScreenshotUi {
             .to_logical(1)
             .to_buffer(1, Transform::Normal, &Size::from((1, 1)));
 
-        let mapping = renderer
-            .copy_texture(&texture, buf_rect, Fourcc::Abgr8888)
-            .context("error copying texture")?;
-        let copy = renderer
-            .map_texture(&mapping)
-            .context("error mapping texture")?;
-
-        Ok((rect.size, copy.to_vec()))
+        Ok((texture, buf_rect))
     }
 
     pub fn action(&self, raw: Keysym, mods: ModifiersState) -> Option<Action> {

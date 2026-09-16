@@ -119,7 +119,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use crate::a11y::A11y;
 use crate::animation::Clock;
 use crate::backend::{Backend, Headless, RenderResult, Tty};
-use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
+use crate::cursor::{CursorManager, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
 #[cfg(feature = "dbus")]
@@ -129,7 +129,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
-use crate::gpu::remote::RemoteRenderer;
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
@@ -163,11 +163,11 @@ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, render_to_vec, shaders, RenderCtx, RenderTarget,
+    render_to_texture, shaders, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -185,7 +185,7 @@ use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, write_png_rgba8, xwayland,
+    send_scale_transform, xwayland,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -196,6 +196,36 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+/// Screenshots handed to the GPU process for PNG encoding, keyed by request token.
+#[derive(Default)]
+pub struct PendingScreenshots {
+    next_token: u64,
+    pending: HashMap<u64, PendingScreenshot>,
+}
+
+impl PendingScreenshots {
+    fn insert(&mut self, screenshot: PendingScreenshot) -> u64 {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.pending.insert(token, screenshot);
+        token
+    }
+
+    fn remove(&mut self, token: u64) -> Option<PendingScreenshot> {
+        self.pending.remove(&token)
+    }
+}
+
+pub enum PendingScreenshot {
+    /// Regular screenshot: clipboard, optional file, IPC event.
+    Save { path: Option<(PathBuf, bool)> },
+    #[cfg(feature = "dbus")]
+    AllOutputs {
+        path: PathBuf,
+        on_done: Box<dyn FnOnce(PathBuf) + Send>,
+    },
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -354,7 +384,8 @@ pub struct Niri {
     pub xkb_from_locale1: Option<Xkb>,
 
     pub cursor_manager: CursorManager,
-    pub cursor_texture_cache: CursorTextureCache,
+    /// Screenshots waiting for the GPU process to encode them.
+    pub pending_screenshots: RefCell<PendingScreenshots>,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub dnd_icon: Option<DndIcon>,
     /// Contents under pointer.
@@ -1607,7 +1638,6 @@ impl State {
             self.niri
                 .cursor_manager
                 .reload(&config.cursor.xcursor_theme, config.cursor.xcursor_size);
-            self.niri.cursor_texture_cache.clear();
         }
 
         // We need &mut self to reload the xkb config, so just store it here.
@@ -2156,8 +2186,11 @@ impl State {
 
         self.backend.with_primary_renderer(|renderer| {
             match self.niri.screenshot_ui.capture(renderer) {
-                Ok((size, pixels)) => {
-                    if let Err(err) = self.niri.save_screenshot(size, pixels, write_to_disk, path) {
+                Ok((texture, region)) => {
+                    let res =
+                        self.niri
+                            .save_screenshot(renderer, &texture, region, write_to_disk, path);
+                    if let Err(err) = res {
                         warn!("error saving screenshot: {err:?}");
                     }
                 }
@@ -2540,8 +2573,11 @@ impl Niri {
         seat.add_pointer();
 
         let cursor_shape_manager_state = CursorShapeManagerState::new::<State>(&display_handle);
-        let cursor_manager =
-            CursorManager::new(&config_.cursor.xcursor_theme, config_.cursor.xcursor_size);
+        let cursor_manager = CursorManager::new(
+            &config_.cursor.xcursor_theme,
+            config_.cursor.xcursor_size,
+            backend.gpu_handle(),
+        );
 
         let mod_key = backend.mod_key(&config.borrow());
         let mods_with_mouse_binds = mods_with_mouse_binds(mod_key, &config_.binds);
@@ -2718,7 +2754,7 @@ impl Niri {
             keyboard_shortcuts_inhibiting_surfaces: HashMap::new(),
             xkb_from_locale1: None,
             cursor_manager,
-            cursor_texture_cache: Default::default(),
+            pending_screenshots: RefCell::new(PendingScreenshots::default()),
             cursor_shape_manager_state,
             dnd_icon: None,
             pointer_contents: PointContents::default(),
@@ -3876,26 +3912,22 @@ impl Niri {
                 scale,
                 cursor,
             } => {
-                let (idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
+                let (_idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
                 let hotspot = XCursor::hotspot(frame).to_logical(scale);
-                let pointer_pos =
+                let pointer_pos: Point<i32, Physical> =
                     (pointer_pos - hotspot.to_f64()).to_physical_precise_round(output_scale);
 
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
-                match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    pointer_pos,
-                    &texture,
-                    None,
+                // The frame texture already lives in the GPU process.
+                let element = TextureRenderElement::from_texture_buffer(
+                    frame.buffer.clone(),
+                    pointer_pos.to_f64().to_logical(output_scale),
+                    1.,
                     None,
                     None,
                     Kind::Cursor,
-                ) {
-                    Ok(element) => push(element.into()),
-                    Err(err) => {
-                        warn!("error importing a cursor texture: {err:?}");
-                    }
-                }
+                );
+                let _ = icon;
+                push(PrimaryGpuTextureRenderElement(element).into());
             }
         }
 
@@ -4087,11 +4119,15 @@ impl Niri {
                     let cursor = self
                         .cursor_manager
                         .get_cursor_with_name(icon, output_scale)
-                        .unwrap_or_else(|| self.cursor_manager.get_default_cursor(output_scale));
+                        .or_else(|| self.cursor_manager.get_default_cursor(output_scale));
 
                     // For simplicity, we always use frame 0 for this computation. Let's hope the
                     // hotspot doesn't change between frames.
-                    let hotspot = XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale);
+                    let hotspot = cursor
+                        .map(|cursor| {
+                            XCursor::hotspot(&cursor.frames()[0]).to_logical(output_scale)
+                        })
+                        .unwrap_or_default();
 
                     let surface_pos = pointer_pos.to_i32_round() - hotspot;
                     let bbox = bbox_from_surface_tree(surface, surface_pos);
@@ -5719,22 +5755,17 @@ impl Niri {
                 scale,
                 cursor,
             } => {
-                let (idx, _frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
-                let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
-                match MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
+                let (_idx, frame) = cursor.frame(self.start_time.elapsed().as_millis() as u32);
+                let _ = (icon, scale);
+                let element = TextureRenderElement::from_texture_buffer(
+                    frame.buffer.clone(),
                     Point::<f64, _>::from((0., 0.)),
-                    &texture,
-                    None,
+                    1.,
                     None,
                     None,
                     Kind::Cursor,
-                ) {
-                    Ok(element) => elements.push(element.into()),
-                    Err(err) => {
-                        warn!("error importing a cursor texture: {err:?}");
-                    }
-                }
+                );
+                elements.push(PrimaryGpuTextureRenderElement(element).into());
             }
         }
 
@@ -6015,7 +6046,7 @@ impl Niri {
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
         let elements = elements.iter().rev();
-        let pixels = render_to_vec(
+        let (texture, _sync) = render_to_texture(
             renderer,
             size,
             scale,
@@ -6024,7 +6055,8 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(size, pixels, write_to_disk, path)
+        let region = Rectangle::from_size(Size::from((size.w, size.h)));
+        self.save_screenshot(renderer, &texture, region, write_to_disk, path)
             .context("error saving screenshot")
     }
 
@@ -6083,7 +6115,7 @@ impl Niri {
         let elements = elements.iter().rev().map(|elem| {
             RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
         });
-        let pixels = render_to_vec(
+        let (texture, _sync) = render_to_texture(
             renderer,
             geo.size,
             scale,
@@ -6092,14 +6124,18 @@ impl Niri {
             elements,
         )?;
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
+        let region = Rectangle::from_size(Size::from((geo.size.w, geo.size.h)));
+        self.save_screenshot(renderer, &texture, region, write_to_disk, path)
             .context("error saving screenshot")
     }
 
+    /// Asks the GPU process to PNG-encode `region` of `texture`; the file write and clipboard
+    /// happen in `on_screenshot_encoded` once the bytes come back.
     pub fn save_screenshot(
         &self,
-        size: Size<i32, Physical>,
-        pixels: Vec<u8>,
+        renderer: &RemoteRenderer,
+        texture: &RemoteTexture,
+        region: Rectangle<i32, BufferCoords>,
         write_to_disk: bool,
         path_arg: Option<String>,
     ) -> anyhow::Result<()> {
@@ -6118,89 +6154,109 @@ impl Niri {
             })
             .flatten();
 
-        // Prepare to set the encoded image as our clipboard selection. This must be done from the
-        // main thread.
-        let (tx, rx) = calloop::channel::sync_channel::<Arc<[u8]>>(1);
-        self.event_loop
-            .insert_source(rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg(buf) => {
-                    set_data_device_selection(
-                        &state.niri.display_handle,
-                        &state.niri.seat,
-                        vec![String::from("image/png")],
-                        buf.clone(),
-                    );
-                }
-                calloop::channel::Event::Closed => (),
-            })
-            .unwrap();
+        let token = self
+            .pending_screenshots
+            .borrow_mut()
+            .insert(PendingScreenshot::Save { path });
+        if let Err(err) = renderer.encode_png(texture, region, token) {
+            self.pending_screenshots.borrow_mut().remove(token);
+            return Err(err.context("error requesting PNG encoding"));
+        }
 
-        // Prepare to send screenshot completion event back to main thread.
-        let (event_tx, event_rx) = calloop::channel::sync_channel::<Option<String>>(1);
-        self.event_loop
-            .insert_source(event_rx, move |event, _, state| match event {
-                calloop::channel::Event::Msg(path) => {
-                    state.ipc_screenshot_taken(path);
-                }
-                calloop::channel::Event::Closed => (),
-            })
-            .unwrap();
+        Ok(())
+    }
 
-        // Encode and save the image in a thread as it's slow.
-        thread::spawn(move || {
-            let mut buf = vec![];
+    /// Handles `GpuEvent::Png`: the encoded screenshot, or `None` if encoding failed.
+    pub fn on_screenshot_encoded(&mut self, token: u64, data: Option<Vec<u8>>) {
+        let Some(pending) = self.pending_screenshots.borrow_mut().remove(token) else {
+            warn!("PNG result for unknown screenshot token {token}");
+            return;
+        };
+        let Some(data) = data else {
+            warn!("the GPU process failed to encode the screenshot");
+            return;
+        };
 
-            let w = std::io::Cursor::new(&mut buf);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
+        match pending {
+            PendingScreenshot::Save { path } => {
+                let buf: Arc<[u8]> = Arc::from(data.into_boxed_slice());
 
-            let buf: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
-            let _ = tx.send(buf.clone());
+                // Set the encoded image as our clipboard selection.
+                set_data_device_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    vec![String::from("image/png")],
+                    buf.clone(),
+                );
 
-            let mut image_path = None;
+                // Prepare to send screenshot completion event back to main thread.
+                let (event_tx, event_rx) = calloop::channel::sync_channel::<Option<String>>(1);
+                self.event_loop
+                    .insert_source(event_rx, move |event, _, state| match event {
+                        calloop::channel::Event::Msg(path) => {
+                            state.ipc_screenshot_taken(path);
+                        }
+                        calloop::channel::Event::Closed => (),
+                    })
+                    .unwrap();
 
-            if let Some((path, create_parent)) = path {
-                debug!("saving screenshot to {path:?}");
+                // Write the file in a thread; disks can be slow.
+                thread::spawn(move || {
+                    let mut image_path = None;
 
-                if create_parent {
-                    if let Some(parent) = path.parent() {
-                        // Relative paths with one component, i.e. "test.png", have Some("") parent.
-                        if !parent.as_os_str().is_empty() {
-                            if let Err(err) = std::fs::create_dir_all(parent) {
-                                if err.kind() != std::io::ErrorKind::AlreadyExists {
-                                    warn!("error creating screenshot directory: {err:?}");
+                    if let Some((path, create_parent)) = path {
+                        debug!("saving screenshot to {path:?}");
+
+                        if create_parent {
+                            if let Some(parent) = path.parent() {
+                                // Relative paths with one component, i.e. "test.png", have
+                                // Some("") parent.
+                                if !parent.as_os_str().is_empty() {
+                                    if let Err(err) = std::fs::create_dir_all(parent) {
+                                        if err.kind() != std::io::ErrorKind::AlreadyExists {
+                                            warn!("error creating screenshot directory: {err:?}");
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
 
-                match std::fs::write(&path, buf) {
-                    Ok(()) => image_path = Some(path),
-                    Err(err) => {
-                        warn!("error saving screenshot image: {err:?}");
+                        match std::fs::write(&path, buf) {
+                            Ok(()) => image_path = Some(path),
+                            Err(err) => {
+                                warn!("error saving screenshot image: {err:?}");
+                            }
+                        }
+                    } else {
+                        debug!("not saving screenshot to disk");
                     }
-                }
-            } else {
-                debug!("not saving screenshot to disk");
+
+                    #[cfg(feature = "dbus")]
+                    if let Err(err) =
+                        crate::utils::show_screenshot_notification(image_path.as_deref())
+                    {
+                        warn!("error showing screenshot notification: {err:?}");
+                    }
+
+                    // Send screenshot completion event.
+                    let path_string = image_path
+                        .as_ref()
+                        .and_then(|p| p.to_str())
+                        .map(|s| s.to_owned());
+                    let _ = event_tx.send(path_string);
+                });
             }
-
             #[cfg(feature = "dbus")]
-            if let Err(err) = crate::utils::show_screenshot_notification(image_path.as_deref()) {
-                warn!("error showing screenshot notification: {err:?}");
+            PendingScreenshot::AllOutputs { path, on_done } => {
+                thread::spawn(move || {
+                    if let Err(err) = std::fs::write(&path, data) {
+                        warn!("error saving screenshot image: {err:?}");
+                        return;
+                    }
+                    on_done(path);
+                });
             }
-
-            // Send screenshot completion event.
-            let path_string = image_path
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_owned());
-            let _ = event_tx.send(path_string);
-        });
-
-        Ok(())
+        }
     }
 
     #[cfg(feature = "dbus")]
@@ -6236,7 +6292,7 @@ impl Niri {
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
         let elements = elements.iter().rev();
-        let pixels = render_to_vec(
+        let (texture, _sync) = render_to_texture(
             renderer,
             size,
             Scale::from(f64::from(output_scale)),
@@ -6255,23 +6311,18 @@ impl Niri {
             });
         debug!("saving screenshot to {path:?}");
 
-        thread::spawn(move || {
-            let file = match std::fs::File::create(&path) {
-                Ok(file) => file,
-                Err(err) => {
-                    warn!("error creating file: {err:?}");
-                    return;
-                }
-            };
-
-            let w = std::io::BufWriter::new(file);
-            if let Err(err) = write_png_rgba8(w, size.w as u32, size.h as u32, &pixels) {
-                warn!("error encoding screenshot image: {err:?}");
-                return;
-            }
-
-            on_done(path);
-        });
+        let token = self
+            .pending_screenshots
+            .borrow_mut()
+            .insert(PendingScreenshot::AllOutputs {
+                path,
+                on_done: Box::new(on_done),
+            });
+        let region = Rectangle::from_size(Size::from((size.w, size.h)));
+        if let Err(err) = renderer.encode_png(&texture, region, token) {
+            self.pending_screenshots.borrow_mut().remove(token);
+            return Err(err.context("error requesting PNG encoding"));
+        }
 
         Ok(())
     }
@@ -6956,7 +7007,7 @@ fn scale_relocate_crop<E: Element>(
 niri_render_elements! {
     PointerRenderElements<R> => {
         Wayland = WaylandSurfaceRenderElement<R>,
-        NamedPointer = MemoryRenderBufferRenderElement<R>,
+        NamedPointer = PrimaryGpuTextureRenderElement,
     }
 }
 

@@ -27,8 +27,8 @@ use super::gl::resources::Resources;
 use super::gl::shader::{self, DrawParams};
 use super::gl::shaders::Shaders;
 use super::protocol::{
-    Caps, Command, CursorMeta, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, ShaderKind,
-    ShaderSupport, Target, TexId, TexProgram,
+    Caps, Command, CursorFrameDesc, CursorMeta, DmabufDesc, Image, OutputRef, PlaneDesc, Rect,
+    ShaderKind, ShaderSupport, Target, TexId, TexProgram,
 };
 
 /// Objects the core refers to by id.
@@ -357,6 +357,44 @@ impl Executor {
             format: format as u32,
             data,
         })
+    }
+
+    /// Uploads Xcursor frames as Argb8888 textures `first_id..`, keeping CPU copies so the
+    /// cursor plane can take them.
+    pub fn import_cursor(
+        &mut self,
+        images: &[xcursor::parser::Image],
+        first_id: TexId,
+    ) -> anyhow::Result<Vec<CursorFrameDesc>> {
+        let renderer = self.renderer.as_mut().context("no renderer yet")?;
+        let mut tables = self.tables.borrow_mut();
+        let mut frames = Vec::with_capacity(images.len());
+        for (i, img) in images.iter().enumerate() {
+            let size: Size<i32, Buffer> = Size::from((img.width as i32, img.height as i32));
+            ensure!(
+                img.pixels_rgba.len() == img.width as usize * img.height as usize * 4,
+                "cursor frame has the wrong data size"
+            );
+            let id = first_id + i as u64;
+            let texture = renderer
+                .import_memory(&img.pixels_rgba, Fourcc::Argb8888, size, false)
+                .context("import_memory")?;
+            if keep_staging(size) {
+                tables.memory.insert(
+                    id,
+                    MemoryBuffer::from_slice(&img.pixels_rgba, Fourcc::Argb8888, size),
+                );
+            }
+            tables.textures.insert(id, texture);
+            frames.push(CursorFrameDesc {
+                width: img.width,
+                height: img.height,
+                xhot: img.xhot,
+                yhot: img.yhot,
+                delay: img.delay,
+            });
+        }
+        Ok(frames)
     }
 
     pub fn execute(

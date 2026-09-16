@@ -317,6 +317,7 @@ impl Tty {
                 GpuEvent::DeviceError { dev, message } => {
                     warn!("DRM device {dev} error: {message}");
                 }
+                GpuEvent::Png { token, data } => niri.on_screenshot_encoded(token, data),
             }
         }
         cast_events
@@ -792,6 +793,8 @@ impl Tty {
         if node == self.primary_node {
             debug!("the primary device is gone; disabling the dmabuf global");
             self.renderer_ready = false;
+            // Cursor textures lived in the renderer that just went away.
+            niri.cursor_manager.clear_cache();
             if let Some(global) = self.dmabuf_global.take() {
                 niri.dmabuf_state
                     .disable_global::<State>(&niri.display_handle, &global);
@@ -1168,6 +1171,10 @@ impl Tty {
     pub fn dmabuf_allocator(&self) -> Option<DmabufAllocator> {
         self.renderer_ready
             .then(|| self.renderer.dmabuf_allocator())
+    }
+
+    pub fn gpu_handle(&self) -> crate::gpu::remote::GpuHandle {
+        self.renderer.gpu_handle()
     }
 
     pub fn with_primary_renderer<T>(

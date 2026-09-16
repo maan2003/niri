@@ -11,8 +11,8 @@ use anyhow::{anyhow, bail, Context};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use super::protocol::{
-    self, Caps, CastCursorMode, DmabufDesc, Event, GpuEvent, Image, Rect, Request, ShaderKind,
-    TexId, PROTOCOL_VERSION,
+    self, Caps, CastCursorMode, CursorFrameDesc, DmabufDesc, Event, GpuEvent, Image, Rect, Request,
+    ShaderKind, TexId, PROTOCOL_VERSION,
 };
 use super::transport::Channel;
 
@@ -286,6 +286,27 @@ impl GpuClient {
             refresh,
         };
         Self::expect_ack(self.request(&req, &[])?)
+    }
+
+    pub fn load_cursor(
+        &mut self,
+        theme: &str,
+        names: &[String],
+        size: i32,
+        fallback: bool,
+        first_id: TexId,
+    ) -> anyhow::Result<Vec<CursorFrameDesc>> {
+        let req = Request::LoadCursor {
+            theme: theme.to_owned(),
+            names: names.to_vec(),
+            size,
+            fallback,
+            first_id,
+        };
+        match self.request(&req, &[])? {
+            Event::Cursor { frames } => Ok(frames),
+            other => Err(anyhow!("expected Cursor, got {other:?}")),
+        }
     }
 
     /// Allocates a render buffer on the GPU side and returns it as a dmabuf.

@@ -1,7 +1,6 @@
 use std::cmp::{max, min};
 use std::ffi::{CString, OsStr};
 use std::fmt::Display;
-use std::io::Write;
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
@@ -303,20 +302,6 @@ pub fn make_screenshot_path(config: &Config) -> anyhow::Result<Option<PathBuf>> 
     }
 
     Ok(Some(path))
-}
-
-pub fn write_png_rgba8(
-    w: impl Write,
-    width: u32,
-    height: u32,
-    pixels: &[u8],
-) -> Result<(), png::EncodingError> {
-    let mut encoder = png::Encoder::new(w, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(pixels)
 }
 
 pub fn output_matches_name(output: &Output, target: &str) -> bool {

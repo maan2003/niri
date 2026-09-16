@@ -5,6 +5,7 @@
 pub mod cast;
 pub mod client;
 pub mod convert;
+pub mod cursor;
 pub mod drm;
 pub mod exec;
 pub mod gl;

@@ -31,8 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlurParams, Caps, Command, CursorMeta, ElementMeta, OutputRef, Rect, ShaderKind, ShaderSupport,
-    Target, TexId, TexProgram,
+    BlurParams, Caps, Command, CursorFrameDesc, CursorMeta, ElementMeta, OutputRef, Rect, Request,
+    ShaderKind, ShaderSupport, Target, TexId, TexProgram, MAX_CURSOR_FRAMES,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -147,6 +147,57 @@ impl Shared {
 
     fn alloc_id(&self) -> TexId {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+/// Handle to the GPU process for code that doesn't render itself.
+#[derive(Clone)]
+pub struct GpuHandle {
+    shared: Arc<Shared>,
+}
+
+impl GpuHandle {
+    /// Whether the GPU process has a renderer up (it comes with the primary DRM device).
+    pub fn is_ready(&self) -> bool {
+        !self.shared.caps.read().unwrap().renderer.is_empty()
+    }
+
+    pub fn context_id(&self) -> ContextId<RemoteTexture> {
+        self.shared.context_id.clone()
+    }
+
+    /// Loads an Xcursor icon in the GPU process; returns each frame with its texture.
+    pub fn load_cursor(
+        &self,
+        theme: &str,
+        names: &[String],
+        size: i32,
+        fallback: bool,
+    ) -> anyhow::Result<Vec<(CursorFrameDesc, RemoteTexture)>> {
+        self.shared.flush()?;
+        let first_id = self
+            .shared
+            .next_id
+            .fetch_add(MAX_CURSOR_FRAMES, Ordering::Relaxed);
+        let frames = self
+            .shared
+            .client
+            .lock()
+            .unwrap()
+            .load_cursor(theme, names, size, fallback, first_id)?;
+        Ok(frames
+            .into_iter()
+            .enumerate()
+            .map(|(i, frame)| {
+                let texture = RemoteTexture(Arc::new(TexInner {
+                    id: first_id + i as u64,
+                    size: Size::from((frame.width as i32, frame.height as i32)),
+                    format: Some(Fourcc::Argb8888),
+                    shared: Arc::downgrade(&self.shared),
+                }));
+                (frame, texture)
+            })
+            .collect())
     }
 }
 
@@ -352,6 +403,33 @@ impl RemoteRenderer {
             _keep: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Handle for code that talks to the GPU process without rendering (cursor loading).
+    pub fn gpu_handle(&self) -> GpuHandle {
+        GpuHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// Encodes `region` of `texture` as PNG in the GPU process. The bytes arrive later as
+    /// `GpuEvent::Png { token, .. }`.
+    pub fn encode_png(
+        &self,
+        texture: &RemoteTexture,
+        region: Rectangle<i32, Buffer>,
+        token: u64,
+    ) -> anyhow::Result<()> {
+        // Queued commands (incl. the render into `texture`) must run first.
+        self.shared.flush()?;
+        self.shared.client.lock().unwrap().send_oneway(
+            &Request::EncodePng {
+                token,
+                id: texture.id(),
+                region: convert::rect(region),
+            },
+            &[],
+        )
     }
 
     /// Parameters for the next `cast_target` frame of `stream`.
