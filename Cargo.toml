@@ -25,20 +25,21 @@ tracing = { version = "0.1.44", features = ["max_level_trace", "release_max_leve
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracy-client = { version = "0.18.5", default-features = false }
 
-# Local fork: adds UnderlyingStorage::Dmabuf, lazy shm pool mapping and
-# with_buffer_fd for the GPU-process split (branch niri-gpu-process).
+# Fork (branch rho/niri-gpu-process): adds UnderlyingStorage::Dmabuf, lazy shm
+# pool mapping, with_buffer_fd and strided memory uploads for the GPU-process
+# split. For local hacking swap `git`/`rev` for `path = "../smithay"`.
 [workspace.dependencies.smithay]
 # version = "0.4.1"
-# git = "https://github.com/Smithay/smithay.git"
-# rev = "22571baa20d34d71092942dbb520c4e3fbbd6263"
-path = "../smithay"
+git = "https://github.com/maan2003/smithay.git"
+rev = "c86f651b"
+# path = "../smithay"
 default-features = false
 
 [workspace.dependencies.smithay-drm-extras]
 # version = "0.1.0"
-# git = "https://github.com/Smithay/smithay.git"
-# rev = "22571baa20d34d71092942dbb520c4e3fbbd6263"
-path = "../smithay/smithay-drm-extras"
+git = "https://github.com/maan2003/smithay.git"
+rev = "c86f651b"
+# path = "../smithay/smithay-drm-extras"
 
 [package]
 name = "niri"
