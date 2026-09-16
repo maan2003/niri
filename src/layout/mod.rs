@@ -45,7 +45,6 @@ use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use scrolling::{Column, ColumnWidth};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::output::{self, Output};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size, Transform};
@@ -56,6 +55,7 @@ pub use self::monitor::MonitorRenderElement;
 use self::monitor::{Monitor, WorkspaceSwitch};
 use self::workspace::{OutputId, Workspace};
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::scrolling::ScrollDirection;
 use crate::niri_render_elements;
@@ -119,7 +119,7 @@ niri_render_elements! {
 }
 
 pub type LayoutElementRenderSnapshot =
-    RenderSnapshot<BakedBuffer<TextureBuffer<GlesTexture>>, BakedBuffer<SolidColorBuffer>>;
+    RenderSnapshot<BakedBuffer<TextureBuffer<RemoteTexture>>, BakedBuffer<SolidColorBuffer>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizingMode {
@@ -202,7 +202,7 @@ pub trait LayoutElement {
     #[allow(clippy::too_many_arguments)]
     fn render_background_effect(
         &self,
-        _ctx: RenderCtx<GlesRenderer>,
+        _ctx: RenderCtx<RemoteRenderer>,
         _geometry: Rectangle<f64, Logical>,
         _scale: f64,
         _clip_to_geometry: bool,
@@ -4672,7 +4672,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn store_unmap_snapshot(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         window: &W::Id,
@@ -4767,7 +4767,7 @@ impl<W: LayoutElement> Layout<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {

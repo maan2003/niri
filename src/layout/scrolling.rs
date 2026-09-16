@@ -7,7 +7,6 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{CenterFocusedColumn, PresetSize, Struts};
 use niri_ipc::{ColumnDisplay, SizeChange, WindowLayout};
 use ordered_float::NotNan;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Serial, Size};
 
 use super::closing_window::{ClosingWindow, ClosingWindowRenderElement};
@@ -17,6 +16,7 @@ use super::tile::{Tile, TileRenderElement, TileRenderSnapshot};
 use super::workspace::{InteractiveResize, ResolvedSize};
 use super::{ConfigureIntent, HitType, InteractiveResizeData, LayoutElement, Options, RemovedTile};
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::RemoteRenderer;
 use crate::input::swipe_tracker::SwipeTracker;
 use crate::layout::{RenderLayer, SizingMode};
 use crate::niri_render_elements;
@@ -1477,7 +1477,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -1538,7 +1538,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
 
     fn start_close_animation_for_tile(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,
@@ -2957,7 +2957,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         if layer.is_normal() {
             let view_rect = Rectangle::new(Point::from((self.view_pos(), 0.)), self.view_size);
             for closing in self.closing_windows.iter().rev() {
-                let elem = closing.render(ctx.as_gles(), view_rect, scale);
+                let elem = closing.render(ctx.as_remote(), view_rect, scale);
                 push(elem.into());
             }
         }

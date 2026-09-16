@@ -1,4 +1,4 @@
-// We need to implement RenderElement manually due to AsGlesFrame requirement.
+// We need to implement RenderElement manually due to AsRemoteFrame requirement.
 // This macro does it for us.
 #[macro_export]
 macro_rules! niri_render_elements {
@@ -101,87 +101,45 @@ macro_rules! niri_render_elements {
             }
         }
 
-        impl smithay::backend::renderer::element::RenderElement<smithay::backend::renderer::gles::GlesRenderer>
-            for $($name_R<smithay::backend::renderer::gles::GlesRenderer>)? $($name_no_R)?
+        impl smithay::backend::renderer::element::RenderElement<$crate::gpu::remote::RemoteRenderer>
+            for $($name_R<$crate::gpu::remote::RemoteRenderer>)? $($name_no_R)?
         {
             fn capture_framebuffer(
                 &self,
-                frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+                frame: &mut $crate::gpu::remote::RemoteFrame<'_, '_>,
                 src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
                 dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
                 cache: &smithay::utils::user_data::UserDataMap,
-            ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+            ) -> Result<(), $crate::gpu::remote::RemoteError> {
                 match self {
                     $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<smithay::backend::renderer::gles::GlesRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
+                        smithay::backend::renderer::element::RenderElement::<$crate::gpu::remote::RemoteRenderer>::capture_framebuffer(elem, frame, src, dst, cache)
                     })+
                 }
             }
 
             fn draw(
                 &self,
-                frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
+                frame: &mut $crate::gpu::remote::RemoteFrame<'_, '_>,
                 src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
                 dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
                 damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
                 opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
                 cache: Option<&smithay::utils::user_data::UserDataMap>,
-            ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+            ) -> Result<(), $crate::gpu::remote::RemoteError> {
                 match self {
                     $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<smithay::backend::renderer::gles::GlesRenderer>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
+                        smithay::backend::renderer::element::RenderElement::<$crate::gpu::remote::RemoteRenderer>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
                     })+
                 }
             }
 
-            fn underlying_storage(&self, renderer: &mut smithay::backend::renderer::gles::GlesRenderer) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+            fn underlying_storage(&self, renderer: &mut $crate::gpu::remote::RemoteRenderer) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
                 match self {
                     $($name::$variant(elem) => elem.underlying_storage(renderer)),+
                 }
             }
         }
 
-        impl<'render> smithay::backend::renderer::element::RenderElement<$crate::backend::tty::TtyRenderer<'render>>
-            for $($name_R<$crate::backend::tty::TtyRenderer<'render>>)? $($name_no_R)?
-        {
-            fn capture_framebuffer(
-                &self,
-                frame: &mut $crate::backend::tty::TtyFrame<'render, '_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                cache: &smithay::utils::user_data::UserDataMap,
-            ) -> Result<(), $crate::backend::tty::TtyRendererError<'render>> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<$crate::backend::tty::TtyRenderer<'render>>::capture_framebuffer(elem, frame, src, dst, cache)
-                    })+
-                }
-            }
-
-            fn draw(
-                &self,
-                frame: &mut $crate::backend::tty::TtyFrame<'render, '_, '_>,
-                src: smithay::utils::Rectangle<f64, smithay::utils::Buffer>,
-                dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
-                damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
-                cache: Option<&smithay::utils::user_data::UserDataMap>,
-            ) -> Result<(), $crate::backend::tty::TtyRendererError<'render>> {
-                match self {
-                    $($name::$variant(elem) => {
-                        smithay::backend::renderer::element::RenderElement::<$crate::backend::tty::TtyRenderer<'render>>::draw(elem, frame, src, dst, damage, opaque_regions, cache)
-                    })+
-                }
-            }
-
-            fn underlying_storage(
-                &self,
-                renderer: &mut $crate::backend::tty::TtyRenderer<'render>,
-            ) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
-                match self {
-                    $($name::$variant(elem) => elem.underlying_storage(renderer)),+
-                }
-            }
-        }
     };
 }

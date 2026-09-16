@@ -12,7 +12,6 @@ use std::thread;
 use std::time::Duration;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::drm::DrmNode;
 use smithay::backend::input::{InputEvent, TabletToolDescriptor};
 use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
@@ -28,9 +27,6 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
-use smithay::wayland::drm_lease::{
-    DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
-};
 use smithay::wayland::fractional_scale::FractionalScaleHandler;
 use smithay::wayland::idle_inhibit::IdleInhibitHandler;
 use smithay::wayland::idle_notify::{IdleNotifierHandler, IdleNotifierState};
@@ -677,52 +673,6 @@ impl VirtualPointerHandler for State {
 
     fn on_virtual_pointer_axis(&mut self, event: VirtualPointerAxisEvent) {
         self.process_input_event(InputEvent::<VirtualPointerInputBackend>::PointerAxis { event });
-    }
-}
-
-impl DrmLeaseHandler for State {
-    fn drm_lease_state(&mut self, node: DrmNode) -> &mut DrmLeaseState {
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .drm_lease_state
-            .as_mut()
-            .unwrap()
-    }
-
-    fn lease_request(
-        &mut self,
-        node: DrmNode,
-        request: DrmLeaseRequest,
-    ) -> Result<DrmLeaseBuilder, LeaseRejected> {
-        debug!(
-            "Received lease request for {} connectors",
-            request.connectors.len()
-        );
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .lease_request(request)
-    }
-
-    fn new_active_lease(&mut self, node: DrmNode, lease: DrmLease) {
-        debug!("Lease success");
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .new_lease(lease);
-    }
-
-    fn lease_destroyed(&mut self, node: DrmNode, lease_id: u32) {
-        debug!("Destroyed lease");
-        self.backend
-            .tty()
-            .get_device_from_node(node)
-            .unwrap()
-            .remove_lease(lease_id);
     }
 }
 

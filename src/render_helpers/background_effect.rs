@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
 use niri_config::CornerRadius;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale};
 use smithay::wayland::compositor::{with_states, SurfaceData};
 use wayland_server::protocol::wl_surface::WlSurface;
 
+use crate::gpu::remote::RemoteRenderer;
 use crate::handlers::background_effect::get_cached_blur_region;
 use crate::niri_render_elements;
 use crate::render_helpers::blur::BlurOptions;
@@ -150,7 +150,7 @@ impl BackgroundEffect {
 
     pub fn render(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<RemoteRenderer>,
         ns: Option<usize>,
         mut params: RenderParams,
         xray_pos: XrayPos,
@@ -282,7 +282,7 @@ pub fn damage_surface(states: &SurfaceData) {
 // A Smithay user is talking
 #[allow(clippy::too_many_arguments)]
 pub fn render_for_tile(
-    ctx: RenderCtx<GlesRenderer>,
+    ctx: RenderCtx<RemoteRenderer>,
     ns: Option<usize>,
     geometry: Rectangle<f64, Logical>,
     scale: f64,

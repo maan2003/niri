@@ -48,7 +48,10 @@ impl Channel {
         }
         let body = postcard::to_stdvec(msg).map_err(|e| io::Error::other(e.to_string()))?;
         if body.len() > MAX_BODY {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame too large",
+            ));
         }
         let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
         frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -77,7 +80,10 @@ impl Channel {
         let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         let num_fds = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         if len > MAX_BODY || num_fds > MAX_FDS_PER_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad frame header"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad frame header",
+            ));
         }
         let mut body = vec![0u8; len];
         self.read_exact_with_fds(&mut body)?;
@@ -120,6 +126,10 @@ impl Channel {
             filled += n;
         }
         Ok(())
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
     }
 
     pub fn into_fd(self) -> OwnedFd {

@@ -6,26 +6,23 @@
 use std::mem;
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context as _;
 use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
-use smithay::backend::egl::native::EGLSurfacelessDisplay;
-use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::element::RenderElementStates;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::utils::Size;
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
+use crate::gpu::client::{GpuClient, Mode as GpuMode};
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{Niri, RedrawState};
-use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Headless {
-    renderer: Option<GlesRenderer>,
+    renderer: Option<RemoteRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
 
@@ -45,17 +42,9 @@ impl Headless {
             return Ok(());
         }
 
-        let mut renderer = unsafe {
-            let display =
-                EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
-            let context = EGLContext::new(&display).context("error creating EGL context")?;
-            GlesRenderer::new(context).context("error creating renderer")?
-        };
-
-        resources::init(&mut renderer);
-        shaders::init(&mut renderer);
-
-        self.renderer = Some(renderer);
+        // In-process GPU server thread: tests don't need the sandbox boundary.
+        let client = GpuClient::spawn_thread(GpuMode::Headless)?;
+        self.renderer = Some(RemoteRenderer::new(client));
         Ok(())
     }
 
@@ -123,7 +112,7 @@ impl Headless {
 
     pub fn with_primary_renderer<T>(
         &mut self,
-        f: impl FnOnce(&mut GlesRenderer) -> T,
+        f: impl FnOnce(&mut RemoteRenderer) -> T,
     ) -> Option<T> {
         self.renderer.as_mut().map(f)
     }

@@ -1,6 +1,5 @@
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{import_surface, RendererSurfaceStateUserData};
 use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -9,13 +8,14 @@ use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
 
 use super::texture::TextureBuffer;
 use super::BakedBuffer;
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 
 /// Renders elements from a surface tree as textures into `storage`.
 pub fn render_snapshot_from_surface_tree(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     surface: &WlSurface,
     location: Point<f64, Logical>,
-    storage: &mut Vec<BakedBuffer<TextureBuffer<GlesTexture>>>,
+    storage: &mut Vec<BakedBuffer<TextureBuffer<RemoteTexture>>>,
 ) {
     let _span = tracy_client::span!("render_snapshot_from_surface_tree");
 

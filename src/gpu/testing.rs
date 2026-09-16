@@ -4,11 +4,11 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind, RenderElement};
-use smithay::render_elements;
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{
     Bind as _, Color32F, ExportMem as _, Frame as _, ImportMem as _, Offscreen as _, Renderer as _,
 };
+use smithay::render_elements;
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::client::GpuClient;
@@ -73,7 +73,12 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     let yellow = [255, 255, 0, 255];
     let green = [0, 255, 0, 255];
 
-    let tex = renderer.import_memory(&pattern(64, 64, red, blue), Fourcc::Abgr8888, (64, 64).into(), false)?;
+    let tex = renderer.import_memory(
+        &pattern(64, 64, red, blue),
+        Fourcc::Abgr8888,
+        (64, 64).into(),
+        false,
+    )?;
 
     let make_elements = |tex| {
         let surface = TextureRenderElement::from_static_texture(
@@ -108,7 +113,11 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     assert_eq!(pixel(&out, 128, 80, 40), blue, "right half");
     assert_eq!(pixel(&out, 128, 120, 120), green, "background bottom right");
 
-    renderer.update_memory(&tex, &pattern(64, 64, yellow, yellow), Rectangle::from_size((64, 64).into()))?;
+    renderer.update_memory(
+        &tex,
+        &pattern(64, 64, yellow, yellow),
+        Rectangle::from_size((64, 64).into()),
+    )?;
     let (surface, background) = make_elements(tex.clone());
     let elements = [SmokeElement::from(surface), SmokeElement::from(background)];
     let out = render_to_vec(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
@@ -119,4 +128,3 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     renderer.flush()?;
     Ok(())
 }
-

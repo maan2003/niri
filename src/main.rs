@@ -99,9 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
-            Sub::GpuProcess { socket_fd } => {
+            Sub::GpuProcess { socket_fd, mode } => {
                 let fd = niri::gpu::client::inherited_socket(socket_fd);
-                if let Err(err) = niri::gpu::server::run(fd) {
+                let Some(mode) = niri::gpu::client::Mode::parse(&mode) else {
+                    error!("unknown gpu process mode {mode:?}");
+                    std::process::exit(1);
+                };
+                if let Err(err) = niri::gpu::server::run(fd, mode) {
                     error!("gpu process failed: {err:?}");
                     std::process::exit(1);
                 }

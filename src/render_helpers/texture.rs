@@ -1,12 +1,12 @@
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::{ContextId, Frame as _, ImportMem, Renderer, Texture};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::memory::MemoryBuffer;
+use crate::gpu::remote::RemoteTexture;
 
 /// Smithay's texture buffer, but with fractional scale.
 #[derive(Debug, Clone)]
@@ -117,7 +117,7 @@ impl<T: Texture> TextureBuffer<T> {
     }
 }
 
-impl TextureBuffer<GlesTexture> {
+impl TextureBuffer<RemoteTexture> {
     pub fn is_texture_reference_unique(&mut self) -> bool {
         self.texture.is_unique_reference()
     }

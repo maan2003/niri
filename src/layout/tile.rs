@@ -5,7 +5,6 @@ use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
 use smithay::backend::renderer::element::{Element, Kind};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -16,6 +15,7 @@ use super::{
     SizeFrac, RESIZE_ANIMATION_THRESHOLD,
 };
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::RemoteRenderer;
 use crate::layout::SizingMode;
 use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
@@ -137,7 +137,7 @@ niri_render_elements! {
 }
 
 pub type TileRenderSnapshot =
-    RenderSnapshot<TileRenderElement<GlesRenderer>, TileRenderElement<GlesRenderer>>;
+    RenderSnapshot<TileRenderElement<RemoteRenderer>, TileRenderElement<RemoteRenderer>>;
 
 #[derive(Debug)]
 struct ResizeAnimation {
@@ -1126,7 +1126,7 @@ impl<W: LayoutElement> Tile<W> {
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
             if ResizeRenderElement::has_shader(ctx.renderer) {
-                let mut ctx = ctx.as_gles();
+                let mut ctx = ctx.as_remote();
 
                 if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
                     let mut window_elements = Vec::new();
@@ -1207,7 +1207,7 @@ impl<W: LayoutElement> Tile<W> {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
-            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer);
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
                     // If we should clip to geometry, render a clipped window.
@@ -1341,7 +1341,7 @@ impl<W: LayoutElement> Tile<W> {
 
         let surface_anim_scale = animated_window_size / window_size;
         self.window.render_background_effect(
-            ctx.as_gles(),
+            ctx.as_remote(),
             area,
             self.scale,
             clip_to_geometry,
@@ -1373,7 +1373,7 @@ impl<W: LayoutElement> Tile<W> {
         self.window().set_offscreen_data(None);
 
         if let Some(open) = &self.open_animation {
-            let mut ctx = ctx.as_gles();
+            let mut ctx = ctx.as_remote();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1400,7 +1400,7 @@ impl<W: LayoutElement> Tile<W> {
                 }
             }
         } else if let Some(alpha) = &self.alpha_animation {
-            let mut ctx = ctx.as_gles();
+            let mut ctx = ctx.as_remote();
             let mut elements = Vec::new();
             self.render_inner(
                 ctx.r(),
@@ -1431,7 +1431,7 @@ impl<W: LayoutElement> Tile<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -1446,7 +1446,7 @@ impl<W: LayoutElement> Tile<W> {
 
     fn render_snapshot(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         mut xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,

@@ -8,7 +8,6 @@ use calloop::LoopHandle;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::reexports::gbm::Modifier;
@@ -16,6 +15,7 @@ use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -98,9 +98,7 @@ impl State {
 
         let mut render_formats = self
             .backend
-            .with_primary_renderer(|renderer| {
-                renderer.egl_context().dmabuf_render_formats().clone()
-            })
+            .with_primary_renderer(|renderer| renderer.dmabuf_render_formats())
             .unwrap_or_default();
 
         {
@@ -535,7 +533,7 @@ impl Niri {
 
     pub fn render_for_screen_cast(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         target_presentation_time: Duration,
     ) {
@@ -623,7 +621,7 @@ impl Niri {
 
     pub fn render_windows_for_screen_cast(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         target_presentation_time: Duration,
     ) {

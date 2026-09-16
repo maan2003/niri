@@ -3,22 +3,20 @@ use niri_config::CornerRadius;
 use smithay::backend::renderer::buffer_y_inverted;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::damage::ExtraDamage;
-use super::renderer::{AsGlesFrame as _, NiriRenderer};
+use super::renderer::NiriRenderer;
 use super::shaders::{mat3_uniform, Shaders};
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram};
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: GlesTexProgram,
+    program: RemoteTexProgram,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -35,7 +33,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        program: GlesTexProgram,
+        program: RemoteTexProgram,
         corner_radius: CornerRadius,
     ) -> Self {
         Self {
@@ -99,8 +97,8 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         ]
     }
 
-    pub fn shader(renderer: &mut R) -> Option<&GlesTexProgram> {
-        Shaders::get(renderer).clipped_surface.as_ref()
+    pub fn shader(renderer: &mut R) -> Option<RemoteTexProgram> {
+        Shaders::get(renderer).clipped_surface.clone()
     }
 
     pub fn will_clip(
@@ -228,18 +226,18 @@ impl<R: NiriRenderer> Element for ClippedSurfaceRenderElement<R> {
     }
 }
 
-impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
+impl RenderElement<RemoteRenderer> for ClippedSurfaceRenderElement<RemoteRenderer> {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), RemoteError> {
         frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::<GlesRenderer>::draw(
+        RenderElement::<RemoteRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -252,37 +250,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         Ok(())
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>>
-    for ClippedSurfaceRenderElement<TtyRenderer<'render>>
-{
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'render, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        frame
-            .as_gles_frame()
-            .override_default_tex_program(self.program.clone(), self.compute_uniforms());
-        RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache)?;
-        frame.as_gles_frame().clear_tex_program_override();
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

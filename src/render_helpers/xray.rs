@@ -5,18 +5,15 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
-};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram};
 use crate::render_helpers::background_effect::RenderParams;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::renderer::AsGlesFrame as _;
 use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
@@ -80,7 +77,7 @@ pub struct XrayElement {
     noise: f32,
     saturation: f32,
     bg_color: Color32F,
-    program: Option<GlesTexProgram>,
+    program: Option<RemoteTexProgram>,
 }
 
 impl Xray {
@@ -96,7 +93,7 @@ impl Xray {
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<RemoteRenderer>,
         params: RenderParams,
         xray_pos: XrayPos,
         blur: bool,
@@ -296,16 +293,16 @@ impl Element for XrayElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for XrayElement {
+impl RenderElement<RemoteRenderer> for XrayElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), RemoteError> {
         let mut buffer = self.buffer.borrow_mut();
         let texture = match buffer.render(frame, self.blur) {
             Ok(x) => x,
@@ -354,29 +351,5 @@ impl RenderElement<GlesRenderer> for XrayElement {
             self.program.as_ref(),
             uniforms,
         )
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for XrayElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
     }
 }

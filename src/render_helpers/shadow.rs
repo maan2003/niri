@@ -4,7 +4,7 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use niri_config::{Color, CornerRadius};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, Uniform};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
@@ -13,8 +13,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderRenderElement;
 use super::shaders::{mat3_uniform, ProgramType, Shaders};
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 
 /// Renders a rounded rectangle shadow.
 #[derive(Debug, Clone)]
@@ -239,19 +238,19 @@ impl Element for ShadowRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for ShadowRenderElement {
+impl RenderElement<RemoteRenderer> for ShadowRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), RemoteError> {
         let _span = tracy_client::span!("ShadowRenderElement::draw");
         frame.with_gpu_span(gpu_span_location!("ShadowRenderElement::draw"), |frame| {
-            RenderElement::<GlesRenderer>::draw(
+            RenderElement::<RemoteRenderer>::draw(
                 &self.inner,
                 frame,
                 src,
@@ -263,30 +262,7 @@ impl RenderElement<GlesRenderer> for ShadowRenderElement {
         })
     }
 
-    fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        self.inner.underlying_storage(renderer)
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for ShadowRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(self, frame, src, dst, damage, opaque_regions, cache)?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {
         self.inner.underlying_storage(renderer)
     }
 }

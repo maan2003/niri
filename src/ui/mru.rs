@@ -17,13 +17,13 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
 use crate::layout::{Layout, LayoutElement as _, LayoutElementRenderElement};
 use crate::niri::Niri;
@@ -185,7 +185,7 @@ struct MoveAnimation {
     from: f64,
 }
 
-type MruTexture = TextureBuffer<GlesTexture>;
+type MruTexture = TextureBuffer<RemoteTexture>;
 
 /// Cached title texture.
 #[derive(Debug, Default)]
@@ -324,7 +324,7 @@ impl Thumbnail {
 
     fn title_texture(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         mapped: &Mapped,
         scale: f64,
     ) -> Option<MruTexture> {
@@ -376,7 +376,7 @@ impl Thumbnail {
         };
 
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
-        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer).cloned();
+        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer);
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
         let clip = move |elem| match elem {
@@ -455,7 +455,7 @@ impl Thumbnail {
         });
 
         let mut title_size = None;
-        let title_texture = self.title_texture(ctx.as_gles().renderer, mapped, scale);
+        let title_texture = self.title_texture(ctx.as_remote().renderer, mapped, scale);
         let title_texture = title_texture.map(|texture| {
             let mut size = texture.logical_size();
             size.w = f64::min(size.w, preview_geo.size.w);
@@ -488,7 +488,7 @@ impl Thumbnail {
                 Kind::Unspecified,
             );
 
-            let ctx = ctx.as_gles();
+            let ctx = ctx.as_remote();
             if let Some(program) = GradientFadeTextureRenderElement::shader(ctx.renderer) {
                 let elem = GradientFadeTextureRenderElement::new(texture, program);
                 push(WindowMruUiRenderElement::GradientFadeElem(elem));
@@ -1135,7 +1135,7 @@ impl WindowMruUi {
         // During the closing fade, use an offscreen to avoid transparent compositing artifacts.
         let mut pushed_offscreen = false;
         if *output == inner.output && alpha < 1. {
-            let mut ctx = ctx.as_gles();
+            let mut ctx = ctx.as_remote();
 
             let mut elems = Vec::new();
             inner.render(niri, ctx.r(), &mut |elem| elems.push(elem));
@@ -1562,7 +1562,7 @@ impl Inner {
         let panel_texture =
             self.scope_panel
                 .borrow_mut()
-                .get(ctx.as_gles().renderer, scale, self.wmru.scope);
+                .get(ctx.as_remote().renderer, scale, self.wmru.scope);
         if let Some(texture) = panel_texture {
             let padding = round_logical_in_physical(scale, f64::from(PANEL_PADDING));
 
@@ -1632,7 +1632,12 @@ impl Inner {
 }
 
 impl TitleTexture {
-    fn get(&mut self, renderer: &mut GlesRenderer, title: &str, scale: f64) -> Option<MruTexture> {
+    fn get(
+        &mut self,
+        renderer: &mut RemoteRenderer,
+        title: &str,
+        scale: f64,
+    ) -> Option<MruTexture> {
         if self.title != title || self.scale != scale {
             self.texture = None;
             self.title = title.to_owned();
@@ -1654,7 +1659,7 @@ impl TitleTexture {
 }
 
 fn generate_title_texture(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     title: &str,
     scale: f64,
 ) -> anyhow::Result<MruTexture> {
@@ -1704,7 +1709,7 @@ fn generate_title_texture(
 impl ScopePanel {
     fn get(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         scale: f64,
         scope: MruScope,
     ) -> Option<MruTexture> {
@@ -1721,7 +1726,7 @@ impl ScopePanel {
 }
 
 fn generate_scope_panels(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     scale: f64,
 ) -> anyhow::Result<[MruTexture; 3]> {
     fn make_panel_text(idx: usize) -> String {
@@ -1761,7 +1766,11 @@ fn generate_scope_panels(
     ])
 }
 
-fn render_panel(renderer: &mut GlesRenderer, scale: f64, text: &str) -> anyhow::Result<MruTexture> {
+fn render_panel(
+    renderer: &mut RemoteRenderer,
+    scale: f64,
+    text: &str,
+) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::render_panel");
 
     let mut font = FontDescription::from_string(FONT);

@@ -15,13 +15,13 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{ExportMem, Texture as _};
 use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
@@ -94,11 +94,11 @@ pub struct OutputData {
     screenshot: [OutputScreenshot; 3],
     buffers: [SolidColorBuffer; 8],
     locations: [Point<i32, Physical>; 8],
-    panel: Option<(TextureBuffer<GlesTexture>, TextureBuffer<GlesTexture>)>,
+    panel: Option<(TextureBuffer<RemoteTexture>, TextureBuffer<RemoteTexture>)>,
 }
 
 pub struct OutputScreenshot {
-    texture: GlesTexture,
+    texture: RemoteTexture,
     buffer: PrimaryGpuTextureRenderElement,
     pointer: Option<PrimaryGpuTextureRenderElement>,
 }
@@ -137,7 +137,7 @@ impl ScreenshotUi {
 
     pub fn open(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         // Output, screencast, screen capture.
         screenshots: HashMap<Output, [OutputScreenshot; 3]>,
         default_output: Output,
@@ -696,7 +696,7 @@ impl ScreenshotUi {
 
     pub fn capture(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
     ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
         let _span = tracy_client::span!("ScreenshotUi::capture");
 
@@ -1023,10 +1023,10 @@ impl ScreenshotUi {
 
 impl OutputScreenshot {
     pub fn from_textures(
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         scale: Scale<f64>,
-        texture: GlesTexture,
-        pointer: Option<(GlesTexture, Rectangle<i32, Physical>)>,
+        texture: RemoteTexture,
+        pointer: Option<(RemoteTexture, Rectangle<i32, Physical>)>,
     ) -> Self {
         let buffer = PrimaryGpuTextureRenderElement(TextureRenderElement::from_texture_buffer(
             TextureBuffer::from_texture(
@@ -1132,10 +1132,10 @@ fn is_within_capture_button(
 }
 
 fn render_panel(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     scale: f64,
     text: &str,
-) -> anyhow::Result<TextureBuffer<GlesTexture>> {
+) -> anyhow::Result<TextureBuffer<RemoteTexture>> {
     let _span = tracy_client::span!("screenshot_ui::render_panel");
 
     let padding: i32 = to_physical_precise_round(scale, PADDING);

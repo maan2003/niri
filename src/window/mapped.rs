@@ -4,7 +4,6 @@ use std::time::Duration;
 use niri_config::{Color, Config, CornerRadius, GradientInterpolation, WindowRule};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::space::SpaceElement as _;
 use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::output::{self, Output};
@@ -22,6 +21,7 @@ use smithay::wayland::shell::xdg::{
 use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
+use crate::gpu::remote::RemoteRenderer;
 use crate::handlers::KdeDecorationsModeState;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
@@ -407,7 +407,7 @@ impl Mapped {
     }
 
     /// Renders a snapshot of the window without popups.
-    fn render_snapshot(&self, renderer: &mut GlesRenderer) -> LayoutElementRenderSnapshot {
+    fn render_snapshot(&self, renderer: &mut RemoteRenderer) -> LayoutElementRenderSnapshot {
         let _span = tracy_client::span!("Mapped::render_snapshot");
 
         let size = self.size().to_f64();
@@ -453,7 +453,7 @@ impl Mapped {
         should_animate
     }
 
-    pub fn store_animation_snapshot(&mut self, renderer: &mut GlesRenderer) {
+    pub fn store_animation_snapshot(&mut self, renderer: &mut RemoteRenderer) {
         self.animation_snapshot = Some(self.render_snapshot(renderer));
     }
 
@@ -719,7 +719,7 @@ impl LayoutElement for Mapped {
             }
             let xray_pos = xray_pos.offset(offset.to_f64());
             background_effect::render_for_tile(
-                ctx.as_gles(),
+                ctx.as_remote(),
                 None,
                 geometry,
                 scale.x,
@@ -739,7 +739,7 @@ impl LayoutElement for Mapped {
 
     fn render_background_effect(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<RemoteRenderer>,
         geometry: Rectangle<f64, Logical>,
         scale: f64,
         clip_to_geometry: bool,

@@ -3,7 +3,9 @@
 
 pub mod client;
 pub mod convert;
+pub mod drm;
 pub mod exec;
+pub mod gl;
 pub mod protocol;
 pub mod remote;
 pub mod server;

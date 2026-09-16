@@ -9,12 +9,13 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, Uniform};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{Blocker, BlockerState};
 
 use crate::animation::Animation;
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::niri_render_elements;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::shader_element::ShaderRenderElement;
@@ -27,16 +28,16 @@ use crate::utils::transaction::TransactionBlocker;
 #[derive(Debug)]
 pub struct ClosingWindow {
     /// Contents of the window.
-    buffer: TextureBuffer<GlesTexture>,
+    buffer: TextureBuffer<RemoteTexture>,
 
     /// Contents that are not blocked out, but the background is blocked out.
     ///
     /// If `None` then the background doesn't have any blocked-out surfaces, and normal `buffer`
     /// can be used instead.
-    buffer_with_blocked_out_bg: Option<TextureBuffer<GlesTexture>>,
+    buffer_with_blocked_out_bg: Option<TextureBuffer<RemoteTexture>>,
 
     /// Blocked-out contents of the window.
-    blocked_out_buffer: TextureBuffer<GlesTexture>,
+    blocked_out_buffer: TextureBuffer<RemoteTexture>,
 
     /// Where the window should be blocked out from.
     block_out_from: Option<BlockOutFrom>,
@@ -94,8 +95,8 @@ impl AnimationState {
 }
 
 impl ClosingWindow {
-    pub fn new<E: RenderElement<GlesRenderer>>(
-        renderer: &mut GlesRenderer,
+    pub fn new<E: RenderElement<RemoteRenderer>>(
+        renderer: &mut RemoteRenderer,
         snapshot: RenderSnapshot<E, E>,
         scale: Scale<f64>,
         geo_size: Size<f64, Logical>,
@@ -178,7 +179,7 @@ impl ClosingWindow {
 
     pub fn render(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<RemoteRenderer>,
         view_rect: Rectangle<f64, Logical>,
         scale: Scale<f64>,
     ) -> ClosingWindowRenderElement {

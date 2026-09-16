@@ -7,11 +7,12 @@ use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{Element as _, Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, Uniform};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::Texture;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use crate::animation::Animation;
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri_render_elements;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData, OffscreenRenderElement};
 use crate::render_helpers::shader_element::ShaderRenderElement;
@@ -48,8 +49,8 @@ impl OpenAnimation {
     // then rendered elsewhere.
     pub fn render(
         &self,
-        renderer: &mut GlesRenderer,
-        elements: &[impl RenderElement<GlesRenderer>],
+        renderer: &mut RemoteRenderer,
+        elements: &[impl RenderElement<RemoteRenderer>],
         geo_size: Size<f64, Logical>,
         location: Point<f64, Logical>,
         scale: Scale<f64>,

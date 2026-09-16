@@ -4,24 +4,26 @@
 //! [`RemoteRenderer::flush`], before any synchronous read, or when the batch grows large.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::marker::PhantomData;
-use std::mem;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::{fmt, mem};
 
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::{get_bpp, FormatSet};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
+use smithay::backend::egl::display::EGLBufferReader;
+use smithay::backend::egl::Error as EglError;
 use smithay::backend::renderer::gles::Uniform as GlesUniform;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, Color32F, ContextId, DebugFlags, ErasedContextId, ExportMem, Frame, ImportDma,
-    ImportDmaWl, ImportMem, ImportMemWl, Offscreen, Renderer, RendererSuper, Texture,
+    ImportDmaWl, ImportEgl, ImportMem, ImportMemWl, Offscreen, Renderer, RendererSuper, Texture,
     TextureFilter, TextureMapping,
 };
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::shm::{self, shm_format_to_fourcc};
@@ -29,7 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    Caps, Command, DmabufDesc, PlaneDesc, ShaderKind, ShaderSupport, Target, TexId, TexProgram,
+    BlurParams, Caps, Command, DmabufDesc, OutputRef, PlaneDesc, ShaderKind, ShaderSupport, Target,
+    TexId, TexProgram,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -73,7 +76,7 @@ struct Shared {
     pending: Mutex<Pending>,
     next_id: AtomicU64,
     context_id: ContextId<RemoteTexture>,
-    caps: Caps,
+    caps: RwLock<Caps>,
     shaders: Mutex<ShaderSupport>,
     dmabuf_cache: Mutex<HashMap<WeakDmabuf, RemoteTexture>>,
 }
@@ -269,7 +272,7 @@ pub struct RemoteRenderer {
 
 impl RemoteRenderer {
     pub fn new(client: GpuClient) -> Self {
-        let caps = client.caps().clone();
+        let caps = client.caps().cloned().unwrap_or_default();
         let shaders = caps.shaders;
         Self {
             shared: Arc::new(Shared {
@@ -277,7 +280,7 @@ impl RemoteRenderer {
                 pending: Mutex::new(Pending::default()),
                 next_id: AtomicU64::new(1),
                 context_id: ContextId::new(),
-                caps,
+                caps: RwLock::new(caps),
                 shaders: Mutex::new(shaders),
                 dmabuf_cache: Mutex::new(HashMap::new()),
             }),
@@ -285,8 +288,78 @@ impl RemoteRenderer {
         }
     }
 
-    pub fn caps(&self) -> &Caps {
-        &self.shared.caps
+    pub fn caps(&self) -> Caps {
+        self.shared.caps.read().unwrap().clone()
+    }
+
+    /// Formats the GPU process can render into, for allocating screencast / capture buffers.
+    pub fn dmabuf_render_formats(&self) -> FormatSet {
+        self.shared
+            .caps
+            .read()
+            .unwrap()
+            .dmabuf_render_formats
+            .iter()
+            .filter_map(|&(code, modifier)| {
+                Some(Format {
+                    code: Fourcc::try_from(code).ok()?,
+                    modifier: Modifier::from(modifier),
+                })
+            })
+            .collect()
+    }
+
+    /// Called once the GPU process has brought up its renderer (after the primary DRM device
+    /// was added).
+    pub fn set_caps(&self, caps: Caps) {
+        *self.shared.shaders.lock().unwrap() = caps.shaders;
+        *self.shared.caps.write().unwrap() = caps;
+    }
+
+    /// The GPU-process connection, for requests that are not renderer calls (DRM/KMS).
+    pub fn client(&self) -> MutexGuard<'_, GpuClient> {
+        self.shared.client.lock().unwrap()
+    }
+
+    /// A render target that scans out on `output`. The recorded frame is drawn when the
+    /// core sends `Request::Present`.
+    pub fn output_target(
+        &self,
+        output: OutputRef,
+        size: Size<i32, Physical>,
+    ) -> RemoteTarget<'static> {
+        RemoteTarget {
+            target: Target::Output(output),
+            size: Size::from((size.w, size.h)),
+            format: None,
+            _keep: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Allocates a framebuffer-capture slot in the GPU process.
+    pub fn new_capture(&self) -> CaptureHandle {
+        CaptureHandle(Arc::new(CaptureInner {
+            key: self.shared.alloc_id(),
+            shared: Arc::downgrade(&self.shared),
+        }))
+    }
+
+    /// Blurs `src` into a new texture. The GPU process caches its pyramid textures per `key`.
+    pub fn blur_texture(
+        &mut self,
+        key: u64,
+        src: &RemoteTexture,
+        params: BlurParams,
+    ) -> RemoteTexture {
+        let id = self.shared.alloc_id();
+        self.shared.push(Command::Blur {
+            key,
+            src: src.id(),
+            dst: id,
+            params,
+        });
+        self.texture(id, src.size(), Some(Fourcc::Abgr8888))
     }
 
     /// Which shader programs the GPU process managed to compile.
@@ -316,13 +389,15 @@ impl RemoteRenderer {
         src: Option<&str>,
     ) -> Result<(), RemoteError> {
         self.flush()?;
-        let mut client = self.shared.client.lock().unwrap();
-        let ok = client
+        let ok = self
+            .client()
             .set_custom_shader(kind, src)
             .map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
         let mut shaders = self.shared.shaders.lock().unwrap();
         match kind {
-            ShaderKind::Resize => shaders.resize = ok || self.shared.caps.shaders.resize,
+            ShaderKind::Resize => shaders.resize = ok,
+            ShaderKind::Close => shaders.close = ok,
+            ShaderKind::Open => shaders.open = ok,
             _ => (),
         }
         Ok(())
@@ -374,6 +449,15 @@ impl fmt::Debug for RemoteFrame<'_, '_> {
 }
 
 impl RemoteFrame<'_, '_> {
+    /// GPU spans are recorded in the GPU process; here this is a plain passthrough so render
+    /// elements can keep their `with_gpu_span` calls.
+    pub fn with_gpu_span<L, F, R>(&mut self, _location: L, func: F) -> R
+    where
+        F: FnOnce(&mut Self) -> R,
+    {
+        func(self)
+    }
+
     pub fn renderer(&mut self) -> &mut RemoteRenderer {
         self.renderer
     }
@@ -423,6 +507,86 @@ impl RemoteFrame<'_, '_> {
     pub fn clear_tex_program_override(&mut self) {
         self.renderer.shared.push(Command::ClearTexProgramOverride);
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_shader(
+        &mut self,
+        program: ShaderKind,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        scale: f32,
+        alpha: f32,
+        uniforms: &[GlesUniform<'_>],
+        textures: &[(String, RemoteTexture)],
+    ) {
+        self.renderer.shared.push(Command::DrawShader {
+            program,
+            src: convert::rect_f64(src),
+            dst: convert::rect(dst),
+            damage: convert::rects(damage),
+            scale,
+            alpha,
+            uniforms: convert::uniforms(uniforms),
+            textures: textures.iter().map(|(n, t)| (n.clone(), t.id())).collect(),
+        });
+    }
+
+    pub fn capture_framebuffer(
+        &mut self,
+        capture: &CaptureHandle,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        scale: f32,
+        blur: Option<BlurParams>,
+    ) {
+        self.renderer.shared.push(Command::CaptureFramebuffer {
+            key: capture.key(),
+            src: convert::rect_f64(src),
+            dst: convert::rect(dst),
+            scale,
+            blur,
+        });
+    }
+
+    pub fn draw_captured(
+        &mut self,
+        capture: &CaptureHandle,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        uniforms: &[GlesUniform<'_>],
+    ) {
+        self.renderer.shared.push(Command::DrawCaptured {
+            key: capture.key(),
+            dst: convert::rect(dst),
+            damage: convert::rects(damage),
+            uniforms: convert::uniforms(uniforms),
+        });
+    }
+}
+
+/// A framebuffer-capture slot in the GPU process; freed when dropped.
+#[derive(Debug, Clone)]
+pub struct CaptureHandle(Arc<CaptureInner>);
+
+#[derive(Debug)]
+struct CaptureInner {
+    key: u64,
+    shared: Weak<Shared>,
+}
+
+impl CaptureHandle {
+    pub fn key(&self) -> u64 {
+        self.0.key
+    }
+}
+
+impl Drop for CaptureInner {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.push(Command::DestroyCapture { key: self.key });
+        }
+    }
 }
 
 impl Frame for RemoteFrame<'_, '_> {
@@ -433,7 +597,11 @@ impl Frame for RemoteFrame<'_, '_> {
         self.renderer.shared.context_id.clone()
     }
 
-    fn clear(&mut self, color: Color32F, at: &[Rectangle<i32, Physical>]) -> Result<(), RemoteError> {
+    fn clear(
+        &mut self,
+        color: Color32F,
+        at: &[Rectangle<i32, Physical>],
+    ) -> Result<(), RemoteError> {
         self.renderer.shared.push(Command::Clear {
             color: color.components(),
             at: convert::rects(at),
@@ -640,6 +808,8 @@ impl ImportMem for RemoteRenderer {
         let formats: Vec<Fourcc> = self
             .shared
             .caps
+            .read()
+            .unwrap()
             .mem_formats
             .iter()
             .filter_map(|f| Fourcc::try_from(*f).ok())
@@ -666,17 +836,26 @@ impl ImportMemWl for RemoteRenderer {
         let context_id = self.shared.context_id.erased();
 
         let result = shm::with_buffer_contents(buffer, |ptr, len, data| {
-            let fourcc = shm_format_to_fourcc(data.format)
-                .ok_or(RemoteError::Unsupported("shm format"))?;
-            if !self.shared.caps.mem_formats.contains(&(fourcc as u32)) {
+            let fourcc =
+                shm_format_to_fourcc(data.format).ok_or(RemoteError::Unsupported("shm format"))?;
+            if !self
+                .shared
+                .caps
+                .read()
+                .unwrap()
+                .mem_formats
+                .contains(&(fourcc as u32))
+            {
                 return Err(RemoteError::Unsupported("shm format"));
             }
             let bpp = get_bpp(fourcc).ok_or(RemoteError::Unsupported("shm format"))? / 8;
 
             let width = data.width;
             let height = data.height;
-            let stride = usize::try_from(data.stride).map_err(|_| RemoteError::Shm("stride".into()))?;
-            let offset = usize::try_from(data.offset).map_err(|_| RemoteError::Shm("offset".into()))?;
+            let stride =
+                usize::try_from(data.stride).map_err(|_| RemoteError::Shm("stride".into()))?;
+            let offset =
+                usize::try_from(data.offset).map_err(|_| RemoteError::Shm("offset".into()))?;
             if width <= 0 || height <= 0 {
                 return Err(RemoteError::Shm("empty buffer".into()));
             }
@@ -754,6 +933,8 @@ impl ImportDma for RemoteRenderer {
     fn dmabuf_formats(&self) -> FormatSet {
         self.shared
             .caps
+            .read()
+            .unwrap()
             .dmabuf_formats
             .iter()
             .filter_map(|(code, modifier)| {
@@ -796,15 +977,14 @@ impl ImportDma for RemoteRenderer {
                 .map(|(offset, stride)| PlaneDesc { offset, stride })
                 .collect(),
         };
+        // Synchronous: a rejected buffer must not take a whole batch down with it, and the
+        // caller (dmabuf global) wants a yes/no answer.
+        let _ = damage;
+        self.flush()?;
         let id = self.shared.alloc_id();
-        self.shared.push_with_fds(
-            Command::ImportDmabuf {
-                id,
-                desc,
-                damage: damage.map(convert::rects),
-            },
-            fds,
-        );
+        self.client()
+            .import_dmabuf(id, desc, &fds)
+            .map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
         let texture = self.texture(id, dmabuf.size(), Some(format.code));
         self.shared
             .dmabuf_cache
@@ -816,6 +996,28 @@ impl ImportDma for RemoteRenderer {
 }
 
 impl ImportDmaWl for RemoteRenderer {}
+
+impl ImportEgl for RemoteRenderer {
+    fn bind_wl_display(&mut self, _display: &DisplayHandle) -> Result<(), EglError> {
+        // Legacy wl_drm buffers aren't supported; clients use linux-dmabuf.
+        Err(EglError::NoEGLDisplayBound)
+    }
+
+    fn unbind_wl_display(&mut self) {}
+
+    fn egl_reader(&self) -> Option<&EGLBufferReader> {
+        None
+    }
+
+    fn import_egl_buffer(
+        &mut self,
+        _buffer: &WlBuffer,
+        _surface: Option<&SurfaceData>,
+        _damage: &[Rectangle<i32, Buffer>],
+    ) -> Result<RemoteTexture, RemoteError> {
+        Err(RemoteError::Unsupported("EGL buffers"))
+    }
+}
 
 impl ExportMem for RemoteRenderer {
     type TextureMapping = RemoteMapping;

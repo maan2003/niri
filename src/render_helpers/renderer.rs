@@ -1,10 +1,11 @@
+use std::error::Error;
+
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{
-    Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
+    Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, Texture,
 };
 
-use crate::backend::tty::{TtyFrame, TtyRenderer};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
 /// Trait with our main renderer requirements to save on the typing.
 pub trait NiriRenderer:
@@ -12,63 +13,47 @@ pub trait NiriRenderer:
     + ImportMem
     + ExportMem
     + Bind<Dmabuf>
-    + Offscreen<GlesTexture>
+    + Offscreen<RemoteTexture>
     + Renderer<TextureId = Self::NiriTextureId, Error = Self::NiriError>
-    + AsGlesRenderer
+    + AsRemoteRenderer
 {
     // Associated types to work around the instability of associated type bounds.
     type NiriTextureId: Texture + Clone + Send + 'static;
-    type NiriError: std::error::Error
-        + Send
-        + Sync
-        + From<<GlesRenderer as RendererSuper>::Error>
-        + 'static;
+    type NiriError: Error + Send + Sync + From<RemoteError> + 'static;
 }
 
 impl<R> NiriRenderer for R
 where
-    R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlesRenderer,
+    R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Offscreen<RemoteTexture>,
+    R: AsRemoteRenderer,
     R::TextureId: Texture + Clone + Send + 'static,
-    R::Error:
-        std::error::Error + Send + Sync + From<<GlesRenderer as RendererSuper>::Error> + 'static,
+    R::Error: Error + Send + Sync + From<RemoteError> + 'static,
 {
     type NiriTextureId = R::TextureId;
     type NiriError = R::Error;
 }
 
-/// Trait for getting the underlying `GlesRenderer`.
-pub trait AsGlesRenderer {
-    fn as_gles_renderer(&mut self) -> &mut GlesRenderer;
+/// Trait for getting the underlying `RemoteRenderer`.
+pub trait AsRemoteRenderer {
+    fn as_remote_renderer(&mut self) -> &mut RemoteRenderer;
 }
 
-impl AsGlesRenderer for GlesRenderer {
-    fn as_gles_renderer(&mut self) -> &mut GlesRenderer {
+impl AsRemoteRenderer for RemoteRenderer {
+    fn as_remote_renderer(&mut self) -> &mut RemoteRenderer {
         self
     }
 }
 
-impl AsGlesRenderer for TtyRenderer<'_> {
-    fn as_gles_renderer(&mut self) -> &mut GlesRenderer {
-        self.as_mut()
-    }
-}
-
-/// Trait for getting the underlying `GlesFrame`.
-pub trait AsGlesFrame<'frame, 'buffer>
+/// Trait for getting the underlying `RemoteFrame`.
+pub trait AsRemoteFrame<'frame, 'buffer>
 where
     Self: 'frame,
 {
-    fn as_gles_frame(&mut self) -> &mut GlesFrame<'frame, 'buffer>;
+    fn as_remote_frame(&mut self) -> &mut RemoteFrame<'frame, 'buffer>;
 }
 
-impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for GlesFrame<'frame, 'buffer> {
-    fn as_gles_frame(&mut self) -> &mut GlesFrame<'frame, 'buffer> {
+impl<'frame, 'buffer> AsRemoteFrame<'frame, 'buffer> for RemoteFrame<'frame, 'buffer> {
+    fn as_remote_frame(&mut self) -> &mut RemoteFrame<'frame, 'buffer> {
         self
-    }
-}
-
-impl<'frame, 'buffer> AsGlesFrame<'frame, 'buffer> for TtyFrame<'_, 'frame, 'buffer> {
-    fn as_gles_frame(&mut self) -> &mut GlesFrame<'frame, 'buffer> {
-        self.as_mut()
     }
 }

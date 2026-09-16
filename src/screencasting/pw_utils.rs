@@ -39,7 +39,6 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::ExportMem;
 use smithay::output::{Output, OutputModeSource};
@@ -55,6 +54,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Scale, Size, Transform}
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
@@ -1187,9 +1187,9 @@ impl Cast {
     #[allow(clippy::too_many_arguments)]
     pub fn dequeue_buffer_and_render(
         &mut self,
-        renderer: &mut GlesRenderer,
-        mut elements: &[CastRenderElement<GlesRenderer>],
-        cursor_data: &CursorData<CastRenderElement<GlesRenderer>>,
+        renderer: &mut RemoteRenderer,
+        mut elements: &[CastRenderElement<RemoteRenderer>],
+        cursor_data: &CursorData<CastRenderElement<RemoteRenderer>>,
         size: Size<i32, Physical>,
         scale: Scale<f64>,
     ) -> bool {
@@ -1325,7 +1325,7 @@ impl Cast {
         }
     }
 
-    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
+    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut RemoteRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1781,9 +1781,9 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
 }
 
 unsafe fn add_cursor_metadata(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     spa_buffer: *mut spa_buffer,
-    cursor_data: &CursorData<impl RenderElement<GlesRenderer>>,
+    cursor_data: &CursorData<impl RenderElement<RemoteRenderer>>,
     redraw: bool,
 ) {
     unsafe {
@@ -1877,11 +1877,11 @@ unsafe fn add_cursor_metadata(
 }
 
 fn render_to_shmbuf(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &Shmbuf,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<RemoteRenderer>],
     states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();

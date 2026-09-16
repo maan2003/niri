@@ -1,28 +1,27 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
-};
+use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
 use super::texture::TextureRenderElement;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
-use crate::render_helpers::renderer::AsGlesFrame as _;
+use crate::gpu::remote::{
+    RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram, RemoteTexture,
+};
 use crate::render_helpers::shaders::Shaders;
 
 #[derive(Debug, Clone)]
 pub struct GradientFadeTextureRenderElement {
-    inner: TextureRenderElement<GlesTexture>,
+    inner: TextureRenderElement<RemoteTexture>,
     program: GradientFadeShader,
     cutoff: (f32, f32),
 }
 
 #[derive(Debug, Clone)]
-pub struct GradientFadeShader(GlesTexProgram);
+pub struct GradientFadeShader(RemoteTexProgram);
 
 impl GradientFadeTextureRenderElement {
-    pub fn new(texture: TextureRenderElement<GlesTexture>, program: GradientFadeShader) -> Self {
+    pub fn new(texture: TextureRenderElement<RemoteTexture>, program: GradientFadeShader) -> Self {
         let logical_w = texture.buffer().logical_size().w;
         let logical_src_w = texture.logical_src().size.w;
         let cutoff = if logical_src_w < logical_w {
@@ -41,7 +40,7 @@ impl GradientFadeTextureRenderElement {
         }
     }
 
-    pub fn shader(renderer: &mut GlesRenderer) -> Option<GradientFadeShader> {
+    pub fn shader(renderer: &mut RemoteRenderer) -> Option<GradientFadeShader> {
         let program = Shaders::get(renderer).gradient_fade.clone();
         program.map(GradientFadeShader)
     }
@@ -89,19 +88,19 @@ impl Element for GradientFadeTextureRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
+impl RenderElement<RemoteRenderer> for GradientFadeTextureRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), RemoteError> {
         let uniforms = vec![Uniform::new("cutoff", self.cutoff)];
         frame.override_default_tex_program(self.program.0.clone(), uniforms);
-        RenderElement::<GlesRenderer>::draw(
+        RenderElement::<RemoteRenderer>::draw(
             &self.inner,
             frame,
             src,
@@ -114,40 +113,7 @@ impl RenderElement<GlesRenderer> for GradientFadeTextureRenderElement {
         Ok(())
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for GradientFadeTextureRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'render, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

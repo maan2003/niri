@@ -81,39 +81,66 @@ pub fn uniform(u: &GlesUniform<'_>) -> Uniform {
         UniformValue::_2ui(a, b) => UniformVal::U2(*a, *b),
         UniformValue::_3ui(a, b, c) => UniformVal::U3(*a, *b, *c),
         UniformValue::_4ui(a, b, c, d) => UniformVal::U4(*a, *b, *c, *d),
-        UniformValue::Matrix2x2 { matrices, transpose } => UniformVal::Mat2x2 {
+        UniformValue::Matrix2x2 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat2x2 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix2x3 { matrices, transpose } => UniformVal::Mat2x3 {
+        UniformValue::Matrix2x3 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat2x3 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix2x4 { matrices, transpose } => UniformVal::Mat2x4 {
+        UniformValue::Matrix2x4 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat2x4 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix3x2 { matrices, transpose } => UniformVal::Mat3x2 {
+        UniformValue::Matrix3x2 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat3x2 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix3x3 { matrices, transpose } => UniformVal::Mat3x3 {
+        UniformValue::Matrix3x3 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat3x3 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix3x4 { matrices, transpose } => UniformVal::Mat3x4 {
+        UniformValue::Matrix3x4 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat3x4 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix4x2 { matrices, transpose } => UniformVal::Mat4x2 {
+        UniformValue::Matrix4x2 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat4x2 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix4x3 { matrices, transpose } => UniformVal::Mat4x3 {
+        UniformValue::Matrix4x3 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat4x3 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
-        UniformValue::Matrix4x4 { matrices, transpose } => UniformVal::Mat4x4 {
+        UniformValue::Matrix4x4 {
+            matrices,
+            transpose,
+        } => UniformVal::Mat4x4 {
             matrices: matrices.clone(),
             transpose: *transpose,
         },
@@ -142,15 +169,69 @@ pub fn to_uniform(u: Uniform) -> GlesUniform<'static> {
         UniformVal::U2(a, b) => UniformValue::_2ui(a, b),
         UniformVal::U3(a, b, c) => UniformValue::_3ui(a, b, c),
         UniformVal::U4(a, b, c, d) => UniformValue::_4ui(a, b, c, d),
-        UniformVal::Mat2x2 { matrices, transpose } => UniformValue::Matrix2x2 { matrices, transpose },
-        UniformVal::Mat2x3 { matrices, transpose } => UniformValue::Matrix2x3 { matrices, transpose },
-        UniformVal::Mat2x4 { matrices, transpose } => UniformValue::Matrix2x4 { matrices, transpose },
-        UniformVal::Mat3x2 { matrices, transpose } => UniformValue::Matrix3x2 { matrices, transpose },
-        UniformVal::Mat3x3 { matrices, transpose } => UniformValue::Matrix3x3 { matrices, transpose },
-        UniformVal::Mat3x4 { matrices, transpose } => UniformValue::Matrix3x4 { matrices, transpose },
-        UniformVal::Mat4x2 { matrices, transpose } => UniformValue::Matrix4x2 { matrices, transpose },
-        UniformVal::Mat4x3 { matrices, transpose } => UniformValue::Matrix4x3 { matrices, transpose },
-        UniformVal::Mat4x4 { matrices, transpose } => UniformValue::Matrix4x4 { matrices, transpose },
+        UniformVal::Mat2x2 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix2x2 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat2x3 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix2x3 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat2x4 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix2x4 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat3x2 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix3x2 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat3x3 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix3x3 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat3x4 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix3x4 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat4x2 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix4x2 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat4x3 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix4x3 {
+            matrices,
+            transpose,
+        },
+        UniformVal::Mat4x4 {
+            matrices,
+            transpose,
+        } => UniformValue::Matrix4x4 {
+            matrices,
+            transpose,
+        },
     };
     GlesUniform {
         name: Cow::Owned(u.name),

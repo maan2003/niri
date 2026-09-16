@@ -1,16 +1,15 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
-use super::renderer::AsGlesFrame;
+use super::renderer::AsRemoteFrame;
 use super::texture::TextureRenderElement;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
 /// Wrapper for a texture from the primary GPU for rendering with the primary GPU.
 #[derive(Debug, Clone)]
-pub struct PrimaryGpuTextureRenderElement(pub TextureRenderElement<GlesTexture>);
+pub struct PrimaryGpuTextureRenderElement(pub TextureRenderElement<RemoteTexture>);
 
 impl Element for PrimaryGpuTextureRenderElement {
     fn id(&self) -> &Id {
@@ -54,18 +53,18 @@ impl Element for PrimaryGpuTextureRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for PrimaryGpuTextureRenderElement {
+impl RenderElement<RemoteRenderer> for PrimaryGpuTextureRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
+    ) -> Result<(), RemoteError> {
+        let gles_frame = frame.as_remote_frame();
+        RenderElement::<RemoteRenderer>::draw(
             &self.0,
             gles_frame,
             src,
@@ -77,40 +76,7 @@ impl RenderElement<GlesRenderer> for PrimaryGpuTextureRenderElement {
         Ok(())
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for PrimaryGpuTextureRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self.0,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

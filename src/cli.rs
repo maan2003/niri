@@ -42,6 +42,9 @@ pub enum Sub {
         /// Socket to the compositor core, inherited from the parent.
         #[arg(long)]
         socket_fd: i32,
+        /// `headless` or `drm`.
+        #[arg(long, default_value = "headless")]
+        mode: String,
     },
     /// Communicate with the running niri instance.
     Msg {

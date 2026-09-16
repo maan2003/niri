@@ -1,18 +1,23 @@
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{ensure, Context as _};
+use anyhow::{bail, Context as _};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::{Id, RenderElementStates};
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{
-    Bind as _, Color32F, ContextId, FrameContext as _, Offscreen as _, Renderer as _, Texture,
+    Bind as _, Color32F, ContextId, Offscreen as _, Renderer as _, Texture,
 };
 use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 
+use crate::gpu::remote::{RemoteFrame, RemoteRenderer, RemoteTexture};
 use crate::niri::OutputRenderElements;
-use crate::render_helpers::blur::{Blur, BlurOptions};
+use crate::render_helpers::blur::BlurOptions;
+use crate::render_helpers::shaders::Shaders;
+
+/// Keys for the GPU process's per-buffer blur pyramid cache.
+static NEXT_BLUR_KEY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct EffectBuffer {
@@ -30,8 +35,8 @@ pub struct EffectBuffer {
     elements: Elements,
     /// Offscreen buffer where elements get rendered.
     offscreen: Option<Offscreen>,
-    /// Blurring program, if available.
-    blur: Option<Blur>,
+    /// Key of this buffer's blur pyramid in the GPU process.
+    blur_key: u64,
 
     /// Commit counter that takes into account both original and blurred texture changes.
     commit_counter: CommitCounter,
@@ -42,18 +47,18 @@ enum Elements {
     /// Contents remain unchanged.
     Unchanged(
         // Storage to avoid reallocating it every time.
-        Vec<OutputRenderElements<GlesRenderer>>,
+        Vec<OutputRenderElements<RemoteRenderer>>,
     ),
     /// New contents, need to check damage and render.
-    New(Vec<OutputRenderElements<GlesRenderer>>),
+    New(Vec<OutputRenderElements<RemoteRenderer>>),
 }
 
 #[derive(Debug)]
 struct Offscreen {
     /// The texture with the offscreen contents.
-    texture: GlesTexture,
+    texture: RemoteTexture,
     /// Id of the renderer context that the texture comes from.
-    renderer_context_id: ContextId<GlesTexture>,
+    renderer_context_id: ContextId<RemoteTexture>,
     /// Scale of the texture.
     scale: Scale<f64>,
     /// Damage tracker for drawing to the texture.
@@ -63,7 +68,7 @@ struct Offscreen {
     /// Rendered blurred version of the texture.
     ///
     /// When texture needs to be reblurred, this field must be reset to `None`.
-    blurred: Option<GlesTexture>,
+    blurred: Option<RemoteTexture>,
 }
 
 impl Default for Elements {
@@ -81,7 +86,7 @@ impl EffectBuffer {
             blur_options: BlurOptions::default(),
             elements: Elements::default(),
             offscreen: None,
-            blur: None,
+            blur_key: NEXT_BLUR_KEY.fetch_add(1, Ordering::Relaxed),
             commit_counter: CommitCounter::default(),
         }
     }
@@ -126,7 +131,7 @@ impl EffectBuffer {
         }
     }
 
-    pub fn elements(&mut self) -> &mut Vec<OutputRenderElements<GlesRenderer>> {
+    pub fn elements(&mut self) -> &mut Vec<OutputRenderElements<RemoteRenderer>> {
         // Assume we're going to insert new elements, switch to New.
         match mem::take(&mut self.elements) {
             Elements::Unchanged(elements) | Elements::New(elements) => {
@@ -139,23 +144,21 @@ impl EffectBuffer {
         elements
     }
 
-    pub fn prepare(&mut self, renderer: &mut GlesRenderer, blur: bool) -> bool {
+    pub fn prepare(&mut self, renderer: &mut RemoteRenderer, blur: bool) -> bool {
         if let Err(err) = self.prepare_offscreen(renderer) {
             warn!("error preparing offscreen: {err:?}");
             return false;
         };
 
-        if blur {
-            if let Err(err) = self.prepare_blur(renderer) {
-                warn!("error preparing blur: {err:?}");
-                return false;
-            }
+        if blur && !Shaders::from_renderer(renderer).blur {
+            warn!("error preparing blur: blur shader unavailable");
+            return false;
         }
 
         true
     }
 
-    fn prepare_offscreen(&mut self, renderer: &mut GlesRenderer) -> anyhow::Result<()> {
+    fn prepare_offscreen(&mut self, renderer: &mut RemoteRenderer) -> anyhow::Result<()> {
         let _span = tracy_client::span!("EffectBuffer::prepare_offscreen");
 
         // Check if we need to create or recreate the texture.
@@ -196,7 +199,7 @@ impl EffectBuffer {
             let span = tracy_client::span!("creating effect offscreen texture");
             span.emit_text(reason);
 
-            let texture: GlesTexture = renderer
+            let texture: RemoteTexture = renderer
                 .create_buffer(Fourcc::Abgr8888, self.size)
                 .context("error creating texture")?;
 
@@ -262,46 +265,11 @@ impl EffectBuffer {
         Ok(())
     }
 
-    fn prepare_blur(&mut self, renderer: &mut GlesRenderer) -> anyhow::Result<()> {
-        let offscreen = self.offscreen.as_mut().context("missing offscreen")?;
-        if offscreen.blurred.is_some() {
-            // Already rendered.
-            return Ok(());
-        }
-
-        if let Some(blur) = &self.blur {
-            if blur.context_id() != renderer.context_id() {
-                debug!("recreating blur: renderer changed");
-                self.blur = None;
-            }
-        }
-
-        let blur = if let Some(blur) = &mut self.blur {
-            blur
-        } else {
-            let Some(blur) = Blur::new(renderer) else {
-                // Missing blur shader.
-                return Ok(());
-            };
-            self.blur.insert(blur)
-        };
-
-        ensure!(
-            offscreen.renderer_context_id == renderer.context_id(),
-            "wrong renderer context id"
-        );
-
-        blur.prepare_textures(
-            |fourcc, size| renderer.create_buffer(fourcc, size),
-            &offscreen.texture,
-            self.blur_options,
-        )
-        .context("error preparing blur textures")?;
-
-        Ok(())
-    }
-
-    pub fn render(&mut self, frame: &mut GlesFrame, blur: bool) -> anyhow::Result<GlesTexture> {
+    pub fn render(
+        &mut self,
+        frame: &mut RemoteFrame<'_, '_>,
+        blur: bool,
+    ) -> anyhow::Result<RemoteTexture> {
         let offscreen = self.offscreen.as_mut().context("offscreen is missing")?;
 
         if !blur {
@@ -311,12 +279,12 @@ impl EffectBuffer {
         let texture = if let Some(texture) = &offscreen.blurred {
             texture.clone()
         } else {
-            let blur = self.blur.as_mut().context("blur is missing")?;
-            let mut guard = frame.renderer();
-            let renderer = guard.as_mut();
-            let blurred = blur
-                .render(renderer, &offscreen.texture, self.blur_options)
-                .context("error rendering blur")?;
+            let renderer = frame.renderer();
+            if !Shaders::from_renderer(renderer).blur {
+                bail!("blur shader unavailable");
+            }
+            let blurred =
+                renderer.blur_texture(self.blur_key, &offscreen.texture, self.blur_options.into());
             offscreen.blurred.insert(blurred).clone()
         };
 

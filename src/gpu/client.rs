@@ -1,5 +1,6 @@
 //! Core side of the GPU-process connection: spawning and request/reply plumbing.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -7,23 +8,55 @@ use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, bail, Context};
-use serde::Serialize;
 
-use super::protocol::{self, Caps, Event, Image, Rect, Request, ShaderKind, TexId, PROTOCOL_VERSION};
+use super::protocol::{
+    self, Caps, DmabufDesc, Event, GpuEvent, Image, Rect, Request, ShaderKind, TexId,
+    PROTOCOL_VERSION,
+};
 use super::transport::Channel;
 
 pub const CHILD_SOCKET_FD: i32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Surfaceless EGL, no outputs. Tests and the headless backend.
+    Headless,
+    /// Waits for DRM devices from the core and scans out on them.
+    Drm,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Headless => "headless",
+            Mode::Drm => "drm",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "headless" => Some(Mode::Headless),
+            "drm" => Some(Mode::Drm),
+            _ => None,
+        }
+    }
+}
 
 pub struct GpuClient {
     chan: Channel,
     child: Option<Child>,
     thread: Option<JoinHandle<anyhow::Result<()>>>,
-    caps: Caps,
+    caps: Option<Caps>,
+    /// Unsolicited events that arrived while waiting for a reply.
+    events: VecDeque<GpuEvent>,
+    /// Called when an event is queued while a reply was awaited. The socket is no longer
+    /// readable by then, so a level-triggered poll would not notice; this wakes the loop.
+    waker: Option<Box<dyn Fn() + Send>>,
 }
 
 impl GpuClient {
     /// Spawns `exe gpu-process` with the socket on fd 3.
-    pub fn spawn_process(exe: &Path) -> anyhow::Result<Self> {
+    pub fn spawn_process(exe: &Path, mode: Mode) -> anyhow::Result<Self> {
         let (ours, theirs) = rustix::net::socketpair(
             rustix::net::AddressFamily::UNIX,
             rustix::net::SocketType::STREAM,
@@ -37,6 +70,8 @@ impl GpuClient {
         cmd.arg("gpu-process")
             .arg("--socket-fd")
             .arg(CHILD_SOCKET_FD.to_string())
+            .arg("--mode")
+            .arg(mode.as_str())
             .stdin(Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
@@ -53,30 +88,40 @@ impl GpuClient {
             chan: Channel::new(ours),
             child: Some(child),
             thread: None,
-            caps: Caps::default(),
+            caps: None,
+            events: VecDeque::new(),
+            waker: None,
         };
         client.handshake()?;
         Ok(client)
     }
 
     /// Runs the GPU server on a thread in this process. For tests and debugging only.
-    pub fn spawn_thread() -> anyhow::Result<Self> {
+    pub fn spawn_thread(mode: Mode) -> anyhow::Result<Self> {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
             .name("gpu-server".into())
-            .spawn(move || super::server::run(theirs.into_fd()))?;
+            .spawn(move || super::server::run(theirs.into_fd(), mode))?;
         let mut client = Self {
             chan: ours,
             child: None,
             thread: Some(thread),
-            caps: Caps::default(),
+            caps: None,
+            events: VecDeque::new(),
+            waker: None,
         };
         client.handshake()?;
         Ok(client)
     }
 
-    pub fn caps(&self) -> &Caps {
-        &self.caps
+    /// None until the GPU process has a renderer (drm mode: after the primary device).
+    pub fn caps(&self) -> Option<&Caps> {
+        self.caps.as_ref()
+    }
+
+    /// The socket, for registering with an event loop. Readable means an event is waiting.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.chan.as_fd()
     }
 
     fn handshake(&mut self) -> anyhow::Result<()> {
@@ -91,28 +136,104 @@ impl GpuClient {
         }
     }
 
-    fn request<T: Serialize>(&mut self, req: &T, fds: &[BorrowedFd<'_>]) -> anyhow::Result<Event> {
-        self.chan.send(req, fds)?;
+    /// Reads one event; unsolicited ones are queued for [`take_events`](Self::take_events).
+    fn recv_reply(&mut self) -> anyhow::Result<Event> {
+        loop {
+            let (event, _): (Event, _) = self.chan.recv()?;
+            match event {
+                Event::Notify(ev) => {
+                    self.events.push_back(ev);
+                    if let Some(waker) = &self.waker {
+                        waker();
+                    }
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+
+    pub fn set_waker(&mut self, waker: impl Fn() + Send + 'static) {
+        self.waker = Some(Box::new(waker));
+    }
+
+    /// Whether a read would not block. Calloop readiness can be stale when an earlier callback
+    /// in the same dispatch drained the socket through a synchronous request.
+    pub fn is_readable(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.chan.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pfd is a valid, initialized pollfd array of length 1.
+        let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+        n > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+    }
+
+    /// Reads one pending message without a request outstanding (the socket was readable).
+    pub fn recv_event(&mut self) -> anyhow::Result<()> {
         let (event, _): (Event, _) = self.chan.recv()?;
+        match event {
+            Event::Notify(ev) => self.events.push_back(ev),
+            other => bail!("unexpected unsolicited event from gpu process: {other:?}"),
+        }
+        Ok(())
+    }
+
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    pub fn take_events(&mut self) -> Vec<GpuEvent> {
+        self.events.drain(..).collect()
+    }
+
+    pub fn request(&mut self, req: &Request, fds: &[BorrowedFd<'_>]) -> anyhow::Result<Event> {
+        self.chan.send(req, fds)?;
+        let event = self.recv_reply()?;
         if let Event::Error { message } = &event {
             bail!("{message}");
+        }
+        if let Event::DeviceAdded {
+            caps: Some(caps), ..
+        } = &event
+        {
+            self.caps = Some(caps.clone());
         }
         Ok(event)
     }
 
-    fn expect_ack(event: Event) -> anyhow::Result<()> {
+    pub fn expect_ack(event: Event) -> anyhow::Result<()> {
         match event {
             Event::Ack => Ok(()),
             other => Err(anyhow!("expected Ack, got {other:?}")),
         }
     }
 
-    pub fn execute(&mut self, commands: Vec<protocol::Command>, fds: &[OwnedFd]) -> anyhow::Result<()> {
+    pub fn execute(
+        &mut self,
+        commands: Vec<protocol::Command>,
+        fds: &[OwnedFd],
+    ) -> anyhow::Result<()> {
         let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
         Self::expect_ack(self.request(&Request::Execute { commands }, &fds)?)
     }
 
-    pub fn read_texture(&mut self, id: TexId, region: Rect<i32>, format: u32) -> anyhow::Result<Image> {
+    pub fn import_dmabuf(
+        &mut self,
+        id: TexId,
+        desc: DmabufDesc,
+        fds: &[OwnedFd],
+    ) -> anyhow::Result<()> {
+        let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+        Self::expect_ack(self.request(&Request::ImportDmabuf { id, desc }, &fds)?)
+    }
+
+    pub fn read_texture(
+        &mut self,
+        id: TexId,
+        region: Rect<i32>,
+        format: u32,
+    ) -> anyhow::Result<Image> {
         match self.request(&Request::ReadTexture { id, region, format }, &[])? {
             Event::Image(image) => Ok(image),
             other => Err(anyhow!("expected Image, got {other:?}")),
@@ -120,10 +241,16 @@ impl GpuClient {
     }
 
     /// Returns whether the shader is now available.
-    pub fn set_custom_shader(&mut self, kind: ShaderKind, src: Option<&str>) -> anyhow::Result<bool> {
+    pub fn set_custom_shader(
+        &mut self,
+        kind: ShaderKind,
+        src: Option<&str>,
+    ) -> anyhow::Result<bool> {
         let src = src.map(str::to_owned);
-        Self::expect_ack(self.request(&Request::SetCustomShader { kind, src }, &[])?)?;
-        Ok(true)
+        match self.request(&Request::SetCustomShader { kind, src }, &[])? {
+            Event::ShaderSet { available } => Ok(available),
+            other => Err(anyhow!("expected ShaderSet, got {other:?}")),
+        }
     }
 
     pub fn shutdown(mut self) -> anyhow::Result<()> {

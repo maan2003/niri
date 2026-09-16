@@ -9,12 +9,12 @@ use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
 use pangocairo::cairo::{self, ImageSurface};
 use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::gbm::Format as Fourcc;
 use smithay::utils::{Scale, Transform};
 
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
@@ -35,7 +35,7 @@ pub struct HotkeyOverlay {
 }
 
 pub struct RenderedOverlay {
-    buffer: Option<TextureBuffer<GlesTexture>>,
+    buffer: Option<TextureBuffer<RemoteTexture>>,
 }
 
 impl HotkeyOverlay {
@@ -101,7 +101,7 @@ impl HotkeyOverlay {
         }
 
         let rendered = buffers.entry(weak).or_insert_with(|| {
-            let renderer = renderer.as_gles_renderer();
+            let renderer = renderer.as_remote_renderer();
             render(renderer, &self.config.borrow(), self.mod_key, scale)
                 .unwrap_or_else(|_| RenderedOverlay { buffer: None })
         });
@@ -304,7 +304,7 @@ fn collect_actions(config: &Config) -> Vec<&Action> {
 }
 
 fn render(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     config: &Config,
     mod_key: ModKey,
     scale: f64,

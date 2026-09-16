@@ -25,22 +25,19 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::utils::{
-    select_dmabuf_feedback, CropRenderElement, Relocate, RelocateRenderElement,
-    RescaleRenderElement,
+    CropRenderElement, Relocate, RelocateRenderElement, RescaleRenderElement,
 };
 use smithay::backend::renderer::element::{
     default_primary_scanout_output_compare, Element, Id, Kind, PrimaryScanoutOutput, RenderElement,
     RenderElementStates,
 };
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::Color32F;
 use smithay::desktop::utils::{
-    bbox_from_surface_tree, output_update, send_dmabuf_feedback_surface_tree,
-    send_frames_surface_tree, surface_presentation_feedback_flags_from_states,
-    surface_primary_scanout_output, take_presentation_feedback_surface_tree,
-    under_from_surface_tree, update_surface_primary_scanout_output, with_surfaces_surface_tree,
-    OutputPresentationFeedback,
+    bbox_from_surface_tree, output_update, send_frames_surface_tree,
+    surface_presentation_feedback_flags_from_states, surface_primary_scanout_output,
+    take_presentation_feedback_surface_tree, under_from_surface_tree,
+    update_surface_primary_scanout_output, with_surfaces_surface_tree, OutputPresentationFeedback,
 };
 use smithay::desktop::{
     find_popup_root_surface, layer_map_for_output, LayerMap, LayerSurface, PopupGrab, PopupManager,
@@ -121,8 +118,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::Clock;
-use crate::backend::tty::SurfaceDmabufFeedback;
-use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
+use crate::backend::{Backend, Headless, RenderResult, Tty};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
 use crate::dbus::freedesktop_locale1::Locale1ToNiri;
@@ -133,6 +129,7 @@ use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospe
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
+use crate::gpu::remote::RemoteRenderer;
 use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
@@ -743,8 +740,11 @@ impl State {
             let headless = Headless::new();
             Backend::Headless(headless)
         } else if has_display {
-            let winit = Winit::new(config.clone(), event_loop.clone())?;
-            Backend::Winit(winit)
+            return Err(
+                "running nested inside another compositor is not supported; \
+                        unset WAYLAND_DISPLAY/DISPLAY to run on a TTY"
+                    .into(),
+            );
         } else {
             let tty = Tty::new(config.clone(), event_loop.clone())
                 .context("error initializing the TTY backend")?;
@@ -4327,7 +4327,7 @@ impl Niri {
             }
         }
 
-        self.fill_xray_elements(ctx.as_gles(), output);
+        self.fill_xray_elements(ctx.as_remote(), output);
 
         // Reborrow to shorten lifetime to be able to put in xray.
         let mut ctx = ctx.r();
@@ -4584,7 +4584,7 @@ impl Niri {
         push(backdrop);
     }
 
-    pub fn fill_xray_elements(&self, mut ctx: RenderCtx<GlesRenderer>, output: &Output) {
+    pub fn fill_xray_elements(&self, mut ctx: RenderCtx<RemoteRenderer>, output: &Output) {
         let _span = tracy_client::span!("Niri::fill_xray_elements");
 
         // Make sure the xrayed elements themselves cannot use xray by mistake.
@@ -5074,96 +5074,6 @@ impl Niri {
         }
     }
 
-    pub fn send_dmabuf_feedbacks(
-        &self,
-        output: &Output,
-        feedback: &SurfaceDmabufFeedback,
-        render_element_states: &RenderElementStates,
-    ) {
-        let _span = tracy_client::span!("Niri::send_dmabuf_feedbacks");
-
-        // We can unconditionally send the current output's feedback to regular and layer-shell
-        // surfaces, as they can only be displayed on a single output at a time. Even if a surface
-        // is currently invisible, this is the DMABUF feedback that it should know about.
-        for mapped in self.layout.windows_for_output(output) {
-            mapped.window.send_dmabuf_feedback(
-                output,
-                |_, _| Some(output.clone()),
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render,
-                        &feedback.scanout,
-                    )
-                },
-            );
-        }
-
-        for surface in layer_map_for_output(output).layers() {
-            surface.send_dmabuf_feedback(
-                output,
-                |_, _| Some(output.clone()),
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render,
-                        &feedback.scanout,
-                    )
-                },
-            );
-        }
-
-        if let Some(surface) = &self.output_state[output].lock_surface {
-            send_dmabuf_feedback_surface_tree(
-                surface.wl_surface(),
-                output,
-                |_, _| Some(output.clone()),
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render,
-                        &feedback.scanout,
-                    )
-                },
-            );
-        }
-
-        if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
-            send_dmabuf_feedback_surface_tree(
-                surface,
-                output,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render,
-                        &feedback.scanout,
-                    )
-                },
-            );
-        }
-
-        if let CursorImageStatus::Surface(surface) = &self.cursor_manager.cursor_image() {
-            send_dmabuf_feedback_surface_tree(
-                surface,
-                output,
-                surface_primary_scanout_output,
-                |surface, _| {
-                    select_dmabuf_feedback(
-                        surface,
-                        render_element_states,
-                        &feedback.render,
-                        &feedback.scanout,
-                    )
-                },
-            );
-        }
-    }
-
     pub fn send_frame_callbacks(&mut self, output: &Output) {
         let _span = tracy_client::span!("Niri::send_frame_callbacks");
 
@@ -5408,7 +5318,7 @@ impl Niri {
 
     pub fn render_for_screencopy_with_damage(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
     ) {
         let _span = tracy_client::span!("Niri::render_for_screencopy_with_damage");
@@ -5483,7 +5393,7 @@ impl Niri {
 
     pub fn render_for_screencopy_without_damage(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         manager: &ZwlrScreencopyManagerV1,
         screencopy: Screencopy,
     ) -> anyhow::Result<()> {
@@ -5535,7 +5445,7 @@ impl Niri {
 
     pub fn render_for_image_copy_capture(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         target_presentation_time: Duration,
     ) {
@@ -5675,7 +5585,7 @@ impl Niri {
 
     pub fn render_for_image_copy_cursor_capture(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         target_presentation_time: Duration,
     ) {
@@ -5777,9 +5687,9 @@ impl Niri {
 
     pub fn render_cursor_for_capture(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
-    ) -> Vec<PointerRenderElements<GlesRenderer>> {
+    ) -> Vec<PointerRenderElements<RemoteRenderer>> {
         let int_scale = output.current_scale().integer_scale();
         let output_scale = Scale::from(output.current_scale().fractional_scale());
 
@@ -5952,9 +5862,9 @@ impl Niri {
 
     #[allow(clippy::type_complexity)]
     fn render_for_screencopy_internal(
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         damage_tracker: &mut OutputDamageTracker,
-        elements: &[impl RenderElement<GlesRenderer>],
+        elements: &[impl RenderElement<RemoteRenderer>],
         states: RenderElementStates,
         screencopy: &Screencopy,
     ) -> anyhow::Result<Option<SyncPoint>> {
@@ -6002,7 +5912,7 @@ impl Niri {
 
     pub fn capture_screenshots<'a>(
         &'a self,
-        renderer: &'a mut GlesRenderer,
+        renderer: &'a mut RemoteRenderer,
     ) -> impl Iterator<Item = (Output, [OutputScreenshot; 3])> + 'a {
         self.global_space.outputs().cloned().filter_map(|output| {
             let size = output.current_mode().unwrap().size;
@@ -6083,7 +5993,7 @@ impl Niri {
 
     pub fn screenshot(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         write_to_disk: bool,
         include_pointer: bool,
@@ -6120,7 +6030,7 @@ impl Niri {
 
     pub fn screenshot_window(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         output: &Output,
         mapped: &Mapped,
         write_to_disk: bool,
@@ -6137,7 +6047,7 @@ impl Niri {
                 mapped.rules().opacity.unwrap_or(1.).clamp(0., 1.)
             };
 
-        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        let mut elements: Vec<WindowScreenshotRenderElement<RemoteRenderer>> = Vec::new();
 
         // Add pointer if requested and it's over this window.
         if show_pointer {
@@ -6296,7 +6206,7 @@ impl Niri {
     #[cfg(feature = "dbus")]
     pub fn screenshot_all_outputs(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         include_pointer: bool,
         on_done: impl FnOnce(PathBuf) + Send + 'static,
     ) -> anyhow::Result<()> {
@@ -6782,7 +6692,7 @@ impl Niri {
         }
     }
 
-    pub fn do_screen_transition(&mut self, renderer: &mut GlesRenderer, delay_ms: Option<u16>) {
+    pub fn do_screen_transition(&mut self, renderer: &mut RemoteRenderer, delay_ms: Option<u16>) {
         let _span = tracy_client::span!("Niri::do_screen_transition");
 
         self.update_render_elements(None);

@@ -8,7 +8,6 @@ use niri_config::{
 };
 use niri_ipc::{ColumnDisplay, PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Window};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -28,6 +27,7 @@ use super::{
     RemovedTile, SizeFrac,
 };
 use crate::animation::Clock;
+use crate::gpu::remote::RemoteRenderer;
 use crate::layout::RenderLayer;
 use crate::niri_render_elements;
 use crate::render_helpers::renderer::NiriRenderer;
@@ -1697,7 +1697,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn store_unmap_snapshot_if_empty(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         xray: Option<&mut Xray>,
         xray_has_blocked_out_layers: bool,
         xray_pos: XrayPos,
@@ -1732,7 +1732,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn start_close_animation_for_window(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         window: &W::Id,
         blocker: TransactionBlocker,
     ) {
@@ -1747,7 +1747,7 @@ impl<W: LayoutElement> Workspace<W> {
 
     pub fn start_close_animation_for_tile(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         snapshot: TileRenderSnapshot,
         tile_size: Size<f64, Logical>,
         tile_pos: Point<f64, Logical>,

@@ -3,10 +3,10 @@ use std::cell::OnceCell;
 use niri_config::BlockOutFrom;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::{Kind, RenderElement};
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::{render_to_encompassing_texture, ToRenderElement};
+use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 
 /// Snapshot of a render.
@@ -35,27 +35,27 @@ pub struct RenderSnapshot<C, B> {
     pub size: Size<f64, Logical>,
 
     /// Contents rendered into a texture (lazily).
-    pub texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
+    pub texture: OnceCell<Option<(RemoteTexture, Rectangle<i32, Physical>)>>,
 
     /// Contents with blocked-out bg rendered into a texture (lazily).
-    pub texture_with_blocked_out_bg: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
+    pub texture_with_blocked_out_bg: OnceCell<Option<(RemoteTexture, Rectangle<i32, Physical>)>>,
 
     /// Blocked-out contents rendered into a texture (lazily).
-    pub blocked_out_texture: OnceCell<Option<(GlesTexture, Rectangle<i32, Physical>)>>,
+    pub blocked_out_texture: OnceCell<Option<(RemoteTexture, Rectangle<i32, Physical>)>>,
 }
 
 impl<C, B, EC, EB> RenderSnapshot<C, B>
 where
     C: ToRenderElement<RenderElement = EC>,
     B: ToRenderElement<RenderElement = EB>,
-    EC: RenderElement<GlesRenderer>,
-    EB: RenderElement<GlesRenderer>,
+    EC: RenderElement<RemoteRenderer>,
+    EB: RenderElement<RemoteRenderer>,
 {
     pub fn texture(
         &self,
-        ctx: RenderCtx<GlesRenderer>,
+        ctx: RenderCtx<RemoteRenderer>,
         scale: Scale<f64>,
-    ) -> Option<&(GlesTexture, Rectangle<i32, Physical>)> {
+    ) -> Option<&(RemoteTexture, Rectangle<i32, Physical>)> {
         if ctx.target.should_block_out(self.block_out_from) {
             self.blocked_out_texture.get_or_init(|| {
                 let _span = tracy_client::span!("RenderSnapshot::texture");

@@ -7,7 +7,6 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{
     Element, Id, Kind, RenderElement, RenderElementStates, UnderlyingStorage,
 };
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::utils::{
     CommitCounter, DamageBag, DamageSet, DamageSnapshot, OpaqueRegions,
@@ -19,8 +18,7 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::encompassing_geo;
-use super::renderer::AsGlesFrame as _;
-use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
 /// Buffer for offscreen rendering.
 #[derive(Debug)]
@@ -36,9 +34,9 @@ pub struct OffscreenBuffer {
 #[derive(Debug)]
 struct Inner {
     /// The texture with offscreened contents.
-    texture: GlesTexture,
+    texture: RemoteTexture,
     /// Id of the renderer context that the texture comes from.
-    renderer_context_id: ContextId<GlesTexture>,
+    renderer_context_id: ContextId<RemoteTexture>,
     /// Scale of the texture.
     scale: Scale<f64>,
     /// Damage tracker for drawing to the texture.
@@ -50,8 +48,8 @@ struct Inner {
 #[derive(Debug, Clone)]
 pub struct OffscreenRenderElement {
     id: Id,
-    texture: GlesTexture,
-    renderer_context_id: ContextId<GlesTexture>,
+    texture: RemoteTexture,
+    renderer_context_id: ContextId<RemoteTexture>,
     scale: Scale<f64>,
     damage: DamageSnapshot<i32, Buffer>,
     offset: Point<f64, Logical>,
@@ -71,9 +69,9 @@ pub struct OffscreenData {
 impl OffscreenBuffer {
     pub fn render(
         &self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut RemoteRenderer,
         scale: Scale<f64>,
-        elements: &[impl RenderElement<GlesRenderer>],
+        elements: &[impl RenderElement<RemoteRenderer>],
     ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
         let _span = tracy_client::span!("OffscreenBuffer::render");
 
@@ -131,7 +129,7 @@ impl OffscreenBuffer {
             let span = tracy_client::span!("creating offscreen buffer");
             span.emit_text(reason);
 
-            let texture: GlesTexture = renderer
+            let texture: RemoteTexture = renderer
                 .create_buffer(Fourcc::Abgr8888, src_size)
                 .context("error creating texture")?;
 
@@ -211,7 +209,7 @@ impl Default for OffscreenBuffer {
 }
 
 impl OffscreenRenderElement {
-    pub fn texture(&self) -> &GlesTexture {
+    pub fn texture(&self) -> &RemoteTexture {
         &self.texture
     }
 
@@ -299,16 +297,16 @@ impl Element for OffscreenRenderElement {
     }
 }
 
-impl RenderElement<GlesRenderer> for OffscreenRenderElement {
+impl RenderElement<RemoteRenderer> for OffscreenRenderElement {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut RemoteFrame<'_, '_>,
         src: Rectangle<f64, Buffer>,
         dest: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), RemoteError> {
         if frame.context_id() != self.renderer_context_id {
             warn!("trying to render texture from different renderer");
             return Ok(());
@@ -327,40 +325,7 @@ impl RenderElement<GlesRenderer> for OffscreenRenderElement {
         )
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        // If scanout for things other than Wayland buffers is implemented, this will need to take
-        // the target GPU into account.
-        None
-    }
-}
-
-impl<'render> RenderElement<TtyRenderer<'render>> for OffscreenRenderElement {
-    fn draw(
-        &self,
-        frame: &mut TtyFrame<'_, '_, '_>,
-        src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        opaque_regions: &[Rectangle<i32, Physical>],
-        cache: Option<&UserDataMap>,
-    ) -> Result<(), TtyRendererError<'render>> {
-        let gles_frame = frame.as_gles_frame();
-        RenderElement::<GlesRenderer>::draw(
-            &self,
-            gles_frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        )?;
-        Ok(())
-    }
-
-    fn underlying_storage(
-        &self,
-        _renderer: &mut TtyRenderer<'render>,
-    ) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {
         // If scanout for things other than Wayland buffers is implemented, this will need to take
         // the target GPU into account.
         None

@@ -4,7 +4,6 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::drm::DrmNode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::calloop::generic::Generic;
@@ -29,6 +28,7 @@ use smithay::wayland::shm;
 use wayland_backend::server::Credentials;
 
 use crate::cursor::{RenderCursor, XCursor};
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{Niri, State};
 use crate::utils::{get_credentials_for_client, CastSessionId, CastStreamId};
 
@@ -95,7 +95,7 @@ pub fn source_output(source: &ImageCaptureSource) -> Option<Output> {
 /// same GBM device, which the TTY backend does during initialization. See
 /// https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44351.
 pub fn output_capture_constraints(
-    renderer: &GlesRenderer,
+    renderer: &RemoteRenderer,
     render_node: Option<DrmNode>,
     output: &Output,
 ) -> Option<BufferConstraints> {
@@ -104,13 +104,11 @@ pub fn output_capture_constraints(
 
     let dma = (|| {
         let node = render_node?;
-        let egl = renderer.egl_context();
-
         // Offer all formats the renderer can draw into to avoid unnecessary
         // conversions, preserving the original order (many clients depend on
         // the order being stable to select the same format when renegotiating).
         let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
-        for format in egl.dmabuf_render_formats().iter() {
+        for format in renderer.dmabuf_render_formats().iter() {
             match formats.iter_mut().find(|(code, _)| *code == format.code) {
                 Some((_, modifiers)) => modifiers.push(format.modifier),
                 None => formats.push((format.code, vec![format.modifier])),

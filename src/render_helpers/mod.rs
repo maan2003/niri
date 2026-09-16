@@ -7,9 +7,6 @@ use smithay::backend::allocator::{Buffer, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::backend::renderer::element::{Element, Kind, RenderElement, RenderElementStates};
-use smithay::backend::renderer::gles::{
-    GlesError, GlesMapping, GlesRenderer, GlesTarget, GlesTexture,
-};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, Offscreen, Renderer, Texture as _,
@@ -23,7 +20,8 @@ use solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 use self::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use self::texture::{TextureBuffer, TextureRenderElement};
-use crate::render_helpers::renderer::AsGlesRenderer;
+use crate::gpu::remote::{RemoteError, RemoteMapping, RemoteRenderer, RemoteTarget, RemoteTexture};
+use crate::render_helpers::renderer::AsRemoteRenderer;
 use crate::render_helpers::xray::Xray;
 
 pub mod background_effect;
@@ -41,7 +39,6 @@ pub mod primary_gpu_texture;
 pub mod render_elements;
 pub mod renderer;
 pub mod resize;
-pub mod resources;
 pub mod shader_element;
 pub mod shaders;
 pub mod shadow;
@@ -72,10 +69,10 @@ impl<'a, R> RenderCtx<'a, R> {
     }
 }
 
-impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
-    pub fn as_gles<'b>(&'b mut self) -> RenderCtx<'b, GlesRenderer> {
+impl<'a, R: AsRemoteRenderer> RenderCtx<'a, R> {
+    pub fn as_remote<'b>(&'b mut self) -> RenderCtx<'b, RemoteRenderer> {
         RenderCtx {
-            renderer: self.renderer.as_gles_renderer(),
+            renderer: self.renderer.as_remote_renderer(),
             target: self.target,
             xray: self.xray,
         }
@@ -126,7 +123,7 @@ impl RenderTarget {
     }
 }
 
-impl ToRenderElement for BakedBuffer<TextureBuffer<GlesTexture>> {
+impl ToRenderElement for BakedBuffer<TextureBuffer<RemoteTexture>> {
     type RenderElement = PrimaryGpuTextureRenderElement;
 
     fn to_render_element(
@@ -173,29 +170,29 @@ pub fn encompassing_geo(
 }
 
 pub fn create_texture(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     size: Size<i32, Physical>,
     fourcc: Fourcc,
-) -> Result<GlesTexture, GlesError> {
+) -> Result<RemoteTexture, RemoteError> {
     let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
     renderer.create_buffer(fourcc, buffer_size)
 }
 
 pub fn copy_framebuffer(
-    renderer: &mut GlesRenderer,
-    target: &GlesTarget,
+    renderer: &mut RemoteRenderer,
+    target: &RemoteTarget,
     fourcc: Fourcc,
-) -> Result<GlesMapping, GlesError> {
+) -> Result<RemoteMapping, RemoteError> {
     renderer.copy_framebuffer(target, Rectangle::from_size(target.size()), fourcc)
 }
 
 pub fn render_to_encompassing_texture(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
-) -> anyhow::Result<(GlesTexture, SyncPoint, Rectangle<i32, Physical>)> {
+    elements: &[impl RenderElement<RemoteRenderer>],
+) -> anyhow::Result<(RemoteTexture, SyncPoint, Rectangle<i32, Physical>)> {
     let geo = encompassing_geo(scale, elements.iter());
     let elements = elements.iter().rev().map(|ele| {
         RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
@@ -208,13 +205,13 @@ pub fn render_to_encompassing_texture(
 }
 
 pub fn render_to_texture(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<(GlesTexture, SyncPoint)> {
+    elements: impl Iterator<Item = impl RenderElement<RemoteRenderer>>,
+) -> anyhow::Result<(RemoteTexture, SyncPoint)> {
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -231,13 +228,13 @@ pub fn render_to_texture(
 }
 
 pub fn render_and_download(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
-) -> anyhow::Result<GlesMapping> {
+    elements: impl Iterator<Item = impl RenderElement<RemoteRenderer>>,
+) -> anyhow::Result<RemoteMapping> {
     let _span = tracy_client::span!();
 
     let mut texture = create_texture(renderer, size, fourcc).context("error creating texture")?;
@@ -252,12 +249,12 @@ pub fn render_and_download(
 }
 
 pub fn render_and_download_with_damage(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     damage_tracker: &mut OutputDamageTracker,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<RemoteRenderer>],
     states: RenderElementStates,
-) -> anyhow::Result<GlesMapping> {
+) -> anyhow::Result<RemoteMapping> {
     let _span = tracy_client::span!();
 
     let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
@@ -281,12 +278,12 @@ pub fn render_and_download_with_damage(
 }
 
 pub fn render_to_vec(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
     fourcc: Fourcc,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: impl Iterator<Item = impl RenderElement<RemoteRenderer>>,
 ) -> anyhow::Result<Vec<u8>> {
     let _span = tracy_client::span!();
 
@@ -299,10 +296,10 @@ pub fn render_to_vec(
 }
 
 pub fn render_to_dmabuf(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<RemoteRenderer>],
     states: RenderElementStates,
 ) -> anyhow::Result<SyncPoint> {
     let _span = tracy_client::span!();
@@ -327,11 +324,11 @@ pub fn render_to_dmabuf(
 }
 
 pub fn render_to_shm(
-    renderer: &mut GlesRenderer,
+    renderer: &mut RemoteRenderer,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &WlBuffer,
     format: wl_shm::Format,
-    elements: &[impl RenderElement<GlesRenderer>],
+    elements: &[impl RenderElement<RemoteRenderer>],
     states: RenderElementStates,
 ) -> anyhow::Result<()> {
     let _span = tracy_client::span!();
@@ -417,7 +414,10 @@ pub fn render_to_shm(
     .context("expected shm buffer, but didn't get one")?
 }
 
-pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+pub fn clear_dmabuf(
+    renderer: &mut RemoteRenderer,
+    mut dmabuf: Dmabuf,
+) -> anyhow::Result<SyncPoint> {
     let size = dmabuf.size();
     let size = size.to_logical(1, Transform::Normal).to_physical(1);
     let mut target = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
@@ -431,12 +431,12 @@ pub fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::
 }
 
 fn render_elements(
-    renderer: &mut GlesRenderer,
-    target: &mut GlesTarget,
+    renderer: &mut RemoteRenderer,
+    target: &mut RemoteTarget,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     transform: Transform,
-    elements: impl Iterator<Item = impl RenderElement<GlesRenderer>>,
+    elements: impl Iterator<Item = impl RenderElement<RemoteRenderer>>,
 ) -> anyhow::Result<SyncPoint> {
     let transform = transform.invert();
     let output_rect = Rectangle::from_size(transform.transform_size(size));
