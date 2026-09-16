@@ -36,6 +36,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Sub {
+    /// Run as the GPU process (internal).
+    #[command(hide = true)]
+    GpuProcess {
+        /// Socket to the compositor core, inherited from the parent.
+        #[arg(long)]
+        socket_fd: i32,
+    },
     /// Communicate with the running niri instance.
     Msg {
         #[command(subcommand)]
