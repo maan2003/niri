@@ -1,3 +1,10 @@
+//! PipeWire screencast streams, owned by the GPU process.
+//!
+//! The core decides what to cast and when (portal D-Bus, targets, frame pacing) and records
+//! the frame's elements into a `Target::Cast` frame. Everything that touches PipeWire or
+//! buffer memory lives here: stream negotiation, buffer allocation, damage tracking, rendering
+//! into the dequeued buffer and cursor metadata. Events flow back as `CastEvent`s.
+
 use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
@@ -10,7 +17,7 @@ use std::time::Duration;
 use std::{mem, slice};
 
 use anyhow::{bail, ensure, Context as _};
-use calloop::timer::{TimeoutAction, Timer};
+use calloop::channel::{Channel as CalloopChannel, Sender};
 use calloop::RegistrationToken;
 use pipewire::context::ContextRc;
 use pipewire::core::{CoreRc, PW_ID_CORE};
@@ -32,15 +39,15 @@ use pipewire::spa::utils::{
 use pipewire::spa::{self};
 use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc, StreamState};
 use pipewire::sys::{pw_buffer, pw_check_library_version, pw_stream_queue_buffer};
-use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::gbm::GbmDevice;
+use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
-use smithay::backend::renderer::element::{Element, RenderElement, RenderElementStates};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::ExportMem;
-use smithay::output::{Output, OutputModeSource};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame as _, Offscreen, Renderer};
+use smithay::output::OutputModeSource;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::gbm::Modifier;
@@ -49,21 +56,14 @@ use smithay::reexports::rustix::fs::{
     fcntl_add_seals, ftruncate, memfd_create, MemfdFlags, SealFlags,
 };
 use smithay::reexports::rustix::mm::{mmap, munmap, MapFlags, ProtFlags};
-use smithay::utils::{DeviceFd, Logical, Physical, Point, Scale, Size, Transform};
-use zbus::object_server::SignalEmitter;
+use smithay::utils::{Buffer, DeviceFd, Physical, Point, Scale, Size, Transform};
 
-use crate::dbus::mutter_screen_cast::{self, CursorMode};
-use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
-use crate::niri::{CastTarget, State};
-use crate::render_helpers::{
-    clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
-    render_to_dmabuf,
-};
-use crate::screencasting::CastRenderElement;
-use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
+use super::drm::allocate_gbm_dmabuf;
+use super::exec::{Deferred, Executor, Tables};
+use super::protocol::{CastCursorMode, CastEvent, Command, CursorMeta};
+use super::scene::{self, split_elements, ElementTracks, SceneElement};
+use super::server::Server;
 
-// Give a 0.1 ms allowance for presentation time errors.
-const CAST_DELAY_ALLOWANCE: Duration = Duration::from_micros(100);
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
 
@@ -77,42 +77,62 @@ const CURSOR_META_SIZE: usize =
 const BITMAP_META_OFFSET: usize = mem::size_of::<spa_meta_cursor>();
 const BITMAP_DATA_OFFSET: usize = mem::size_of::<spa_meta_bitmap>();
 
-pub struct PipeWire {
-    _context: ContextRc,
-    pub core: CoreRc,
-    pub token: RegistrationToken,
-    event_loop: LoopHandle<'static, State>,
-    to_niri: calloop::channel::Sender<PwToNiri>,
+/// All screencast streams of this GPU process.
+pub struct Casting {
+    // Casts are declared (and so dropped) before PipeWire to prevent a double-free.
+    casts: HashMap<u64, Cast>,
+    pw: Option<PipeWire>,
+    loop_handle: LoopHandle<'static, Server>,
+    tx: Sender<CastEvent>,
 }
 
-pub enum PwToNiri {
-    StopCast { session_id: CastSessionId },
-    Redraw { stream_id: CastStreamId },
-    FatalError,
+struct PipeWire {
+    _context: ContextRc,
+    core: CoreRc,
+    token: RegistrationToken,
+}
+
+pub struct StartParams {
+    pub stream: u64,
+    pub size: Size<i32, Physical>,
+    pub refresh: u32,
+    pub alpha: bool,
+    pub cursor_mode: CastCursorMode,
+    /// Dmabuf formats to offer; empty means shm only.
+    pub formats: FormatSet,
+    pub gbm: Option<GbmDevice<DeviceFd>>,
+}
+
+/// Per-frame parameters the core sends before the cast frame itself.
+#[derive(Debug, Clone, Copy)]
+struct FrameInfo {
+    scale: f64,
+    target_time_ns: u64,
+    cursor: Option<CursorMeta>,
 }
 
 pub struct Cast {
-    event_loop: LoopHandle<'static, State>,
-    pub session_id: CastSessionId,
-    pub stream_id: CastStreamId,
+    stream_id: u64,
+    loop_handle: LoopHandle<'static, Server>,
     // Listener is dropped before Stream to prevent a use-after-free.
     _listener: StreamListener<()>,
-    pub stream: StreamRc,
-    pub target: CastTarget,
-    pub dynamic_target: bool,
+    stream: StreamRc,
     formats: FormatSet,
     offer_alpha: bool,
-    cursor_mode: CursorMode,
-    pub last_frame_time: Duration,
-    scheduled_redraw: Option<RegistrationToken>,
+    cursor_mode: CastCursorMode,
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
+    tracks: ElementTracks,
+    cursor_tracks: ElementTracks,
+    pending_info: Option<FrameInfo>,
+    pending_cursor: Option<(Size<i32, Physical>, Vec<Command>)>,
 }
 
 /// Mutable `Cast` state shared with PipeWire callbacks.
-#[derive(Debug)]
 struct CastInner {
+    stream_id: u64,
+    tx: Sender<CastEvent>,
     is_active: bool,
     node_id: Option<u32>,
     state: CastState,
@@ -120,14 +140,15 @@ struct CastInner {
     min_time_between_frames: Duration,
     dmabufs: HashMap<i64, Dmabuf>,
     shmbufs: HashMap<i64, Shmbuf>,
-    /// Buffers dequeued from PipeWire in process of rendering.
-    ///
-    /// This is an ordered list of buffers that we started rendering to and waiting for the
-    /// rendering to complete. The completion can be checked from the `SyncPoint`s. The buffers are
-    /// stored in order from oldest to newest, and the same ordering should be preserved when
-    /// submitting completed buffers to PipeWire.
+    /// Buffers dequeued from PipeWire in process of rendering, oldest first. They are queued
+    /// back in this order once their `SyncPoint`s are reached.
     rendering_buffers: Vec<(NonNull<pw_buffer>, SyncPoint)>,
+    /// Last `CastEvent::State` sent, to avoid repeats.
+    last_emitted: Option<EmittedState>,
 }
+
+/// (active, ready size, min frame time in ns) as last reported to the core.
+type EmittedState = (bool, Option<(i32, i32)>, u64);
 
 #[derive(Debug, Clone, Copy)]
 struct DmaNegotiation {
@@ -157,65 +178,6 @@ enum CastState {
         cursor_damage_tracker: Option<OutputDamageTracker>,
         last_cursor_location: Option<Point<i32, Physical>>,
     },
-}
-
-#[derive(PartialEq, Eq)]
-pub enum CastSizeChange {
-    Ready,
-    Pending,
-}
-
-/// Data for drawing a cursor either as metadata or embedded.
-///
-/// The cursor elements are expected to be at the start of the main elements slice. `elem_count` is
-/// the count of the pointer elements. This way, the full slice includes both main and cursor
-/// elements for embedded mode, and `&elements[elem_count..]` gives just the main elements for
-/// metadata mode.
-///
-/// We have weird borrowed references here in order to support both metadata and embedded cases.
-/// The cursor damage tracker needs a slice of impl Element at (0, 0), so we pass it `relocated`
-/// (luckily, &impl Element also impls Element). Then, if we need to embed the cursor, we use the
-/// full elements slice which starts with non-relocated pointer elements (that we borrow from).
-#[derive(Debug)]
-pub struct CursorData<'a, E> {
-    /// Count of the pointer elements in the slice (index of the first non-pointer element).
-    elem_count: usize,
-    /// Cursor elements relocated to (0, 0).
-    relocated: Vec<RelocateRenderElement<&'a E>>,
-    /// Location of the cursor's hotspot in the video buffer.
-    location: Point<i32, Physical>,
-    /// Location of the cursor's hotspot on the cursor bitmap.
-    hotspot: Point<i32, Physical>,
-    /// Size of the elements' encompassing geo.
-    size: Size<i32, Physical>,
-    /// Scale the elements should be rendered at.
-    scale: Scale<f64>,
-}
-
-impl<'a, E: Element> CursorData<'a, E> {
-    pub fn compute(
-        elements: &'a [E],
-        elem_count: usize,
-        location: Point<f64, Logical>,
-        scale: Scale<f64>,
-    ) -> Self {
-        let pointer_elements = &elements[..elem_count];
-        let location = location.to_physical_precise_round(scale);
-
-        let geo = encompassing_geo(scale, pointer_elements.iter());
-        let relocated = Vec::from_iter(pointer_elements.iter().map(|elem| {
-            RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
-        }));
-
-        Self {
-            elem_count,
-            relocated,
-            location,
-            hotspot: location - geo.loc,
-            size: geo.size,
-            scale,
-        }
-    }
 }
 
 fn make_video_params(
@@ -346,16 +308,177 @@ macro_rules! make_params {
     };
 }
 
+impl Casting {
+    pub(super) fn new(loop_handle: LoopHandle<'static, Server>) -> Self {
+        let (tx, rx): (Sender<CastEvent>, CalloopChannel<CastEvent>) = calloop::channel::channel();
+        loop_handle
+            .insert_source(rx, |event, _, server: &mut Server| {
+                if let calloop::channel::Event::Msg(event) = event {
+                    server.on_cast_event(event);
+                }
+            })
+            .unwrap();
+        Self {
+            casts: HashMap::new(),
+            pw: None,
+            loop_handle,
+            tx,
+        }
+    }
+
+    /// Drops every stream and the PipeWire connection (after a fatal connection error).
+    pub fn reset(&mut self) {
+        self.casts.clear();
+        if let Some(pw) = self.pw.take() {
+            self.loop_handle.remove(pw.token);
+        }
+    }
+
+    fn pipewire(&mut self) -> anyhow::Result<&PipeWire> {
+        if self.pw.is_none() {
+            let pw = PipeWire::new(&self.loop_handle, self.tx.clone())
+                .context("error initializing PipeWire")?;
+            self.pw = Some(pw);
+        }
+        Ok(self.pw.as_ref().unwrap())
+    }
+
+    /// Returns the effective cursor mode.
+    pub fn start(&mut self, params: StartParams) -> anyhow::Result<CastCursorMode> {
+        ensure!(
+            !self.casts.contains_key(&params.stream),
+            "stream {} already exists",
+            params.stream
+        );
+        let loop_handle = self.loop_handle.clone();
+        let tx = self.tx.clone();
+        let pw = self.pipewire()?;
+        let cast = pw.start_cast(loop_handle, tx, params)?;
+        let cursor_mode = cast.cursor_mode;
+        self.casts.insert(cast.stream_id, cast);
+        Ok(cursor_mode)
+    }
+
+    pub fn configure(
+        &mut self,
+        stream: u64,
+        size: Size<i32, Physical>,
+        refresh: u32,
+    ) -> anyhow::Result<()> {
+        let cast = self.casts.get_mut(&stream).context("unknown stream")?;
+        cast.set_refresh(refresh)?;
+        cast.ensure_size(size)?;
+        Ok(())
+    }
+
+    pub fn clear(
+        &mut self,
+        stream: u64,
+        target_time_ns: u64,
+        exec: &mut Executor,
+    ) -> anyhow::Result<()> {
+        let cast = self.casts.get_mut(&stream).context("unknown stream")?;
+        let renderer = exec.renderer()?;
+        let sent = cast.dequeue_buffer_and_clear(renderer);
+        self.report(stream, target_time_ns, sent);
+        Ok(())
+    }
+
+    /// Tells the core whether a frame it recorded went out, for pacing.
+    fn report(&self, stream: u64, target_time_ns: u64, sent: bool) {
+        let event = if sent {
+            CastEvent::Rendered {
+                stream,
+                target_time_ns,
+            }
+        } else {
+            CastEvent::Skipped {
+                stream,
+                target_time_ns,
+            }
+        };
+        if let Err(err) = self.tx.send(event) {
+            warn!("error sending cast frame report: {err:?}");
+        }
+    }
+
+    pub fn stop(&mut self, stream: u64) {
+        if let Some(cast) = self.casts.remove(&stream) {
+            if let Err(err) = cast.stream.disconnect() {
+                warn!("error disconnecting stream: {err:?}");
+            }
+        }
+    }
+
+    pub fn queue_completed_buffers(&mut self, stream: u64) {
+        if let Some(cast) = self.casts.get_mut(&stream) {
+            cast.queue_completed_buffers();
+        }
+    }
+
+    /// Renders the cast frames the executor collected from the last batch.
+    pub fn handle_deferred(&mut self, deferred: Vec<Deferred>, exec: &mut Executor) {
+        let Some(renderer) = exec.renderer.as_mut() else {
+            warn!("cast frames without a renderer");
+            return;
+        };
+        let tables = &exec.tables;
+        for item in deferred {
+            let stream = match &item {
+                Deferred::CastInfo { stream, .. }
+                | Deferred::CastCursor { stream, .. }
+                | Deferred::CastFrame { stream, .. } => *stream,
+            };
+            // The core may still record for a stream we just stopped.
+            let Some(cast) = self.casts.get_mut(&stream) else {
+                trace!("cast frame for unknown stream {stream}");
+                continue;
+            };
+            match item {
+                Deferred::CastInfo {
+                    scale,
+                    target_time_ns,
+                    cursor,
+                    ..
+                } => {
+                    cast.pending_info = Some(FrameInfo {
+                        scale,
+                        target_time_ns,
+                        cursor,
+                    });
+                }
+                Deferred::CastCursor { size, commands, .. } => {
+                    cast.pending_cursor = Some((size, commands));
+                }
+                Deferred::CastFrame { size, commands, .. } => {
+                    let info = cast.pending_info.take().unwrap_or(FrameInfo {
+                        scale: 1.0,
+                        target_time_ns: 0,
+                        cursor: None,
+                    });
+                    let sent = match cast.render_frame(renderer, tables, info, size, commands) {
+                        Ok(sent) => sent,
+                        Err(err) => {
+                            warn!("error rendering cast frame: {err:?}");
+                            false
+                        }
+                    };
+                    self.report(stream, info.target_time_ns, sent);
+                }
+            }
+        }
+    }
+}
+
 impl PipeWire {
-    pub fn new(
-        event_loop: LoopHandle<'static, State>,
-        to_niri: calloop::channel::Sender<PwToNiri>,
+    fn new(
+        loop_handle: &LoopHandle<'static, Server>,
+        tx: Sender<CastEvent>,
     ) -> anyhow::Result<Self> {
         let main_loop = MainLoopRc::new(None).context("error creating MainLoop")?;
         let context = ContextRc::new(&main_loop, None).context("error creating Context")?;
         let core = context.connect_rc(None).context("error creating Core")?;
 
-        let to_niri_ = to_niri.clone();
         let listener = core
             .add_listener_local()
             .error(move |id, seq, res, message| {
@@ -363,8 +486,8 @@ impl PipeWire {
 
                 // Reset PipeWire on connection errors.
                 if id == PW_ID_CORE && res == -32 {
-                    if let Err(err) = to_niri_.send(PwToNiri::FatalError) {
-                        warn!("error sending FatalError to niri: {err:?}");
+                    if let Err(err) = tx.send(CastEvent::PipeWireFatal) {
+                        warn!("error sending FatalError: {err:?}");
                     }
                 }
             })
@@ -378,7 +501,7 @@ impl PipeWire {
             }
         }
         let generic = Generic::new(AsFdWrapper(main_loop), Interest::READ, Mode::Level);
-        let token = event_loop
+        let token = loop_handle
             .insert_source(generic, move |_, wrapper, _| {
                 let _span = tracy_client::span!("pipewire iteration");
                 wrapper.0.loop_().iterate(Timeout::None);
@@ -390,37 +513,37 @@ impl PipeWire {
             _context: context,
             core,
             token,
-            event_loop,
-            to_niri,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_cast(
+    fn start_cast(
         &self,
-        gbm: Option<(DmabufAllocator, FormatSet)>,
-        session_id: CastSessionId,
-        stream_id: CastStreamId,
-        target: CastTarget,
-        size: Size<i32, Physical>,
-        refresh: u32,
-        alpha: bool,
-        mut cursor_mode: CursorMode,
-        signal_ctx: SignalEmitter<'static>,
+        loop_handle: LoopHandle<'static, Server>,
+        tx: Sender<CastEvent>,
+        params: StartParams,
     ) -> anyhow::Result<Cast> {
         let _span = tracy_client::span!("PipeWire::start_cast");
-        let _span = debug_span!("start_cast", %session_id).entered();
+        let StartParams {
+            stream: stream_id,
+            size,
+            refresh,
+            alpha,
+            mut cursor_mode,
+            formats,
+            gbm,
+        } = params;
+        let _span = debug_span!("start_cast", %stream_id).entered();
 
-        let to_niri_ = self.to_niri.clone();
+        let tx_ = tx.clone();
         let stop_cast = move || {
-            if let Err(err) = to_niri_.send(PwToNiri::StopCast { session_id }) {
-                warn!("error sending StopCast to niri: {err:?}");
+            if let Err(err) = tx_.send(CastEvent::Stop { stream: stream_id }) {
+                warn!("error sending Stop: {err:?}");
             }
         };
-        let to_niri_ = self.to_niri.clone();
+        let tx_ = tx.clone();
         let redraw = move || {
-            if let Err(err) = to_niri_.send(PwToNiri::Redraw { stream_id }) {
-                warn!("error sending Redraw to niri: {err:?}");
+            if let Err(err) = tx_.send(CastEvent::Redraw { stream: stream_id }) {
+                warn!("error sending Redraw: {err:?}");
             }
         };
         let redraw_ = redraw.clone();
@@ -432,25 +555,26 @@ impl PipeWire {
         )
         .context("error creating Stream")?;
 
-        if cursor_mode == CursorMode::Metadata && !pw_version_supports_cursor_metadata() {
+        if cursor_mode == CastCursorMode::Metadata && !pw_version_supports_cursor_metadata() {
             debug!(
                 "metadata cursor mode requested, but PipeWire is too old (need >= 1.4.8); \
                  switching to embedded cursor"
             );
-            cursor_mode = CursorMode::Embedded;
+            cursor_mode = CastCursorMode::Embedded;
         }
 
         let pending_size = Size::from((size.w as u32, size.h as u32));
 
-        let (gbm, formats) = if let Some((gbm, formats)) = gbm {
-            (Some(gbm), formats)
+        let formats = if gbm.is_some() {
+            formats
         } else {
             debug!("no dmabuf allocator; advertising only shm formats");
-            (None, FormatSet::default())
+            FormatSet::default()
         };
 
-        // Like in good old wayland-rs times...
         let inner = Rc::new(RefCell::new(CastInner {
+            stream_id,
+            tx,
             is_active: false,
             node_id: None,
             state: CastState::ResizePending { pending_size },
@@ -459,6 +583,7 @@ impl PipeWire {
             dmabufs: HashMap::new(),
             shmbufs: HashMap::new(),
             rendering_buffers: Vec::new(),
+            last_emitted: None,
         }));
 
         let listener =
@@ -477,22 +602,14 @@ impl PipeWire {
                                 if inner.node_id.is_none() {
                                     let id = stream.node_id();
                                     inner.node_id = Some(id);
-                                    debug!("sending signal with {id}");
-
-                                    let _span = tracy_client::span!("sending PipeWireStreamAdded");
-                                    async_io::block_on(async {
-                                        let res =
-                                            mutter_screen_cast::Stream::pipe_wire_stream_added(
-                                                &signal_ctx,
-                                                id,
-                                            )
-                                            .await;
-
-                                        if let Err(err) = res {
-                                            warn!("error sending PipeWireStreamAdded: {err:?}");
-                                            stop_cast();
-                                        }
-                                    });
+                                    debug!("sending node id {id}");
+                                    if let Err(err) = inner.tx.send(CastEvent::NodeId {
+                                        stream: stream_id,
+                                        node_id: id,
+                                    }) {
+                                        warn!("error sending NodeId: {err:?}");
+                                        stop_cast();
+                                    }
                                 }
 
                                 inner.is_active = false;
@@ -510,6 +627,7 @@ impl PipeWire {
                                 redraw();
                             }
                         }
+                        inner.emit_state();
                     }
                 })
                 .param_changed({
@@ -652,6 +770,7 @@ impl PipeWire {
                                         plane_count: plane_count as i32,
                                     }),
                                 };
+                                inner.emit_state();
 
                                 let o = make_video_params(
                                     format.format(),
@@ -842,6 +961,7 @@ impl PipeWire {
                                 ),
                             )
                         };
+                        inner.emit_state();
 
                         let o2 = pod::object!(
                             SpaTypes::ObjectParamMeta,
@@ -862,7 +982,7 @@ impl PipeWire {
                         let mut params = vec![make_pod(&mut b1, o1), make_pod(&mut b2, o2)];
 
                         let mut b_cursor = vec![];
-                        if cursor_mode == CursorMode::Metadata {
+                        if cursor_mode == CastCursorMode::Metadata {
                             let o_cursor = pod::object!(
                                 SpaTypes::ObjectParamMeta,
                                 ParamType::Meta,
@@ -931,48 +1051,38 @@ impl PipeWire {
             )
             .context("error connecting stream")?;
 
-        let cast = Cast {
-            event_loop: self.event_loop.clone(),
-            session_id,
+        Ok(Cast {
             stream_id,
+            loop_handle,
             stream,
             _listener: listener,
-            target,
-            dynamic_target: false,
             formats,
             offer_alpha: alpha,
             cursor_mode,
-            last_frame_time: Duration::ZERO,
-            scheduled_redraw: None,
             sequence_counter: 0,
             inner,
-        };
-        Ok(cast)
+            tracks: ElementTracks::default(),
+            cursor_tracks: ElementTracks::default(),
+            pending_info: None,
+            pending_cursor: None,
+        })
     }
 }
 
 impl Cast {
-    pub fn is_active(&self) -> bool {
-        self.inner.borrow().is_active
-    }
-
-    pub fn node_id(&self) -> Option<u32> {
-        self.inner.borrow().node_id
-    }
-
-    pub fn ensure_size(&self, size: Size<i32, Physical>) -> anyhow::Result<CastSizeChange> {
+    fn ensure_size(&mut self, size: Size<i32, Physical>) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
 
         let new_size = Size::from((size.w as u32, size.h as u32));
 
         let state = &mut inner.state;
         if matches!(state, CastState::Ready { size, .. } if *size == new_size) {
-            return Ok(CastSizeChange::Ready);
+            return Ok(());
         }
 
         if state.pending_size() == Some(new_size) {
-            debug!("stream size still hasn't changed, skipping frame");
-            return Ok(CastSizeChange::Pending);
+            debug!("stream size still hasn't changed");
+            return Ok(());
         }
 
         let _span = tracy_client::span!("Cast::ensure_size");
@@ -981,6 +1091,9 @@ impl Cast {
         *state = CastState::ResizePending {
             pending_size: new_size,
         };
+        // Old frames are meaningless at the new size.
+        self.tracks.clear();
+        inner.emit_state();
 
         make_params!(
             params,
@@ -993,10 +1106,10 @@ impl Cast {
             .update_params(&mut params)
             .context("error updating stream params")?;
 
-        Ok(CastSizeChange::Pending)
+        Ok(())
     }
 
-    pub fn set_refresh(&mut self, refresh: u32) -> anyhow::Result<()> {
+    fn set_refresh(&mut self, refresh: u32) -> anyhow::Result<()> {
         let mut inner = self.inner.borrow_mut();
 
         if inner.refresh == refresh {
@@ -1014,99 +1127,6 @@ impl Cast {
             .context("error updating stream params")?;
 
         Ok(())
-    }
-
-    fn compute_extra_delay(&self, target_frame_time: Duration) -> Duration {
-        let inner = self.inner.borrow();
-
-        let last = self.last_frame_time;
-        let min = inner.min_time_between_frames;
-
-        if last.is_zero() {
-            trace!(?target_frame_time, ?last, "last is zero, recording");
-            return Duration::ZERO;
-        }
-
-        if target_frame_time < last {
-            // Record frame with a warning; in case it was an overflow this will fix it.
-            warn!(
-                ?target_frame_time,
-                ?last,
-                "target frame time is below last, did it overflow or did we mispredict?"
-            );
-            return Duration::ZERO;
-        }
-
-        let diff = target_frame_time - last;
-        if diff < min {
-            let delay = min - diff;
-            trace!(
-                ?target_frame_time,
-                ?last,
-                "frame is too soon: min={min:?}, delay={:?}",
-                delay
-            );
-            return delay;
-        } else {
-            trace!("overshoot={:?}", diff - min);
-        }
-
-        Duration::ZERO
-    }
-
-    fn schedule_redraw(&mut self, output: Output, target_time: Duration) {
-        if self.scheduled_redraw.is_some() {
-            return;
-        }
-
-        let now = get_monotonic_time();
-        let duration = target_time.saturating_sub(now);
-        let timer = Timer::from_duration(duration);
-        let token = self
-            .event_loop
-            .insert_source(timer, move |_, _, state| {
-                // Guard against output disconnecting before the timer has a chance to run.
-                if state.niri.output_state.contains_key(&output) {
-                    state.niri.queue_redraw(&output);
-                }
-
-                TimeoutAction::Drop
-            })
-            .unwrap();
-        self.scheduled_redraw = Some(token);
-    }
-
-    fn remove_scheduled_redraw(&mut self) {
-        if let Some(token) = self.scheduled_redraw.take() {
-            self.event_loop.remove(token);
-        }
-    }
-
-    /// Checks whether this frame should be skipped because it's too soon.
-    ///
-    /// If the frame should be skipped, schedules a redraw and returns `true`. Otherwise, removes a
-    /// scheduled redraw, if any, and returns `false`.
-    ///
-    /// When this method returns `false`, the calling code is assumed to follow up with
-    /// [`Cast::dequeue_buffer_and_render()`].
-    pub fn check_time_and_schedule(
-        &mut self,
-        output: &Output,
-        target_frame_time: Duration,
-    ) -> bool {
-        let delay = self.compute_extra_delay(target_frame_time);
-        if delay >= CAST_DELAY_ALLOWANCE {
-            trace!("delay >= allowance, scheduling redraw");
-            self.schedule_redraw(output.clone(), target_frame_time + delay);
-            true
-        } else {
-            self.remove_scheduled_redraw();
-            false
-        }
-    }
-
-    fn dequeue_available_buffer(&mut self) -> Option<NonNull<pw_buffer>> {
-        unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }
     }
 
     fn queue_completed_buffers(&mut self) {
@@ -1130,80 +1150,59 @@ impl Cast {
         }
     }
 
-    unsafe fn queue_after_sync(&mut self, pw_buffer: NonNull<pw_buffer>, sync_point: SyncPoint) {
-        let _span = tracy_client::span!("Cast::queue_after_sync");
-
-        let mut inner = self.inner.borrow_mut();
-
-        let mut sync_point = sync_point;
-        let sync_fd = match sync_point.export() {
-            Some(sync_fd) => Some(sync_fd),
-            None => {
-                // There are two main ways this can happen. First is that the SyncPoint is
-                // pre-signalled, then the buffer is already ready and no waiting is needed. Second
-                // is that the SyncPoint is potentially still not signalled, but exporting a fence
-                // fd had failed. In this case, there's not much we can do (perhaps do a blocking
-                // wait for the SyncPoint, which itself might fail).
-                //
-                // So let's hope for the best and mark the buffer as submittable. We do not reuse
-                // the original SyncPoint because if we do hit the second case (when it's not
-                // signalled), then without a sync fd we cannot schedule a queue upon its
-                // completion, effectively going stuck. It's better to queue an incomplete buffer
-                // than getting stuck.
-                sync_point = SyncPoint::signaled();
-                None
-            }
-        };
-
-        inner.rendering_buffers.push((pw_buffer, sync_point));
-        drop(inner);
-
-        match sync_fd {
-            None => {
-                trace!("sync_fd is None, queueing completed buffers");
-                // In case this is the only buffer in the list, we will queue it right away.
-                self.queue_completed_buffers();
-            }
-            Some(sync_fd) => {
-                trace!("scheduling buffer to queue");
-                let stream_id = self.stream_id;
-                let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
-                self.event_loop
-                    .insert_source(source, move |_, _, state| {
-                        for cast in &mut state.niri.casting.casts {
-                            if cast.stream_id == stream_id {
-                                cast.queue_completed_buffers();
-                            }
-                        }
-
-                        Ok(PostAction::Remove)
-                    })
-                    .unwrap();
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn dequeue_buffer_and_render(
+    /// Renders the elements the core recorded for this stream into the next PipeWire buffer.
+    /// Returns whether a buffer was submitted.
+    fn render_frame(
         &mut self,
-        renderer: &mut RemoteRenderer,
-        mut elements: &[CastRenderElement<RemoteRenderer>],
-        cursor_data: &CursorData<CastRenderElement<RemoteRenderer>>,
+        renderer: &mut GlesRenderer,
+        tables: &RefCell<Tables>,
+        info: FrameInfo,
         size: Size<i32, Physical>,
-        scale: Scale<f64>,
-    ) -> bool {
-        let mut inner = self.inner.borrow_mut();
+        commands: Vec<Command>,
+    ) -> anyhow::Result<bool> {
+        let _span = tracy_client::span!("Cast::render_frame");
+        let (cursor_size, cursor_commands) = self.pending_cursor.take().unwrap_or_default();
+        let scale = Scale::from(info.scale);
+        let cursor_location: Point<i32, Physical> = info
+            .cursor
+            .map(|c| Point::from(c.location))
+            .unwrap_or_default();
 
+        let segments = split_elements(&commands);
+        self.tracks.update(&segments);
+        let cursor_segments = split_elements(&cursor_commands);
+        self.cursor_tracks.update(&cursor_segments);
+        let (storages, cursor_storages) = {
+            let tables = tables.borrow();
+            (
+                scene::element_storages(&tables, &segments),
+                scene::element_storages(&tables, &cursor_segments),
+            )
+        };
+        let elements = scene::scene_elements(&self.tracks, &segments, &storages, tables);
+        let cursor_elements = scene::scene_elements(
+            &self.cursor_tracks,
+            &cursor_segments,
+            &cursor_storages,
+            tables,
+        );
+
+        let mut inner = self.inner.borrow_mut();
         let CastState::Ready {
             damage_tracker,
             cursor_damage_tracker,
             last_cursor_location,
+            size: ready_size,
             ..
         } = &mut inner.state
         else {
-            error!("cast must be in Ready state to render");
-            return false;
+            trace!("cast not ready, dropping frame");
+            return Ok(false);
         };
+        ensure!(
+            *ready_size == Size::from((size.w as u32, size.h as u32)),
+            "frame size {size:?} does not match stream size {ready_size:?}"
+        );
         let damage_tracker = damage_tracker
             .get_or_insert_with(|| OutputDamageTracker::new(size, scale, Transform::Normal));
         let cursor_damage_tracker = cursor_damage_tracker.get_or_insert_with(|| {
@@ -1230,32 +1229,27 @@ impl Cast {
         let mut has_cursor_update = false;
         let mut redraw_cursor = false;
 
-        // For embedded cursor, pass the full slice (cursor + main) to the damage tracker.
-        // For metadata or hidden cursor, pass only the main elements.
-        if self.cursor_mode == CursorMode::Metadata || self.cursor_mode == CursorMode::Hidden {
-            elements = &elements[cursor_data.elem_count..];
-        }
-        let (damage, states) = damage_tracker.damage_output(1, elements).unwrap();
+        let (damage, states) = damage_tracker.damage_output(1, &elements).unwrap();
+        let has_damage = damage.is_some();
 
-        if self.cursor_mode == CursorMode::Metadata {
+        if self.cursor_mode == CastCursorMode::Metadata {
             let (damage, _states) = cursor_damage_tracker
-                .damage_output(1, &cursor_data.relocated)
+                .damage_output(1, &cursor_elements)
                 .unwrap();
             redraw_cursor = damage.is_some();
-            has_cursor_update =
-                redraw_cursor || *last_cursor_location != Some(cursor_data.location);
+            has_cursor_update = redraw_cursor || *last_cursor_location != Some(cursor_location);
         }
 
-        if damage.is_none() && !has_cursor_update {
+        if !has_damage && !has_cursor_update {
             trace!("no damage, skipping frame");
-            return false;
+            return Ok(false);
         }
-        *last_cursor_location = Some(cursor_data.location);
+        *last_cursor_location = Some(cursor_location);
         drop(inner);
 
-        let Some(pw_buffer) = self.dequeue_available_buffer() else {
+        let Some(pw_buffer) = (unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }) else {
             warn!("no available buffer in pw stream, skipping frame");
-            return false;
+            return Ok(false);
         };
         let buffer = pw_buffer.as_ptr();
 
@@ -1275,8 +1269,19 @@ impl Cast {
         unsafe {
             let spa_buffer = (*buffer).buffer;
 
-            if self.cursor_mode == CursorMode::Metadata {
-                add_cursor_metadata(renderer, spa_buffer, cursor_data, redraw_cursor);
+            if self.cursor_mode == CastCursorMode::Metadata {
+                add_cursor_metadata(
+                    renderer,
+                    spa_buffer,
+                    info.cursor.unwrap_or(CursorMeta {
+                        location: (0, 0),
+                        hotspot: (0, 0),
+                    }),
+                    cursor_size,
+                    scale,
+                    &cursor_elements,
+                    redraw_cursor,
+                );
             }
 
             // FIXME: would be good to skip rendering the full frame if only the pointer changed.
@@ -1287,7 +1292,7 @@ impl Cast {
             let res = match (*(*spa_buffer).datas).type_ {
                 x if x == DataType::DmaBuf.as_raw() => {
                     let dmabuf = inner_.dmabufs[&fd].clone();
-                    render_to_dmabuf(renderer, damage_tracker, dmabuf, elements, states)
+                    render_to_dmabuf(renderer, damage_tracker, dmabuf, &elements, states)
                         .map(|x| (x, SharingBuf::Dma))
                 }
                 x if x == DataType::MemFd.as_raw() => {
@@ -1299,12 +1304,10 @@ impl Cast {
                         Fourcc::Xrgb8888
                     };
 
-                    render_to_shmbuf(renderer, damage_tracker, &shmbuf, fourcc, elements, states)
+                    render_to_shmbuf(renderer, damage_tracker, &shmbuf, fourcc, &elements, states)
                         .map(|()| (SyncPoint::signaled(), SharingBuf::Shm(shmbuf)))
                 }
-                _ => Err(anyhow::anyhow!(
-                    "unknown data type in dequeue_buffer_and_render"
-                )),
+                _ => Err(anyhow::anyhow!("unknown data type in render_frame")),
             };
 
             drop(inner);
@@ -1312,19 +1315,24 @@ impl Cast {
                 Ok((sync_point, buf)) => {
                     mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, buf);
                     trace!("queueing buffer with seq={}", self.sequence_counter);
-                    self.queue_after_sync(pw_buffer, sync_point);
-                    true
+                    queue_after_sync(
+                        &self.loop_handle,
+                        &self.inner,
+                        &self.stream,
+                        pw_buffer,
+                        sync_point,
+                    );
+                    Ok(true)
                 }
                 Err(err) => {
-                    warn!("error rendering to buffer: {err:?}");
                     return_unused_buffer(&self.stream, pw_buffer);
-                    false
+                    Err(err.context("error rendering to buffer"))
                 }
             }
         }
     }
 
-    pub fn dequeue_buffer_and_clear(&mut self, renderer: &mut RemoteRenderer) -> bool {
+    fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1338,8 +1346,10 @@ impl Cast {
             *cursor_damage_tracker = None;
         };
         drop(inner);
+        self.tracks.clear();
+        self.cursor_tracks.clear();
 
-        let Some(pw_buffer) = self.dequeue_available_buffer() else {
+        let Some(pw_buffer) = (unsafe { NonNull::new(self.stream.dequeue_raw_buffer()) }) else {
             warn!("no available buffer in pw stream, skipping frame");
             return false;
         };
@@ -1348,7 +1358,7 @@ impl Cast {
         unsafe {
             let spa_buffer = (*buffer).buffer;
 
-            if self.cursor_mode == CursorMode::Metadata {
+            if self.cursor_mode == CastCursorMode::Metadata {
                 add_invisible_cursor(spa_buffer);
             }
 
@@ -1372,7 +1382,13 @@ impl Cast {
                 Ok((sync_point, buf)) => {
                     mark_buffer_as_good(pw_buffer, &mut self.sequence_counter, buf);
                     trace!("queueing clear buffer with seq={}", self.sequence_counter);
-                    self.queue_after_sync(pw_buffer, sync_point);
+                    queue_after_sync(
+                        &self.loop_handle,
+                        &self.inner,
+                        &self.stream,
+                        pw_buffer,
+                        sync_point,
+                    );
                     true
                 }
                 Err(err) => {
@@ -1385,10 +1401,87 @@ impl Cast {
     }
 }
 
+/// Queues the buffer to PipeWire once `sync_point` is reached, keeping submission order.
+unsafe fn queue_after_sync(
+    loop_handle: &LoopHandle<'static, Server>,
+    inner: &Rc<RefCell<CastInner>>,
+    stream: &StreamRc,
+    pw_buffer: NonNull<pw_buffer>,
+    sync_point: SyncPoint,
+) {
+    let _span = tracy_client::span!("Cast::queue_after_sync");
+
+    let mut sync_point = sync_point;
+    let sync_fd = match sync_point.export() {
+        Some(sync_fd) => Some(sync_fd),
+        None => {
+            // Either the SyncPoint is pre-signalled (buffer is ready), or exporting a fence fd
+            // failed. Without a fd we cannot schedule a queue on completion, so mark the buffer
+            // submittable: queueing an incomplete buffer beats getting stuck.
+            sync_point = SyncPoint::signaled();
+            None
+        }
+    };
+
+    let stream_id = inner.borrow().stream_id;
+    inner
+        .borrow_mut()
+        .rendering_buffers
+        .push((pw_buffer, sync_point));
+
+    match sync_fd {
+        None => {
+            trace!("sync_fd is None, queueing completed buffers");
+            // Same logic as Cast::queue_completed_buffers, without needing the Cast.
+            let mut inner = inner.borrow_mut();
+            let first_in_progress_idx = inner
+                .rendering_buffers
+                .iter()
+                .position(|(_, sync)| !sync.is_reached())
+                .unwrap_or(inner.rendering_buffers.len());
+            for (buffer, _) in inner.rendering_buffers.drain(..first_in_progress_idx) {
+                pw_stream_queue_buffer(stream.as_raw_ptr(), buffer.as_ptr());
+            }
+        }
+        Some(sync_fd) => {
+            trace!("scheduling buffer to queue");
+            let source = Generic::new(sync_fd, Interest::READ, Mode::OneShot);
+            loop_handle
+                .insert_source(source, move |_, _, server: &mut Server| {
+                    server.casting.queue_completed_buffers(stream_id);
+                    Ok(PostAction::Remove)
+                })
+                .unwrap();
+        }
+    }
+}
+
 impl CastInner {
+    /// Tells the core about activity / readiness changes, once per change.
+    fn emit_state(&mut self) {
+        let ready_size = match &self.state {
+            CastState::Ready { size, .. } => Some((size.w as i32, size.h as i32)),
+            _ => None,
+        };
+        let min_ns = self.min_time_between_frames.as_nanos() as u64;
+        let current = (self.is_active, ready_size, min_ns);
+        if self.last_emitted == Some(current) {
+            return;
+        }
+        self.last_emitted = Some(current);
+        if let Err(err) = self.tx.send(CastEvent::State {
+            stream: self.stream_id,
+            active: self.is_active,
+            ready_size,
+            min_frame_time_ns: min_ns,
+        }) {
+            warn!("error sending cast State: {err:?}");
+        }
+    }
+
     unsafe fn on_add_buffer(
         &mut self,
-        gbm: Option<&DmabufAllocator>,
+        gbm: Option<&GbmDevice<DeviceFd>>,
         buffer: *mut pw_buffer,
     ) -> anyhow::Result<bool> {
         let CastState::Ready {
@@ -1551,18 +1644,15 @@ fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
 }
 
 fn find_preferred_modifier(
-    gbm: &DmabufAllocator,
+    gbm: &GbmDevice<DeviceFd>,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifiers: Vec<i64>,
 ) -> anyhow::Result<(Modifier, usize)> {
     debug!("find_preferred_modifier: size={size:?}, fourcc={fourcc}, modifiers={modifiers:?}");
 
-    let modifiers: Vec<Modifier> = modifiers
-        .iter()
-        .map(|m| Modifier::from(*m as u64))
-        .collect();
-    let dmabuf = gbm.allocate(Size::from((size.w, size.h)), fourcc, &modifiers)?;
+    let modifiers: Vec<u64> = modifiers.iter().map(|m| *m as u64).collect();
+    let dmabuf = allocate_gbm_dmabuf(gbm, size.w, size.h, fourcc, &modifiers)?;
     let plane_count = dmabuf.num_planes();
 
     // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
@@ -1571,16 +1661,16 @@ fn find_preferred_modifier(
 }
 
 fn allocate_dmabuf(
-    gbm: &DmabufAllocator,
+    gbm: &GbmDevice<DeviceFd>,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifier: Modifier,
 ) -> anyhow::Result<Dmabuf> {
-    gbm.allocate(Size::from((size.w, size.h)), fourcc, &[modifier])
+    allocate_gbm_dmabuf(gbm, size.w, size.h, fourcc, &[u64::from(modifier)])
 }
 
 #[derive(Debug, Clone)]
-pub struct Shmbuf {
+struct Shmbuf {
     fd: Rc<OwnedFd>,
     layout: ShmLayout,
 }
@@ -1600,7 +1690,6 @@ impl ShmLayout {
         let buffer_size = stride
             .checked_mul(size.h)
             .context("SHM buffer size overflows u32")?;
-
         Ok(Self {
             stride: stride.try_into().context("SHM stride exceeds i32")?,
             size: buffer_size,
@@ -1619,6 +1708,7 @@ enum SharingBuf {
 
 fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
     let layout = ShmLayout::new(size)?;
+
     let fd = memfd_create(
         "niri-pw-stream-memfd",
         MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
@@ -1627,6 +1717,7 @@ fn allocate_shmbuf(size: Size<u32, Physical>) -> anyhow::Result<Shmbuf> {
     ftruncate(&fd, layout.size.into()).context("error setting size of the fd")?;
     fcntl_add_seals(&fd, SealFlags::SEAL | SealFlags::SHRINK | SealFlags::GROW)
         .context("error sealing the fd")?;
+
     Ok(Shmbuf {
         fd: fd.into(),
         layout,
@@ -1676,12 +1767,12 @@ unsafe fn mark_buffer_as_good(pw_buffer: NonNull<pw_buffer>, sequence: &mut u64,
     }
 
     *sequence = sequence.wrapping_add(1);
+
     if let Some(header) = find_meta_header(spa_buffer) {
         let header = header.as_ptr();
         // Clear the corrupted flag we may have set before.
         (*header).flags = 0;
         (*header).seq = *sequence;
-
         // Set buffer timestamp as unknown.
         //
         // FIXME: we could try passing real presentation timestamps for rendered frames here.
@@ -1743,10 +1834,15 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
     }
 }
 
+/// Writes the cursor position and, if `redraw`, a freshly rendered bitmap of the (already
+/// relocated to 0,0) cursor elements into the buffer's cursor metadata.
 unsafe fn add_cursor_metadata(
-    renderer: &mut RemoteRenderer,
+    renderer: &mut GlesRenderer,
     spa_buffer: *mut spa_buffer,
-    cursor_data: &CursorData<impl RenderElement<RemoteRenderer>>,
+    meta: CursorMeta,
+    cursor_size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    elements: &[SceneElement<'_>],
     redraw: bool,
 ) {
     unsafe {
@@ -1761,10 +1857,10 @@ unsafe fn add_cursor_metadata(
         };
 
         cursor_meta.id = 1;
-        cursor_meta.position.x = cursor_data.location.x;
-        cursor_meta.position.y = cursor_data.location.y;
-        cursor_meta.hotspot.x = cursor_data.hotspot.x;
-        cursor_meta.hotspot.y = cursor_data.hotspot.y;
+        cursor_meta.position.x = meta.location.0;
+        cursor_meta.position.y = meta.location.1;
+        cursor_meta.hotspot.x = meta.hotspot.0;
+        cursor_meta.hotspot.y = meta.hotspot.1;
 
         if !redraw {
             trace!("cursor not damaged, skipping rerendering");
@@ -1791,10 +1887,10 @@ unsafe fn add_cursor_metadata(
         bitmap_slice[..4].copy_from_slice(&[0, 0, 0, 0]);
 
         let size = Size::new(
-            min(cursor_data.size.w, CURSOR_WIDTH as i32),
-            min(cursor_data.size.h, CURSOR_HEIGHT as i32),
+            min(cursor_size.w, CURSOR_WIDTH as i32),
+            min(cursor_size.h, CURSOR_HEIGHT as i32),
         );
-        if size.w == 0 || size.h == 0 {
+        if size.w <= 0 || size.h <= 0 {
             trace!("cursor is invisible, skipping rendering");
             return;
         }
@@ -1808,29 +1904,14 @@ unsafe fn add_cursor_metadata(
         //
         // Reliable buffers should be available starting from 1.6.0:
         // https://gitlab.freedesktop.org/pipewire/pipewire/-/issues/4885
-        let mapping = match render_and_download(
-            renderer,
-            size,
-            cursor_data.scale,
-            Transform::Normal,
-            Fourcc::Argb8888,
-            cursor_data.relocated.iter().rev(),
-        ) {
-            Ok(mapping) => mapping,
+        let pixels = match render_and_download(renderer, size, scale, Fourcc::Argb8888, elements) {
+            Ok(pixels) => pixels,
             Err(err) => {
                 warn!("error rendering cursor: {err:?}");
                 return;
             }
         };
-        let pixels = match renderer.map_texture(&mapping) {
-            Ok(pixels) => pixels,
-            Err(err) => {
-                warn!("error mapping cursor texture: {err:?}");
-                return;
-            }
-        };
-
-        bitmap_slice[..pixels.len()].copy_from_slice(pixels);
+        bitmap_slice[..pixels.len()].copy_from_slice(&pixels);
 
         // Fill the metadata now that everything succeeded.
         bitmap_meta.size.width = size.w as _;
@@ -1839,28 +1920,109 @@ unsafe fn add_cursor_metadata(
     }
 }
 
+fn buffer_size(size: Size<i32, Physical>) -> Size<i32, Buffer> {
+    Size::from((size.w, size.h))
+}
+
+/// Renders `elements` (top to bottom) into a fresh texture and reads it back.
+fn render_and_download(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+    scale: Scale<f64>,
+    fourcc: Fourcc,
+    elements: &[SceneElement<'_>],
+) -> anyhow::Result<Vec<u8>> {
+    let mut texture: GlesTexture = renderer
+        .create_buffer(fourcc, buffer_size(size))
+        .context("error creating texture")?;
+    let mut fb = renderer
+        .bind(&mut texture)
+        .context("error binding texture")?;
+    let mut tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+    tracker
+        .render_output(renderer, &mut fb, 0, elements, Color32F::TRANSPARENT)
+        .context("error rendering")?;
+    let mapping = renderer
+        .copy_framebuffer(
+            &fb,
+            smithay::utils::Rectangle::from_size(buffer_size(size)),
+            fourcc,
+        )
+        .context("error copying framebuffer")?;
+    drop(fb);
+    let bytes = renderer
+        .map_texture(&mapping)
+        .context("error mapping texture")?;
+    Ok(bytes.to_vec())
+}
+
+fn render_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    damage_tracker: &mut OutputDamageTracker,
+    mut dmabuf: Dmabuf,
+    elements: &[SceneElement<'_>],
+    states: smithay::backend::renderer::element::RenderElementStates,
+) -> anyhow::Result<SyncPoint> {
+    let _span = tracy_client::span!("render_to_dmabuf");
+    let mut fb = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
+    let res = damage_tracker
+        .render_output_with_states(
+            renderer,
+            &mut fb,
+            0,
+            elements,
+            Color32F::TRANSPARENT,
+            states,
+        )
+        .context("error rendering")?;
+    Ok(res.sync.clone())
+}
+
 fn render_to_shmbuf(
-    renderer: &mut RemoteRenderer,
+    renderer: &mut GlesRenderer,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &Shmbuf,
     fourcc: Fourcc,
-    elements: &[impl RenderElement<RemoteRenderer>],
-    states: RenderElementStates,
+    elements: &[SceneElement<'_>],
+    states: smithay::backend::renderer::element::RenderElementStates,
 ) -> anyhow::Result<()> {
-    let _span = tracy_client::span!();
-    let (size, _scale, _transform) = damage_tracker.mode().try_into().unwrap();
+    let _span = tracy_client::span!("render_to_shmbuf");
+    let (size, _scale, _transform): (Size<i32, Physical>, Scale<f64>, Transform) =
+        damage_tracker.mode().try_into().unwrap();
     let expected_size = size.w as usize * size.h as usize * SHM_BYTES_PER_PIXEL;
     ensure!(
         buffer.layout.size_usize() == expected_size,
         "invalid buffer size"
     );
 
-    let mapping =
-        render_and_download_with_damage(renderer, damage_tracker, fourcc, elements, states)?;
-
+    let mut texture: GlesTexture = renderer
+        .create_buffer(fourcc, buffer_size(size))
+        .context("error creating texture")?;
+    let mut fb = renderer
+        .bind(&mut texture)
+        .context("error binding texture")?;
+    damage_tracker
+        .render_output_with_states(
+            renderer,
+            &mut fb,
+            0,
+            elements,
+            Color32F::TRANSPARENT,
+            states,
+        )
+        .context("error rendering")?;
+    let mapping = renderer
+        .copy_framebuffer(
+            &fb,
+            smithay::utils::Rectangle::from_size(buffer_size(size)),
+            fourcc,
+        )
+        .context("error copying framebuffer")?;
+    drop(fb);
     let bytes = renderer
         .map_texture(&mapping)
         .context("error mapping texture")?;
+    ensure!(bytes.len() == expected_size, "unexpected mapping size");
 
     unsafe {
         let buf = mmap(
@@ -1879,7 +2041,25 @@ fn render_to_shmbuf(
             warn!("error unmapping shm buffer: {err:?}");
         }
     }
+
     Ok(())
+}
+
+fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+    let size = dmabuf.size();
+    let size: Size<i32, Physical> = Size::from((size.w, size.h));
+    let mut fb = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;
+    let mut frame = renderer
+        .render(&mut fb, size, Transform::Normal)
+        .context("error starting frame")?;
+    frame
+        .clear(
+            Color32F::TRANSPARENT,
+            &[smithay::utils::Rectangle::from_size(size)],
+        )
+        .context("error clearing")?;
+    let sync = frame.finish().context("error finishing frame")?;
+    Ok(sync)
 }
 
 fn clear_shmbuf(buffer: &Shmbuf) -> anyhow::Result<()> {
@@ -1900,6 +2080,7 @@ fn clear_shmbuf(buffer: &Shmbuf) -> anyhow::Result<()> {
             warn!("error unmapping shm buffer: {err:?}");
         }
     }
+
     Ok(())
 }
 

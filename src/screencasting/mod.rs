@@ -1,28 +1,31 @@
+//! Screencasting through xdg-desktop-portal-gnome.
+//!
+//! The core owns the portal session, picks targets and paces frames; the GPU process owns the
+//! PipeWire streams and buffers (see `gpu::cast`).
+
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use calloop::LoopHandle;
-use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::desktop::Window;
 use smithay::output::Output;
-use smithay::reexports::gbm::Modifier;
-use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
+use smithay::utils::{Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
-use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
+use crate::gpu::protocol::{CastEvent, Request};
+use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, CastSessionId, CastStreamId};
 use crate::window::mapped::{MappedId, WindowCastRenderElements};
 
-mod pw_utils;
-use pw_utils::{Cast, CastSizeChange, CursorData, PipeWire, PwToNiri};
+mod cast;
+use cast::{from_gpu_cursor_mode, to_gpu_cursor_mode, Cast, CastSizeChange, CursorData};
 
 pub struct Screencasting {
     pub casts: Vec<Cast>,
@@ -30,16 +33,11 @@ pub struct Screencasting {
     /// Dynamic-target casts waiting for their first target to start.
     pub pending_dynamic_casts: Vec<PendingCast>,
 
-    pub pw_to_niri: calloop::channel::Sender<PwToNiri>,
-
     /// Screencast output for each mapped window.
     pub mapped_cast_output: HashMap<Window, Output>,
 
     /// Window ID for the "dynamic cast" special window for the xdp-gnome picker.
     pub dynamic_cast_id_for_portal: MappedId,
-
-    // Drop PipeWire last, and specifically after casts, to prevent a double-free (yay).
-    pub pipewire: Option<PipeWire>,
 }
 
 /// A screencast request that hasn't been started yet.
@@ -51,76 +49,146 @@ pub struct PendingCast {
 }
 
 impl Screencasting {
-    pub fn new(event_loop: &LoopHandle<'static, State>) -> Self {
-        let pw_to_niri = {
-            let (pw_to_niri, from_pipewire) = calloop::channel::channel();
-            event_loop
-                .insert_source(from_pipewire, move |event, _, state| match event {
-                    calloop::channel::Event::Msg(msg) => state.on_pw_msg(msg),
-                    calloop::channel::Event::Closed => (),
-                })
-                .unwrap();
-            pw_to_niri
-        };
-
+    pub fn new() -> Self {
         Self {
             casts: vec![],
             pending_dynamic_casts: vec![],
-            pw_to_niri,
             mapped_cast_output: HashMap::new(),
             dynamic_cast_id_for_portal: MappedId::next(),
-            pipewire: None,
         }
+    }
+
+    fn cast_mut(&mut self, stream: u64) -> Option<&mut Cast> {
+        self.casts
+            .iter_mut()
+            .find(|cast| cast.stream_id.get() == stream)
     }
 }
 
+/// What to pass to the GPU when starting a stream.
+struct StartCast {
+    session_id: CastSessionId,
+    stream_id: CastStreamId,
+    target: CastTarget,
+    size: Size<i32, Physical>,
+    refresh: u32,
+    alpha: bool,
+    cursor_mode: CursorMode,
+    signal_ctx: SignalEmitter<'static>,
+}
+
 impl State {
-    fn prepare_pw_cast(&mut self) -> anyhow::Result<Option<(DmabufAllocator, FormatSet)>> {
-        // Ensure PipeWire is initialized.
-        if self.niri.casting.pipewire.is_none() {
-            let pw = PipeWire::new(
-                self.niri.event_loop.clone(),
-                self.niri.casting.pw_to_niri.clone(),
-            )
-            .context("error initializing PipeWire")?;
-            self.niri.casting.pipewire = Some(pw);
-        }
-
-        if self.niri.config.borrow().debug.disable_pipewire_dmabuf {
-            return Ok(None);
-        }
-
-        let Some(alloc) = self.backend.dmabuf_allocator() else {
-            // We will offer shm only.
-            return Ok(None);
-        };
-
-        let mut render_formats = self
-            .backend
-            .with_primary_renderer(|renderer| renderer.dmabuf_render_formats())
-            .unwrap_or_default();
-
-        {
+    /// Creates the PipeWire stream in the GPU process.
+    fn start_cast(&mut self, params: StartCast) -> anyhow::Result<Cast> {
+        let _span = tracy_client::span!("State::start_cast");
+        let (allow_dmabuf, force_invalid_modifier) = {
             let config = self.niri.config.borrow();
-            if config.debug.force_pipewire_invalid_modifier {
-                render_formats = render_formats
-                    .into_iter()
-                    .filter(|f| f.modifier == Modifier::Invalid)
-                    .collect();
-            }
-        }
+            (
+                !config.debug.disable_pipewire_dmabuf,
+                config.debug.force_pipewire_invalid_modifier,
+            )
+        };
+        let StartCast {
+            session_id,
+            stream_id,
+            target,
+            size,
+            refresh,
+            alpha,
+            cursor_mode,
+            signal_ctx,
+        } = params;
 
-        Ok(Some((alloc, render_formats)))
+        let cursor_mode = self
+            .backend
+            .with_primary_renderer(|renderer| {
+                renderer.client().cast_start(
+                    stream_id.get(),
+                    (size.w, size.h),
+                    refresh,
+                    alpha,
+                    to_gpu_cursor_mode(cursor_mode),
+                    allow_dmabuf,
+                    force_invalid_modifier,
+                )
+            })
+            .context("no renderer")??;
+
+        Ok(Cast::new(
+            self.niri.event_loop.clone(),
+            session_id,
+            stream_id,
+            target,
+            size,
+            refresh,
+            from_gpu_cursor_mode(cursor_mode),
+            signal_ctx,
+        ))
     }
 
-    pub fn on_pw_msg(&mut self, msg: PwToNiri) {
-        match msg {
-            PwToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
-            PwToNiri::Redraw { stream_id } => self.redraw_cast(stream_id),
-            PwToNiri::FatalError => {
-                warn!("stopping PipeWire due to fatal error");
-                let casting = &mut self.niri.casting;
-                if let Some(pw) = casting.pipewire.take() {
+    /// Screencast events from the GPU process.
+    pub fn on_cast_events(&mut self, events: Vec<CastEvent>) {
+        for event in events {
+            match event {
+                CastEvent::NodeId { stream, node_id } => {
+                    let Some(cast) = self.niri.casting.cast_mut(stream) else {
+                        continue;
+                    };
+                    cast.node_id = Some(node_id);
+                    let session_id = cast.session_id;
+                    debug!("sending PipeWireStreamAdded with {node_id}");
+                    let _span = tracy_client::span!("sending PipeWireStreamAdded");
+                    let res =
+                        async_io::block_on(mutter_screen_cast::Stream::pipe_wire_stream_added(
+                            &cast.signal_ctx,
+                            node_id,
+                        ));
+                    if let Err(err) = res {
+                        warn!("error sending PipeWireStreamAdded: {err:?}");
+                        self.niri.stop_cast(session_id);
+                    }
+                }
+                CastEvent::State {
+                    stream,
+                    active,
+                    ready_size,
+                    min_frame_time_ns,
+                } => {
+                    if let Some(cast) = self.niri.casting.cast_mut(stream) {
+                        cast.set_state(active, ready_size, Duration::from_nanos(min_frame_time_ns));
+                    }
+                }
+                CastEvent::Redraw { stream } => {
+                    if let Some(cast) = self.niri.casting.cast_mut(stream) {
+                        let stream_id = cast.stream_id;
+                        self.redraw_cast(stream_id);
+                    }
+                }
+                CastEvent::Rendered {
+                    stream,
+                    target_time_ns,
+                } => {
+                    if let Some(cast) = self.niri.casting.cast_mut(stream) {
+                        cast.on_rendered(Duration::from_nanos(target_time_ns));
+                    }
+                }
+                CastEvent::Skipped {
+                    stream,
+                    target_time_ns,
+                } => {
+                    if let Some(cast) = self.niri.casting.cast_mut(stream) {
+                        cast.on_skipped(Duration::from_nanos(target_time_ns));
+                    }
+                }
+                CastEvent::Stop { stream } => {
+                    if let Some(cast) = self.niri.casting.cast_mut(stream) {
+                        let session_id = cast.session_id;
+                        self.niri.stop_cast(session_id);
+                    }
+                }
+                CastEvent::PipeWireFatal => {
+                    warn!("PipeWire failed in the GPU process; stopping all casts");
+                    let casting = &self.niri.casting;
                     let mut ids = HashSet::new();
                     for cast in &casting.pending_dynamic_casts {
                         ids.insert(cast.session_id);
@@ -131,7 +199,6 @@ impl State {
                     for id in ids {
                         self.niri.stop_cast(id);
                     }
-                    self.niri.event_loop.remove(pw.token);
                 }
             }
         }
@@ -149,11 +216,13 @@ impl State {
 
         let id = match &cast.target {
             CastTarget::Nothing => {
-                self.backend.with_primary_renderer(|renderer| {
-                    if cast.dequeue_buffer_and_clear(renderer) {
-                        cast.last_frame_time = get_monotonic_time();
-                    }
-                });
+                let now = get_monotonic_time();
+                let res = self
+                    .backend
+                    .with_primary_renderer(|renderer| cast.clear(renderer, now));
+                if let Some(Err(err)) = res {
+                    warn!("error clearing cast: {err:?}");
+                }
                 return;
             }
             CastTarget::Output { output, .. } => {
@@ -189,17 +258,13 @@ impl State {
                 .bbox_with_popups()
                 .to_physical_precise_up(scale);
 
-            match cast.ensure_size(bbox.size) {
-                Ok(CastSizeChange::Ready) => (),
-                Ok(CastSizeChange::Pending) => break,
-                Err(err) => {
-                    warn!("error updating stream size, stopping screencast: {err:?}");
-                    stop = true;
-                    break;
+            let res = self.backend.with_primary_renderer(|renderer| {
+                match cast.ensure_size(renderer, bbox.size) {
+                    Ok(CastSizeChange::Ready) => (),
+                    Ok(CastSizeChange::Pending) => return Ok(()),
+                    Err(err) => return Err(err),
                 }
-            }
 
-            self.backend.with_primary_renderer(|renderer| {
                 let mut elements = Vec::new();
                 let mut pointer_location = Point::default();
 
@@ -233,16 +298,19 @@ impl State {
                 let cursor_data =
                     CursorData::compute(&elements, main_start, pointer_location, scale);
 
-                if cast.dequeue_buffer_and_render(
+                cast.record(
                     renderer,
                     &elements,
                     &cursor_data,
                     bbox.size,
                     scale,
-                ) {
-                    cast.last_frame_time = get_monotonic_time();
-                }
+                    get_monotonic_time(),
+                )
             });
+            if let Some(Err(err)) = res {
+                warn!("error rendering window cast, stopping screencast: {err:?}");
+                stop = true;
+            }
 
             break;
         }
@@ -278,18 +346,13 @@ impl State {
         }
 
         let mut to_redraw = Vec::new();
-        let mut to_stop = Vec::new();
         for cast in &mut self.niri.casting.casts {
             if !cast.dynamic_target {
                 continue;
             }
 
             if let Some(refresh) = refresh {
-                if let Err(err) = cast.set_refresh(refresh) {
-                    warn!("error changing cast FPS: {err:?}");
-                    to_stop.push(cast.session_id);
-                    continue;
-                }
+                cast.set_refresh(refresh);
             }
 
             cast.target = target.clone();
@@ -332,39 +395,23 @@ impl State {
             }
         };
 
-        let gbm = match self.prepare_pw_cast() {
-            Ok(x) => x,
-            Err(err) => {
-                warn!("error starting pending screencasts: {err:?}");
-                let mut ids = HashSet::new();
-                for pending in self.niri.casting.pending_dynamic_casts.drain(..) {
-                    ids.insert(pending.session_id);
-                }
-                for id in ids {
-                    self.niri.stop_cast(id);
-                }
-                return;
-            }
-        };
-        let pw = self.niri.casting.pipewire.as_ref().unwrap();
-
         // Alpha is always true since the dynamic target can change between window & output.
         let alpha = true;
 
         // Start each pending cast.
         let mut to_stop = HashSet::new();
-        for pending in self.niri.casting.pending_dynamic_casts.drain(..) {
-            let res = pw.start_cast(
-                gbm.clone(),
-                pending.session_id,
-                pending.stream_id,
-                target.clone(),
+        let pending: Vec<_> = self.niri.casting.pending_dynamic_casts.drain(..).collect();
+        for pending in pending {
+            let res = self.start_cast(StartCast {
+                session_id: pending.session_id,
+                stream_id: pending.stream_id,
+                target: target.clone(),
                 size,
                 refresh,
                 alpha,
-                pending.cursor_mode,
-                pending.signal_ctx,
-            );
+                cursor_mode: pending.cursor_mode,
+                signal_ctx: pending.signal_ctx,
+            });
             match res {
                 Ok(mut cast) => {
                     cast.dynamic_target = true;
@@ -429,18 +476,7 @@ impl State {
                     }
                 };
 
-                let gbm = match self.prepare_pw_cast() {
-                    Ok(x) => x,
-                    Err(err) => {
-                        warn!("error starting screencast: {err:?}");
-                        self.niri.stop_cast(session_id);
-                        return;
-                    }
-                };
-                let pw = self.niri.casting.pipewire.as_ref().unwrap();
-
-                let res = pw.start_cast(
-                    gbm,
+                let res = self.start_cast(StartCast {
                     session_id,
                     stream_id,
                     target,
@@ -449,7 +485,7 @@ impl State {
                     alpha,
                     cursor_mode,
                     signal_ctx,
-                );
+                });
                 match res {
                     Ok(cast) => {
                         self.niri.casting.casts.push(cast);
@@ -508,7 +544,6 @@ impl Niri {
             .mapped_cast_output
             .retain(|win, _| seen.contains(win));
 
-        let mut to_stop = vec![];
         for (id, out) in output_changed {
             let refresh = out.current_mode().unwrap().refresh as u32;
             let target = CastTarget::Window { id: id.get() };
@@ -518,15 +553,8 @@ impl Niri {
                 .iter_mut()
                 .filter(|cast| cast.target == target)
             {
-                if let Err(err) = cast.set_refresh(refresh) {
-                    warn!("error changing cast FPS: {err:?}");
-                    to_stop.push(cast.session_id);
-                };
+                cast.set_refresh(refresh);
             }
-        }
-
-        for session_id in to_stop {
-            self.stop_cast(session_id);
         }
     }
 
@@ -545,7 +573,7 @@ impl Niri {
 
         let scale = Scale::from(output.current_scale().fractional_scale());
 
-        let mut elements = Vec::new();
+        let mut elements: Vec<CastRenderElement<RemoteRenderer>> = Vec::new();
         let mut cursor_data = None;
 
         let mut casts_to_stop = vec![];
@@ -560,12 +588,13 @@ impl Niri {
                 continue;
             }
 
-            match cast.ensure_size(size) {
+            match cast.ensure_size(renderer, size) {
                 Ok(CastSizeChange::Ready) => (),
                 Ok(CastSizeChange::Pending) => continue,
                 Err(err) => {
                     warn!("error updating stream size, stopping screencast: {err:?}");
                     casts_to_stop.push(cast.session_id);
+                    continue;
                 }
             }
 
@@ -607,8 +636,16 @@ impl Niri {
             }
             let cursor_data = cursor_data.as_ref().unwrap();
 
-            if cast.dequeue_buffer_and_render(renderer, &elements, cursor_data, size, scale) {
-                cast.last_frame_time = target_presentation_time;
+            if let Err(err) = cast.record(
+                renderer,
+                &elements,
+                cursor_data,
+                size,
+                scale,
+                target_presentation_time,
+            ) {
+                warn!("error recording cast frame, stopping screencast: {err:?}");
+                casts_to_stop.push(cast.session_id);
             }
         }
         self.casting.casts = casts;
@@ -650,12 +687,13 @@ impl Niri {
                 .bbox_with_popups()
                 .to_physical_precise_up(scale);
 
-            match cast.ensure_size(bbox.size) {
+            match cast.ensure_size(renderer, bbox.size) {
                 Ok(CastSizeChange::Ready) => (),
                 Ok(CastSizeChange::Pending) => continue,
                 Err(err) => {
                     warn!("error updating stream size, stopping screencast: {err:?}");
                     casts_to_stop.push(cast.session_id);
+                    continue;
                 }
             }
 
@@ -692,8 +730,16 @@ impl Niri {
 
             let cursor_data = CursorData::compute(&elements, main_start, pointer_location, scale);
 
-            if cast.dequeue_buffer_and_render(renderer, &elements, &cursor_data, bbox.size, scale) {
-                cast.last_frame_time = target_presentation_time;
+            if let Err(err) = cast.record(
+                renderer,
+                &elements,
+                &cursor_data,
+                bbox.size,
+                scale,
+                target_presentation_time,
+            ) {
+                warn!("error recording cast frame, stopping screencast: {err:?}");
+                casts_to_stop.push(cast.session_id);
             }
         }
         self.casting.casts = casts;
@@ -718,9 +764,7 @@ impl Niri {
             }
 
             let cast = self.casting.casts.swap_remove(i);
-            if let Err(err) = cast.stream.disconnect() {
-                warn!("error disconnecting stream: {err:?}");
-            }
+            self.stop_cast_stream(&cast);
         }
 
         let dbus = &self.dbus.as_ref().unwrap();
@@ -736,6 +780,22 @@ impl Niri {
                     .await
             });
         }
+    }
+
+    /// Tears down the GPU-side stream. `Niri` doesn't own the backend, so this goes through
+    /// the event loop like `stop_casts_for_target` does.
+    fn stop_cast_stream(&self, cast: &Cast) {
+        let stream = cast.stream_id.get();
+        self.event_loop.insert_idle(move |state| {
+            state.backend.with_primary_renderer(|renderer| {
+                if let Err(err) = renderer
+                    .client()
+                    .send_oneway(&Request::CastStop { stream }, &[])
+                {
+                    warn!("error stopping cast stream: {err:?}");
+                }
+            });
+        });
     }
 
     pub fn stop_casts_for_target(&mut self, target: CastTarget) {

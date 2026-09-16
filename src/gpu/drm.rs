@@ -4,8 +4,7 @@
 //! connector is on, which mode, VRR) stays in the core. This module just does what it is told
 //! and reports connectors and vblanks back.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::iter::zip;
 use std::mem;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -24,12 +23,8 @@ use smithay::backend::drm::{
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
-use smithay::backend::renderer::element::memory::MemoryBuffer;
-use smithay::backend::renderer::element::{
-    Element, Id, Kind, RenderElement, RenderElementPresentationState, UnderlyingStorage,
-};
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer};
-use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::element::RenderElementPresentationState;
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::DebugFlags;
 use smithay::output::OutputModeSource;
 use smithay::reexports::calloop::RegistrationToken;
@@ -40,24 +35,21 @@ use smithay::reexports::drm::control::{
     ResourceHandle,
 };
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Scale, Size, Transform};
+use smithay::utils::{DeviceFd, Physical, Scale, Size, Transform};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use super::convert;
-use super::exec::{run_frame, Executor, Tables};
+use super::exec::Executor;
 use super::gl::{resources, shaders};
 use super::protocol::{
-    Command, ConnectorInfo, DevId, ElementKind, ElementMeta, ElementState, Event, ModeDesc,
-    OutputGeometry, OutputRef, PresentFlags, Presentation,
+    ConnectorInfo, DevId, ElementState, Event, ModeDesc, OutputGeometry, OutputRef, PresentFlags,
+    Presentation,
 };
+use super::scene::{self, split_elements, ElementTracks};
 
 const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
     [Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Abgr8888];
 const SUPPORTED_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
-
-/// How many past frames of damage we remember for the DRM compositor's buffer ages.
-const DAMAGE_HISTORY: usize = 8;
 
 type GbmDrmCompositor =
     DrmCompositor<GbmAllocator<DeviceFd>, GbmFramebufferExporter<DeviceFd>, u64, DeviceFd>;
@@ -89,15 +81,7 @@ struct Surface {
     max_bpc: Option<u8>,
     geometry: OutputGeometry,
     /// Damage tracking state per core element id, so the DRM compositor sees real elements.
-    elements: HashMap<u64, ElementTrack>,
-}
-
-struct ElementTrack {
-    id: Id,
-    commit: CommitCounter,
-    /// Element-relative damage of recent commits, newest last.
-    history: VecDeque<Vec<Rectangle<i32, Physical>>>,
-    seen: bool,
+    elements: ElementTracks,
 }
 
 struct GammaProps {
@@ -502,7 +486,7 @@ impl DrmState {
                 gamma_props,
                 max_bpc,
                 geometry,
-                elements: HashMap::new(),
+                elements: ElementTracks::default(),
             },
         );
 
@@ -629,32 +613,15 @@ impl DrmState {
         format: u32,
         modifiers: &[u64],
     ) -> anyhow::Result<Dmabuf> {
-        let device = self
-            .primary
-            .and_then(|p| self.devices.get(&p))
-            .context("no primary device")?;
+        let gbm = self.primary_gbm().context("no primary device")?;
         let fourcc = Fourcc::try_from(format).map_err(|_| anyhow!("unknown fourcc {format:#x}"))?;
-        let flags = GbmBufferFlags::RENDERING;
-        let buffer = if modifiers.len() == 1 && Modifier::from(modifiers[0]) == Modifier::Invalid {
-            let bo = device
-                .gbm
-                .create_buffer_object::<()>(width, height, fourcc, flags)
-                .context("error creating GBM buffer object")?;
-            GbmBuffer::from_bo(bo, true)
-        } else {
-            let modifiers = modifiers
-                .iter()
-                .map(|m| Modifier::from(*m))
-                .filter(|m| *m != Modifier::Invalid);
-            let bo = device
-                .gbm
-                .create_buffer_object_with_modifiers2::<()>(width, height, fourcc, modifiers, flags)
-                .context("error creating GBM buffer object")?;
-            GbmBuffer::from_bo(bo, false)
-        };
-        buffer
-            .export()
-            .context("error exporting GBM buffer object as dmabuf")
+        allocate_gbm_dmabuf(&gbm, width, height, fourcc, modifiers)
+    }
+
+    /// GBM handle of the primary (rendering) device, for allocating outside `DrmState`.
+    pub fn primary_gbm(&self) -> Option<GbmDevice<DeviceFd>> {
+        let device = self.primary.and_then(|p| self.devices.get(&p))?;
+        Some(device.gbm.clone())
     }
 
     pub fn present(
@@ -675,63 +642,11 @@ impl DrmState {
             .context("no frame recorded for this output")?;
         let segments = split_elements(&commands);
 
-        // Advance per-element commits by the damage the core reported.
-        for seg in &segments {
-            let track = surface
-                .elements
-                .entry(seg.meta.id)
-                .or_insert_with(|| ElementTrack {
-                    id: Id::new(),
-                    commit: CommitCounter::default(),
-                    history: VecDeque::new(),
-                    seen: false,
-                });
-            track.seen = true;
-            let damage = match &seg.meta.damage {
-                None => {
-                    let size = convert::to_rect::<Physical>(seg.meta.geometry).size;
-                    Some(vec![Rectangle::from_size(size)])
-                }
-                Some(d) if d.is_empty() => None,
-                Some(d) => Some(convert::to_rects(d)),
-            };
-            if let Some(damage) = damage {
-                track.commit.increment();
-                track.history.push_back(damage);
-                while track.history.len() > DAMAGE_HISTORY {
-                    track.history.pop_front();
-                }
-            }
-        }
-        surface.elements.retain(|_, t| mem::take(&mut t.seen));
-        let id_map: HashMap<Id, u64> = surface
-            .elements
-            .iter()
-            .map(|(k, t)| (t.id.clone(), *k))
-            .collect();
-
-        let storages: Vec<Option<Storage>> = {
-            let tables = exec.tables.borrow();
-            segments
-                .iter()
-                .map(|seg| element_storage(&tables, seg))
-                .collect()
-        };
-
+        surface.elements.update(&segments);
+        let id_map = surface.elements.id_map();
+        let storages = scene::element_storages(&exec.tables.borrow(), &segments);
         // smithay wants elements top to bottom; the core recorded bottom to top.
-        let mut elements: Vec<SceneElement> = segments
-            .iter()
-            .zip(&storages)
-            .map(|(seg, storage)| SceneElement {
-                track: &surface.elements[&seg.meta.id],
-                meta: seg.meta,
-                capture: seg.capture,
-                draw: seg.draw,
-                storage: storage.as_ref(),
-                tables: &exec.tables,
-            })
-            .collect();
-        elements.reverse();
+        let elements = scene::scene_elements(&surface.elements, &segments, &storages, &exec.tables);
 
         let mut frame_flags = FrameFlags::empty();
         if flags.primary_scanout {
@@ -993,227 +908,34 @@ impl Device {
     }
 }
 
-struct Segment<'a> {
-    meta: &'a ElementMeta,
-    capture: &'a [Command],
-    draw: &'a [Command],
-}
-
-/// What an element is made of, when it is a plain copy of one buffer. Lets the DRM compositor
-/// scan the buffer out directly or copy it to the cursor plane.
-enum Storage {
-    Dmabuf(Dmabuf),
-    Memory(MemoryBuffer),
-}
-
-fn element_storage(tables: &Tables, seg: &Segment<'_>) -> Option<Storage> {
-    let [Command::DrawTexture {
-        texture,
-        src,
-        dst,
-        transform,
-        alpha,
-        program,
-        uniforms,
-        ..
-    }] = seg.draw
-    else {
-        return None;
+/// Allocates a GBM render buffer and exports it as a dmabuf. A lone `Invalid` modifier means
+/// "no modifiers" (implicit layout).
+pub fn allocate_gbm_dmabuf(
+    gbm: &GbmDevice<DeviceFd>,
+    width: u32,
+    height: u32,
+    fourcc: Fourcc,
+    modifiers: &[u64],
+) -> anyhow::Result<Dmabuf> {
+    let flags = GbmBufferFlags::RENDERING;
+    let buffer = if modifiers.len() == 1 && Modifier::from(modifiers[0]) == Modifier::Invalid {
+        let bo = gbm
+            .create_buffer_object::<()>(width, height, fourcc, flags)
+            .context("error creating GBM buffer object")?;
+        GbmBuffer::from_bo(bo, true)
+    } else {
+        let modifiers = modifiers
+            .iter()
+            .map(|m| Modifier::from(*m))
+            .filter(|m| *m != Modifier::Invalid);
+        let bo = gbm
+            .create_buffer_object_with_modifiers2::<()>(width, height, fourcc, modifiers, flags)
+            .context("error creating GBM buffer object")?;
+        GbmBuffer::from_bo(bo, false)
     };
-    // Anything but an untinted 1:1 copy of the whole element must be rendered.
-    if *alpha != 1.0
-        || program.is_some()
-        || !uniforms.is_empty()
-        || *src != seg.meta.src
-        || *dst != seg.meta.geometry
-        || *transform != seg.meta.transform
-    {
-        return None;
-    }
-    if let Some(dmabuf) = tables.dmabufs.get(texture) {
-        return Some(Storage::Dmabuf(dmabuf.clone()));
-    }
-    if let Some(mem) = tables.memory.get(texture) {
-        return Some(Storage::Memory(mem.clone()));
-    }
-    None
-}
-
-/// Splits an output frame recording into its `BeginElement … EndElement` segments.
-fn split_elements(commands: &[Command]) -> Vec<Segment<'_>> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < commands.len() {
-        let Command::BeginElement(meta) = &commands[i] else {
-            debug!("ignoring command outside an element: {:?}", commands[i]);
-            i += 1;
-            continue;
-        };
-        let start = i + 1;
-        let mut draw_start = None;
-        let mut j = start;
-        loop {
-            match commands.get(j) {
-                None => {
-                    warn!("unterminated element in frame recording");
-                    return out;
-                }
-                Some(Command::BeginElementDraw) => draw_start = Some(j),
-                Some(Command::EndElement) => break,
-                Some(_) => (),
-            }
-            j += 1;
-        }
-        let (capture, draw) = match draw_start {
-            Some(k) => (&commands[start..k], &commands[k + 1..j]),
-            None => (&commands[start..start], &commands[start..j]),
-        };
-        out.push(Segment {
-            meta,
-            capture,
-            draw,
-        });
-        i = j + 1;
-    }
-    out
-}
-
-/// One core element, replayed from its recorded commands. Damage and opaque regions come from
-/// the core, so the DRM compositor tracks and culls exactly like in-process smithay would.
-struct SceneElement<'a> {
-    track: &'a ElementTrack,
-    meta: &'a ElementMeta,
-    capture: &'a [Command],
-    draw: &'a [Command],
-    storage: Option<&'a Storage>,
-    tables: &'a RefCell<Tables>,
-}
-
-impl Element for SceneElement<'_> {
-    fn id(&self) -> &Id {
-        &self.track.id
-    }
-
-    fn current_commit(&self) -> CommitCounter {
-        self.track.commit
-    }
-
-    fn src(&self) -> Rectangle<f64, Buffer> {
-        convert::to_rect_f64(self.meta.src)
-    }
-
-    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        convert::to_rect(self.meta.geometry)
-    }
-
-    fn transform(&self) -> Transform {
-        convert::to_transform(self.meta.transform)
-    }
-
-    fn damage_since(
-        &self,
-        scale: Scale<f64>,
-        commit: Option<CommitCounter>,
-    ) -> DamageSet<i32, Physical> {
-        let full = || DamageSet::from_slice(&[Rectangle::from_size(self.geometry(scale).size)]);
-        let Some(distance) = self.track.commit.distance(commit) else {
-            return full();
-        };
-        if distance == 0 {
-            return DamageSet::default();
-        }
-        if distance > self.track.history.len() {
-            return full();
-        }
-        let rects: Vec<_> = self
-            .track
-            .history
-            .iter()
-            .rev()
-            .take(distance)
-            .flatten()
-            .copied()
-            .collect();
-        DamageSet::from_slice(&rects)
-    }
-
-    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        OpaqueRegions::from_slice(&convert::to_rects(&self.meta.opaque))
-    }
-
-    fn kind(&self) -> Kind {
-        match self.meta.kind {
-            ElementKind::Cursor => Kind::Cursor,
-            ElementKind::ScanoutCandidate => Kind::ScanoutCandidate,
-            ElementKind::Unspecified => Kind::Unspecified,
-        }
-    }
-
-    fn is_framebuffer_effect(&self) -> bool {
-        self.meta.framebuffer_effect
-    }
-}
-
-impl RenderElement<GlesRenderer> for SceneElement<'_> {
-    fn draw(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
-        dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
-        _opaque_regions: &[Rectangle<i32, Physical>],
-        _cache: Option<&UserDataMap>,
-    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-        // The recording used output coordinates; damage arrives element-relative.
-        let clip: Vec<_> = damage
-            .iter()
-            .map(|d| {
-                let mut d = *d;
-                d.loc += dst.loc;
-                d
-            })
-            .collect();
-        let mut iter = self
-            .draw
-            .iter()
-            .cloned()
-            .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(
-            frame,
-            self.tables,
-            &mut iter,
-            Some(&clip),
-            &mut VecDeque::new(),
-        ) {
-            warn!("error replaying element: {err:#}");
-        }
-        Ok(())
-    }
-
-    fn capture_framebuffer(
-        &self,
-        frame: &mut GlesFrame<'_, '_>,
-        _src: Rectangle<f64, Buffer>,
-        _dst: Rectangle<i32, Physical>,
-        _cache: &UserDataMap,
-    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-        let mut iter = self
-            .capture
-            .iter()
-            .cloned()
-            .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(frame, self.tables, &mut iter, None, &mut VecDeque::new()) {
-            warn!("error replaying element capture: {err:#}");
-        }
-        Ok(())
-    }
-
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        match self.storage? {
-            Storage::Dmabuf(dmabuf) => Some(UnderlyingStorage::Dmabuf(dmabuf)),
-            Storage::Memory(mem) => Some(UnderlyingStorage::Memory(mem)),
-        }
-    }
+    buffer
+        .export()
+        .context("error exporting GBM buffer object as dmabuf")
 }
 
 impl GammaProps {

@@ -31,8 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlurParams, Caps, Command, ElementMeta, OutputRef, Rect, ShaderKind, ShaderSupport, Target,
-    TexId, TexProgram,
+    BlurParams, Caps, Command, CursorMeta, ElementMeta, OutputRef, Rect, ShaderKind, ShaderSupport,
+    Target, TexId, TexProgram,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -347,6 +347,48 @@ impl RemoteRenderer {
     ) -> RemoteTarget<'static> {
         RemoteTarget {
             target: Target::Output(output),
+            size: Size::from((size.w, size.h)),
+            format: None,
+            _keep: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Parameters for the next `cast_target` frame of `stream`.
+    pub fn cast_frame_info(
+        &self,
+        stream: u64,
+        scale: f64,
+        target_time_ns: u64,
+        cursor: Option<CursorMeta>,
+    ) {
+        self.shared.push(Command::CastFrameInfo {
+            stream,
+            scale,
+            target_time_ns,
+            cursor,
+        });
+    }
+
+    /// Target for a screencast stream's next buffer; the GPU renders it when the frame ends.
+    pub fn cast_target(&self, stream: u64, size: Size<i32, Physical>) -> RemoteTarget<'static> {
+        RemoteTarget {
+            target: Target::Cast(stream),
+            size: Size::from((size.w, size.h)),
+            format: None,
+            _keep: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Target for a screencast stream's cursor bitmap (metadata cursor mode).
+    pub fn cast_cursor_target(
+        &self,
+        stream: u64,
+        size: Size<i32, Physical>,
+    ) -> RemoteTarget<'static> {
+        RemoteTarget {
+            target: Target::CastCursor(stream),
             size: Size::from((size.w, size.h)),
             format: None,
             _keep: None,
@@ -1087,7 +1129,9 @@ impl ExportMem for RemoteRenderer {
         match target.target {
             // A dmabuf target is read back through the texture imported from the same buffer.
             Target::Texture(id) | Target::Dmabuf(id) => self.read(id, region, format),
-            Target::Output(_) => Err(RemoteError::InvalidTarget),
+            Target::Output(_) | Target::Cast(_) | Target::CastCursor(_) => {
+                Err(RemoteError::InvalidTarget)
+            }
         }
     }
 

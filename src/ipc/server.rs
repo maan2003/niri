@@ -850,7 +850,7 @@ impl State {
                 let stream_id = cast.stream_id.get();
                 seen.insert(stream_id);
 
-                let pw_node_id = cast.node_id();
+                let pw_node_id = cast.node_id;
                 if state.casts.get(&stream_id).is_none_or(|existing| {
                     // Only these properties can change.
                     existing.is_active != cast.is_active()

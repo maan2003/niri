@@ -11,8 +11,8 @@ use anyhow::{anyhow, bail, Context};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use super::protocol::{
-    self, Caps, DmabufDesc, Event, GpuEvent, Image, Rect, Request, ShaderKind, TexId,
-    PROTOCOL_VERSION,
+    self, Caps, CastCursorMode, DmabufDesc, Event, GpuEvent, Image, Rect, Request, ShaderKind,
+    TexId, PROTOCOL_VERSION,
 };
 use super::transport::Channel;
 
@@ -244,6 +244,48 @@ impl GpuClient {
     /// Returns once everything sent before has executed and finished on the GPU.
     pub fn sync(&mut self) -> anyhow::Result<()> {
         Self::expect_ack(self.request(&Request::Sync, &[])?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cast_start(
+        &mut self,
+        stream: u64,
+        size: (i32, i32),
+        refresh: u32,
+        alpha: bool,
+        cursor_mode: CastCursorMode,
+        allow_dmabuf: bool,
+        force_invalid_modifier: bool,
+    ) -> anyhow::Result<CastCursorMode> {
+        let req = Request::CastStart {
+            stream,
+            width: size.0,
+            height: size.1,
+            refresh,
+            alpha,
+            cursor_mode,
+            allow_dmabuf,
+            force_invalid_modifier,
+        };
+        match self.request(&req, &[])? {
+            Event::CastStarted { cursor_mode } => Ok(cursor_mode),
+            other => Err(anyhow!("expected CastStarted, got {other:?}")),
+        }
+    }
+
+    pub fn cast_configure(
+        &mut self,
+        stream: u64,
+        size: (i32, i32),
+        refresh: u32,
+    ) -> anyhow::Result<()> {
+        let req = Request::CastConfigure {
+            stream,
+            width: size.0,
+            height: size.1,
+            refresh,
+        };
+        Self::expect_ack(self.request(&req, &[])?)
     }
 
     /// Allocates a render buffer on the GPU side and returns it as a dmabuf.

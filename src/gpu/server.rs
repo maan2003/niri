@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use anyhow::Context as _;
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::drm::DrmEvent;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
@@ -12,11 +14,19 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
 };
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::reexports::gbm::Modifier;
+#[cfg(feature = "xdp-gnome-screencast")]
+use smithay::utils::Size;
 
+#[cfg(feature = "xdp-gnome-screencast")]
+use super::cast::{Casting, StartParams};
 use super::client::Mode;
 use super::drm::DrmState;
 use super::exec::Executor;
 use super::gl::{resources, shaders};
+#[cfg(feature = "xdp-gnome-screencast")]
+use super::protocol::CastEvent;
 use super::protocol::{Event, GpuEvent, Request, PROTOCOL_VERSION};
 use super::transport::Channel;
 
@@ -32,10 +42,12 @@ pub fn new_surfaceless_renderer() -> anyhow::Result<GlesRenderer> {
     Ok(renderer)
 }
 
-struct Server {
+pub(super) struct Server {
     chan: Channel,
     exec: Executor,
     drm: DrmState,
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub(super) casting: Casting,
     loop_handle: LoopHandle<'static, Server>,
     signal: LoopSignal,
     /// Fds to attach to the reply of the request being handled.
@@ -72,6 +84,8 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
         chan,
         exec,
         drm: DrmState::default(),
+        #[cfg(feature = "xdp-gnome-screencast")]
+        casting: Casting::new(event_loop.handle()),
         loop_handle: event_loop.handle(),
         signal: event_loop.get_signal(),
         reply_fds: Vec::new(),
@@ -104,10 +118,19 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
 }
 
 impl Server {
-    fn notify(&mut self, event: GpuEvent) {
+    pub(super) fn notify(&mut self, event: GpuEvent) {
         if let Err(err) = self.chan.send(&Event::Notify(event), &[]) {
             warn!("error sending event to core: {err}");
         }
+    }
+
+    #[cfg(feature = "xdp-gnome-screencast")]
+    pub(super) fn on_cast_event(&mut self, event: CastEvent) {
+        if let CastEvent::PipeWireFatal = event {
+            warn!("PipeWire connection failed; dropping all casts");
+            self.casting.reset();
+        }
+        self.notify(GpuEvent::Cast(event));
     }
 
     /// Returns Ok(false) when the core went away.
@@ -148,7 +171,14 @@ impl Server {
         let drm = &mut self.drm;
         Ok(match req {
             Request::Execute { commands } => {
-                exec.execute(commands, fds)?;
+                let res = exec.execute(commands, fds);
+                // Cast frames found in the batch render even if a later command failed.
+                let deferred = std::mem::take(&mut exec.deferred);
+                #[cfg(feature = "xdp-gnome-screencast")]
+                self.casting.handle_deferred(deferred, exec);
+                #[cfg(not(feature = "xdp-gnome-screencast"))]
+                drop(deferred);
+                res?;
                 Event::Ack
             }
             Request::ImportDmabuf { id, desc } => {
@@ -161,6 +191,78 @@ impl Server {
             // Requests are handled in order, and Execute runs to completion (dmabuf targets
             // wait for their fence), so reaching this point is the guarantee.
             Request::Sync => Event::Ack,
+            #[cfg(feature = "xdp-gnome-screencast")]
+            Request::CastStart {
+                stream,
+                width,
+                height,
+                refresh,
+                alpha,
+                cursor_mode,
+                allow_dmabuf,
+                force_invalid_modifier,
+            } => {
+                let gbm = if allow_dmabuf {
+                    drm.primary_gbm()
+                } else {
+                    None
+                };
+                let mut formats = FormatSet::default();
+                if gbm.is_some() {
+                    formats = exec
+                        .renderer()?
+                        .egl_context()
+                        .dmabuf_render_formats()
+                        .clone();
+                    if force_invalid_modifier {
+                        formats = formats
+                            .into_iter()
+                            .filter(|f| f.modifier == Modifier::Invalid)
+                            .collect();
+                    }
+                }
+                let cursor_mode = self.casting.start(StartParams {
+                    stream,
+                    size: Size::from((width, height)),
+                    refresh,
+                    alpha,
+                    cursor_mode,
+                    formats,
+                    gbm,
+                })?;
+                Event::CastStarted { cursor_mode }
+            }
+            #[cfg(feature = "xdp-gnome-screencast")]
+            Request::CastConfigure {
+                stream,
+                width,
+                height,
+                refresh,
+            } => {
+                self.casting
+                    .configure(stream, Size::from((width, height)), refresh)?;
+                Event::Ack
+            }
+            #[cfg(feature = "xdp-gnome-screencast")]
+            Request::CastClear {
+                stream,
+                target_time_ns,
+            } => {
+                self.casting.clear(stream, target_time_ns, exec)?;
+                Event::Ack
+            }
+            #[cfg(feature = "xdp-gnome-screencast")]
+            Request::CastStop { stream } => {
+                self.casting.stop(stream);
+                Event::Ack
+            }
+            #[cfg(not(feature = "xdp-gnome-screencast"))]
+            Request::CastStart { .. }
+            | Request::CastConfigure { .. }
+            | Request::CastClear { .. }
+            | Request::CastStop { .. } => {
+                anyhow::bail!("built without screencast support")
+            }
             Request::SetCustomShader { kind, src } => Event::ShaderSet {
                 available: exec.set_custom_shader(kind, src.as_deref())?,
             },

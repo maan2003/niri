@@ -2598,7 +2598,7 @@ impl Niri {
         };
 
         #[cfg(feature = "xdp-gnome-screencast")]
-        let screencasting = Screencasting::new(&event_loop);
+        let screencasting = Screencasting::new();
 
         let display_source = Generic::new(display, Interest::READ, Mode::Level);
         event_loop
@@ -6988,4 +6988,9 @@ niri_render_elements! {
         // Used for the CPU-rendered panels.
         RelocatedMemoryBuffer = RelocateRenderElement<MemoryRenderBufferRenderElement<R>>,
     }
+}
+
+#[cfg(not(feature = "xdp-gnome-screencast"))]
+impl State {
+    pub fn on_cast_events(&mut self, _events: Vec<crate::gpu::protocol::CastEvent>) {}
 }

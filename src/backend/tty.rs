@@ -24,12 +24,8 @@ use niri_ipc::{HSyncPolarity, VSyncPolarity};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::{
-    Id, Kind, RenderElement, RenderElementPresentationState, RenderElementState,
-    RenderElementStates,
-};
-use smithay::backend::renderer::utils::CommitCounter;
-use smithay::backend::renderer::{Frame as _, ImportDma as _, Renderer as _};
+use smithay::backend::renderer::element::RenderElementStates;
+use smithay::backend::renderer::ImportDma as _;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -46,8 +42,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::user_data::UserDataMap;
-use smithay::utils::{Physical, Rectangle, Scale, Size, Transform};
+use smithay::utils::Scale;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
@@ -58,9 +53,10 @@ use crate::frame_clock::FrameClock;
 use crate::gpu::client::{GpuClient, Mode as GpuMode};
 use crate::gpu::convert;
 use crate::gpu::protocol::{
-    ConnectorInfo, ElementKind, ElementMeta, ElementState, Event, GpuEvent, ModeDesc,
-    OutputGeometry, OutputRef, PresentFlags, Presentation, Request,
+    CastEvent, ConnectorInfo, ElementState, Event, GpuEvent, ModeDesc, OutputGeometry, OutputRef,
+    PresentFlags, Request,
 };
+use crate::gpu::record::Recorder;
 use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
@@ -113,11 +109,8 @@ struct Surface {
     /// Gamma change requested while the session was inactive; applied on resume.
     pending_gamma_change: Option<Option<Vec<u16>>>,
     /// Recreated whenever the output geometry changes.
-    /// Per-element state for framebuffer effects, keyed like smithay's damage tracker does it.
-    effects_cache: HashMap<Id, UserDataMap>,
-    /// Elements sent to the GPU last frame, so we can send only their damage since then.
-    elements: HashMap<Id, ElementTrack>,
-    next_element_id: u64,
+    /// Element recording state (damage since last frame, effect caches).
+    recorder: Recorder,
     /// Geometry the GPU process currently has for this output.
     geometry: Option<OutputGeometry>,
     vblank_frame: Option<tracy_client::Frame>,
@@ -210,7 +203,8 @@ impl Tty {
                     let tty = state.backend.tty();
                     if !tty.renderer.client().is_readable() {
                         // A sync request in an earlier callback already consumed it.
-                        tty.dispatch_gpu_events(&mut state.niri);
+                        let casts = tty.dispatch_gpu_events(&mut state.niri);
+                        state.on_cast_events(casts);
                         return Ok(PostAction::Continue);
                     }
                     if let Err(err) = tty.renderer.client().recv_event() {
@@ -219,7 +213,8 @@ impl Tty {
                         state.niri.stop_signal.stop();
                         return Ok(PostAction::Remove);
                     }
-                    tty.dispatch_gpu_events(&mut state.niri);
+                    let casts = tty.dispatch_gpu_events(&mut state.niri);
+                    state.on_cast_events(casts);
                     Ok(PostAction::Continue)
                 },
             )
@@ -227,7 +222,8 @@ impl Tty {
 
         event_loop
             .insert_source(ping_source, |_, _, state| {
-                state.backend.tty().dispatch_gpu_events(&mut state.niri);
+                let casts = state.backend.tty().dispatch_gpu_events(&mut state.niri);
+                state.on_cast_events(casts);
             })
             .unwrap();
 
@@ -293,10 +289,13 @@ impl Tty {
         GpuClient::expect_ack(self.request(req)?)
     }
 
-    fn dispatch_gpu_events(&mut self, niri: &mut Niri) {
+    /// Handles GPU events; returns the screencast events, which need the whole `State`.
+    fn dispatch_gpu_events(&mut self, niri: &mut Niri) -> Vec<CastEvent> {
         let events = self.renderer.client().take_events();
+        let mut cast_events = Vec::new();
         for event in events {
             match event {
+                GpuEvent::Cast(event) => cast_events.push(event),
                 GpuEvent::VBlank {
                     output,
                     sequence,
@@ -320,6 +319,7 @@ impl Tty {
                 }
             }
         }
+        cast_events
     }
 
     pub fn init(&mut self, niri: &mut Niri) {
@@ -950,9 +950,7 @@ impl Tty {
             vrr_enabled,
             vrr_supported,
             pending_gamma_change: None,
-            effects_cache: HashMap::new(),
-            elements: HashMap::new(),
-            next_element_id: 1,
+            recorder: Recorder::default(),
             geometry: None,
             vblank_frame: None,
             vblank_frame_name,
@@ -1213,7 +1211,7 @@ impl Tty {
         if surface.geometry != Some(geometry) {
             surface.geometry = Some(geometry);
             // The GPU forgets its element history on geometry changes; start over too.
-            surface.elements.clear();
+            surface.recorder.clear();
             if let Err(err) = self.request_ack(Request::SetOutputGeometry {
                 output: output_ref,
                 geometry,
@@ -1241,28 +1239,24 @@ impl Tty {
         let scale = Scale::from(output.current_scale().fractional_scale());
         let transform = output.current_transform();
         let surface = self.find_surface(output_ref).unwrap();
-        let mut effects_cache = mem::take(&mut surface.effects_cache);
-        let mut tracks = mem::take(&mut surface.elements);
-        let mut next_element_id = surface.next_element_id;
-        let res = record_frame(
+        let mut recorder = mem::take(&mut surface.recorder);
+        let target = self
+            .renderer
+            .output_target(output_ref, transform.transform_size(mode.size));
+        let res = recorder.record(
             &mut self.renderer,
-            output_ref,
+            target,
             mode.size,
             transform,
             scale,
             &elements,
-            &mut effects_cache,
-            &mut tracks,
-            &mut next_element_id,
         );
         let surface = self.find_surface(output_ref).unwrap();
-        surface.effects_cache = effects_cache;
-        surface.elements = tracks;
-        surface.next_element_id = next_element_id;
+        surface.recorder = recorder;
         if let Err(err) = res {
             warn!("error recording frame: {err:?}");
             // The GPU never saw this frame; resend everything next time.
-            surface.elements.clear();
+            surface.recorder.clear();
             drop(surface.vblank_frame.take());
             queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
             return rv;
@@ -1303,7 +1297,7 @@ impl Tty {
         if let Err(err) = sent {
             warn!("error sending frame to the GPU process: {err:?}");
             let surface = self.find_surface(output_ref).unwrap();
-            surface.elements.clear();
+            surface.recorder.clear();
             drop(surface.vblank_frame.take());
             queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
             return rv;
@@ -1351,7 +1345,7 @@ impl Tty {
         let output = pending.output.clone();
 
         let states = match self.find_surface(output_ref) {
-            Some(surface) => element_states(&surface.elements, states),
+            Some(surface) => surface.recorder.element_states(states),
             None => RenderElementStates::default(),
         };
         niri.update_primary_scanout_output(&output, &states);
@@ -1993,127 +1987,6 @@ fn suspend() -> anyhow::Result<()> {
     )
     .context("error suspending")?;
     Ok(())
-}
-
-struct ElementTrack {
-    remote_id: u64,
-    commit: CommitCounter,
-    seen: bool,
-}
-
-/// Records every element for one output, bottom to top, each wrapped in element markers with
-/// the damage since the last frame we sent it in.
-#[allow(clippy::too_many_arguments)]
-fn record_frame<E: RenderElement<RemoteRenderer>>(
-    renderer: &mut RemoteRenderer,
-    output_ref: OutputRef,
-    mode_size: Size<i32, Physical>,
-    transform: Transform,
-    scale: Scale<f64>,
-    elements: &[E],
-    effects_cache: &mut HashMap<Id, UserDataMap>,
-    tracks: &mut HashMap<Id, ElementTrack>,
-    next_id: &mut u64,
-) -> anyhow::Result<()> {
-    let _span = tracy_client::span!("record_frame");
-
-    // Output transform is in surface-rotation terms; inverting gives the render transform.
-    let output_geo = Rectangle::from_size(transform.transform_size(mode_size));
-    let mut target = renderer.output_target(output_ref, output_geo.size);
-    let mut frame = renderer.render(&mut target, mode_size, transform.invert())?;
-
-    for element in elements.iter().rev() {
-        let id = element.id();
-        let geometry = element.geometry(scale);
-        let src = element.src();
-        let commit = element.current_commit();
-        let (remote_id, damage) = match tracks.get_mut(id) {
-            Some(track) => {
-                let damage = element.damage_since(scale, Some(track.commit));
-                track.commit = commit;
-                track.seen = true;
-                (track.remote_id, Some(convert::rects(&damage)))
-            }
-            None => {
-                let remote_id = *next_id;
-                *next_id += 1;
-                tracks.insert(
-                    id.clone(),
-                    ElementTrack {
-                        remote_id,
-                        commit,
-                        seen: true,
-                    },
-                );
-                (remote_id, None)
-            }
-        };
-        let framebuffer_effect = element.is_framebuffer_effect();
-
-        frame.begin_element(ElementMeta {
-            id: remote_id,
-            src: convert::rect_f64(src),
-            geometry: convert::rect(geometry),
-            damage,
-            opaque: convert::rects(&element.opaque_regions(scale)),
-            kind: match element.kind() {
-                Kind::Cursor => ElementKind::Cursor,
-                Kind::ScanoutCandidate => ElementKind::ScanoutCandidate,
-                Kind::Unspecified => ElementKind::Unspecified,
-            },
-            transform: convert::transform(element.transform()),
-            framebuffer_effect,
-        });
-        if framebuffer_effect {
-            let cache = effects_cache.entry(id.clone()).or_default();
-            element.capture_framebuffer(&mut frame, src, geometry, cache)?;
-        }
-        frame.begin_element_draw();
-        element.draw(
-            &mut frame,
-            src,
-            geometry,
-            &[Rectangle::from_size(geometry.size)],
-            &[],
-            effects_cache.get(id),
-        )?;
-        frame.end_element();
-    }
-    tracks.retain(|_, t| mem::take(&mut t.seen));
-    effects_cache.retain(|id, _| tracks.contains_key(id));
-
-    // No fence to wait on: the GPU process syncs when it replays.
-    let _ = frame.finish()?;
-    Ok(())
-}
-
-/// Maps the GPU's per-element results back onto smithay ids for presentation feedback.
-fn element_states(
-    tracks: &HashMap<Id, ElementTrack>,
-    states: &[ElementState],
-) -> RenderElementStates {
-    let by_remote: HashMap<u64, &ElementState> = states.iter().map(|s| (s.id, s)).collect();
-    let states = tracks
-        .iter()
-        .filter_map(|(id, track)| {
-            let s = by_remote.get(&track.remote_id)?;
-            Some((
-                id.clone(),
-                RenderElementState {
-                    visible_area: s.visible_area as usize,
-                    presentation_state: match s.presentation {
-                        Presentation::Rendering => {
-                            RenderElementPresentationState::Rendering { reason: None }
-                        }
-                        Presentation::ZeroCopy => RenderElementPresentationState::ZeroCopy,
-                        Presentation::Skipped => RenderElementPresentationState::Skipped,
-                    },
-                    needs_capture: false,
-                },
-            ))
-        })
-        .collect();
-    RenderElementStates { states }
 }
 
 fn queue_estimated_vblank_timer(

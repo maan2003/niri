@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// `dev_t` of a DRM device node, as reported by udev.
 pub type DevId = u64;
@@ -145,6 +145,27 @@ pub enum Target {
     Dmabuf(TexId),
     /// Recorded frames for outputs are kept by the GPU process and drawn by [`Request::Present`].
     Output(OutputRef),
+    /// A screencast stream's next PipeWire buffer; rendered when the frame ends.
+    Cast(u64),
+    /// The cursor bitmap for a screencast stream in metadata cursor mode; must be recorded
+    /// right before that stream's `Cast` frame.
+    CastCursor(u64),
+}
+
+/// Cursor placement for a screencast frame in metadata cursor mode.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CursorMeta {
+    /// Hotspot location in the video buffer.
+    pub location: (i32, i32),
+    /// Hotspot location on the cursor bitmap.
+    pub hotspot: (i32, i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CastCursorMode {
+    Hidden,
+    Embedded,
+    Metadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -255,6 +276,15 @@ pub enum Command {
         flipped: bool,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+    },
+    /// Parameters for the next `Begin { Target::Cast(stream) }` frame.
+    CastFrameInfo {
+        stream: u64,
+        scale: f64,
+        /// The presentation time this frame was rendered for; echoed in `CastEvent::Rendered`.
+        target_time_ns: u64,
+        /// `None` in embedded/hidden cursor modes or when the pointer is not over the target.
+        cursor: Option<CursorMeta>,
     },
     /// Shm buffer contents by pool fd (attached), so the core never maps client memory. With
     /// `damage` set, `id` is an existing texture to update in those regions; otherwise a new
@@ -393,7 +423,13 @@ impl Request {
     /// One-way requests get no reply; failures surface as `GpuEvent::Error`. Used on the
     /// per-frame path so the core never blocks on the GPU process.
     pub fn is_oneway(&self) -> bool {
-        matches!(self, Request::Execute { .. } | Request::Present { .. })
+        matches!(
+            self,
+            Request::Execute { .. }
+                | Request::Present { .. }
+                | Request::CastClear { .. }
+                | Request::CastStop { .. }
+        )
     }
 }
 
@@ -497,6 +533,35 @@ pub enum Request {
         frame: u64,
         flags: PresentFlags,
     },
+    /// Creates a PipeWire screencast stream. Reply: `CastStarted` with the effective cursor
+    /// mode (metadata needs a recent PipeWire).
+    CastStart {
+        stream: u64,
+        width: i32,
+        height: i32,
+        refresh: u32,
+        alpha: bool,
+        cursor_mode: CastCursorMode,
+        allow_dmabuf: bool,
+        force_invalid_modifier: bool,
+    },
+    /// Renegotiates the stream size / frame rate. Reply: Ack.
+    CastConfigure {
+        stream: u64,
+        width: i32,
+        height: i32,
+        refresh: u32,
+    },
+    /// Sends one cleared frame (dynamic cast without a target). One-way; reported like a
+    /// recorded frame with `Rendered` / `Skipped`.
+    CastClear {
+        stream: u64,
+        target_time_ns: u64,
+    },
+    /// One-way.
+    CastStop {
+        stream: u64,
+    },
     /// Allocates a GBM buffer on the primary device. Reply: `Dmabuf` with fds attached.
     AllocateDmabuf {
         width: u32,
@@ -539,7 +604,9 @@ pub enum GpuEvent {
         states: Vec<ElementState>,
     },
     /// A one-way request failed.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     VBlank {
         output: OutputRef,
         sequence: u64,
@@ -548,7 +615,37 @@ pub enum GpuEvent {
         frame: Option<u64>,
     },
     /// The kernel told us the device is gone or errored; the core should remove it.
-    DeviceError { dev: DevId, message: String },
+    DeviceError {
+        dev: DevId,
+        message: String,
+    },
+    Cast(CastEvent),
+}
+
+/// Screencast stream events from the GPU process, which owns PipeWire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CastEvent {
+    /// The stream got its PipeWire node id (to hand to the portal).
+    NodeId { stream: u64, node_id: u32 },
+    /// Negotiation state changed. `ready_size` is `Some` once buffers of that size can be
+    /// rendered into.
+    State {
+        stream: u64,
+        active: bool,
+        ready_size: Option<(i32, i32)>,
+        min_frame_time_ns: u64,
+    },
+    /// PipeWire wants a new frame (e.g. after a resize or on becoming active).
+    Redraw { stream: u64 },
+    /// A recorded frame was actually sent (it had damage and a buffer was free). The core uses
+    /// this for frame pacing.
+    Rendered { stream: u64, target_time_ns: u64 },
+    /// A recorded frame was not sent (no damage, no free buffer, or an error).
+    Skipped { stream: u64, target_time_ns: u64 },
+    /// The stream failed; the core should stop the cast.
+    Stop { stream: u64 },
+    /// The PipeWire connection died; all streams are gone.
+    PipeWireFatal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +659,9 @@ pub enum Event {
     Image(Image),
     /// Fds attached.
     Dmabuf(DmabufDesc),
+    CastStarted {
+        cursor_mode: CastCursorMode,
+    },
     ShaderSet {
         available: bool,
     },

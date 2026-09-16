@@ -27,8 +27,8 @@ use super::gl::resources::Resources;
 use super::gl::shader::{self, DrawParams};
 use super::gl::shaders::Shaders;
 use super::protocol::{
-    Caps, Command, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, ShaderKind, ShaderSupport,
-    Target, TexId, TexProgram,
+    Caps, Command, CursorMeta, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, ShaderKind,
+    ShaderSupport, Target, TexId, TexProgram,
 };
 
 /// Objects the core refers to by id.
@@ -153,6 +153,29 @@ pub struct Executor {
     pub tables: RefCell<Tables>,
     /// Frames recorded for outputs, waiting for `Present`.
     pub output_frames: HashMap<OutputRef, Vec<Command>>,
+    /// Screencast work found in the last `execute`, in order; the server hands it to the
+    /// PipeWire side after the batch.
+    pub deferred: Vec<Deferred>,
+}
+
+/// Commands whose effect lives outside the executor (screencast streams).
+pub enum Deferred {
+    CastInfo {
+        stream: u64,
+        scale: f64,
+        target_time_ns: u64,
+        cursor: Option<CursorMeta>,
+    },
+    CastCursor {
+        stream: u64,
+        size: Size<i32, Physical>,
+        commands: Vec<Command>,
+    },
+    CastFrame {
+        stream: u64,
+        size: Size<i32, Physical>,
+        commands: Vec<Command>,
+    },
 }
 
 #[derive(Default)]
@@ -224,6 +247,7 @@ impl Executor {
             renderer,
             tables: RefCell::new(Tables::default()),
             output_frames: HashMap::new(),
+            deferred: Vec::new(),
         }
     }
 
@@ -349,24 +373,46 @@ impl Executor {
                     ..
                 } => {
                     // Kept until Present; drawn by the DRM compositor with real damage.
-                    let mut frame = Vec::new();
-                    loop {
-                        match iter.next() {
-                            None => bail!("unterminated frame"),
-                            Some(Command::End) => break,
-                            // Fd-bearing imports must consume their fds from this batch now;
-                            // the frame is replayed later without them.
-                            Some(
-                                cmd @ (Command::ImportShm { .. } | Command::ImportDmabuf { .. }),
-                            ) => {
-                                let mut tables = self.tables.borrow_mut();
-                                execute_one(renderer, &mut tables, cmd, fds)?;
-                            }
-                            Some(cmd) => frame.push(cmd),
-                        }
-                    }
+                    let frame = collect_frame(renderer, &self.tables, &mut iter, fds)?;
                     self.output_frames.insert(output, frame);
                 }
+                Command::Begin {
+                    target: Target::Cast(stream),
+                    width,
+                    height,
+                    ..
+                } => {
+                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
+                    self.deferred.push(Deferred::CastFrame {
+                        stream,
+                        size: Size::from((width, height)),
+                        commands,
+                    });
+                }
+                Command::Begin {
+                    target: Target::CastCursor(stream),
+                    width,
+                    height,
+                    ..
+                } => {
+                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
+                    self.deferred.push(Deferred::CastCursor {
+                        stream,
+                        size: Size::from((width, height)),
+                        commands,
+                    });
+                }
+                Command::CastFrameInfo {
+                    stream,
+                    scale,
+                    target_time_ns,
+                    cursor,
+                } => self.deferred.push(Deferred::CastInfo {
+                    stream,
+                    scale,
+                    target_time_ns,
+                    cursor,
+                }),
                 Command::Begin {
                     target: Target::Texture(target),
                     width,
@@ -432,6 +478,29 @@ impl Executor {
         }
         Ok(())
     }
+}
+
+/// Gathers a recorded frame up to its `End` for later replay. Fd-bearing imports must consume
+/// their fds from this batch now, so they run immediately.
+fn collect_frame(
+    renderer: &mut GlesRenderer,
+    tables: &RefCell<Tables>,
+    iter: &mut impl Iterator<Item = Command>,
+    fds: &mut VecDeque<OwnedFd>,
+) -> anyhow::Result<Vec<Command>> {
+    let mut frame = Vec::new();
+    loop {
+        match iter.next() {
+            None => bail!("unterminated frame"),
+            Some(Command::End) => break,
+            Some(cmd @ (Command::ImportShm { .. } | Command::ImportDmabuf { .. })) => {
+                let mut tables = tables.borrow_mut();
+                execute_one(renderer, &mut tables, cmd, fds)?;
+            }
+            Some(cmd) => frame.push(cmd),
+        }
+    }
+    Ok(frame)
 }
 
 /// Commands valid outside a frame (and, via the frame's renderer guard, inside one).
