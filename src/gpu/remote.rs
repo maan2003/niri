@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::{fmt, mem};
 
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
-use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::format::{get_bpp, FormatSet};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::egl::display::EGLBufferReader;
 use smithay::backend::egl::Error as EglError;
@@ -866,10 +866,33 @@ impl ImportMem for RemoteRenderer {
         data: &[u8],
         region: Rectangle<i32, Buffer>,
     ) -> Result<(), RemoteError> {
+        // `data` is the whole buffer (smithay semantics); ship only the rows of `region`.
+        let bpp = texture
+            .format()
+            .and_then(get_bpp)
+            .ok_or(RemoteError::Unsupported("memory format"))?
+            / 8;
+        let size = texture.size();
+        let region =
+            region
+                .intersection(Rectangle::from_size(size))
+                .ok_or(RemoteError::Unsupported(
+                    "update region outside the texture",
+                ))?;
+        let stride = size.w as usize * bpp;
+        let row_len = region.size.w as usize * bpp;
+        let mut rows = Vec::with_capacity(row_len * region.size.h as usize);
+        for y in region.loc.y..region.loc.y + region.size.h {
+            let start = y as usize * stride + region.loc.x as usize * bpp;
+            let row = data
+                .get(start..start + row_len)
+                .ok_or(RemoteError::Unsupported("update data too short"))?;
+            rows.extend_from_slice(row);
+        }
         self.shared.push(Command::UpdateMemory {
             id: texture.id(),
             region: convert::rect(region),
-            data: data.to_vec(),
+            data: rows,
         });
         Ok(())
     }

@@ -3,7 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::FileExt as _;
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
 use smithay::backend::renderer::{
     Bind as _, Color32F, DebugFlags, ExportMem as _, Frame as _, FrameContext as _, ImportDma as _,
-    ImportMem as _, Offscreen as _, Renderer as _,
+    ImportMem as _, Offscreen as _, Renderer as _, Texture as _,
 };
 use smithay::utils::{Buffer, Physical, Rectangle, Size};
 use tracing::warn;
@@ -40,6 +40,7 @@ pub struct Tables {
     /// CPU copies of small memory/shm textures (cursor images), so the DRM compositor can put
     /// them on the cursor plane without going through GL.
     pub memory: HashMap<TexId, MemoryBuffer>,
+    pools: ShmPools,
     captures: HashMap<u64, Capture>,
     blurs: HashMap<u64, Blur>,
 }
@@ -51,8 +52,18 @@ fn keep_staging(size: Size<i32, Buffer>) -> bool {
     size.w * size.h <= STAGING_MAX_PIXELS
 }
 
-/// Copies tightly packed `data` covering `region` into `mem`.
-fn patch_memory(mem: &mut MemoryBuffer, region: Rectangle<i32, Buffer>, data: &[u8], bpp: usize) {
+/// Copies `region` into `mem` from `src`, which points at the region's first pixel in memory
+/// laid out with `src_stride` bytes per row. `region` must lie within `mem`.
+///
+/// # Safety
+/// `src` must be readable for `(region.h - 1) * src_stride + region.w * bpp` bytes.
+unsafe fn patch_memory(
+    mem: &mut MemoryBuffer,
+    region: Rectangle<i32, Buffer>,
+    src: *const u8,
+    src_stride: usize,
+) {
+    let bpp = get_bpp(mem.format()).unwrap_or(32) / 8;
     let Some(region) = region.intersection(Rectangle::from_size(mem.size())) else {
         return;
     };
@@ -60,11 +71,77 @@ fn patch_memory(mem: &mut MemoryBuffer, region: Rectangle<i32, Buffer>, data: &[
     let stride = mem.stride() as usize;
     let bytes = mem.as_mut_slice();
     for (i, y) in (region.loc.y..region.loc.y + region.size.h).enumerate() {
-        let Some(src) = data.get(i * row_len..(i + 1) * row_len) else {
-            return;
-        };
         let start = y as usize * stride + region.loc.x as usize * bpp;
-        bytes[start..start + row_len].copy_from_slice(src);
+        std::ptr::copy_nonoverlapping(
+            src.add(i * src_stride),
+            bytes[start..start + row_len].as_mut_ptr(),
+            row_len,
+        );
+    }
+}
+
+/// Mappings of client shm pools that are sealed against shrinking. A mapping of such a pool
+/// can never fault, so pixels are uploaded straight from it (one mmap per pool, not per commit).
+#[derive(Default)]
+pub struct ShmPools {
+    pools: HashMap<(u64, u64), PoolMap>,
+    tick: u64,
+}
+
+struct PoolMap {
+    map: memmap2::MmapRaw,
+    last_used: u64,
+}
+
+const MAX_POOL_MAPS: usize = 256;
+
+impl ShmPools {
+    /// Base pointer of a read-only mapping covering at least `len` bytes of the pool behind
+    /// `file`, or `None` if the pool may shrink (caller falls back to `pread`).
+    fn map_sealed(&mut self, file: &File, len: usize) -> Option<*const u8> {
+        // SAFETY: plain fcntl on a valid fd.
+        let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 || seals & libc::F_SEAL_SHRINK == 0 {
+            return None;
+        }
+        let stat = rustix::fs::fstat(file).ok()?;
+        let file_len = usize::try_from(stat.st_size).ok()?;
+        if len > file_len {
+            return None;
+        }
+        let key = (stat.st_dev as u64, stat.st_ino as u64);
+        self.tick += 1;
+        if let Some(pool) = self.pools.get_mut(&key) {
+            if pool.map.len() >= len {
+                pool.last_used = self.tick;
+                return Some(pool.map.as_ptr());
+            }
+            // The pool grew (allowed by F_SEAL_SHRINK); map it again at the new size.
+            self.pools.remove(&key);
+        }
+        let map = memmap2::MmapOptions::new()
+            .len(file_len)
+            .map_raw_read_only(file)
+            .ok()?;
+        if self.pools.len() >= MAX_POOL_MAPS {
+            if let Some(oldest) = self
+                .pools
+                .iter()
+                .min_by_key(|(_, p)| p.last_used)
+                .map(|(k, _)| *k)
+            {
+                self.pools.remove(&oldest);
+            }
+        }
+        let ptr = map.as_ptr();
+        self.pools.insert(
+            key,
+            PoolMap {
+                map,
+                last_used: self.tick,
+            },
+        );
+        Some(ptr)
     }
 }
 
@@ -398,13 +475,29 @@ fn execute_one(
         }
         Command::UpdateMemory { id, region, data } => {
             let texture = tables.textures.get(&id).context("unknown texture")?;
-            let region = convert::to_rect(region);
-            renderer
-                .update_memory(texture, &data, region)
-                .context("update_memory")?;
-            if let Some(mem) = tables.memory.get_mut(&id) {
-                let bpp = get_bpp(mem.format()).unwrap_or(32) / 8;
-                patch_memory(mem, region, &data, bpp);
+            let region: Rectangle<i32, Buffer> = convert::to_rect(region);
+            let bpp = texture
+                .format()
+                .and_then(get_bpp)
+                .context("texture without a memory format")?
+                / 8;
+            ensure!(
+                region.size.w > 0 && region.size.h > 0,
+                "empty update region"
+            );
+            let row_len = region.size.w as usize * bpp;
+            ensure!(
+                data.len() >= row_len * region.size.h as usize,
+                "update data too short"
+            );
+            // SAFETY: `data` holds `region.h` packed rows of `row_len` bytes (checked above).
+            unsafe {
+                renderer
+                    .update_memory_strided(texture, data.as_ptr(), row_len as i32, region)
+                    .context("update_memory")?;
+                if let Some(mem) = tables.memory.get_mut(&id) {
+                    patch_memory(mem, region, data.as_ptr(), row_len);
+                }
             }
         }
         Command::ImportShm {
@@ -421,31 +514,79 @@ fn execute_one(
             let bpp = get_bpp(fourcc).context("shm format without bpp")? / 8;
             ensure!(width > 0 && height > 0, "empty shm buffer");
             ensure!(
-                offset >= 0 && stride >= width * bpp as i32,
+                offset >= 0 && stride >= width * bpp as i32 && stride % bpp as i32 == 0,
                 "bad shm buffer layout"
             );
             let file = File::from(fd);
             let size = Size::<i32, Buffer>::from((width, height));
             let full = Rectangle::from_size(size);
-            // pread never faults on a truncated pool, unlike a mapping. A short pool (client
-            // bug) yields zeros for the missing rows rather than failing the whole batch.
-            let read_rows = |region: Rectangle<i32, Buffer>| -> Vec<u8> {
-                let row_len = region.size.w as usize * bpp;
-                let mut data = vec![0u8; row_len * region.size.h as usize];
-                for (i, y) in (region.loc.y..region.loc.y + region.size.h).enumerate() {
-                    let pos =
-                        offset as u64 + y as u64 * stride as u64 + region.loc.x as u64 * bpp as u64;
-                    if let Err(err) =
-                        file.read_exact_at(&mut data[i * row_len..(i + 1) * row_len], pos)
-                    {
-                        warn!("error reading shm pool at row {y}: {err}");
-                        break;
+            let (stride_u, offset_u) = (stride as usize, offset as usize);
+            let end = offset_u + (height as usize - 1) * stride_u + width as usize * bpp;
+            let pixel_at = |region: Rectangle<i32, Buffer>| -> usize {
+                offset_u + region.loc.y as usize * stride_u + region.loc.x as usize * bpp
+            };
+
+            let regions: Vec<Rectangle<i32, Buffer>> = match &damage {
+                None => vec![full],
+                Some(damage) => damage
+                    .iter()
+                    .filter_map(|r| convert::to_rect::<Buffer>(*r).intersection(full))
+                    .collect(),
+            };
+
+            if let Some(base) = tables.pools.map_sealed(&file, end) {
+                // SAFETY: the pool is sealed against shrinking and the mapping covers `end`
+                // bytes, so every read below stays inside memory that cannot fault. The
+                // client may write concurrently; we only ever copy bytes out.
+                unsafe {
+                    if damage.is_none() {
+                        let texture = renderer
+                            .import_memory_strided(base.add(offset_u), stride, fourcc, size, false)
+                            .context("import_memory")?;
+                        if keep_staging(size) {
+                            let mut mem = MemoryBuffer::new(fourcc, size);
+                            patch_memory(&mut mem, full, base.add(offset_u), stride_u);
+                            tables.memory.insert(id, mem);
+                        }
+                        tables.textures.insert(id, texture);
+                    } else {
+                        let texture = tables
+                            .textures
+                            .get(&id)
+                            .context("unknown shm texture")?
+                            .clone();
+                        for region in regions {
+                            let src = base.add(pixel_at(region));
+                            renderer
+                                .update_memory_strided(&texture, src, stride, region)
+                                .context("update_memory")?;
+                            if let Some(mem) = tables.memory.get_mut(&id) {
+                                patch_memory(mem, region, src, stride_u);
+                            }
+                        }
                     }
                 }
-                data
-            };
-            match damage {
-                None => {
+            } else {
+                // Unsealed pool (legacy shm_open clients): the client could shrink it under a
+                // mapping, so copy with pread instead, which fails cleanly. A short pool yields
+                // zeros for the missing rows rather than failing the whole batch.
+                let read_rows = |region: Rectangle<i32, Buffer>| -> Vec<u8> {
+                    let row_len = region.size.w as usize * bpp;
+                    let mut data = vec![0u8; row_len * region.size.h as usize];
+                    for (i, y) in (region.loc.y..region.loc.y + region.size.h).enumerate() {
+                        let pos = offset_u as u64
+                            + y as u64 * stride_u as u64
+                            + region.loc.x as u64 * bpp as u64;
+                        if let Err(err) =
+                            file.read_exact_at(&mut data[i * row_len..(i + 1) * row_len], pos)
+                        {
+                            warn!("error reading shm pool at row {y}: {err}");
+                            break;
+                        }
+                    }
+                    data
+                };
+                if damage.is_none() {
                     let data = read_rows(full);
                     let texture = renderer
                         .import_memory(&data, fourcc, size, false)
@@ -456,24 +597,28 @@ fn execute_one(
                             .insert(id, MemoryBuffer::from_slice(&data, fourcc, size));
                     }
                     tables.textures.insert(id, texture);
-                }
-                Some(damage) => {
+                } else {
                     let texture = tables
                         .textures
                         .get(&id)
                         .context("unknown shm texture")?
                         .clone();
-                    for region in damage {
-                        let Some(region) = convert::to_rect::<Buffer>(region).intersection(full)
-                        else {
-                            continue;
-                        };
+                    for region in regions {
                         let data = read_rows(region);
-                        renderer
-                            .update_memory(&texture, &data, region)
-                            .context("update_memory")?;
-                        if let Some(mem) = tables.memory.get_mut(&id) {
-                            patch_memory(mem, region, &data, bpp);
+                        let row_len = region.size.w as usize * bpp;
+                        // SAFETY: `data` holds `region.h` packed rows of `row_len` bytes.
+                        unsafe {
+                            renderer
+                                .update_memory_strided(
+                                    &texture,
+                                    data.as_ptr(),
+                                    row_len as i32,
+                                    region,
+                                )
+                                .context("update_memory")?;
+                            if let Some(mem) = tables.memory.get_mut(&id) {
+                                patch_memory(mem, region, data.as_ptr(), row_len);
+                            }
                         }
                     }
                 }

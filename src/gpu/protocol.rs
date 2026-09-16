@@ -268,7 +268,7 @@ pub enum Command {
         offset: i32,
         damage: Option<Vec<Rect<i32>>>,
     },
-    /// `data` holds tightly packed rows covering `region`.
+    /// `data` holds tightly packed rows covering `region` (only the damaged rows travel).
     UpdateMemory {
         id: TexId,
         region: Rect<i32>,
