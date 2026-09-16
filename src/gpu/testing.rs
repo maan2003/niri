@@ -1,124 +1,122 @@
-//! Shared smoke scenario for the in-thread unit test and the spawned-process
-//! integration test.
+//! Shared smoke test for the remote renderer, run both in-thread and cross-process.
 
-use std::os::fd::AsFd;
-
-use anyhow::Context;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
+use smithay::backend::renderer::element::{Id, Kind, RenderElement};
+use smithay::render_elements;
+use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::{
+    Bind as _, Color32F, ExportMem as _, Frame as _, ImportMem as _, Offscreen as _, Renderer as _,
+};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::client::GpuClient;
-use super::protocol::ShmDesc;
-use super::scene::{BufferId, Kind, Node, NodeId, Rect, Scene, Transform};
+use super::remote::RemoteRenderer;
 
-pub const SURFACE: i32 = 64;
-pub const CANVAS: i32 = 128;
-/// Deliberately not `width * 4`, so row repacking is exercised.
-pub const STRIDE: i32 = SURFACE * 4 + 16;
-
-/// Left half red, right half blue, opaque. ARGB8888 little-endian is B,G,R,A.
-pub fn make_pattern_pool() -> anyhow::Result<std::fs::File> {
-    let size = (STRIDE * SURFACE) as usize;
-    let fd = rustix::fs::memfd_create(
-        "niri-gpu-test",
-        rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
-    )?;
-    let file = std::fs::File::from(fd);
-    file.set_len(size as u64)?;
-    {
-        let mut map = unsafe { memmap2::MmapOptions::new().len(size).map_mut(&file) }?;
-        for y in 0..SURFACE as usize {
-            for x in 0..SURFACE as usize {
-                let i = y * STRIDE as usize + x * 4;
-                let px: [u8; 4] = if x < SURFACE as usize / 2 {
-                    [0, 0, 255, 255]
-                } else {
-                    [255, 0, 0, 255]
-                };
-                map[i..i + 4].copy_from_slice(&px);
-            }
+pub fn pattern(width: i32, height: i32, left: [u8; 4], right: [u8; 4]) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for _y in 0..height {
+        for x in 0..width {
+            let px = if x < width / 2 { left } else { right };
+            data.extend_from_slice(&px);
         }
-        map.flush()?;
     }
-    rustix::fs::fcntl_add_seals(file.as_fd(), rustix::fs::SealFlags::SHRINK)?;
-    Ok(file)
+    data
 }
 
-pub fn smoke_scene() -> Scene {
-    Scene {
-        size: (CANVAS, CANVAS),
-        scale: 1.0,
-        transform: Transform::Normal,
-        nodes: vec![
-            Node::Surface {
-                id: NodeId(2),
-                commit: 0,
-                buffer: BufferId(1),
-                location: (32.0, 32.0),
-                buffer_scale: 1,
-                transform: Transform::Normal,
-                alpha: 1.0,
-                src: None,
-                size: None,
-                opaque: vec![Rect::new(0, 0, SURFACE, SURFACE)],
-                kind: Kind::Unspecified,
-            },
-            Node::SolidColor {
-                id: NodeId(1),
-                commit: 0,
-                geometry: Rect::new(0, 0, CANVAS, CANVAS),
-                color: [0.0, 1.0, 0.0, 1.0],
-            },
-        ],
+/// Renders `elements` (front to back) into a fresh texture and reads it back as `fourcc`.
+pub fn render_to_vec<E: RenderElement<RemoteRenderer>>(
+    renderer: &mut RemoteRenderer,
+    size: Size<i32, Physical>,
+    elements: &[E],
+    fourcc: Fourcc,
+) -> anyhow::Result<Vec<u8>> {
+    let buffer_size = Size::<i32, Buffer>::from((size.w, size.h));
+    let mut texture = renderer.create_buffer(fourcc, buffer_size)?;
+    {
+        let mut target = renderer.bind(&mut texture)?;
+        let mut frame = renderer.render(&mut target, size, Transform::Normal)?;
+        frame.clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])?;
+        for element in elements.iter().rev() {
+            let src = element.src();
+            let dst = element.geometry(Scale::from(1.));
+            let damage = Rectangle::from_size(dst.size);
+            element.draw(&mut frame, src, dst, &[damage], &[], None)?;
+        }
+        let _sync = frame.finish()?;
     }
+    let mapping = renderer.copy_texture(&texture, Rectangle::from_size(buffer_size), fourcc)?;
+    Ok(renderer.map_texture(&mapping)?.to_vec())
 }
 
-/// Registers the pattern buffer, renders the smoke scene, checks three pixels.
-pub fn run_smoke(client: &mut GpuClient) -> anyhow::Result<()> {
-    let pool = make_pattern_pool()?;
-    client.register_shm(
-        BufferId(1),
-        pool.as_fd(),
-        ShmDesc {
-            size: (STRIDE * SURFACE) as usize,
-            offset: 0,
-            stride: STRIDE,
-            width: SURFACE,
-            height: SURFACE,
-            format: Fourcc::Argb8888 as u32,
-        },
-    )?;
+render_elements! {
+    SmokeElement<=RemoteRenderer>;
+    Texture = TextureRenderElement<super::remote::RemoteTexture>,
+    Solid = SolidColorRenderElement,
+}
 
-    // Abgr8888 in memory is R,G,B,A.
-    let image = client.render_to_image(smoke_scene(), Fourcc::Abgr8888)?;
-    anyhow::ensure!(image.width == CANVAS && image.height == CANVAS);
-    anyhow::ensure!(image.pixels.len() == (CANVAS * CANVAS * 4) as usize);
+fn pixel(data: &[u8], width: i32, x: i32, y: i32) -> [u8; 4] {
+    let i = ((y * width + x) * 4) as usize;
+    data[i..i + 4].try_into().unwrap()
+}
 
-    let px = |x: i32, y: i32| -> [u8; 4] {
-        let i = ((y * CANVAS + x) * 4) as usize;
-        image.pixels[i..i + 4].try_into().unwrap()
+/// Draws a red/blue memory texture over a green background, reads back, checks pixels,
+/// then updates the texture and checks again.
+pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
+    let mut renderer = RemoteRenderer::new(client);
+    let context_id = renderer.context_id();
+
+    // Abgr8888 in memory is R, G, B, A bytes.
+    let red = [255, 0, 0, 255];
+    let blue = [0, 0, 255, 255];
+    let yellow = [255, 255, 0, 255];
+    let green = [0, 255, 0, 255];
+
+    let tex = renderer.import_memory(&pattern(64, 64, red, blue), Fourcc::Abgr8888, (64, 64).into(), false)?;
+
+    let make_elements = |tex| {
+        let surface = TextureRenderElement::from_static_texture(
+            Id::new(),
+            context_id.clone(),
+            Point::<f64, Physical>::from((32., 32.)),
+            tex,
+            1,
+            Transform::Normal,
+            None,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        );
+        let background = SolidColorRenderElement::new(
+            Id::new(),
+            Rectangle::from_size((128, 128).into()),
+            CommitCounter::default(),
+            Color32F::new(0., 1., 0., 1.),
+            Kind::Unspecified,
+        );
+        (surface, background)
     };
-    let close = |a: [u8; 4], b: [u8; 4]| a.iter().zip(b).all(|(p, q)| (*p as i32 - q as i32).abs() <= 2);
 
-    anyhow::ensure!(close(px(10, 10), [0, 255, 0, 255]), "background: {:?}", px(10, 10));
-    anyhow::ensure!(close(px(40, 40), [255, 0, 0, 255]), "left half: {:?}", px(40, 40));
-    anyhow::ensure!(close(px(80, 40), [0, 0, 255, 255]), "right half: {:?}", px(80, 40));
-    anyhow::ensure!(close(px(120, 120), [0, 255, 0, 255]), "corner: {:?}", px(120, 120));
+    let (surface, background) = make_elements(tex.clone());
+    let size = Size::<i32, Physical>::from((128, 128));
+    let elements = [SmokeElement::from(surface), SmokeElement::from(background)];
+    let out = render_to_vec(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
+    assert_eq!(pixel(&out, 128, 10, 10), green, "background");
+    assert_eq!(pixel(&out, 128, 40, 40), red, "left half");
+    assert_eq!(pixel(&out, 128, 80, 40), blue, "right half");
+    assert_eq!(pixel(&out, 128, 120, 120), green, "background bottom right");
 
-    // Repaint the pool and make sure UpdateShm picks it up.
-    {
-        let size = (STRIDE * SURFACE) as usize;
-        let mut map = unsafe { memmap2::MmapOptions::new().len(size).map_mut(&pool) }?;
-        for chunk in map.chunks_exact_mut(4) {
-            chunk.copy_from_slice(&[0, 255, 255, 255]); // yellow in B,G,R,A
-        }
-        map.flush()?;
-    }
-    client.update_shm(BufferId(1), vec![Rect::new(0, 0, SURFACE, SURFACE)])?;
-    let image = client.render_to_image(smoke_scene(), Fourcc::Abgr8888)?;
-    let i = ((40 * CANVAS + 40) * 4) as usize;
-    let p: [u8; 4] = image.pixels[i..i + 4].try_into().unwrap();
-    anyhow::ensure!(close(p, [255, 255, 0, 255]), "after update: {p:?}");
+    renderer.update_memory(&tex, &pattern(64, 64, yellow, yellow), Rectangle::from_size((64, 64).into()))?;
+    let (surface, background) = make_elements(tex.clone());
+    let elements = [SmokeElement::from(surface), SmokeElement::from(background)];
+    let out = render_to_vec(&mut renderer, size, &elements, Fourcc::Abgr8888)?;
+    assert_eq!(pixel(&out, 128, 40, 40), yellow, "after update");
+    assert_eq!(pixel(&out, 128, 10, 10), green, "background after update");
 
-    client.destroy_buffer(BufferId(1)).context("destroy")?;
+    drop(tex);
+    renderer.flush()?;
     Ok(())
 }
+

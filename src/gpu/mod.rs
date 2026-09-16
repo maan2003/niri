@@ -1,12 +1,11 @@
-//! GPU process: everything that touches Mesa, GBM, EGL or KMS runs here, in a
-//! separate process from the compositor core. See ARCH-gpu-process-split.
-//!
-//! The core never opens a render node and never maps client memory. It
-//! validates and forwards buffer fds, then sends a scene tree per frame.
+//! Out-of-process rendering: the core records renderer commands, the GPU process
+//! (the only thing that touches Mesa) replays them.
 
 pub mod client;
+pub mod convert;
+pub mod exec;
 pub mod protocol;
-pub mod scene;
+pub mod remote;
 pub mod server;
 pub mod testing;
 pub mod transport;

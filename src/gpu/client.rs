@@ -1,9 +1,6 @@
-//! Core side handle to the GPU process.
-//!
-//! Synchronous request/reply for now. The frame path will move to an event
-//! loop source once the core sends real frames.
+//! Core side of the GPU-process connection: spawning and request/reply plumbing.
 
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -11,24 +8,21 @@ use std::thread::JoinHandle;
 
 use anyhow::{anyhow, bail, Context};
 use serde::Serialize;
-use smithay::backend::allocator::Fourcc;
 
-use super::protocol::{DmabufDesc, Event, Image, Request, ShmDesc, PROTOCOL_VERSION};
-use super::scene::{BufferId, Rect, Scene};
+use super::protocol::{self, Caps, Event, Image, Rect, Request, ShaderKind, TexId, PROTOCOL_VERSION};
 use super::transport::Channel;
 
-/// Fd number the child finds its socket on, like Chromium's fixed IPC fd.
 pub const CHILD_SOCKET_FD: i32 = 3;
 
 pub struct GpuClient {
     chan: Channel,
     child: Option<Child>,
     thread: Option<JoinHandle<anyhow::Result<()>>>,
-    pub renderer: String,
+    caps: Caps,
 }
 
 impl GpuClient {
-    /// Spawns `exe gpu-process --socket-fd 3`.
+    /// Spawns `exe gpu-process` with the socket on fd 3.
     pub fn spawn_process(exe: &Path) -> anyhow::Result<Self> {
         let (ours, theirs) = rustix::net::socketpair(
             rustix::net::AddressFamily::UNIX,
@@ -46,7 +40,6 @@ impl GpuClient {
             .stdin(Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
-                // dup2 clears CLOEXEC on the target, so the child keeps only fd 3.
                 if libc::dup2(theirs_raw, CHILD_SOCKET_FD) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -60,14 +53,13 @@ impl GpuClient {
             chan: Channel::new(ours),
             child: Some(child),
             thread: None,
-            renderer: String::new(),
+            caps: Caps::default(),
         };
         client.handshake()?;
         Ok(client)
     }
 
-    /// Runs the server on a thread in this process. For tests only: it gives
-    /// none of the isolation, just the same protocol path.
+    /// Runs the GPU server on a thread in this process. For tests and debugging only.
     pub fn spawn_thread() -> anyhow::Result<Self> {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
@@ -77,17 +69,21 @@ impl GpuClient {
             chan: ours,
             child: None,
             thread: Some(thread),
-            renderer: String::new(),
+            caps: Caps::default(),
         };
         client.handshake()?;
         Ok(client)
     }
 
+    pub fn caps(&self) -> &Caps {
+        &self.caps
+    }
+
     fn handshake(&mut self) -> anyhow::Result<()> {
         let (event, _): (Event, _) = self.chan.recv().context("waiting for gpu process")?;
         match event {
-            Event::Ready { version, renderer } if version == PROTOCOL_VERSION => {
-                self.renderer = renderer;
+            Event::Ready { version, caps } if version == PROTOCOL_VERSION => {
+                self.caps = caps;
                 Ok(())
             }
             Event::Ready { version, .. } => bail!("gpu process protocol version {version}"),
@@ -99,7 +95,7 @@ impl GpuClient {
         self.chan.send(req, fds)?;
         let (event, _): (Event, _) = self.chan.recv()?;
         if let Event::Error { message } = &event {
-            bail!("gpu process: {message}");
+            bail!("{message}");
         }
         Ok(event)
     }
@@ -111,38 +107,23 @@ impl GpuClient {
         }
     }
 
-    pub fn register_shm(&mut self, id: BufferId, fd: BorrowedFd<'_>, desc: ShmDesc) -> anyhow::Result<()> {
-        Self::expect_ack(self.request(&Request::RegisterShm { id, desc }, &[fd])?)
+    pub fn execute(&mut self, commands: Vec<protocol::Command>, fds: &[OwnedFd]) -> anyhow::Result<()> {
+        let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+        Self::expect_ack(self.request(&Request::Execute { commands }, &fds)?)
     }
 
-    pub fn register_dmabuf(
-        &mut self,
-        id: BufferId,
-        fds: &[BorrowedFd<'_>],
-        desc: DmabufDesc,
-    ) -> anyhow::Result<()> {
-        Self::expect_ack(self.request(&Request::RegisterDmabuf { id, desc }, fds)?)
-    }
-
-    pub fn update_shm(&mut self, id: BufferId, damage: Vec<Rect<i32>>) -> anyhow::Result<()> {
-        Self::expect_ack(self.request(&Request::UpdateShm { id, damage }, &[])?)
-    }
-
-    pub fn destroy_buffer(&mut self, id: BufferId) -> anyhow::Result<()> {
-        Self::expect_ack(self.request(&Request::DestroyBuffer { id }, &[])?)
-    }
-
-    pub fn render_to_image(&mut self, scene: Scene, format: Fourcc) -> anyhow::Result<Image> {
-        match self.request(
-            &Request::RenderToImage {
-                scene,
-                format: format as u32,
-            },
-            &[],
-        )? {
+    pub fn read_texture(&mut self, id: TexId, region: Rect<i32>, format: u32) -> anyhow::Result<Image> {
+        match self.request(&Request::ReadTexture { id, region, format }, &[])? {
             Event::Image(image) => Ok(image),
             other => Err(anyhow!("expected Image, got {other:?}")),
         }
+    }
+
+    /// Returns whether the shader is now available.
+    pub fn set_custom_shader(&mut self, kind: ShaderKind, src: Option<&str>) -> anyhow::Result<bool> {
+        let src = src.map(str::to_owned);
+        Self::expect_ack(self.request(&Request::SetCustomShader { kind, src }, &[])?)?;
+        Ok(true)
     }
 
     pub fn shutdown(mut self) -> anyhow::Result<()> {
@@ -173,7 +154,7 @@ impl Drop for GpuClient {
     }
 }
 
-/// Adopts the socket the parent left on `CHILD_SOCKET_FD`.
+/// Wraps the socket fd inherited from the parent (see [`CHILD_SOCKET_FD`]).
 pub fn inherited_socket(fd: i32) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(fd) }
 }

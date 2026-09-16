@@ -21,7 +21,7 @@ use serde::Serialize;
 
 /// Upper bound on a single frame body. Scenes and screenshots fit comfortably.
 const MAX_BODY: usize = 256 * 1024 * 1024;
-const MAX_FDS_PER_FRAME: usize = 16;
+const MAX_FDS_PER_FRAME: usize = 64;
 const HEADER_LEN: usize = 8;
 
 pub struct Channel {
@@ -55,7 +55,7 @@ impl Channel {
         frame.extend_from_slice(&(fds.len() as u32).to_le_bytes());
         frame.extend_from_slice(&body);
 
-        let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(16))];
+        let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(64))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
             return Err(io::Error::other("cannot attach fds"));
@@ -96,7 +96,7 @@ impl Channel {
     fn read_exact_with_fds(&mut self, buf: &mut [u8]) -> io::Result<()> {
         let mut filled = 0;
         while filled < buf.len() {
-            let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(16))];
+            let mut space = [MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(64))];
             let mut control = RecvAncillaryBuffer::new(&mut space);
             let msg = recvmsg(
                 self.stream.as_fd(),
