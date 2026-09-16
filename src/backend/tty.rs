@@ -86,7 +86,8 @@ pub struct Tty {
     debug_tint: bool,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     /// Frames queued for scanout, waiting for their vblank.
-    pending_frames: HashMap<u64, (OutputPresentationFeedback, Duration)>,
+    /// Frames sent to the GPU process whose vblank hasn't arrived yet.
+    pending_frames: HashMap<u64, PendingFrame>,
     next_frame_id: u64,
 }
 
@@ -126,6 +127,12 @@ struct Surface {
 /// Stored in `Output::user_data()` to find the DRM output behind a wl_output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TtyOutputState(pub OutputRef);
+
+struct PendingFrame {
+    output: Output,
+    /// Filled in when the GPU reports the frame was submitted for scanout.
+    feedback: Option<OutputPresentationFeedback>,
+}
 
 fn output_ref_of(output: &Output) -> OutputRef {
     output.user_data().get::<TtyOutputState>().unwrap().0
@@ -298,6 +305,15 @@ impl Tty {
                 } => {
                     let time = time_ns.map(Duration::from_nanos);
                     self.on_vblank(niri, output, sequence, time, frame);
+                }
+                GpuEvent::Presented {
+                    output,
+                    frame,
+                    submitted,
+                    states,
+                } => self.on_presented(niri, output, frame, submitted, &states),
+                GpuEvent::Error { message } => {
+                    warn!("GPU process request failed: {message}");
                 }
                 GpuEvent::DeviceError { dev, message } => {
                     warn!("DRM device {dev} error: {message}");
@@ -1075,10 +1091,8 @@ impl Tty {
             }
         };
 
-        if let Some(frame) = frame {
-            if let Some((mut feedback, _target_presentation_time)) =
-                self.pending_frames.remove(&frame)
-            {
+        if let Some(pending) = frame.and_then(|frame| self.pending_frames.remove(&frame)) {
+            if let Some(mut feedback) = pending.feedback {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
                         if output_state.frame_clock.vrr() {
@@ -1173,7 +1187,7 @@ impl Tty {
         target_presentation_time: Duration,
     ) -> RenderResult {
         let span = tracy_client::span!("Tty::render");
-        let mut rv = RenderResult::Skipped;
+        let rv = RenderResult::Skipped;
 
         let output_ref = output_ref_of(output);
         if !self.renderer_ready || !self.session.is_active() {
@@ -1251,67 +1265,107 @@ impl Tty {
         let frame_id = self.next_frame_id;
         self.next_frame_id += 1;
 
-        let reply = self
+        // Both are one-way: the outcome arrives as GpuEvent::Presented, then VBlank.
+        let sent = self
             .renderer
             .flush()
             .map_err(anyhow::Error::from)
             .and_then(|()| {
-                match self.request(Request::Present {
-                    output: output_ref,
-                    frame: frame_id,
-                })? {
-                    Event::Presented { submitted, states } => Ok((submitted, states)),
-                    other => bail!("unexpected reply to Present: {other:?}"),
-                }
+                self.renderer.client().send_oneway(
+                    &Request::Present {
+                        output: output_ref,
+                        frame: frame_id,
+                    },
+                    &[],
+                )
             });
-        let (submitted, states) = match reply {
-            Ok((submitted, states)) => (Ok(submitted), states),
-            Err(err) => (Err(err), Vec::new()),
-        };
-        let states = {
+        if let Err(err) = sent {
+            warn!("error sending frame to the GPU process: {err:?}");
             let surface = self.find_surface(output_ref).unwrap();
-            if submitted.is_err() {
-                surface.elements.clear();
-            }
-            element_states(&surface.elements, &states)
-        };
-
-        niri.update_primary_scanout_output(output, &states);
-
-        {
-            match submitted {
-                Ok(true) => {
-                    let presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
-                    self.pending_frames
-                        .insert(frame_id, (presentation_feedbacks, target_presentation_time));
-
-                    let output_state = niri.output_state.get_mut(output).unwrap();
-                    let new_state = RedrawState::WaitingForVBlank {
-                        redraw_needed: false,
-                    };
-                    match mem::replace(&mut output_state.redraw_state, new_state) {
-                        RedrawState::Idle => unreachable!(),
-                        RedrawState::Queued => (),
-                        RedrawState::WaitingForVBlank { .. } => unreachable!(),
-                        RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
-                        RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
-                            niri.event_loop.remove(token);
-                        }
-                    };
-                    output_state.frame_callback_sequence =
-                        output_state.frame_callback_sequence.wrapping_add(1);
-                    return RenderResult::Submitted;
-                }
-                Ok(false) => rv = RenderResult::NoDamage,
-                Err(err) => warn!("error presenting frame: {err:?}"),
-            }
+            surface.elements.clear();
+            drop(surface.vblank_frame.take());
+            queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
+            return rv;
         }
 
+        self.pending_frames.insert(
+            frame_id,
+            PendingFrame {
+                output: output.clone(),
+                feedback: None,
+            },
+        );
+
+        let output_state = niri.output_state.get_mut(output).unwrap();
+        let new_state = RedrawState::WaitingForVBlank {
+            redraw_needed: false,
+        };
+        match mem::replace(&mut output_state.redraw_state, new_state) {
+            RedrawState::Idle => unreachable!(),
+            RedrawState::Queued => (),
+            RedrawState::WaitingForVBlank { .. } => unreachable!(),
+            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
+            RedrawState::WaitingForEstimatedVBlankAndQueued(token) => {
+                niri.event_loop.remove(token);
+            }
+        };
+        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
+        RenderResult::Submitted
+    }
+
+    /// The GPU process finished compositing a frame we sent with `Present`.
+    fn on_presented(
+        &mut self,
+        niri: &mut Niri,
+        output_ref: OutputRef,
+        frame: u64,
+        submitted: bool,
+        states: &[ElementState],
+    ) {
+        let _span = tracy_client::span!("Tty::on_presented");
+        let Some(pending) = self.pending_frames.get(&frame) else {
+            debug!("presented event for unknown frame {frame}");
+            return;
+        };
+        let output = pending.output.clone();
+
+        let states = match self.find_surface(output_ref) {
+            Some(surface) => element_states(&surface.elements, states),
+            None => RenderElementStates::default(),
+        };
+        niri.update_primary_scanout_output(&output, &states);
+
+        if submitted {
+            let feedback = niri.take_presentation_feedbacks(&output, &states);
+            if let Some(pending) = self.pending_frames.get_mut(&frame) {
+                pending.feedback = Some(feedback);
+            }
+            return;
+        }
+
+        // Nothing changed on screen, so no vblank will come for this frame. Fall back to the
+        // estimated vblank timer like an in-process no-damage render would.
+        self.pending_frames.remove(&frame);
         if let Some(surface) = self.find_surface(output_ref) {
             drop(surface.vblank_frame.take());
         }
+        let Some(output_state) = niri.output_state.get_mut(&output) else {
+            return;
+        };
+        let redraw_needed = match output_state.redraw_state {
+            RedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
+            // Something else (VT switch, output change) already moved the state on.
+            _ => return,
+        };
+        output_state.redraw_state = RedrawState::Queued;
+        let target_presentation_time = output_state.frame_clock.next_presentation_time();
         queue_estimated_vblank_timer(niri, output.clone(), target_presentation_time);
-        rv
+        if redraw_needed {
+            let output_state = niri.output_state.get_mut(&output).unwrap();
+            if let RedrawState::WaitingForEstimatedVBlank(token) = output_state.redraw_state {
+                output_state.redraw_state = RedrawState::WaitingForEstimatedVBlankAndQueued(token);
+            }
+        }
     }
 
     pub fn change_vt(&mut self, vt: i32) {

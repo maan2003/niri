@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// `dev_t` of a DRM device node, as reported by udev.
 pub type DevId = u64;
@@ -371,6 +371,14 @@ pub struct Caps {
     pub shaders: ShaderSupport,
 }
 
+impl Request {
+    /// One-way requests get no reply; failures surface as `GpuEvent::Error`. Used on the
+    /// per-frame path so the core never blocks on the GPU process.
+    pub fn is_oneway(&self) -> bool {
+        matches!(self, Request::Execute { .. } | Request::Present { .. })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Execute {
@@ -462,7 +470,8 @@ pub enum Request {
         enable: bool,
     },
     /// Scan out the frame most recently recorded for `output` (`Begin { Target::Output }`).
-    /// Reply: `Presented`. `frame` comes back in the matching `VBlank`.
+    /// One-way; the outcome arrives as `GpuEvent::Presented`, then `frame` comes back in the
+    /// matching `VBlank`.
     Present {
         output: OutputRef,
         frame: u64,
@@ -482,6 +491,16 @@ pub struct Image {
 /// Unsolicited GPU-process events, delivered between replies as `Event::Notify`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GpuEvent {
+    /// Outcome of a `Present`. `submitted == false` means nothing changed on screen.
+    Presented {
+        output: OutputRef,
+        frame: u64,
+        submitted: bool,
+        /// Per element, what the DRM compositor did with it (for presentation feedback).
+        states: Vec<ElementState>,
+    },
+    /// A one-way request failed.
+    Error { message: String },
     VBlank {
         output: OutputRef,
         sequence: u64,
@@ -524,11 +543,6 @@ pub enum Event {
         vrr_supported: bool,
         /// The "max bpc" property as actually committed, for IPC.
         max_bpc: Option<u8>,
-    },
-    Presented {
-        submitted: bool,
-        /// Per element, what the DRM compositor did with it (for presentation feedback).
-        states: Vec<ElementState>,
     },
     Notify(GpuEvent),
     Error {

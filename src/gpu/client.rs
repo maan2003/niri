@@ -209,13 +209,21 @@ impl GpuClient {
         }
     }
 
+    /// Sends a request that gets no reply (see `Request::is_oneway`).
+    pub fn send_oneway(&mut self, req: &Request, fds: &[BorrowedFd<'_>]) -> anyhow::Result<()> {
+        debug_assert!(req.is_oneway());
+        self.chan.send(req, fds)?;
+        Ok(())
+    }
+
+    /// Queues commands for execution. Failures come back as `GpuEvent::Error`.
     pub fn execute(
         &mut self,
         commands: Vec<protocol::Command>,
         fds: &[OwnedFd],
     ) -> anyhow::Result<()> {
         let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
-        Self::expect_ack(self.request(&Request::Execute { commands }, &fds)?)
+        self.send_oneway(&Request::Execute { commands }, &fds)
     }
 
     pub fn import_dmabuf(

@@ -121,13 +121,20 @@ impl Server {
             return Ok(false);
         }
 
+        let oneway = req.is_oneway();
         let reply = self.dispatch(req, &mut fds).unwrap_or_else(|err| {
             warn!("gpu request failed: {err:#}");
             Event::Error {
                 message: format!("{err:#}"),
             }
         });
-        self.chan.send(&reply, &[])?;
+        if oneway {
+            if let Event::Error { message } = reply {
+                self.notify(GpuEvent::Error { message });
+            }
+        } else {
+            self.chan.send(&reply, &[])?;
+        }
         Ok(true)
     }
 
@@ -255,7 +262,16 @@ impl Server {
             }
             Request::Present { output, frame } => {
                 let (submitted, states) = drm.present(exec, output, frame)?;
-                Event::Presented { submitted, states }
+                let event = Event::Notify(GpuEvent::Presented {
+                    output,
+                    frame,
+                    submitted,
+                    states,
+                });
+                if let Err(err) = self.chan.send(&event, &[]) {
+                    warn!("error sending event to core: {err}");
+                }
+                Event::Ack
             }
             Request::Shutdown => unreachable!(),
         })
