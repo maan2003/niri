@@ -149,12 +149,9 @@ impl Backend {
     }
 
     #[cfg(feature = "xdp-gnome-screencast")]
-    pub fn gbm_device(
-        &self,
-    ) -> Option<smithay::backend::allocator::gbm::GbmDevice<smithay::utils::DeviceFd>> {
+    pub fn dmabuf_allocator(&self) -> Option<crate::gpu::remote::DmabufAllocator> {
         match self {
-            // Screencasting needs a GBM allocator; that lives in the GPU process now.
-            Backend::Tty(_) => None,
+            Backend::Tty(tty) => tty.dmabuf_allocator(),
             Backend::Headless(_) => None,
         }
     }

@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, bail, Context};
+use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use super::protocol::{
     self, Caps, DmabufDesc, Event, GpuEvent, Image, Rect, Request, ShaderKind, TexId,
@@ -138,8 +139,12 @@ impl GpuClient {
 
     /// Reads one event; unsolicited ones are queued for [`take_events`](Self::take_events).
     fn recv_reply(&mut self) -> anyhow::Result<Event> {
+        Ok(self.recv_reply_with_fds()?.0)
+    }
+
+    fn recv_reply_with_fds(&mut self) -> anyhow::Result<(Event, Vec<OwnedFd>)> {
         loop {
-            let (event, _): (Event, _) = self.chan.recv()?;
+            let (event, fds): (Event, Vec<OwnedFd>) = self.chan.recv()?;
             match event {
                 Event::Notify(ev) => {
                     self.events.push_back(ev);
@@ -147,7 +152,7 @@ impl GpuClient {
                         waker();
                     }
                 }
-                other => return Ok(other),
+                other => return Ok((other, fds)),
             }
         }
     }
@@ -234,6 +239,39 @@ impl GpuClient {
     ) -> anyhow::Result<()> {
         let fds: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
         Self::expect_ack(self.request(&Request::ImportDmabuf { id, desc }, &fds)?)
+    }
+
+    /// Returns once everything sent before has executed and finished on the GPU.
+    pub fn sync(&mut self) -> anyhow::Result<()> {
+        Self::expect_ack(self.request(&Request::Sync, &[])?)
+    }
+
+    /// Allocates a render buffer on the GPU side and returns it as a dmabuf.
+    pub fn allocate_dmabuf(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: Vec<u64>,
+    ) -> anyhow::Result<Dmabuf> {
+        self.chan.send(
+            &Request::AllocateDmabuf {
+                width,
+                height,
+                format,
+                modifiers,
+            },
+            &[],
+        )?;
+        let (event, fds) = self.recv_reply_with_fds()?;
+        match event {
+            Event::Dmabuf(desc) => {
+                let mut fds: VecDeque<OwnedFd> = fds.into();
+                super::exec::build_dmabuf(&desc, &mut fds)
+            }
+            Event::Error { message } => bail!("{message}"),
+            other => Err(anyhow!("expected Dmabuf, got {other:?}")),
+        }
     }
 
     pub fn read_texture(

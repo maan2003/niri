@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::{fmt, mem};
 
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
-use smithay::backend::allocator::format::{get_bpp, FormatSet};
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::egl::display::EGLBufferReader;
 use smithay::backend::egl::Error as EglError;
@@ -31,8 +31,8 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlurParams, Caps, Command, DmabufDesc, ElementMeta, OutputRef, PlaneDesc, ShaderKind,
-    ShaderSupport, Target, TexId, TexProgram,
+    BlurParams, Caps, Command, ElementMeta, OutputRef, Rect, ShaderKind, ShaderSupport, Target,
+    TexId, TexProgram,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -69,6 +69,8 @@ struct Pending {
     commands: Vec<Command>,
     fds: Vec<OwnedFd>,
     bytes: usize,
+    /// `Begin`s without their `End` yet. A batch must not be cut inside a frame.
+    open_frames: usize,
 }
 
 struct Shared {
@@ -102,7 +104,9 @@ impl Shared {
 
         let needs_flush = {
             let pending = self.pending.lock().unwrap();
-            !pending.fds.is_empty() && pending.fds.len() + fds.len() > MAX_PENDING_FDS
+            pending.open_frames == 0
+                && !pending.fds.is_empty()
+                && pending.fds.len() + fds.len() > MAX_PENDING_FDS
         };
         if needs_flush {
             if let Err(err) = self.flush() {
@@ -112,10 +116,16 @@ impl Shared {
 
         let over_budget = {
             let mut pending = self.pending.lock().unwrap();
+            match &cmd {
+                Command::Begin { .. } => pending.open_frames += 1,
+                Command::End => pending.open_frames = pending.open_frames.saturating_sub(1),
+                _ => (),
+            }
             pending.bytes += bytes;
             pending.commands.push(cmd);
             pending.fds.extend(fds);
-            pending.bytes > MAX_PENDING_BYTES
+            pending.open_frames == 0
+                && (pending.bytes > MAX_PENDING_BYTES || pending.fds.len() > MAX_PENDING_FDS)
         };
         if over_budget {
             if let Err(err) = self.flush() {
@@ -319,6 +329,13 @@ impl RemoteRenderer {
     /// The GPU-process connection, for requests that are not renderer calls (DRM/KMS).
     pub fn client(&self) -> MutexGuard<'_, GpuClient> {
         self.shared.client.lock().unwrap()
+    }
+
+    /// A handle for allocating GPU-side render buffers, usable without the renderer.
+    pub fn dmabuf_allocator(&self) -> DmabufAllocator {
+        DmabufAllocator {
+            shared: self.shared.clone(),
+        }
     }
 
     /// A render target that scans out on `output`. The recorded frame is drawn when the
@@ -673,6 +690,15 @@ impl Frame for RemoteFrame<'_, '_> {
 
     fn finish(self) -> Result<SyncPoint, RemoteError> {
         self.renderer.shared.push(Command::End);
+        if let Target::Dmabuf(_) = self.target.target {
+            // The caller hands this buffer to another process right away (PipeWire, an
+            // image-copy client), so make "signaled" true: run and finish it on the GPU now.
+            self.renderer.shared.flush()?;
+            self.renderer
+                .client()
+                .sync()
+                .map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
+        }
         Ok(SyncPoint::signaled())
     }
 }
@@ -769,11 +795,43 @@ impl Offscreen<RemoteTexture> for RemoteRenderer {
     }
 }
 
+/// Allocates dmabufs in the GPU process (screencast and capture targets). The buffers are
+/// rendered into GPU-side via `Bind<Dmabuf>`; the core only passes fds around.
+#[derive(Clone)]
+pub struct DmabufAllocator {
+    shared: Arc<Shared>,
+}
+
+impl fmt::Debug for DmabufAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DmabufAllocator").finish_non_exhaustive()
+    }
+}
+
+impl DmabufAllocator {
+    pub fn allocate(
+        &self,
+        size: Size<u32, Buffer>,
+        fourcc: Fourcc,
+        modifiers: &[Modifier],
+    ) -> anyhow::Result<Dmabuf> {
+        // Ordering with queued commands doesn't matter for a fresh buffer, but keep the
+        // channel simple: everything pending goes first.
+        self.shared.flush()?;
+        let modifiers = modifiers.iter().map(|m| u64::from(*m)).collect();
+        self.shared
+            .client
+            .lock()
+            .unwrap()
+            .allocate_dmabuf(size.w, size.h, fourcc as u32, modifiers)
+    }
+}
+
 impl Bind<Dmabuf> for RemoteRenderer {
     fn bind<'a>(&mut self, target: &'a mut Dmabuf) -> Result<RemoteTarget<'a>, RemoteError> {
         let texture = self.import_dmabuf(target, None)?;
         Ok(RemoteTarget {
-            target: Target::Texture(texture.id()),
+            target: Target::Dmabuf(texture.id()),
             size: texture.size(),
             format: texture.format(),
             _keep: Some(texture),
@@ -847,7 +905,7 @@ impl ImportMemWl for RemoteRenderer {
         });
         let context_id = self.shared.context_id.erased();
 
-        let result = shm::with_buffer_contents(buffer, |ptr, len, data| {
+        let result = shm::with_buffer_fd(buffer, |fd, data| {
             let fourcc =
                 shm_format_to_fourcc(data.format).ok_or(RemoteError::Unsupported("shm format"))?;
             if !self
@@ -860,82 +918,59 @@ impl ImportMemWl for RemoteRenderer {
             {
                 return Err(RemoteError::Unsupported("shm format"));
             }
-            let bpp = get_bpp(fourcc).ok_or(RemoteError::Unsupported("shm format"))? / 8;
-
-            let width = data.width;
-            let height = data.height;
-            let stride =
-                usize::try_from(data.stride).map_err(|_| RemoteError::Shm("stride".into()))?;
-            let offset =
-                usize::try_from(data.offset).map_err(|_| RemoteError::Shm("offset".into()))?;
-            if width <= 0 || height <= 0 {
+            if data.width <= 0 || data.height <= 0 {
                 return Err(RemoteError::Shm("empty buffer".into()));
             }
-            let row_len = width as usize * bpp;
-            let end = offset + (height as usize - 1) * stride + row_len;
-            if stride < row_len || end > len {
-                return Err(RemoteError::Shm("buffer does not fit in its pool".into()));
-            }
-
-            let size = Size::<i32, Buffer>::from((width, height));
+            let size = Size::<i32, Buffer>::from((data.width, data.height));
             let existing = cache
                 .as_ref()
                 .and_then(|cache| cache.lock().unwrap().get(&context_id).cloned())
                 .filter(|tex| tex.size() == size && tex.format() == Some(fourcc));
 
-            // SAFETY: bounds were checked against the pool length above; the pool is mapped
-            // for the duration of the closure.
-            let row = |y: usize, x: usize, w: usize| unsafe {
-                std::slice::from_raw_parts(ptr.add(offset + y * stride + x * bpp), w * bpp)
+            // The GPU process reads the pool itself; we only pass the fd along. Nothing here
+            // maps client memory, so a truncated pool can't SIGBUS the compositor.
+            let fd = fd
+                .try_clone_to_owned()
+                .map_err(|err| RemoteError::Transport(err.to_string()))?;
+            let (id, damage) = match &existing {
+                Some(texture) => {
+                    let full = Rectangle::from_size(size);
+                    let regions: Vec<Rect<i32>> = if damage.is_empty() {
+                        vec![convert::rect(full)]
+                    } else {
+                        damage
+                            .iter()
+                            .filter_map(|r| r.intersection(full))
+                            .map(convert::rect)
+                            .collect()
+                    };
+                    (texture.id(), Some(regions))
+                }
+                None => (self.shared.alloc_id(), None),
             };
-
-            if let Some(texture) = existing {
-                let full = Rectangle::from_size(size);
-                let regions: Vec<Rectangle<i32, Buffer>> = if damage.is_empty() {
-                    vec![full]
-                } else {
-                    damage.iter().filter_map(|r| r.intersection(full)).collect()
-                };
-                for region in regions {
-                    let mut bytes =
-                        Vec::with_capacity(region.size.w as usize * region.size.h as usize * bpp);
-                    for y in region.loc.y..region.loc.y + region.size.h {
-                        bytes.extend_from_slice(row(
-                            y as usize,
-                            region.loc.x as usize,
-                            region.size.w as usize,
-                        ));
-                    }
-                    self.shared.push(Command::UpdateMemory {
-                        id: texture.id(),
-                        region: convert::rect(region),
-                        data: bytes,
-                    });
-                }
-                Ok(texture)
-            } else {
-                let mut bytes = Vec::with_capacity(row_len * height as usize);
-                for y in 0..height as usize {
-                    bytes.extend_from_slice(row(y, 0, width as usize));
-                }
-                let id = self.shared.alloc_id();
-                self.shared.push(Command::ImportMemory {
+            self.shared.push_with_fds(
+                Command::ImportShm {
                     id,
                     format: fourcc as u32,
-                    width,
-                    height,
-                    flipped: false,
-                    data: bytes,
-                });
-                let texture = self.texture(id, size, Some(fourcc));
-                if let Some(cache) = &cache {
-                    cache
-                        .lock()
-                        .unwrap()
-                        .insert(context_id.clone(), texture.clone());
-                }
-                Ok(texture)
+                    width: data.width,
+                    height: data.height,
+                    stride: data.stride,
+                    offset: data.offset,
+                    damage,
+                },
+                vec![fd],
+            );
+            if let Some(texture) = existing {
+                return Ok(texture);
             }
+            let texture = self.texture(id, size, Some(fourcc));
+            if let Some(cache) = &cache {
+                cache
+                    .lock()
+                    .unwrap()
+                    .insert(context_id.clone(), texture.clone());
+            }
+            Ok(texture)
         });
         result.map_err(|err| RemoteError::Shm(format!("{err:?}")))?
     }
@@ -972,23 +1007,9 @@ impl ImportDma for RemoteRenderer {
             cache.retain(|weak, _| weak.upgrade().is_some());
         }
 
-        let fds = dmabuf
-            .handles()
-            .map(|fd| fd.try_clone_to_owned())
-            .collect::<Result<Vec<OwnedFd>, _>>()
-            .map_err(|err| RemoteError::Transport(err.to_string()))?;
         let format = dmabuf.format();
-        let desc = DmabufDesc {
-            width: dmabuf.width(),
-            height: dmabuf.height(),
-            format: format.code as u32,
-            modifier: u64::from(format.modifier),
-            planes: dmabuf
-                .offsets()
-                .zip(dmabuf.strides())
-                .map(|(offset, stride)| PlaneDesc { offset, stride })
-                .collect(),
-        };
+        let (desc, fds) = super::exec::describe_dmabuf(dmabuf)
+            .map_err(|err| RemoteError::Transport(err.to_string()))?;
         // Synchronous: a rejected buffer must not take a whole batch down with it, and the
         // caller (dmabuf global) wants a yes/no answer.
         let _ = damage;
@@ -1041,7 +1062,8 @@ impl ExportMem for RemoteRenderer {
         format: Fourcc,
     ) -> Result<RemoteMapping, RemoteError> {
         match target.target {
-            Target::Texture(id) => self.read(id, region, format),
+            // A dmabuf target is read back through the texture imported from the same buffer.
+            Target::Texture(id) | Target::Dmabuf(id) => self.read(id, region, format),
             Target::Output(_) => Err(RemoteError::InvalidTarget),
         }
     }

@@ -1,7 +1,7 @@
 //! Entry point of the GPU process: owns Mesa (and, in drm mode, KMS) and serves the core.
 
 use std::collections::VecDeque;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 use anyhow::Context as _;
 use smithay::backend::drm::DrmEvent;
@@ -38,6 +38,8 @@ struct Server {
     drm: DrmState,
     loop_handle: LoopHandle<'static, Server>,
     signal: LoopSignal,
+    /// Fds to attach to the reply of the request being handled.
+    reply_fds: Vec<OwnedFd>,
 }
 
 pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
@@ -72,6 +74,7 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
         drm: DrmState::default(),
         loop_handle: event_loop.handle(),
         signal: event_loop.get_signal(),
+        reply_fds: Vec::new(),
     };
 
     event_loop
@@ -133,7 +136,9 @@ impl Server {
                 self.notify(GpuEvent::Error { message });
             }
         } else {
-            self.chan.send(&reply, &[])?;
+            let fds = std::mem::take(&mut self.reply_fds);
+            let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+            self.chan.send(&reply, &borrowed)?;
         }
         Ok(true)
     }
@@ -153,6 +158,9 @@ impl Server {
             Request::ReadTexture { id, region, format } => {
                 Event::Image(exec.read_texture(id, region, format)?)
             }
+            // Requests are handled in order, and Execute runs to completion (dmabuf targets
+            // wait for their fence), so reaching this point is the guarantee.
+            Request::Sync => Event::Ack,
             Request::SetCustomShader { kind, src } => Event::ShaderSet {
                 available: exec.set_custom_shader(kind, src.as_deref())?,
             },
@@ -260,8 +268,23 @@ impl Server {
                 drm.set_debug_tint(enable);
                 Event::Ack
             }
-            Request::Present { output, frame } => {
-                let (submitted, states) = drm.present(exec, output, frame)?;
+            Request::AllocateDmabuf {
+                width,
+                height,
+                format,
+                modifiers,
+            } => {
+                let dmabuf = drm.allocate_dmabuf(width, height, format, &modifiers)?;
+                let (desc, fds) = super::exec::describe_dmabuf(&dmabuf)?;
+                self.reply_fds = fds;
+                Event::Dmabuf(desc)
+            }
+            Request::Present {
+                output,
+                frame,
+                flags,
+            } => {
+                let (submitted, states) = drm.present(exec, output, frame, flags)?;
                 let event = Event::Notify(GpuEvent::Presented {
                     output,
                     frame,

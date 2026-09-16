@@ -59,9 +59,9 @@ use crate::gpu::client::{GpuClient, Mode as GpuMode};
 use crate::gpu::convert;
 use crate::gpu::protocol::{
     ConnectorInfo, ElementKind, ElementMeta, ElementState, Event, GpuEvent, ModeDesc,
-    OutputGeometry, OutputRef, Presentation, Request,
+    OutputGeometry, OutputRef, PresentFlags, Presentation, Request,
 };
-use crate::gpu::remote::RemoteRenderer;
+use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{Niri, RedrawState, State};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{shaders, RenderCtx, RenderTarget};
@@ -1166,6 +1166,12 @@ impl Tty {
         self.session.seat()
     }
 
+    /// Allocator for screencast / capture buffers; `None` until the GPU has a renderer.
+    pub fn dmabuf_allocator(&self) -> Option<DmabufAllocator> {
+        self.renderer_ready
+            .then(|| self.renderer.dmabuf_allocator())
+    }
+
     pub fn with_primary_renderer<T>(
         &mut self,
         f: impl FnOnce(&mut RemoteRenderer) -> T,
@@ -1265,6 +1271,20 @@ impl Tty {
         let frame_id = self.next_frame_id;
         self.next_frame_id += 1;
 
+        // Overlay planes are disabled by default as they cause weird performance issues on my
+        // system.
+        let flags = {
+            let debug = &self.config.borrow().debug;
+            let vrr = niri.output_state.get(output).unwrap().frame_clock.vrr();
+            PresentFlags {
+                primary_scanout: !debug.disable_direct_scanout,
+                primary_scanout_any_format: !debug.restrict_primary_scanout_to_matching_format,
+                overlay_planes: debug.enable_overlay_planes && !debug.disable_direct_scanout,
+                cursor_plane: !debug.disable_cursor_plane,
+                skip_cursor_only_updates: debug.skip_cursor_only_updates_during_vrr && vrr,
+            }
+        };
+
         // Both are one-way: the outcome arrives as GpuEvent::Presented, then VBlank.
         let sent = self
             .renderer
@@ -1275,6 +1295,7 @@ impl Tty {
                     &Request::Present {
                         output: output_ref,
                         frame: frame_id,
+                        flags,
                     },
                     &[],
                 )
@@ -2040,6 +2061,7 @@ fn record_frame<E: RenderElement<RemoteRenderer>>(
                 Kind::ScanoutCandidate => ElementKind::ScanoutCandidate,
                 Kind::Unspecified => ElementKind::Unspecified,
             },
+            transform: convert::transform(element.transform()),
             framebuffer_effect,
         });
         if framebuffer_effect {

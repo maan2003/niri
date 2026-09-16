@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// `dev_t` of a DRM device node, as reported by udev.
 pub type DevId = u64;
@@ -126,6 +126,8 @@ pub struct DmabufDesc {
     pub height: u32,
     pub format: u32,
     pub modifier: u64,
+    /// `DmabufFlags` bits (y-invert, interlaced, ...).
+    pub flags: u32,
     pub planes: Vec<PlaneDesc>,
 }
 
@@ -139,6 +141,8 @@ pub struct OutputRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
     Texture(TexId),
+    /// A dmabuf previously imported under this id; bound directly (not via its texture).
+    Dmabuf(TexId),
     /// Recorded frames for outputs are kept by the GPU process and drawn by [`Request::Present`].
     Output(OutputRef),
 }
@@ -210,6 +214,8 @@ pub struct ElementMeta {
     /// Element-relative.
     pub opaque: Vec<Rect<i32>>,
     pub kind: ElementKind,
+    /// Buffer transform, for direct scanout.
+    pub transform: Transform,
     pub framebuffer_effect: bool,
 }
 
@@ -249,6 +255,18 @@ pub enum Command {
         flipped: bool,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
+    },
+    /// Shm buffer contents by pool fd (attached), so the core never maps client memory. With
+    /// `damage` set, `id` is an existing texture to update in those regions; otherwise a new
+    /// texture is created.
+    ImportShm {
+        id: TexId,
+        format: u32,
+        width: i32,
+        height: i32,
+        stride: i32,
+        offset: i32,
+        damage: Option<Vec<Rect<i32>>>,
     },
     /// `data` holds tightly packed rows covering `region`.
     UpdateMemory {
@@ -395,6 +413,8 @@ pub enum Request {
         region: Rect<i32>,
         format: u32,
     },
+    /// Replied to (Ack) once everything sent before it has executed and finished on the GPU.
+    Sync,
     /// Reply: `ShaderSet`.
     SetCustomShader {
         kind: ShaderKind,
@@ -475,8 +495,27 @@ pub enum Request {
     Present {
         output: OutputRef,
         frame: u64,
+        flags: PresentFlags,
+    },
+    /// Allocates a GBM buffer on the primary device. Reply: `Dmabuf` with fds attached.
+    AllocateDmabuf {
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: Vec<u64>,
     },
     Shutdown,
+}
+
+/// Which planes the DRM compositor may use; mirrors smithay's `FrameFlags`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentFlags {
+    pub primary_scanout: bool,
+    /// Allow primary-plane scanout of buffers whose format differs from the swapchain's.
+    pub primary_scanout_any_format: bool,
+    pub overlay_planes: bool,
+    pub cursor_plane: bool,
+    pub skip_cursor_only_updates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +560,8 @@ pub enum Event {
     },
     Ack,
     Image(Image),
+    /// Fds attached.
+    Dmabuf(DmabufDesc),
     ShaderSet {
         available: bool,
     },

@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::Context as _;
 use calloop::LoopHandle;
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
 use smithay::desktop::Window;
 use smithay::output::Output;
@@ -15,7 +14,7 @@ use smithay::utils::{DeviceFd, Physical, Point, Scale, Size};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
-use crate::gpu::remote::RemoteRenderer;
+use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
 use crate::niri_render_elements;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -76,7 +75,7 @@ impl Screencasting {
 }
 
 impl State {
-    fn prepare_pw_cast(&mut self) -> anyhow::Result<Option<(GbmDevice<DeviceFd>, FormatSet)>> {
+    fn prepare_pw_cast(&mut self) -> anyhow::Result<Option<(DmabufAllocator, FormatSet)>> {
         // Ensure PipeWire is initialized.
         if self.niri.casting.pipewire.is_none() {
             let pw = PipeWire::new(
@@ -91,7 +90,7 @@ impl State {
             return Ok(None);
         }
 
-        let Some(gbm) = self.backend.gbm_device() else {
+        let Some(alloc) = self.backend.dmabuf_allocator() else {
             // We will offer shm only.
             return Ok(None);
         };
@@ -111,7 +110,7 @@ impl State {
             }
         }
 
-        Ok(Some((gbm, render_formats)))
+        Ok(Some((alloc, render_formats)))
     }
 
     pub fn on_pw_msg(&mut self, msg: PwToNiri) {

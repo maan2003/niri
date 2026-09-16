@@ -2,18 +2,23 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt as _;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{anyhow, bail, ensure, Context as _};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
-use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::allocator::format::get_bpp;
+use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
+use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
 use smithay::backend::renderer::{
     Bind as _, Color32F, DebugFlags, ExportMem as _, Frame as _, FrameContext as _, ImportDma as _,
     ImportMem as _, Offscreen as _, Renderer as _,
 };
 use smithay::utils::{Buffer, Physical, Rectangle, Size};
+use tracing::warn;
 
 use super::convert;
 use super::gl::blur::Blur;
@@ -22,16 +27,45 @@ use super::gl::resources::Resources;
 use super::gl::shader::{self, DrawParams};
 use super::gl::shaders::Shaders;
 use super::protocol::{
-    Caps, Command, DmabufDesc, Image, OutputRef, Rect, ShaderKind, ShaderSupport, Target, TexId,
-    TexProgram,
+    Caps, Command, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, ShaderKind, ShaderSupport,
+    Target, TexId, TexProgram,
 };
 
 /// Objects the core refers to by id.
 #[derive(Default)]
 pub struct Tables {
     pub textures: HashMap<TexId, GlesTexture>,
+    /// Dmabufs behind imported textures, for direct scanout and for binding as render targets.
+    pub dmabufs: HashMap<TexId, Dmabuf>,
+    /// CPU copies of small memory/shm textures (cursor images), so the DRM compositor can put
+    /// them on the cursor plane without going through GL.
+    pub memory: HashMap<TexId, MemoryBuffer>,
     captures: HashMap<u64, Capture>,
     blurs: HashMap<u64, Blur>,
+}
+
+/// Textures up to this many pixels keep a CPU copy in `Tables::memory`.
+const STAGING_MAX_PIXELS: i32 = 512 * 512;
+
+fn keep_staging(size: Size<i32, Buffer>) -> bool {
+    size.w * size.h <= STAGING_MAX_PIXELS
+}
+
+/// Copies tightly packed `data` covering `region` into `mem`.
+fn patch_memory(mem: &mut MemoryBuffer, region: Rectangle<i32, Buffer>, data: &[u8], bpp: usize) {
+    let Some(region) = region.intersection(Rectangle::from_size(mem.size())) else {
+        return;
+    };
+    let row_len = region.size.w as usize * bpp;
+    let stride = mem.stride() as usize;
+    let bytes = mem.as_mut_slice();
+    for (i, y) in (region.loc.y..region.loc.y + region.size.h).enumerate() {
+        let Some(src) = data.get(i * row_len..(i + 1) * row_len) else {
+            return;
+        };
+        let start = y as usize * stride + region.loc.x as usize * bpp;
+        bytes[start..start + row_len].copy_from_slice(src);
+    }
 }
 
 /// Blur pyramids are cheap to recreate; cap how many we keep for closed windows.
@@ -65,6 +99,29 @@ fn fourcc(format: u32) -> anyhow::Result<Fourcc> {
     Fourcc::try_from(format).map_err(|_| anyhow!("unknown fourcc {format:#x}"))
 }
 
+/// The wire description of a dmabuf plus duplicated plane fds to attach.
+pub fn describe_dmabuf(dmabuf: &Dmabuf) -> anyhow::Result<(DmabufDesc, Vec<OwnedFd>)> {
+    let fds = dmabuf
+        .handles()
+        .map(|fd| fd.try_clone_to_owned())
+        .collect::<Result<Vec<OwnedFd>, _>>()
+        .context("duplicating dmabuf fds")?;
+    let format = dmabuf.format();
+    let desc = DmabufDesc {
+        width: dmabuf.width(),
+        height: dmabuf.height(),
+        format: format.code as u32,
+        modifier: u64::from(format.modifier),
+        flags: dmabuf.flags().bits(),
+        planes: dmabuf
+            .offsets()
+            .zip(dmabuf.strides())
+            .map(|(offset, stride)| PlaneDesc { offset, stride })
+            .collect(),
+    };
+    Ok((desc, fds))
+}
+
 pub fn build_dmabuf(desc: &DmabufDesc, fds: &mut VecDeque<OwnedFd>) -> anyhow::Result<Dmabuf> {
     if desc.planes.is_empty() || fds.len() < desc.planes.len() {
         bail!("ImportDmabuf expects one fd per plane");
@@ -73,7 +130,7 @@ pub fn build_dmabuf(desc: &DmabufDesc, fds: &mut VecDeque<OwnedFd>) -> anyhow::R
         (desc.width as i32, desc.height as i32),
         fourcc(desc.format)?,
         Modifier::from(desc.modifier),
-        DmabufFlags::empty(),
+        DmabufFlags::from_bits_retain(desc.flags),
     );
     for plane in &desc.planes {
         let fd = fds.pop_front().unwrap();
@@ -170,7 +227,9 @@ impl Executor {
             .renderer()?
             .import_dmabuf(&dmabuf, None)
             .context("import_dmabuf")?;
-        self.tables.borrow_mut().textures.insert(id, texture);
+        let mut tables = self.tables.borrow_mut();
+        tables.textures.insert(id, texture);
+        tables.dmabufs.insert(id, dmabuf);
         Ok(())
     }
 
@@ -218,6 +277,14 @@ impl Executor {
                         match iter.next() {
                             None => bail!("unterminated frame"),
                             Some(Command::End) => break,
+                            // Fd-bearing imports must consume their fds from this batch now;
+                            // the frame is replayed later without them.
+                            Some(
+                                cmd @ (Command::ImportShm { .. } | Command::ImportDmabuf { .. }),
+                            ) => {
+                                let mut tables = self.tables.borrow_mut();
+                                execute_one(renderer, &mut tables, cmd, fds)?;
+                            }
                             Some(cmd) => frame.push(cmd),
                         }
                     }
@@ -244,9 +311,41 @@ impl Executor {
                             convert::to_transform(transform),
                         )
                         .context("render")?;
-                    let res = run_frame(&mut frame, &self.tables, &mut iter, None);
+                    let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
                     let _sync = frame.finish().context("finish")?;
                     res?;
+                }
+                Command::Begin {
+                    target: Target::Dmabuf(target),
+                    width,
+                    height,
+                    transform,
+                } => {
+                    // Bind the dmabuf itself rather than its imported texture: external
+                    // (EGLImage) textures can't be framebuffer attachments.
+                    let mut dmabuf = self
+                        .tables
+                        .borrow()
+                        .dmabufs
+                        .get(&target)
+                        .context("unknown target dmabuf")?
+                        .clone();
+                    let mut fb = renderer.bind(&mut dmabuf).context("bind dmabuf")?;
+                    let mut frame = renderer
+                        .render(
+                            &mut fb,
+                            Size::from((width, height)),
+                            convert::to_transform(transform),
+                        )
+                        .context("render")?;
+                    let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
+                    let sync = frame.finish().context("finish")?;
+                    res?;
+                    // The buffer leaves for another process (PipeWire consumer, image-copy
+                    // client) as soon as the core's Sync returns, so finish it here.
+                    if let Err(err) = sync.wait() {
+                        warn!("error waiting for dmabuf render: {err:?}");
+                    }
                 }
                 cmd => {
                     let mut tables = self.tables.borrow_mut();
@@ -285,16 +384,100 @@ fn execute_one(
             flipped,
             data,
         } => {
+            let fourcc = fourcc(format)?;
+            let size = Size::from((width, height));
             let texture = renderer
-                .import_memory(&data, fourcc(format)?, Size::from((width, height)), flipped)
+                .import_memory(&data, fourcc, size, flipped)
                 .context("import_memory")?;
+            if !flipped && keep_staging(size) && get_bpp(fourcc).is_some() {
+                tables
+                    .memory
+                    .insert(id, MemoryBuffer::from_slice(&data, fourcc, size));
+            }
             tables.textures.insert(id, texture);
         }
         Command::UpdateMemory { id, region, data } => {
             let texture = tables.textures.get(&id).context("unknown texture")?;
+            let region = convert::to_rect(region);
             renderer
-                .update_memory(texture, &data, convert::to_rect(region))
+                .update_memory(texture, &data, region)
                 .context("update_memory")?;
+            if let Some(mem) = tables.memory.get_mut(&id) {
+                let bpp = get_bpp(mem.format()).unwrap_or(32) / 8;
+                patch_memory(mem, region, &data, bpp);
+            }
+        }
+        Command::ImportShm {
+            id,
+            format,
+            width,
+            height,
+            stride,
+            offset,
+            damage,
+        } => {
+            let fd = fds.pop_front().context("ImportShm needs the pool fd")?;
+            let fourcc = fourcc(format)?;
+            let bpp = get_bpp(fourcc).context("shm format without bpp")? / 8;
+            ensure!(width > 0 && height > 0, "empty shm buffer");
+            ensure!(
+                offset >= 0 && stride >= width * bpp as i32,
+                "bad shm buffer layout"
+            );
+            let file = File::from(fd);
+            let size = Size::<i32, Buffer>::from((width, height));
+            let full = Rectangle::from_size(size);
+            // pread never faults on a truncated pool, unlike a mapping. A short pool (client
+            // bug) yields zeros for the missing rows rather than failing the whole batch.
+            let read_rows = |region: Rectangle<i32, Buffer>| -> Vec<u8> {
+                let row_len = region.size.w as usize * bpp;
+                let mut data = vec![0u8; row_len * region.size.h as usize];
+                for (i, y) in (region.loc.y..region.loc.y + region.size.h).enumerate() {
+                    let pos =
+                        offset as u64 + y as u64 * stride as u64 + region.loc.x as u64 * bpp as u64;
+                    if let Err(err) =
+                        file.read_exact_at(&mut data[i * row_len..(i + 1) * row_len], pos)
+                    {
+                        warn!("error reading shm pool at row {y}: {err}");
+                        break;
+                    }
+                }
+                data
+            };
+            match damage {
+                None => {
+                    let data = read_rows(full);
+                    let texture = renderer
+                        .import_memory(&data, fourcc, size, false)
+                        .context("import_memory")?;
+                    if keep_staging(size) {
+                        tables
+                            .memory
+                            .insert(id, MemoryBuffer::from_slice(&data, fourcc, size));
+                    }
+                    tables.textures.insert(id, texture);
+                }
+                Some(damage) => {
+                    let texture = tables
+                        .textures
+                        .get(&id)
+                        .context("unknown shm texture")?
+                        .clone();
+                    for region in damage {
+                        let Some(region) = convert::to_rect::<Buffer>(region).intersection(full)
+                        else {
+                            continue;
+                        };
+                        let data = read_rows(region);
+                        renderer
+                            .update_memory(&texture, &data, region)
+                            .context("update_memory")?;
+                        if let Some(mem) = tables.memory.get_mut(&id) {
+                            patch_memory(mem, region, &data, bpp);
+                        }
+                    }
+                }
+            }
         }
         Command::ImportDmabuf { id, desc, damage } => {
             let dmabuf = build_dmabuf(&desc, fds)?;
@@ -303,9 +486,12 @@ fn execute_one(
                 .import_dmabuf(&dmabuf, damage.as_deref())
                 .context("import_dmabuf")?;
             tables.textures.insert(id, texture);
+            tables.dmabufs.insert(id, dmabuf);
         }
         Command::DestroyTexture { id } => {
             tables.textures.remove(&id);
+            tables.dmabufs.remove(&id);
+            tables.memory.remove(&id);
         }
         Command::DestroyCapture { key } => {
             tables.captures.remove(&key);
@@ -365,6 +551,7 @@ pub fn run_frame(
     tables: &RefCell<Tables>,
     iter: &mut impl Iterator<Item = Command>,
     clip: Option<&[Rectangle<i32, Physical>]>,
+    fds: &mut VecDeque<OwnedFd>,
 ) -> anyhow::Result<()> {
     let programs = {
         let shaders = Shaders::get_from_frame(frame);
@@ -548,8 +735,7 @@ pub fn run_frame(
                 // mid-frame): run it through the frame's renderer guard.
                 let mut guard = frame.renderer();
                 let mut tables = tables.borrow_mut();
-                let mut no_fds = VecDeque::new();
-                execute_one(guard.as_mut(), &mut tables, cmd, &mut no_fds)?;
+                execute_one(guard.as_mut(), &mut tables, cmd, fds)?;
             }
         }
     }

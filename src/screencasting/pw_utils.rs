@@ -34,7 +34,6 @@ use pipewire::stream::{Stream, StreamFlags, StreamListener, StreamRc, StreamStat
 use pipewire::sys::{pw_buffer, pw_check_library_version, pw_stream_queue_buffer};
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::{GbmBuffer, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -54,7 +53,7 @@ use smithay::utils::{DeviceFd, Logical, Physical, Point, Scale, Size, Transform}
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::{self, CursorMode};
-use crate::gpu::remote::RemoteRenderer;
+use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{CastTarget, State};
 use crate::render_helpers::{
     clear_dmabuf, encompassing_geo, render_and_download, render_and_download_with_damage,
@@ -399,7 +398,7 @@ impl PipeWire {
     #[allow(clippy::too_many_arguments)]
     pub fn start_cast(
         &self,
-        gbm: Option<(GbmDevice<DeviceFd>, FormatSet)>,
+        gbm: Option<(DmabufAllocator, FormatSet)>,
         session_id: CastSessionId,
         stream_id: CastStreamId,
         target: CastTarget,
@@ -446,7 +445,7 @@ impl PipeWire {
         let (gbm, formats) = if let Some((gbm, formats)) = gbm {
             (Some(gbm), formats)
         } else {
-            debug!("no gbm device; advertising only shm formats");
+            debug!("no dmabuf allocator; advertising only shm formats");
             (None, FormatSet::default())
         };
 
@@ -1389,7 +1388,7 @@ impl Cast {
 impl CastInner {
     unsafe fn on_add_buffer(
         &mut self,
-        gbm: Option<&GbmDevice<DeviceFd>>,
+        gbm: Option<&DmabufAllocator>,
         buffer: *mut pw_buffer,
     ) -> anyhow::Result<bool> {
         let CastState::Ready {
@@ -1552,68 +1551,32 @@ fn make_pod(buffer: &mut Vec<u8>, object: pod::Object) -> &Pod {
 }
 
 fn find_preferred_modifier(
-    gbm: &GbmDevice<DeviceFd>,
+    gbm: &DmabufAllocator,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifiers: Vec<i64>,
 ) -> anyhow::Result<(Modifier, usize)> {
     debug!("find_preferred_modifier: size={size:?}, fourcc={fourcc}, modifiers={modifiers:?}");
 
-    let (buffer, modifier) = allocate_buffer(gbm, size, fourcc, &modifiers)?;
-
-    let dmabuf = buffer
-        .export()
-        .context("error exporting GBM buffer object as dmabuf")?;
+    let modifiers: Vec<Modifier> = modifiers
+        .iter()
+        .map(|m| Modifier::from(*m as u64))
+        .collect();
+    let dmabuf = gbm.allocate(Size::from((size.w, size.h)), fourcc, &modifiers)?;
     let plane_count = dmabuf.num_planes();
 
     // FIXME: Ideally this also needs to try binding the dmabuf for rendering.
 
-    Ok((modifier, plane_count))
-}
-
-fn allocate_buffer(
-    gbm: &GbmDevice<DeviceFd>,
-    size: Size<u32, Physical>,
-    fourcc: Fourcc,
-    modifiers: &[i64],
-) -> anyhow::Result<(GbmBuffer, Modifier)> {
-    let (w, h) = (size.w, size.h);
-    let flags = GbmBufferFlags::RENDERING;
-
-    if modifiers.len() == 1 && Modifier::from(modifiers[0] as u64) == Modifier::Invalid {
-        let bo = gbm
-            .create_buffer_object::<()>(w, h, fourcc, flags)
-            .context("error creating GBM buffer object")?;
-
-        let buffer = GbmBuffer::from_bo(bo, true);
-        Ok((buffer, Modifier::Invalid))
-    } else {
-        let modifiers = modifiers
-            .iter()
-            .map(|m| Modifier::from(*m as u64))
-            .filter(|m| *m != Modifier::Invalid);
-
-        let bo = gbm
-            .create_buffer_object_with_modifiers2::<()>(w, h, fourcc, modifiers, flags)
-            .context("error creating GBM buffer object")?;
-
-        let modifier = bo.modifier();
-        let buffer = GbmBuffer::from_bo(bo, false);
-        Ok((buffer, modifier))
-    }
+    Ok((dmabuf.format().modifier, plane_count))
 }
 
 fn allocate_dmabuf(
-    gbm: &GbmDevice<DeviceFd>,
+    gbm: &DmabufAllocator,
     size: Size<u32, Physical>,
     fourcc: Fourcc,
     modifier: Modifier,
 ) -> anyhow::Result<Dmabuf> {
-    let (buffer, _modifier) = allocate_buffer(gbm, size, fourcc, &[u64::from(modifier) as i64])?;
-    let dmabuf = buffer
-        .export()
-        .context("error exporting GBM buffer object as dmabuf")?;
-    Ok(dmabuf)
+    gbm.allocate(Size::from((size.w, size.h)), fourcc, &[modifier])
 }
 
 #[derive(Debug, Clone)]

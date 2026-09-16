@@ -13,8 +13,9 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use anyhow::{anyhow, bail, ensure, Context as _};
 use bytemuck::cast_slice_mut;
+use smithay::backend::allocator::dmabuf::{AsDmabuf as _, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
@@ -23,6 +24,7 @@ use smithay::backend::drm::{
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
+use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::backend::renderer::element::{
     Element, Id, Kind, RenderElement, RenderElementPresentationState, UnderlyingStorage,
 };
@@ -47,7 +49,7 @@ use super::exec::{run_frame, Executor, Tables};
 use super::gl::{resources, shaders};
 use super::protocol::{
     Command, ConnectorInfo, DevId, ElementKind, ElementMeta, ElementState, Event, ModeDesc,
-    OutputGeometry, OutputRef, Presentation,
+    OutputGeometry, OutputRef, PresentFlags, Presentation,
 };
 
 const SUPPORTED_COLOR_FORMATS_10BIT: [Fourcc; 3] =
@@ -619,11 +621,48 @@ impl DrmState {
 
     /// Draws the frame the core recorded for `output` and queues it for scanout. Returns
     /// whether anything was submitted plus what happened to each element.
+    /// Allocates a render buffer on the primary device (for screencast / capture targets).
+    pub fn allocate_dmabuf(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: &[u64],
+    ) -> anyhow::Result<Dmabuf> {
+        let device = self
+            .primary
+            .and_then(|p| self.devices.get(&p))
+            .context("no primary device")?;
+        let fourcc = Fourcc::try_from(format).map_err(|_| anyhow!("unknown fourcc {format:#x}"))?;
+        let flags = GbmBufferFlags::RENDERING;
+        let buffer = if modifiers.len() == 1 && Modifier::from(modifiers[0]) == Modifier::Invalid {
+            let bo = device
+                .gbm
+                .create_buffer_object::<()>(width, height, fourcc, flags)
+                .context("error creating GBM buffer object")?;
+            GbmBuffer::from_bo(bo, true)
+        } else {
+            let modifiers = modifiers
+                .iter()
+                .map(|m| Modifier::from(*m))
+                .filter(|m| *m != Modifier::Invalid);
+            let bo = device
+                .gbm
+                .create_buffer_object_with_modifiers2::<()>(width, height, fourcc, modifiers, flags)
+                .context("error creating GBM buffer object")?;
+            GbmBuffer::from_bo(bo, false)
+        };
+        buffer
+            .export()
+            .context("error exporting GBM buffer object as dmabuf")
+    }
+
     pub fn present(
         &mut self,
         exec: &mut Executor,
         output: OutputRef,
         frame: u64,
+        flags: PresentFlags,
     ) -> anyhow::Result<(bool, Vec<ElementState>)> {
         let _span = tracy_client::span!("DrmState::present");
         let (device, crtc) = self.surface(output)?;
@@ -671,23 +710,51 @@ impl DrmState {
             .map(|(k, t)| (t.id.clone(), *k))
             .collect();
 
+        let storages: Vec<Option<Storage>> = {
+            let tables = exec.tables.borrow();
+            segments
+                .iter()
+                .map(|seg| element_storage(&tables, seg))
+                .collect()
+        };
+
         // smithay wants elements top to bottom; the core recorded bottom to top.
         let mut elements: Vec<SceneElement> = segments
             .iter()
-            .map(|seg| SceneElement {
+            .zip(&storages)
+            .map(|(seg, storage)| SceneElement {
                 track: &surface.elements[&seg.meta.id],
                 meta: seg.meta,
                 capture: seg.capture,
                 draw: seg.draw,
+                storage: storage.as_ref(),
                 tables: &exec.tables,
             })
             .collect();
         elements.reverse();
 
+        let mut frame_flags = FrameFlags::empty();
+        if flags.primary_scanout {
+            frame_flags |= if flags.primary_scanout_any_format {
+                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+            } else {
+                FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT
+            };
+        }
+        if flags.overlay_planes {
+            frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;
+        }
+        if flags.cursor_plane {
+            frame_flags |= FrameFlags::ALLOW_CURSOR_PLANE_SCANOUT;
+        }
+        if flags.skip_cursor_only_updates {
+            frame_flags |= FrameFlags::SKIP_CURSOR_ONLY_UPDATES;
+        }
+
         let renderer = exec.renderer.as_mut().context("no renderer yet")?;
         let res = surface
             .compositor
-            .render_frame(renderer, &elements, [0.; 4], FrameFlags::empty())
+            .render_frame(renderer, &elements, [0.; 4], frame_flags)
             .map_err(|err| anyhow!("error rendering frame: {err}"))?;
 
         let states = res
@@ -932,6 +999,46 @@ struct Segment<'a> {
     draw: &'a [Command],
 }
 
+/// What an element is made of, when it is a plain copy of one buffer. Lets the DRM compositor
+/// scan the buffer out directly or copy it to the cursor plane.
+enum Storage {
+    Dmabuf(Dmabuf),
+    Memory(MemoryBuffer),
+}
+
+fn element_storage(tables: &Tables, seg: &Segment<'_>) -> Option<Storage> {
+    let [Command::DrawTexture {
+        texture,
+        src,
+        dst,
+        transform,
+        alpha,
+        program,
+        uniforms,
+        ..
+    }] = seg.draw
+    else {
+        return None;
+    };
+    // Anything but an untinted 1:1 copy of the whole element must be rendered.
+    if *alpha != 1.0
+        || program.is_some()
+        || !uniforms.is_empty()
+        || *src != seg.meta.src
+        || *dst != seg.meta.geometry
+        || *transform != seg.meta.transform
+    {
+        return None;
+    }
+    if let Some(dmabuf) = tables.dmabufs.get(texture) {
+        return Some(Storage::Dmabuf(dmabuf.clone()));
+    }
+    if let Some(mem) = tables.memory.get(texture) {
+        return Some(Storage::Memory(mem.clone()));
+    }
+    None
+}
+
 /// Splits an output frame recording into its `BeginElement … EndElement` segments.
 fn split_elements(commands: &[Command]) -> Vec<Segment<'_>> {
     let mut out = Vec::new();
@@ -978,6 +1085,7 @@ struct SceneElement<'a> {
     meta: &'a ElementMeta,
     capture: &'a [Command],
     draw: &'a [Command],
+    storage: Option<&'a Storage>,
     tables: &'a RefCell<Tables>,
 }
 
@@ -996,6 +1104,10 @@ impl Element for SceneElement<'_> {
 
     fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
         convert::to_rect(self.meta.geometry)
+    }
+
+    fn transform(&self) -> Transform {
+        convert::to_transform(self.meta.transform)
     }
 
     fn damage_since(
@@ -1066,7 +1178,13 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
             .iter()
             .cloned()
             .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(frame, self.tables, &mut iter, Some(&clip)) {
+        if let Err(err) = run_frame(
+            frame,
+            self.tables,
+            &mut iter,
+            Some(&clip),
+            &mut VecDeque::new(),
+        ) {
             warn!("error replaying element: {err:#}");
         }
         Ok(())
@@ -1084,14 +1202,17 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
             .iter()
             .cloned()
             .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(frame, self.tables, &mut iter, None) {
+        if let Err(err) = run_frame(frame, self.tables, &mut iter, None, &mut VecDeque::new()) {
             warn!("error replaying element capture: {err:#}");
         }
         Ok(())
     }
 
     fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        None
+        match self.storage? {
+            Storage::Dmabuf(dmabuf) => Some(UnderlyingStorage::Dmabuf(dmabuf)),
+            Storage::Memory(mem) => Some(UnderlyingStorage::Memory(mem)),
+        }
     }
 }
 
