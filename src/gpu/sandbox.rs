@@ -1,11 +1,11 @@
 //! Confinement of the GPU process.
 //!
-//! Two layers. Landlock goes on at process start and limits which files the process can open
-//! while Mesa and PipeWire initialize (driver libraries, config, `/dev/dri`). Once the core has
-//! handed over everything the process needs (the DRM devices), it sends `Request::Lockdown`
-//! and a seccomp allowlist closes the door for good: no open, no socket, no exec, ioctl only
-//! for DRM / dma-buf / sync-file requests. Files the process still needs later (cursor theme
-//! icons, the PipeWire socket) arrive as fds on the requests that use them.
+//! The process starts with everything it will ever need: the socket to the core and the DRM
+//! devices the core opened, on its command line. Mesa initializes on those (loading drivers,
+//! opening render nodes), then `lockdown` applies a seccomp allowlist and only then does the
+//! process answer the core. No open, no socket, no exec, ioctl only for DRM / dma-buf /
+//! sync-file requests. Files it needs later (cursor theme icons, the PipeWire socket) arrive as
+//! fds on the requests that use them.
 //!
 //! A syscall outside the allowlist traps to a SIGSYS handler that logs the syscall number and
 //! fails the call with EPERM. Libraries then degrade instead of the process dying, and the log
@@ -22,49 +22,6 @@ pub const DISABLE_ENV: &str = "NIRI_GPU_SANDBOX";
 
 pub fn enabled() -> bool {
     std::env::var_os(DISABLE_ENV).is_none_or(|v| v != "0")
-}
-
-/// Trees the process may read: drivers, config, and what libdrm / Mesa look at to identify
-/// devices. No home directory, so no user config and no shader cache (disabled by the core).
-const READ_ONLY: &[&str] = &[
-    "/nix/store",
-    "/usr",
-    "/lib",
-    "/lib64",
-    "/etc",
-    "/run/opengl-driver",
-    "/run/opengl-driver-32",
-    "/run/current-system",
-    "/sys",
-    "/proc",
-    "/dev/urandom",
-    "/dev/random",
-];
-/// Device nodes Mesa opens itself (render nodes of the devices the core hands over).
-const READ_WRITE: &[&str] = &["/dev/dri", "/dev/null"];
-
-/// Landlock: applied before anything else runs in the GPU process.
-pub fn restrict_filesystem() -> anyhow::Result<()> {
-    use landlock::{
-        path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, ABI,
-    };
-
-    // V2 is Linux 5.19. Later ABIs add restrictions (ioctl on devices, sockets) that we do not
-    // want to handle: unhandled means allowed, and Mesa needs its ioctls.
-    let abi = ABI::V2;
-    let status = Ruleset::default()
-        .handle_access(AccessFs::from_all(abi))?
-        .create()?
-        .add_rules(path_beneath_rules(READ_ONLY, AccessFs::from_read(abi)))?
-        .add_rules(path_beneath_rules(READ_WRITE, AccessFs::from_all(abi)))?
-        .restrict_self()?;
-    match status.ruleset {
-        RulesetStatus::FullyEnforced => debug!("Landlock: filesystem restricted"),
-        RulesetStatus::PartiallyEnforced => warn!("Landlock: only partially enforced"),
-        RulesetStatus::NotEnforced => warn!("Landlock: not supported by this kernel"),
-    }
-    Ok(())
 }
 
 /// Seccomp: after this, the process can only talk to the fds it already holds.

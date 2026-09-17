@@ -45,6 +45,13 @@ pub enum Sub {
         /// `headless` or `drm`.
         #[arg(long, default_value = "headless")]
         mode: String,
+        /// DRM devices to add before sealing the sandbox, as `dev_t:fd` (fds inherited from
+        /// the parent).
+        #[arg(long = "device")]
+        devices: Vec<String>,
+        /// `dev_t` of the render node the renderer should live on.
+        #[arg(long)]
+        render_node_hint: Option<u64>,
     },
     /// Communicate with the running niri instance.
     Msg {

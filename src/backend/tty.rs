@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::iter::zip;
 use std::mem;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -31,10 +31,10 @@ use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::ping::make_ping;
+use smithay::reexports::calloop::ping::{make_ping, Ping};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
-    Dispatcher, Interest, LoopHandle, Mode as CalloopMode, PostAction,
+    Dispatcher, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
 use smithay::reexports::drm::control::{Mode as DrmMode, ModeFlags, ModeTypeFlags};
 use smithay::reexports::input::Libinput;
@@ -55,8 +55,8 @@ use crate::frame_clock::FrameClock;
 use crate::gpu::client::{GpuClient, Mode as GpuMode};
 use crate::gpu::convert;
 use crate::gpu::protocol::{
-    CastEvent, ColorState, ConnectorInfo, ElementState, Event, GpuEvent, HdrCaps, HdrMetadataDesc,
-    ModeDesc, OutputGeometry, OutputRef, PresentFlags, Request,
+    Caps, CastEvent, ColorState, ConnectorInfo, DevId, DeviceResult, ElementState, Event, GpuEvent,
+    HdrCaps, HdrMetadataDesc, ModeDesc, OutputGeometry, OutputRef, PresentFlags, Request,
 };
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
@@ -71,10 +71,22 @@ pub struct Tty {
     session: LibSeatSession,
     udev_dispatcher: Dispatcher<'static, UdevBackend, State>,
     libinput: Libinput,
+    event_loop: LoopHandle<'static, State>,
     /// Connection to the GPU process; also carries all DRM requests.
     renderer: RemoteRenderer,
     /// Set once the GPU process has a renderer (after the primary device was added).
     renderer_ready: bool,
+    /// Our executable, for (re)spawning the GPU process. `None` runs it in-process
+    /// (`NIRI_GPU_THREAD`), which can't be respawned.
+    gpu_exe: Option<PathBuf>,
+    /// The GPU process socket in the event loop.
+    gpu_source: RegistrationToken,
+    /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
+    gpu_ping: Ping,
+    /// Devices the current GPU process was started with (whether they worked or not).
+    gpu_devices: HashSet<DrmNode>,
+    /// Devices the GPU process accepted at startup, registered in `init` (needs `Niri`).
+    pending_devices: Vec<PendingDevice>,
     /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
     /// Where we'd like the GPU process to render: the configured render node, else udev's
     /// primary GPU. `None` lets the GPU process take the first device that works.
@@ -100,6 +112,15 @@ pub struct OutputDevice {
     /// Our copy of the DRM fd; the GPU process has a dup. Closed through libseat on removal.
     fd: OwnedFd,
     connectors: HashMap<u32, Connector>,
+}
+
+/// A device the GPU process has, not yet registered on our side.
+struct PendingDevice {
+    node: DrmNode,
+    fd: OwnedFd,
+    /// Set when this device brought up the renderer.
+    render_node: Option<DevId>,
+    caps: Option<Caps>,
 }
 
 struct Connector {
@@ -195,52 +216,6 @@ impl Tty {
             })
             .unwrap();
 
-        // The GPU process. NIRI_GPU_THREAD runs it in-process, for debugging.
-        let mut client = if std::env::var_os("NIRI_GPU_THREAD").is_some() {
-            warn!("running the GPU server in-process (NIRI_GPU_THREAD)");
-            GpuClient::spawn_thread(GpuMode::Drm)?
-        } else {
-            let exe = std::env::current_exe().context("error getting our executable path")?;
-            GpuClient::spawn_process(&exe, GpuMode::Drm)
-                .context("error spawning the GPU process")?
-        };
-        let poll_fd = client.as_fd().try_clone_to_owned()?;
-        // Events queued during a synchronous request are dispatched via this ping.
-        let (ping, ping_source) = make_ping().context("error creating ping")?;
-        client.set_waker(move || ping.ping());
-        let renderer = RemoteRenderer::new(client);
-
-        event_loop
-            .insert_source(
-                Generic::new(poll_fd, Interest::READ, CalloopMode::Level),
-                |_, _, state| {
-                    let tty = state.backend.tty();
-                    if !tty.renderer.client().is_readable() {
-                        // A sync request in an earlier callback already consumed it.
-                        let casts = tty.dispatch_gpu_events(&mut state.niri);
-                        state.on_cast_events(casts);
-                        return Ok(PostAction::Continue);
-                    }
-                    if let Err(err) = tty.renderer.client().recv_event() {
-                        // Nothing can be drawn without it; bail out like a GPU crash would.
-                        error!("lost the GPU process, exiting: {err:#}");
-                        state.niri.stop_signal.stop();
-                        return Ok(PostAction::Remove);
-                    }
-                    let casts = tty.dispatch_gpu_events(&mut state.niri);
-                    state.on_cast_events(casts);
-                    Ok(PostAction::Continue)
-                },
-            )
-            .unwrap();
-
-        event_loop
-            .insert_source(ping_source, |_, _, state| {
-                let casts = state.backend.tty().dispatch_gpu_events(&mut state.niri);
-                state.on_cast_events(casts);
-            })
-            .unwrap();
-
         let render_node_hint = render_node_from_config(&config.borrow()).or_else(|| {
             let path = match udev::primary_gpu(&seat_name) {
                 Ok(Some(path)) => path,
@@ -272,17 +247,60 @@ impl Tty {
             None => info!("no preferred render node"),
         }
 
+        let ignored_nodes = compute_ignored_nodes(&config.borrow(), render_node_hint);
+
+        // The GPU process gets every device we can open right now and seals itself once
+        // they're in. NIRI_GPU_THREAD runs it in-process instead, for debugging.
+        let gpu_exe = if std::env::var_os("NIRI_GPU_THREAD").is_some() {
+            None
+        } else {
+            Some(std::env::current_exe().context("error getting our executable path")?)
+        };
+        let mut session = session;
+        let (mut client, pending_devices, unusable_devices) = spawn_gpu(
+            gpu_exe.as_deref(),
+            &mut session,
+            &udev_dispatcher,
+            &ignored_nodes,
+            render_node_hint,
+        )?;
+        let gpu_devices = pending_devices
+            .iter()
+            .map(|p| p.node)
+            .chain(unusable_devices.iter().copied())
+            .collect();
+        let poll_fd = client.as_fd().try_clone_to_owned()?;
+        // Events queued during a synchronous request are dispatched via this ping.
+        let (ping, ping_source) = make_ping().context("error creating ping")?;
+        let waker_ping = ping.clone();
+        client.set_waker(move || waker_ping.ping());
+        let renderer = RemoteRenderer::new(client);
+        let gpu_source = register_gpu_source(&event_loop, poll_fd);
+
+        event_loop
+            .insert_source(ping_source, |_, _, state| {
+                let casts = state.backend.tty().dispatch_gpu_events(&mut state.niri);
+                state.on_cast_events(casts);
+            })
+            .unwrap();
+
         Ok(Self {
             config,
             session,
             udev_dispatcher,
             libinput,
+            event_loop,
             renderer,
             renderer_ready: false,
+            gpu_exe,
+            gpu_source,
+            gpu_ping: ping,
+            gpu_devices,
+            pending_devices,
             render_node_hint,
             render_node: None,
-            unusable_devices: HashSet::new(),
-            ignored_nodes: HashSet::new(),
+            unusable_devices,
+            ignored_nodes,
             devices: HashMap::new(),
             dmabuf_global: None,
             update_output_config_on_resume: false,
@@ -348,33 +366,107 @@ impl Tty {
 
         self.ignored_nodes = self.compute_ignored_nodes();
 
-        let udev = self.udev_dispatcher.clone();
-        let udev = udev.as_source_ref();
+        // The GPU process already has the devices we opened in `new`; register them here
+        // (needs `Niri`), then scan connectors: an output on a display-only device needs the
+        // rendering device to be known, whatever the order udev lists them in.
+        let pending = mem::take(&mut self.pending_devices);
+        self.register_devices(niri, pending);
 
-        // Hand every device to the GPU process first, then scan connectors: an output on a
-        // display-only device needs the rendering device to be known, whatever the order udev
-        // lists them in.
-        let devices: Vec<_> = udev
-            .device_list()
-            .map(|(id, path)| (id, path.to_owned()))
-            .collect();
-        self.add_devices(niri, devices);
-        self.lockdown_gpu();
+        if self.gpu_exe.is_none() {
+            // In-process server: it gets its devices at runtime.
+            let udev = self.udev_dispatcher.clone();
+            let udev = udev.as_source_ref();
+            let devices: Vec<_> = udev
+                .device_list()
+                .map(|(id, path)| (id, path.to_owned()))
+                .collect();
+            self.add_devices(niri, devices);
+        }
     }
 
-    /// Seals the GPU process once the initial devices are in: Mesa is up (or never will be
-    /// for these devices). Devices hot-plugged from now on can still scan out, but cannot
-    /// bring up a renderer. A GPU process that cannot be confined is a fatal error; set
-    /// `NIRI_GPU_SANDBOX=0` to run without the sandbox.
-    fn lockdown_gpu(&mut self) {
-        if let Err(err) = self.renderer.client().lockdown() {
-            error!("error locking down the GPU process: {err:?}");
-            std::process::exit(1);
+    /// Registers devices the GPU process accepted, then scans their connectors.
+    fn register_devices(&mut self, niri: &mut Niri, pending: Vec<PendingDevice>) {
+        let mut added = Vec::new();
+        for device in pending {
+            let dev_id = device.node.dev_id();
+            match self.register_device(niri, device) {
+                Ok(()) => added.push(dev_id),
+                Err(err) => warn!("error registering device {dev_id}: {err:?}"),
+            }
         }
+        for dev_id in added {
+            self.device_changed(dev_id, niri, true);
+        }
+    }
+
+    /// Replaces the GPU process with one started on the current device set. For when there is
+    /// no renderer: the sealed process cannot bring one up on a device it did not start with
+    /// (Mesa cannot open anything anymore). Without a renderer nothing lives on the GPU side,
+    /// so the swap only costs re-adding the devices.
+    fn respawn_gpu(&mut self, niri: &mut Niri) {
+        let _span = tracy_client::span!("Tty::respawn_gpu");
+        info!("no renderer; restarting the GPU process with the current devices");
+
+        for node in self.devices.keys().copied().collect::<Vec<_>>() {
+            self.device_removed(node.dev_id(), niri);
+        }
+        self.unusable_devices.clear();
+
+        let res = spawn_gpu(
+            self.gpu_exe.as_deref(),
+            &mut self.session,
+            &self.udev_dispatcher,
+            &self.ignored_nodes,
+            self.render_node_hint,
+        );
+        let (mut client, pending, unusable) = match res {
+            Ok(x) => x,
+            Err(err) => {
+                error!("error restarting the GPU process, exiting: {err:#}");
+                niri.stop_signal.stop();
+                return;
+            }
+        };
+        self.gpu_devices = pending
+            .iter()
+            .map(|p| p.node)
+            .chain(unusable.iter().copied())
+            .collect();
+        self.unusable_devices = unusable;
+
+        let ping = self.gpu_ping.clone();
+        client.set_waker(move || ping.ping());
+        let poll_fd = match client.as_fd().try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(err) => {
+                error!("error duplicating the GPU socket, exiting: {err}");
+                niri.stop_signal.stop();
+                return;
+            }
+        };
+        self.renderer.replace_client(client);
+        self.event_loop.remove(self.gpu_source);
+        self.gpu_source = register_gpu_source(&self.event_loop, poll_fd);
+
+        self.register_devices(niri, pending);
     }
 
     /// Adds `devices` (any order), then scans the connectors of the ones that worked.
     fn add_devices(&mut self, niri: &mut Niri, devices: Vec<(dev_t, PathBuf)>) {
+        if !self.renderer_ready && self.gpu_exe.is_some() {
+            // The sealed GPU process can only render on a device it was started with. Restart
+            // it if these are new to it (a device it already failed on stays failed).
+            let new = devices.iter().any(|(dev_id, _)| {
+                DrmNode::from_dev_id(*dev_id).is_ok_and(|node| {
+                    node.ty() == NodeType::Primary && !self.gpu_devices.contains(&node)
+                })
+            });
+            if new {
+                self.respawn_gpu(niri);
+            }
+            return;
+        }
+
         let mut added = Vec::new();
         for (device_id, path) in devices {
             match self.device_added(device_id, &path, niri) {
@@ -435,80 +527,83 @@ impl Tty {
 
                 self.ignored_nodes = self.compute_ignored_nodes();
 
-                let mut device_list = self
-                    .udev_dispatcher
-                    .as_source_ref()
-                    .device_list()
-                    .map(|(device_id, path)| (device_id, path.to_owned()))
-                    .collect::<HashMap<_, _>>();
+                if !self.renderer_ready && self.gpu_exe.is_some() {
+                    // Started on an inactive VT (or the rendering device is gone): the sealed
+                    // GPU process cannot bring up a renderer, so start over with a fresh one.
+                    self.respawn_gpu(niri);
+                } else {
+                    let mut device_list = self
+                        .udev_dispatcher
+                        .as_source_ref()
+                        .device_list()
+                        .map(|(device_id, path)| (device_id, path.to_owned()))
+                        .collect::<HashMap<_, _>>();
 
-                let removed_devices = self
-                    .devices
-                    .keys()
-                    .filter(|node| {
-                        !device_list.contains_key(&node.dev_id())
-                            || self.ignored_nodes.contains(node)
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
-                let remained_devices = self
-                    .devices
-                    .keys()
-                    .filter(|node| {
-                        device_list.contains_key(&node.dev_id())
-                            && !self.ignored_nodes.contains(node)
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
+                    let removed_devices = self
+                        .devices
+                        .keys()
+                        .filter(|node| {
+                            !device_list.contains_key(&node.dev_id())
+                                || self.ignored_nodes.contains(node)
+                        })
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let remained_devices = self
+                        .devices
+                        .keys()
+                        .filter(|node| {
+                            device_list.contains_key(&node.dev_id())
+                                && !self.ignored_nodes.contains(node)
+                        })
+                        .copied()
+                        .collect::<Vec<_>>();
 
-                for node in removed_devices {
-                    device_list.remove(&node.dev_id());
-                    self.device_removed(node.dev_id(), niri);
-                }
+                    for node in removed_devices {
+                        device_list.remove(&node.dev_id());
+                        self.device_removed(node.dev_id(), niri);
+                    }
 
-                let force_disable = self
-                    .config
-                    .borrow()
-                    .debug
-                    .force_disable_connectors_on_resume;
-                if let Err(err) = self.request_ack(Request::ResumeDevices { force_disable }) {
-                    warn!("error activating DRM devices: {err:?}");
-                }
+                    let force_disable = self
+                        .config
+                        .borrow()
+                        .debug
+                        .force_disable_connectors_on_resume;
+                    if let Err(err) = self.request_ack(Request::ResumeDevices { force_disable }) {
+                        warn!("error activating DRM devices: {err:?}");
+                    }
 
-                for node in remained_devices {
-                    device_list.remove(&node.dev_id());
+                    for node in remained_devices {
+                        device_list.remove(&node.dev_id());
 
-                    // Re-read connectors and drop any stale kernel state.
-                    self.device_changed(node.dev_id(), niri, true);
+                        // Re-read connectors and drop any stale kernel state.
+                        self.device_changed(node.dev_id(), niri, true);
 
-                    // Apply gamma changes requested while we were inactive.
-                    let device = self.devices.get_mut(&node).unwrap();
-                    let mut pending = Vec::new();
-                    for (crtc, connector) in device.connectors.iter_mut() {
-                        if let Some(surface) = &mut connector.surface {
-                            // Give a rejected HDR color state another chance after resume.
-                            surface.failed_color_state = None;
-                            if let Some(ramp) = surface.pending_gamma_change.take() {
-                                pending.push((*crtc, ramp));
+                        // Apply gamma changes requested while we were inactive.
+                        let device = self.devices.get_mut(&node).unwrap();
+                        let mut pending = Vec::new();
+                        for (crtc, connector) in device.connectors.iter_mut() {
+                            if let Some(surface) = &mut connector.surface {
+                                // Give a rejected HDR color state another chance after resume.
+                                surface.failed_color_state = None;
+                                if let Some(ramp) = surface.pending_gamma_change.take() {
+                                    pending.push((*crtc, ramp));
+                                }
+                            }
+                        }
+                        for (crtc, ramp) in pending {
+                            let output = OutputRef {
+                                dev: node.dev_id(),
+                                crtc,
+                            };
+                            if let Err(err) = self.request_ack(Request::SetGamma { output, ramp }) {
+                                warn!("error applying pending gamma change: {err:?}");
                             }
                         }
                     }
-                    for (crtc, ramp) in pending {
-                        let output = OutputRef {
-                            dev: node.dev_id(),
-                            crtc,
-                        };
-                        if let Err(err) = self.request_ack(Request::SetGamma { output, ramp }) {
-                            warn!("error applying pending gamma change: {err:?}");
-                        }
-                    }
+
+                    // Add new devices.
+                    self.add_devices(niri, device_list.into_iter().collect());
                 }
-
-                // Add new devices.
-                self.add_devices(niri, device_list.into_iter().collect());
-
-                // For a compositor started on an inactive VT this is the first enumeration.
-                self.lockdown_gpu();
 
                 if self.update_output_config_on_resume {
                     self.on_output_config_changed(niri);
@@ -536,14 +631,6 @@ impl Tty {
         debug!("adding device: {device_id} {path:?}");
 
         let node = DrmNode::from_dev_id(device_id)?;
-        if node.ty() != NodeType::Primary {
-            debug!("not a primary node, skipping");
-            return Ok(false);
-        }
-        if self.ignored_nodes.contains(&node) {
-            debug!("node is ignored, skipping");
-            return Ok(false);
-        }
         if self.unusable_devices.contains(&node) {
             debug!("device is unusable, skipping");
             return Ok(false);
@@ -552,16 +639,15 @@ impl Tty {
             debug!("device already added");
             return Ok(false);
         }
+        let Some((node, fd)) =
+            open_device(&mut self.session, &self.ignored_nodes, device_id, path)?
+        else {
+            return Ok(false);
+        };
 
         let _span = tracy_client::span!("Tty::device_added");
 
-        let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
-        let fd = {
-            let _span = tracy_client::span!("LibSeatSession::open");
-            self.session.open(path, open_flags)
-        }?;
         let gpu_fd = fd.try_clone().context("error duplicating DRM fd")?;
-
         let res = self.request_with_fds(
             Request::AddDevice {
                 dev: device_id,
@@ -581,6 +667,28 @@ impl Tty {
                 return Err(err.context("GPU process failed to add device"));
             }
         };
+
+        self.register_device(
+            niri,
+            PendingDevice {
+                node,
+                fd,
+                render_node,
+                caps,
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Records a device the GPU process has; brings up our side of the renderer when it is
+    /// the rendering device.
+    fn register_device(&mut self, niri: &mut Niri, device: PendingDevice) -> anyhow::Result<()> {
+        let PendingDevice {
+            node,
+            fd,
+            render_node,
+            caps,
+        } = device;
 
         if let Some(caps) = caps {
             let render_node = render_node
@@ -627,7 +735,7 @@ impl Tty {
                 connectors: HashMap::new(),
             },
         );
-        Ok(true)
+        Ok(())
     }
 
     fn device_changed(&mut self, device_id: dev_t, niri: &mut Niri, cleanup: bool) {
@@ -1822,14 +1930,7 @@ impl Tty {
     }
 
     fn compute_ignored_nodes(&self) -> HashSet<DrmNode> {
-        let mut ignored_nodes = ignored_nodes_from_config(&self.config.borrow());
-        if let Some(hint) = self.render_node_hint {
-            let primary = hint.node_with_type(NodeType::Primary).and_then(Result::ok);
-            if ignored_nodes.remove(&hint) || primary.is_some_and(|p| ignored_nodes.remove(&p)) {
-                warn!("ignoring the render node is not allowed");
-            }
-        }
-        ignored_nodes
+        compute_ignored_nodes(&self.config.borrow(), self.render_node_hint)
     }
 
     pub fn update_ignored_nodes_config(&mut self, niri: &mut Niri) {
@@ -2142,6 +2243,166 @@ fn node_display(node: &DrmNode) -> String {
         Some(path) => format!("{path:?}"),
         None => node.to_string(),
     }
+}
+
+fn compute_ignored_nodes(config: &Config, render_node_hint: Option<DrmNode>) -> HashSet<DrmNode> {
+    let mut ignored_nodes = ignored_nodes_from_config(config);
+    if let Some(hint) = render_node_hint {
+        let primary = hint.node_with_type(NodeType::Primary).and_then(Result::ok);
+        if ignored_nodes.remove(&hint) || primary.is_some_and(|p| ignored_nodes.remove(&p)) {
+            warn!("ignoring the render node is not allowed");
+        }
+    }
+    ignored_nodes
+}
+
+/// Checks that `path` is a primary node we're not ignoring and opens it through the session.
+fn open_device(
+    session: &mut LibSeatSession,
+    ignored_nodes: &HashSet<DrmNode>,
+    device_id: dev_t,
+    path: &Path,
+) -> anyhow::Result<Option<(DrmNode, OwnedFd)>> {
+    let node = DrmNode::from_dev_id(device_id)?;
+    if node.ty() != NodeType::Primary {
+        debug!("not a primary node, skipping");
+        return Ok(None);
+    }
+    if ignored_nodes.contains(&node) {
+        debug!("node is ignored, skipping");
+        return Ok(None);
+    }
+
+    let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
+    let fd = {
+        let _span = tracy_client::span!("LibSeatSession::open");
+        session.open(path, open_flags)
+    }?;
+    Ok(Some((node, fd)))
+}
+
+/// Opens every usable DRM device (when the session is active) and starts the GPU process with
+/// them. Returns the client, the devices it accepted, and the ones it rejected (closed here,
+/// not to be retried). `exe: None` runs the server in-process instead, without devices.
+fn spawn_gpu(
+    exe: Option<&Path>,
+    session: &mut LibSeatSession,
+    udev: &Dispatcher<'static, UdevBackend, State>,
+    ignored_nodes: &HashSet<DrmNode>,
+    render_node_hint: Option<DrmNode>,
+) -> anyhow::Result<(GpuClient, Vec<PendingDevice>, HashSet<DrmNode>)> {
+    let _span = tracy_client::span!("spawn_gpu");
+
+    let Some(exe) = exe else {
+        warn!("running the GPU server in-process (NIRI_GPU_THREAD)");
+        let client = GpuClient::spawn_thread(GpuMode::Drm)?;
+        return Ok((client, Vec::new(), HashSet::new()));
+    };
+
+    let mut opened = Vec::new();
+    if session.is_active() {
+        let devices: Vec<(dev_t, PathBuf)> = udev
+            .as_source_ref()
+            .device_list()
+            .map(|(id, path)| (id, path.to_owned()))
+            .collect();
+        for (device_id, path) in devices {
+            match open_device(session, ignored_nodes, device_id, &path) {
+                Ok(Some(device)) => opened.push(device),
+                Ok(None) => (),
+                Err(err) => warn!("error opening device {path:?}: {err:?}"),
+            }
+        }
+    } else {
+        debug!("session is inactive; starting the GPU process without devices");
+    }
+
+    let fds: Vec<(DevId, BorrowedFd<'_>)> = opened
+        .iter()
+        .map(|(node, fd)| (node.dev_id(), fd.as_fd()))
+        .collect();
+    let mut client = GpuClient::spawn_process(
+        exe,
+        GpuMode::Drm,
+        &fds,
+        render_node_hint.map(|n| n.dev_id()),
+    )
+    .context("error spawning the GPU process")?;
+
+    let results: HashMap<DevId, DeviceResult> = client
+        .take_device_results()
+        .into_iter()
+        .map(|r| (r.dev, r))
+        .collect();
+    let caps = client.caps().cloned();
+    let mut pending = Vec::new();
+    let mut unusable = HashSet::new();
+    for (node, fd) in opened {
+        let error = match results.get(&node.dev_id()) {
+            Some(DeviceResult {
+                error: None,
+                render_node,
+                ..
+            }) => {
+                let caps = if render_node.is_some() {
+                    caps.clone()
+                } else {
+                    None
+                };
+                pending.push(PendingDevice {
+                    node,
+                    fd,
+                    render_node: *render_node,
+                    caps,
+                });
+                continue;
+            }
+            Some(DeviceResult {
+                error: Some(err), ..
+            }) => err.clone(),
+            None => "no result from the GPU process".to_owned(),
+        };
+        warn!(
+            "GPU process failed to add device {}: {error}",
+            node_display(&node)
+        );
+        if let Err(err) = session.close(fd) {
+            warn!("error closing DRM device fd: {err:?}");
+        }
+        unusable.insert(node);
+    }
+    Ok((client, pending, unusable))
+}
+
+/// Watches the GPU socket: events are dispatched from here (or from the ping, when a
+/// synchronous request already drained the socket).
+fn register_gpu_source(
+    event_loop: &LoopHandle<'static, State>,
+    poll_fd: OwnedFd,
+) -> RegistrationToken {
+    event_loop
+        .insert_source(
+            Generic::new(poll_fd, Interest::READ, CalloopMode::Level),
+            |_, _, state| {
+                let tty = state.backend.tty();
+                if !tty.renderer.client().is_readable() {
+                    // A sync request in an earlier callback already consumed it.
+                    let casts = tty.dispatch_gpu_events(&mut state.niri);
+                    state.on_cast_events(casts);
+                    return Ok(PostAction::Continue);
+                }
+                if let Err(err) = tty.renderer.client().recv_event() {
+                    // Nothing can be drawn without it; bail out like a GPU crash would.
+                    error!("lost the GPU process, exiting: {err:#}");
+                    state.niri.stop_signal.stop();
+                    return Ok(PostAction::Remove);
+                }
+                let casts = tty.dispatch_gpu_events(&mut state.niri);
+                state.on_cast_events(casts);
+                Ok(PostAction::Continue)
+            },
+        )
+        .unwrap()
 }
 
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {

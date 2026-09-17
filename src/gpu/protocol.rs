@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -576,6 +576,9 @@ pub enum Request {
     /// node. That's not always the render node's own card: on Asahi the GPU's card node has no
     /// KMS and Mesa renders through the display controller's node instead. Every other device
     /// is display-only and scans out buffers allocated on the rendering device.
+    ///
+    /// Hot-plug only: the initial devices come with the process's command line so Mesa can
+    /// initialize before the sandbox seals. A sealed process cannot bring up a renderer.
     AddDevice {
         dev: DevId,
         path: String,
@@ -700,9 +703,6 @@ pub enum Request {
         fallback: bool,
         first_id: TexId,
     },
-    /// Applies the seccomp sandbox: from here on the GPU process can only use the fds it holds
-    /// or receives. Sent once the initial devices are added (Mesa is up). Reply: Ack.
-    Lockdown,
     /// Encodes `region` of a texture as PNG (RGBA) on a GPU-process thread. One-way; the
     /// result arrives as `GpuEvent::Png { token }`.
     EncodePng {
@@ -812,12 +812,25 @@ pub enum CastEvent {
     PipeWireFatal,
 }
 
+/// Outcome of adding a device given at startup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceResult {
+    pub dev: DevId,
+    /// Set when this device brought up the renderer.
+    pub render_node: Option<DevId>,
+    /// Set when the device could not be added (it should be closed and not retried).
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
-    /// `caps` is present once a renderer exists (immediately in headless mode).
+    /// Sent once the devices given at startup are added and the sandbox is sealed. `caps` is
+    /// present when a renderer exists (always in headless mode); `devices` reports on every
+    /// startup device.
     Ready {
         version: u32,
         caps: Option<Caps>,
+        devices: Vec<DeviceResult>,
     },
     Ack,
     Image(Image),

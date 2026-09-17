@@ -418,6 +418,17 @@ impl RemoteRenderer {
         *self.shared.caps.write().unwrap() = caps;
     }
 
+    /// Swaps in a fresh GPU process. Only valid while nothing lives on the GPU side (no
+    /// renderer was ready), so all the per-process state to reset is the queue and the dmabuf
+    /// import cache. The old client is shut down here.
+    pub fn replace_client(&self, client: GpuClient) {
+        let caps = client.caps().cloned().unwrap_or_default();
+        *self.shared.pending.lock().unwrap() = Pending::default();
+        self.shared.dmabuf_cache.lock().unwrap().clear();
+        *self.shared.client.lock().unwrap() = client;
+        self.set_caps(caps);
+    }
+
     /// The GPU-process connection, for requests that are not renderer calls (DRM/KMS).
     pub fn client(&self) -> MutexGuard<'_, GpuClient> {
         self.shared.client.lock().unwrap()

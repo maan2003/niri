@@ -11,12 +11,10 @@ use anyhow::{anyhow, bail, Context};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use super::protocol::{
-    self, Caps, CastCursorMode, CursorFrameDesc, DmabufDesc, Event, GpuEvent, Image, Rect, Request,
-    ShaderKind, TexId, PROTOCOL_VERSION,
+    self, Caps, CastCursorMode, CursorFrameDesc, DevId, DeviceResult, DmabufDesc, Event, GpuEvent,
+    Image, Rect, Request, ShaderKind, TexId, PROTOCOL_VERSION,
 };
 use super::transport::Channel;
-
-pub const CHILD_SOCKET_FD: i32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -53,12 +51,20 @@ pub struct GpuClient {
     /// Called when an event is queued while a reply was awaited. The socket is no longer
     /// readable by then, so a level-triggered poll would not notice; this wakes the loop.
     waker: Option<Box<dyn Fn() + Send>>,
-    locked_down: bool,
+    /// What the process made of the devices it was started with, until taken.
+    device_results: Vec<DeviceResult>,
 }
 
 impl GpuClient {
-    /// Spawns `exe gpu-process` with the socket on fd 3.
-    pub fn spawn_process(exe: &Path, mode: Mode) -> anyhow::Result<Self> {
+    /// Spawns `exe gpu-process` with the socket and `devices` (DRM fds the caller opened)
+    /// inherited. The process adds the devices, seals itself, then answers; their outcome is in
+    /// [`take_device_results`](Self::take_device_results).
+    pub fn spawn_process(
+        exe: &Path,
+        mode: Mode,
+        devices: &[(DevId, BorrowedFd<'_>)],
+        render_node_hint: Option<DevId>,
+    ) -> anyhow::Result<Self> {
         let (ours, theirs) = rustix::net::socketpair(
             rustix::net::AddressFamily::UNIX,
             rustix::net::SocketType::STREAM,
@@ -67,21 +73,33 @@ impl GpuClient {
         )
         .context("socketpair")?;
 
-        let theirs_raw = theirs.as_raw_fd();
+        // Fds are inherited under their current numbers (no dup2 dance that could clobber
+        // one of them); the child just gets CLOEXEC cleared on exactly these.
+        let mut inherit = vec![theirs.as_raw_fd()];
         let mut cmd = Command::new(exe);
         cmd.arg("gpu-process")
             .arg("--socket-fd")
-            .arg(CHILD_SOCKET_FD.to_string())
+            .arg(theirs.as_raw_fd().to_string())
             .arg("--mode")
-            .arg(mode.as_str())
+            .arg(mode.as_str());
+        if let Some(hint) = render_node_hint {
+            cmd.arg("--render-node-hint").arg(hint.to_string());
+        }
+        for (dev, fd) in devices {
+            cmd.arg("--device").arg(format!("{dev}:{}", fd.as_raw_fd()));
+            inherit.push(fd.as_raw_fd());
+        }
+        cmd
             // No home directory in the sandbox, so no shader cache on disk.
             .env("MESA_SHADER_CACHE_DISABLE", "true")
             .env("MESA_GLSL_CACHE_DISABLE", "true")
             .stdin(Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(theirs_raw, CHILD_SOCKET_FD) < 0 {
-                    return Err(std::io::Error::last_os_error());
+                for fd in &inherit {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -94,9 +112,9 @@ impl GpuClient {
             child: Some(child),
             thread: None,
             caps: None,
+            device_results: Vec::new(),
             events: VecDeque::new(),
             waker: None,
-            locked_down: false,
         };
         client.handshake()?;
         Ok(client)
@@ -107,15 +125,15 @@ impl GpuClient {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
             .name("gpu-server".into())
-            .spawn(move || super::server::run(theirs.into_fd(), mode, false))?;
+            .spawn(move || super::server::run(theirs.into_fd(), mode, false, Vec::new(), None))?;
         let mut client = Self {
             chan: ours,
             child: None,
             thread: Some(thread),
             caps: None,
+            device_results: Vec::new(),
             events: VecDeque::new(),
             waker: None,
-            locked_down: false,
         };
         client.handshake()?;
         Ok(client)
@@ -134,8 +152,13 @@ impl GpuClient {
     fn handshake(&mut self) -> anyhow::Result<()> {
         let (event, _): (Event, _) = self.chan.recv().context("waiting for gpu process")?;
         match event {
-            Event::Ready { version, caps } if version == PROTOCOL_VERSION => {
+            Event::Ready {
+                version,
+                caps,
+                devices,
+            } if version == PROTOCOL_VERSION => {
                 self.caps = caps;
+                self.device_results = devices;
                 Ok(())
             }
             Event::Ready { version, .. } => bail!("gpu process protocol version {version}"),
@@ -296,15 +319,9 @@ impl GpuClient {
         Self::expect_ack(self.request(&req, &[])?)
     }
 
-    /// Seals the GPU process with seccomp; see `Request::Lockdown`. A no-op after the first
-    /// success, so every "the devices are in" site can call it.
-    pub fn lockdown(&mut self) -> anyhow::Result<()> {
-        if self.locked_down {
-            return Ok(());
-        }
-        Self::expect_ack(self.request(&Request::Lockdown, &[])?)?;
-        self.locked_down = true;
-        Ok(())
+    /// Outcome of the devices passed to [`spawn_process`](Self::spawn_process).
+    pub fn take_device_results(&mut self) -> Vec<DeviceResult> {
+        std::mem::take(&mut self.device_results)
     }
 
     /// `icon` is the opened Xcursor file, if one was found.
@@ -408,7 +425,7 @@ impl Drop for GpuClient {
     }
 }
 
-/// Wraps the socket fd inherited from the parent (see [`CHILD_SOCKET_FD`]).
+/// Wraps an fd inherited from the parent (`--socket-fd`, `--device`).
 pub fn inherited_socket(fd: i32) -> OwnedFd {
     unsafe { OwnedFd::from_raw_fd(fd) }
 }

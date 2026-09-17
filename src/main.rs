@@ -99,25 +99,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
-            Sub::GpuProcess { socket_fd, mode } => {
+            Sub::GpuProcess {
+                socket_fd,
+                mode,
+                devices,
+                render_node_hint,
+            } => {
                 let fd = niri::gpu::client::inherited_socket(socket_fd);
                 let Some(mode) = niri::gpu::client::Mode::parse(&mode) else {
                     error!("unknown gpu process mode {mode:?}");
                     std::process::exit(1);
                 };
-                let sandbox = niri::gpu::sandbox::enabled();
-                if sandbox {
-                    if let Err(err) = niri::gpu::sandbox::restrict_filesystem() {
-                        error!("gpu process: error applying Landlock: {err:?}");
+                let mut startup = Vec::with_capacity(devices.len());
+                for arg in &devices {
+                    let parsed = arg.split_once(':').and_then(|(dev, fd)| {
+                        Some((dev.parse::<u64>().ok()?, fd.parse::<i32>().ok()?))
+                    });
+                    let Some((dev, fd)) = parsed else {
+                        error!("bad --device {arg:?}, expected dev_t:fd");
                         std::process::exit(1);
-                    }
-                } else {
+                    };
+                    startup.push(niri::gpu::server::StartupDevice {
+                        dev,
+                        fd: niri::gpu::client::inherited_socket(fd),
+                    });
+                }
+                let sandbox = niri::gpu::sandbox::enabled();
+                if !sandbox {
                     warn!(
                         "gpu process: sandbox disabled ({}=0)",
                         niri::gpu::sandbox::DISABLE_ENV
                     );
                 }
-                if let Err(err) = niri::gpu::server::run(fd, mode, sandbox) {
+                if let Err(err) =
+                    niri::gpu::server::run(fd, mode, sandbox, startup, render_node_hint)
+                {
                     error!("gpu process failed: {err:?}");
                     std::process::exit(1);
                 }

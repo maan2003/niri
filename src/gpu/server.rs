@@ -29,7 +29,7 @@ use super::exec::Executor;
 use super::gl::{resources, shaders};
 #[cfg(feature = "xdp-gnome-screencast")]
 use super::protocol::CastEvent;
-use super::protocol::{Event, GpuEvent, Request, PROTOCOL_VERSION};
+use super::protocol::{DevId, DeviceResult, Event, GpuEvent, Request, PROTOCOL_VERSION};
 use super::transport::Channel;
 use super::{cursor, sandbox};
 
@@ -55,14 +55,25 @@ pub(super) struct Server {
     signal: LoopSignal,
     /// Fds to attach to the reply of the request being handled.
     reply_fds: Vec<OwnedFd>,
-    /// Whether `Lockdown` applies seccomp. Off when the server runs on a thread of the core.
-    sandbox: bool,
     /// Events from worker threads (PNG encoding), forwarded to the core.
     bg: Sender<GpuEvent>,
 }
 
-/// `sandbox`: honor `Request::Lockdown` (only makes sense in a process of our own).
-pub fn run(fd: OwnedFd, mode: Mode, sandbox: bool) -> anyhow::Result<()> {
+/// A DRM device the core opened for us before we started.
+pub struct StartupDevice {
+    pub dev: DevId,
+    pub fd: OwnedFd,
+}
+
+/// Adds `devices`, seals the process with seccomp (when `sandbox`; never for a server on a
+/// thread of the core), then serves requests on `fd`.
+pub fn run(
+    fd: OwnedFd,
+    mode: Mode,
+    sandbox: bool,
+    devices: Vec<StartupDevice>,
+    render_node_hint: Option<DevId>,
+) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<'static, Server> =
         EventLoop::try_new().context("error creating event loop")?;
 
@@ -70,22 +81,9 @@ pub fn run(fd: OwnedFd, mode: Mode, sandbox: bool) -> anyhow::Result<()> {
         Mode::Headless => Some(new_surfaceless_renderer()?),
         Mode::Drm => None,
     };
-    let mut exec = Executor::new(renderer);
-    let caps = if exec.has_renderer() {
-        Some(exec.caps()?)
-    } else {
-        None
-    };
+    let exec = Executor::new(renderer);
 
-    let mut chan = Channel::new(fd);
-    chan.send(
-        &Event::Ready {
-            version: PROTOCOL_VERSION,
-            caps,
-        },
-        &[],
-    )?;
-
+    let chan = Channel::new(fd);
     // A dup of the socket for readiness polling; the Channel keeps the original.
     let poll_fd = chan.as_fd().try_clone_to_owned()?;
     let (bg, bg_rx) = calloop::channel::channel::<GpuEvent>();
@@ -106,9 +104,47 @@ pub fn run(fd: OwnedFd, mode: Mode, sandbox: bool) -> anyhow::Result<()> {
         loop_handle: event_loop.handle(),
         signal: event_loop.get_signal(),
         reply_fds: Vec::new(),
-        sandbox,
         bg,
     };
+
+    // Mesa initializes here, while the process can still open files.
+    let mut results = Vec::with_capacity(devices.len());
+    for StartupDevice { dev, fd } in devices {
+        let result = match server.add_device(dev, fd, render_node_hint) {
+            Ok(render_node) => DeviceResult {
+                dev,
+                render_node,
+                error: None,
+            },
+            Err(err) => {
+                warn!("error adding startup device {dev}: {err:#}");
+                DeviceResult {
+                    dev,
+                    render_node: None,
+                    error: Some(format!("{err:#}")),
+                }
+            }
+        };
+        results.push(result);
+    }
+
+    if sandbox {
+        sandbox::lockdown().context("error applying seccomp sandbox")?;
+    }
+
+    let caps = if server.exec.has_renderer() {
+        Some(server.exec.caps()?)
+    } else {
+        None
+    };
+    server.chan.send(
+        &Event::Ready {
+            version: PROTOCOL_VERSION,
+            caps,
+            devices: results,
+        },
+        &[],
+    )?;
 
     event_loop
         .handle()
@@ -137,6 +173,48 @@ pub fn run(fd: OwnedFd, mode: Mode, sandbox: bool) -> anyhow::Result<()> {
 }
 
 impl Server {
+    /// Registers a DRM device (and its vblank events); returns the render node when this
+    /// device brought up the renderer.
+    fn add_device(
+        &mut self,
+        dev: DevId,
+        fd: OwnedFd,
+        render_node_hint: Option<DevId>,
+    ) -> anyhow::Result<Option<DevId>> {
+        let loop_handle = self.loop_handle.clone();
+        let added = self.drm.add_device(
+            &mut self.exec,
+            fd,
+            dev,
+            render_node_hint,
+            |notifier, dev| {
+                loop_handle
+                    .insert_source(
+                        notifier,
+                        move |event, meta, server: &mut Server| match event {
+                            DrmEvent::VBlank(crtc) => {
+                                let meta = meta.expect("VBlank events must have metadata");
+                                if let Some(event) = server.drm.on_vblank(dev, crtc, meta) {
+                                    if let Err(err) = server.chan.send(&event, &[]) {
+                                        warn!("error sending vblank to core: {err}");
+                                    }
+                                }
+                            }
+                            DrmEvent::Error(error) => {
+                                warn!("DRM error: {error}");
+                                server.notify(GpuEvent::DeviceError {
+                                    dev,
+                                    message: error.to_string(),
+                                });
+                            }
+                        },
+                    )
+                    .map_err(|err| anyhow::anyhow!("error registering DRM notifier: {err}"))
+            },
+        )?;
+        Ok(added.render_node)
+    }
+
     pub(super) fn notify(&mut self, event: GpuEvent) {
         if let Err(err) = self.chan.send(&Event::Notify(event), &[]) {
             warn!("error sending event to core: {err}");
@@ -216,16 +294,6 @@ impl Server {
                 Event::Cursor {
                     frames: exec.import_cursor(&images, first_id)?,
                 }
-            }
-            Request::Lockdown => {
-                if self.sandbox {
-                    sandbox::lockdown().context("error applying seccomp sandbox")?;
-                    // Applying it twice would just stack filters.
-                    self.sandbox = false;
-                } else {
-                    debug!("Lockdown ignored: GPU server runs in-process");
-                }
-                Event::Ack
             }
             Request::EncodePng { token, id, region } => {
                 let image = match exec.read_texture(id, region, Fourcc::Abgr8888 as u32) {
@@ -346,40 +414,13 @@ impl Server {
             } => {
                 let fd = fds.pop_front().context("AddDevice needs the device fd")?;
                 debug!("adding DRM device {dev} ({path}), render node hint: {render_node_hint:?}");
-                let loop_handle = self.loop_handle.clone();
-                let added = drm.add_device(exec, fd, dev, render_node_hint, |notifier, dev| {
-                    loop_handle
-                        .insert_source(
-                            notifier,
-                            move |event, meta, server: &mut Server| match event {
-                                DrmEvent::VBlank(crtc) => {
-                                    let meta = meta.expect("VBlank events must have metadata");
-                                    if let Some(event) = server.drm.on_vblank(dev, crtc, meta) {
-                                        if let Err(err) = server.chan.send(&event, &[]) {
-                                            warn!("error sending vblank to core: {err}");
-                                        }
-                                    }
-                                }
-                                DrmEvent::Error(error) => {
-                                    warn!("DRM error: {error}");
-                                    server.notify(GpuEvent::DeviceError {
-                                        dev,
-                                        message: error.to_string(),
-                                    });
-                                }
-                            },
-                        )
-                        .map_err(|err| anyhow::anyhow!("error registering DRM notifier: {err}"))
-                })?;
-                let caps = if added.render_node.is_some() {
-                    Some(exec.caps()?)
+                let render_node = self.add_device(dev, fd, render_node_hint)?;
+                let caps = if render_node.is_some() {
+                    Some(self.exec.caps()?)
                 } else {
                     None
                 };
-                Event::DeviceAdded {
-                    render_node: added.render_node,
-                    caps,
-                }
+                Event::DeviceAdded { render_node, caps }
             }
             Request::RemoveDevice { dev } => {
                 let mut renderer_dropped = false;
