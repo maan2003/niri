@@ -15,6 +15,7 @@ let
     ${pkgs.coreutils}/bin/env > "$HOME/env.txt"
     ${pkgs.coreutils}/bin/ls -la /run /tmp /dev/shm > "$HOME/run.txt" 2>&1
     ${pkgs.procps}/bin/ps -eo user,pid,cmd > "$HOME/ps.txt" 2>&1
+    ${pkgs.coreutils}/bin/cat /proc/net/dev > "$HOME/net.txt" 2>&1
     ${pkgs.pipewire}/bin/pw-cli info 0 > "$HOME/pipewire.txt" 2>&1 || echo "pw-cli failed: $?" >> "$HOME/pipewire.txt"
     ${pkgs.wayland-utils}/bin/wayland-info > "$HOME/globals.txt" 2> "$HOME/wayland-info.err"
     ${pkgs.coreutils}/bin/touch "$HOME/done"
@@ -93,6 +94,7 @@ in
           "--autoplay-policy=no-user-gesture-required" "file://${audioPage}"
         ];
         gpu = true;
+        network = true;
         groups = [ "render" "pipewire" ];
       };
       # Plays a sound: audio is just the `pipewire` group plus the exposed socket directory.

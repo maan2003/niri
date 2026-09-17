@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 /// uid = 100042
 /// exec = ["firefox"]    # defaults to [name]; the only arguments the app ever gets
 /// gpu = true
+/// network = true
 /// groups = ["render"]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,9 @@ pub struct AppConfig {
     pub trusted: bool,
     #[serde(default)]
     pub gpu: bool,
+    /// Keep the host network; off means an empty network namespace.
+    #[serde(default)]
+    pub network: bool,
     #[serde(default)]
     pub globals: Vec<Global>,
     #[serde(default)]
@@ -204,6 +208,7 @@ impl Handler for Identity {
             groups: app.groups.clone(),
             argv,
             env: full_env,
+            network: app.network,
         };
         niri_forker::fork(&self.forker, &request).map_err(|e| format!("forker: {e}"))?;
         Ok(app.uid)

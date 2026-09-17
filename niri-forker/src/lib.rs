@@ -28,6 +28,9 @@ pub struct Request {
     /// The child's whole environment, plus `HOME` and `XDG_RUNTIME_DIR` which the forker sets
     /// for range UIDs.
     pub env: Vec<(String, String)>,
+    /// Keep the host network. Otherwise the child gets a new, empty network namespace.
+    #[serde(default)]
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,7 +210,7 @@ impl Server {
             if we_are_root {
                 let mut expose = self.expose.clone();
                 expose.push(runtime);
-                sandbox = Some(Sandbox::plan(&expose)?);
+                sandbox = Some(Sandbox::plan(&expose, request.network)?);
             }
         }
         let mut all_gids = vec![gid];
@@ -267,12 +270,15 @@ impl Server {
 /// exec (only syscalls on pre-built strings; nothing allocates there). Same UID plus this is
 /// the floor every app gets; what it may reach on top is groups and sockets.
 ///
-/// - a new mount namespace, so none of it leaks out;
+/// - a new mount namespace, so none of it leaks out, and unless the app was granted the
+///   network a new network namespace with nothing in it;
 /// - `/tmp` and `/dev/shm` are fresh tmpfs: no shared scratch space between apps;
 /// - `/proc` shows only the app's own processes;
 /// - `/run` is a fresh, read-only tmpfs holding only the exposed entries: no system D-Bus,
 ///   no forker or identity sockets, no other app's runtime directory, no setuid wrappers.
 struct Sandbox {
+    /// `unshare(CLONE_NEWNET)` too: no interfaces at all.
+    no_network: bool,
     /// Directories to create in the staging tmpfs, parents first.
     dirs: Vec<CString>,
     /// `(source, target)` bind mounts into the staging tmpfs.
@@ -284,7 +290,7 @@ struct Sandbox {
 const STAGE: &str = "/tmp/.run";
 
 impl Sandbox {
-    fn plan(expose: &[PathBuf]) -> Result<Self, String> {
+    fn plan(expose: &[PathBuf], network: bool) -> Result<Self, String> {
         let cstr = |p: &Path| {
             CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("NUL in {}", p.display()))
         };
@@ -327,6 +333,7 @@ impl Sandbox {
             }
         }
         Ok(Self {
+            no_network: !network,
             dirs,
             binds,
             symlinks,
@@ -365,10 +372,11 @@ impl Sandbox {
             unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype, flags, data.cast()) }
         };
         let nodev = libc::MS_NOSUID | libc::MS_NODEV;
+        let flags = libc::CLONE_NEWNS | if self.no_network { libc::CLONE_NEWNET } else { 0 };
         // SAFETY: syscalls only.
         unsafe {
-            if libc::unshare(libc::CLONE_NEWNS) != 0 {
-                return fail("unshare(CLONE_NEWNS)");
+            if libc::unshare(flags) != 0 {
+                return fail("unshare(CLONE_NEWNS | CLONE_NEWNET)");
             }
         }
         if mnt(c"none", root, none, libc::MS_REC | libc::MS_PRIVATE, none) != 0 {
@@ -515,6 +523,7 @@ mod tests {
                 groups: Vec::new(),
                 argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
                 env: vec![("PATH".into(), path.clone())],
+                network: false,
             },
         )
         .unwrap();
@@ -527,6 +536,7 @@ mod tests {
                 groups: vec!["render".into()],
                 argv: vec!["sh".into()],
                 env: vec![("PATH".into(), path.clone())],
+                network: false,
             },
         )
         .unwrap_err();
@@ -539,6 +549,7 @@ mod tests {
                 groups: Vec::new(),
                 argv: vec!["sh".into()],
                 env: vec![("PATH".into(), path)],
+                network: false,
             },
         )
         .unwrap_err();

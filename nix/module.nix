@@ -8,7 +8,7 @@ let
   toml = pkgs.formats.toml { };
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups trusted gpu globals;
+    inherit (app) uid groups trusted gpu network globals;
     exec = app.exec;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   identityFile = toml.generate "identity.toml" {
@@ -97,6 +97,11 @@ in
           groups = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           trusted = lib.mkOption { type = lib.types.bool; default = false; };
           gpu = lib.mkOption { type = lib.types.bool; default = false; };
+          network = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Keep the host network; otherwise an empty network namespace.";
+          };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
         };
