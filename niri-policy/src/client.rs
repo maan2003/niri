@@ -1,4 +1,5 @@
-//! The compositor's side: ask the daemon, cache per UID, fail closed.
+//! The compositor's side: ask the daemon, cache per UID, fail closed. There is no mode without
+//! a daemon: nobody is trusted unless a daemon says so.
 
 use std::collections::HashMap;
 use std::io;
@@ -15,8 +16,6 @@ use crate::AppPolicy;
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Source {
-    /// No daemon: everyone is trusted (single-user setup, tests).
-    Permissive,
     /// Connect to this path, reconnecting after an error.
     Socket {
         path: PathBuf,
@@ -32,13 +31,6 @@ pub struct PolicyClient {
 }
 
 impl PolicyClient {
-    pub fn permissive() -> Self {
-        Self {
-            source: Source::Permissive,
-            cache: HashMap::new(),
-        }
-    }
-
     /// Connects now (so a missing daemon is caught at startup) and reconnects on demand later.
     pub fn connect(path: PathBuf) -> io::Result<Self> {
         let conn = open(&path)?;
@@ -59,19 +51,6 @@ impl PolicyClient {
         })
     }
 
-    pub fn is_permissive(&self) -> bool {
-        matches!(self.source, Source::Permissive)
-    }
-
-    /// For connections whose UID cannot be read: trusted only without a daemon.
-    pub fn fallback(&self) -> Arc<AppPolicy> {
-        if self.is_permissive() {
-            Arc::new(AppPolicy::trusted("unknown"))
-        } else {
-            Arc::new(AppPolicy::unknown())
-        }
-    }
-
     /// The daemon's answer for `uid`, cached. An error means the daemon could not be reached or
     /// misbehaved; the caller decides what to do (the compositor uses [`AppPolicy::unknown`]).
     pub fn lookup(&mut self, uid: u32) -> io::Result<Arc<AppPolicy>> {
@@ -85,7 +64,6 @@ impl PolicyClient {
 
     fn ask(&mut self, uid: u32) -> io::Result<AppPolicy> {
         match &mut self.source {
-            Source::Permissive => Ok(AppPolicy::trusted("unknown")),
             Source::Socket { path, conn } => {
                 if conn.is_none() {
                     *conn = Some(open(path)?);

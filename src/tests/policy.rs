@@ -7,9 +7,9 @@ use std::thread;
 
 use niri_config::Config;
 use niri_policy::rpc::{self, Request, Response};
-use niri_policy::{daemon, AppEntry, AppPolicy, Global, PolicyClient, PolicyFile, PolicyStore};
+use niri_policy::{AppEntry, AppPolicy, Global, PolicyClient, PolicyFile};
 
-use super::fixture::Fixture;
+use super::fixture::{serve_policy as serve, Fixture};
 
 const PRIVILEGED: &[&str] = &[
     "zwlr_layer_shell_v1",
@@ -27,13 +27,6 @@ const PRIVILEGED: &[&str] = &[
     "zwlr_output_manager_v1",
     "wp_security_context_manager_v1",
 ];
-
-fn serve(file: PolicyFile) -> PolicyClient {
-    let store = PolicyStore::new(file).unwrap();
-    let (ours, theirs) = UnixStream::pair().unwrap();
-    thread::spawn(move || daemon::serve_connection(theirs, &store));
-    PolicyClient::from_stream(ours).unwrap()
-}
 
 fn for_our_uid(policy: AppPolicy) -> PolicyClient {
     let uid = rustix::process::getuid().as_raw();

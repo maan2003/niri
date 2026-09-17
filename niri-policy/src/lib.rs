@@ -238,16 +238,6 @@ impl PolicyStore {
         })
     }
 
-    /// Everyone trusted: the behaviour before there was a policy. For a single-user desktop
-    /// without a policy file, and for tests.
-    pub fn permissive() -> Self {
-        Self {
-            default: Arc::new(AppPolicy::trusted("unknown")),
-            apps: Vec::new(),
-            cache: Mutex::new(HashMap::new()),
-        }
-    }
-
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(Error::Io)?;
         let file: PolicyFile = toml::from_str(&text).map_err(Error::Parse)?;

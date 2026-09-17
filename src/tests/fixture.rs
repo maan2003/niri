@@ -1,17 +1,34 @@
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
-use niri_policy::PolicyClient;
+use niri_policy::{daemon, AppPolicy, PolicyClient, PolicyFile, PolicyStore};
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
 use super::server::Server;
 use crate::niri::{NewClient, Niri};
+
+/// A policy daemon on a thread, driven over a socket pair like the real one.
+pub fn serve_policy(file: PolicyFile) -> PolicyClient {
+    let store = PolicyStore::new(file).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    thread::spawn(move || daemon::serve_connection(theirs, &store));
+    PolicyClient::from_stream(ours).unwrap()
+}
+
+/// The single-user answer, said out loud by a daemon: every UID trusted.
+pub fn trust_everyone() -> PolicyClient {
+    serve_policy(PolicyFile {
+        default: AppPolicy::trusted("test"),
+        apps: Vec::new(),
+    })
+}
 
 pub struct Fixture {
     pub event_loop: EventLoop<'static, State>,
@@ -30,7 +47,7 @@ impl Fixture {
     }
 
     pub fn with_config(config: Config) -> Self {
-        Self::with_policy(config, PolicyClient::permissive())
+        Self::with_policy(config, trust_everyone())
     }
 
     pub fn with_policy(config: Config, policy: PolicyClient) -> Self {

@@ -3105,7 +3105,7 @@ impl Niri {
         // Identity is the peer UID; PIDs are reused and never used for this. Any failure along
         // the way fails closed: the client gets the nothing-optional policy.
         let policy = if credentials_unknown {
-            self.policy.fallback()
+            Arc::new(AppPolicy::unknown())
         } else {
             match rustix::net::sockopt::socket_peercred(&client) {
                 Ok(cred) => {

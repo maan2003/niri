@@ -408,25 +408,18 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-/// Socket from `NIRI_POLICY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-policy.sock`. No socket at the
-/// default path means a single-user setup: everyone is trusted, as before. A socket we cannot
-/// talk to is fatal, never permissive.
+/// Socket from `NIRI_POLICY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-policy.sock`. Nobody is
+/// trusted unless a daemon says so, so no daemon means no compositor.
 fn connect_policy() -> PolicyClient {
-    let explicit = env::var_os("NIRI_POLICY_SOCKET").map(PathBuf::from);
-    let path = explicit.clone().or_else(|| {
-        env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-policy.sock"))
-    });
+    let path = env::var_os("NIRI_POLICY_SOCKET")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-policy.sock"))
+        });
     let Some(path) = path else {
-        warn!("no policy daemon (XDG_RUNTIME_DIR unset); every client is trusted");
-        return PolicyClient::permissive();
+        error!("no policy daemon: set NIRI_POLICY_SOCKET or XDG_RUNTIME_DIR");
+        std::process::exit(1);
     };
-    if explicit.is_none() && !path.exists() {
-        warn!(
-            "no policy daemon at {}; every client is trusted",
-            path.display()
-        );
-        return PolicyClient::permissive();
-    }
     match PolicyClient::connect(path.clone()) {
         Ok(policy) => {
             info!("connected to policy daemon at {}", path.display());
@@ -434,7 +427,8 @@ fn connect_policy() -> PolicyClient {
         }
         Err(err) => {
             error!(
-                "error connecting to policy daemon at {}: {err}",
+                "error connecting to policy daemon at {}: {err}; \
+                 run niri-policyd or set NIRI_POLICY_SOCKET",
                 path.display()
             );
             std::process::exit(1);
