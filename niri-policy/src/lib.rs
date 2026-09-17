@@ -1,9 +1,10 @@
 //! Per-UID policy for Wayland clients.
 //!
-//! Identity is the UID of the connecting process (`SO_PEERCRED`); this crate says what a UID
-//! may do. Today the answers come from a static TOML file ([`PolicyStore::load`]); later an
-//! identity daemon answers the same question over a socket with the [`rpc`] types. The
-//! compositor only ever sees an [`AppPolicy`], so swapping the source touches nothing else.
+//! Identity is the UID of the connecting process (`SO_PEERCRED`); a policy daemon says what a
+//! UID may do. The compositor holds a [`client::PolicyClient`], asks it once per new
+//! connection and caches per UID. `niri-policyd` (this crate's binary) is the first daemon: it
+//! answers from a TOML file ([`PolicyStore`]). The identity daemon that allocates UIDs will
+//! replace it behind the same [`rpc`] protocol.
 //!
 //! The compositor applies the policy at one choke point: which optional globals a connection
 //! is shown. Everything a plain app needs (`wl_compositor`, `xdg_wm_base`, `wl_shm`, input,
@@ -15,6 +16,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+pub use client::PolicyClient;
 use serde::{Deserialize, Serialize};
 
 /// Optional globals the compositor may hide from a client. Anything not listed here is always
@@ -272,25 +274,9 @@ impl PolicyStore {
     }
 }
 
-/// Wire types for the identity daemon (postcard-framed, not wired up yet). The compositor asks
-/// once per connection and caches per UID.
-pub mod rpc {
-    use serde::{Deserialize, Serialize};
-
-    use super::AppPolicy;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum Request {
-        /// Policy for a UID; the daemon answers `Response::Policy` with the default record for
-        /// unknown UIDs.
-        Lookup { uid: u32 },
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum Response {
-        Policy(AppPolicy),
-    }
-}
+pub mod client;
+pub mod daemon;
+pub mod rpc;
 
 #[cfg(test)]
 mod tests {
@@ -328,6 +314,22 @@ mod tests {
         let unknown = store.lookup(5);
         assert_eq!(unknown.name, "unknown");
         assert!(!unknown.allows(Global::Dmabuf));
+    }
+
+    #[test]
+    fn client_and_daemon_roundtrip() {
+        let file: PolicyFile =
+            toml::from_str("[[app]]\nuid = 7\nname = \"seven\"\ngpu = true\n").unwrap();
+        let store = PolicyStore::new(file).unwrap();
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || daemon::serve_connection(b, &store));
+
+        let mut client = PolicyClient::from_stream(a).unwrap();
+        assert_eq!(client.lookup(7).unwrap().name, "seven");
+        assert!(client.lookup(7).unwrap().allows(Global::Dmabuf));
+        assert_eq!(client.lookup(8).unwrap().name, "unknown");
+        drop(client);
+        server.join().unwrap().unwrap();
     }
 
     #[test]

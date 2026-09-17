@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use calloop::EventLoop;
 use niri_config::Config;
-use niri_policy::PolicyStore;
+use niri_policy::PolicyClient;
 use smithay::reexports::wayland_server::Display;
 
 use crate::niri::State;
@@ -13,7 +13,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn with_policy(config: Config, policy: PolicyStore) -> Self {
+    pub fn with_policy(config: Config, policy: PolicyClient) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
         let display = Display::new().unwrap();

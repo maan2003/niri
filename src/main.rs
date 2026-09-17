@@ -27,7 +27,7 @@ use niri::utils::spawning::{
 use niri::utils::{cause_panic, version, watcher, IS_SYSTEMD_SERVICE};
 use niri_config::{Config, ConfigPath};
 use niri_ipc::socket::SOCKET_PATH_ENV;
-use niri_policy::PolicyStore;
+use niri_policy::PolicyClient;
 use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
@@ -210,7 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spawn_sh_at_startup = mem::take(&mut config.spawn_sh_at_startup);
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
-    let policy = load_policy();
+    let policy = connect_policy();
 
     store_and_increase_nofile_rlimit();
 
@@ -408,26 +408,35 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-/// Path from `NIRI_POLICY`, else `/etc/niri/policy.toml`. No file at all means a single-user
-/// setup: everyone is trusted, as before. A file that fails to load is fatal, never permissive.
-fn load_policy() -> PolicyStore {
-    let path = env::var_os("NIRI_POLICY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/etc/niri/policy.toml"));
-    if !path.exists() {
+/// Socket from `NIRI_POLICY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-policy.sock`. No socket at the
+/// default path means a single-user setup: everyone is trusted, as before. A socket we cannot
+/// talk to is fatal, never permissive.
+fn connect_policy() -> PolicyClient {
+    let explicit = env::var_os("NIRI_POLICY_SOCKET").map(PathBuf::from);
+    let path = explicit.clone().or_else(|| {
+        env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-policy.sock"))
+    });
+    let Some(path) = path else {
+        warn!("no policy daemon (XDG_RUNTIME_DIR unset); every client is trusted");
+        return PolicyClient::permissive();
+    };
+    if explicit.is_none() && !path.exists() {
         warn!(
-            "no policy file at {}; every client is trusted",
+            "no policy daemon at {}; every client is trusted",
             path.display()
         );
-        return PolicyStore::permissive();
+        return PolicyClient::permissive();
     }
-    match PolicyStore::load(&path) {
+    match PolicyClient::connect(path.clone()) {
         Ok(policy) => {
-            info!("loaded client policy from {}", path.display());
+            info!("connected to policy daemon at {}", path.display());
             policy
         }
         Err(err) => {
-            error!("error loading policy file {}: {err}", path.display());
+            error!(
+                "error connecting to policy daemon at {}: {err}",
+                path.display()
+            );
             std::process::exit(1);
         }
     }

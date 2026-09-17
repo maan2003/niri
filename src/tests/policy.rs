@@ -1,8 +1,13 @@
 //! A client is shown only the globals its UID's policy grants. The test client connects as our
-//! own UID, so the policy entry for that UID decides what the registry advertises.
+//! own UID, so the policy entry for that UID decides what the registry advertises. The daemon
+//! side runs on a thread over a socket pair, so the real protocol is exercised.
+
+use std::os::unix::net::UnixStream;
+use std::thread;
 
 use niri_config::Config;
-use niri_policy::{AppEntry, AppPolicy, Global, PolicyFile, PolicyStore};
+use niri_policy::rpc::{self, Request, Response};
+use niri_policy::{daemon, AppEntry, AppPolicy, Global, PolicyClient, PolicyFile, PolicyStore};
 
 use super::fixture::Fixture;
 
@@ -23,9 +28,16 @@ const PRIVILEGED: &[&str] = &[
     "wp_security_context_manager_v1",
 ];
 
-fn store(policy: AppPolicy) -> PolicyStore {
+fn serve(file: PolicyFile) -> PolicyClient {
+    let store = PolicyStore::new(file).unwrap();
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    thread::spawn(move || daemon::serve_connection(theirs, &store));
+    PolicyClient::from_stream(ours).unwrap()
+}
+
+fn for_our_uid(policy: AppPolicy) -> PolicyClient {
     let uid = rustix::process::getuid().as_raw();
-    PolicyStore::new(PolicyFile {
+    serve(PolicyFile {
         default: AppPolicy::unknown(),
         apps: vec![AppEntry {
             uid,
@@ -33,20 +45,22 @@ fn store(policy: AppPolicy) -> PolicyStore {
             policy,
         }],
     })
-    .unwrap()
 }
 
-fn advertised(policy: AppPolicy) -> Vec<String> {
-    let mut f = Fixture::with_policy(Config::default(), store(policy));
+fn advertised_with(client: PolicyClient) -> Vec<String> {
+    let mut f = Fixture::with_policy(Config::default(), client);
     let id = f.add_client();
     f.roundtrip(id);
-    let client = f.client(id);
-    client
+    f.client(id)
         .state
         .globals
         .iter()
         .map(|g| g.interface.clone())
         .collect()
+}
+
+fn advertised(policy: AppPolicy) -> Vec<String> {
+    advertised_with(for_our_uid(policy))
 }
 
 #[test]
@@ -80,18 +94,30 @@ fn granted_global_is_advertised() {
 
 #[test]
 fn unknown_uid_gets_the_default() {
-    let mut f = Fixture::with_policy(
-        Config::default(),
-        PolicyStore::new(PolicyFile::default()).unwrap(),
-    );
-    let id = f.add_client();
-    f.roundtrip(id);
-    let names: Vec<_> = f
-        .client(id)
-        .state
-        .globals
-        .iter()
-        .map(|g| g.interface.clone())
-        .collect();
+    let names = advertised_with(serve(PolicyFile::default()));
+    assert!(names.iter().any(|n| n == "wl_compositor"));
+    assert!(!names.iter().any(|n| n == "zwlr_layer_shell_v1"));
+}
+
+/// A daemon that dies after the handshake must not leave clients trusted.
+#[test]
+fn dead_daemon_fails_closed() {
+    let (ours, theirs) = UnixStream::pair().unwrap();
+    thread::spawn(move || {
+        let request: Request = rpc::read_msg(&theirs).unwrap();
+        assert!(matches!(request, Request::Hello { .. }));
+        rpc::write_msg(
+            &theirs,
+            &Response::Hello {
+                version: rpc::VERSION,
+            },
+        )
+        .unwrap();
+        // Dropped here: every later request sees EOF.
+    });
+    let client = PolicyClient::from_stream(ours).unwrap();
+
+    let names = advertised_with(client);
+    assert!(names.iter().any(|n| n == "wl_compositor"));
     assert!(!names.iter().any(|n| n == "zwlr_layer_shell_v1"));
 }

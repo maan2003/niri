@@ -19,7 +19,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
-use niri_policy::{AppPolicy, Global as PolicyGlobal, PolicyStore};
+use niri_policy::{AppPolicy, Global as PolicyGlobal, PolicyClient};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{InputTime, Keycode};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -233,8 +233,8 @@ pub enum PendingScreenshot {
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
-    /// Per-UID client policy; consulted once per new connection.
-    pub policy: PolicyStore,
+    /// Connection to the policy daemon; asked once per new connection, cached per UID.
+    pub policy: PolicyClient,
 
     /// Output config from the config file.
     ///
@@ -763,7 +763,7 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
-        policy: PolicyStore,
+        policy: PolicyClient,
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
@@ -2617,7 +2617,7 @@ impl Niri {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Rc<RefCell<Config>>,
-        policy: PolicyStore,
+        policy: PolicyClient,
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
@@ -3102,15 +3102,22 @@ impl Niri {
             credentials_unknown,
         } = client;
 
-        // Identity is the peer UID; PIDs are reused and never used for this.
+        // Identity is the peer UID; PIDs are reused and never used for this. Any failure along
+        // the way fails closed: the client gets the nothing-optional policy.
         let policy = if credentials_unknown {
-            self.policy.default_policy()
+            self.policy.fallback()
         } else {
             match rustix::net::sockopt::socket_peercred(&client) {
-                Ok(cred) => self.policy.lookup(cred.uid.as_raw()),
+                Ok(cred) => {
+                    let uid = cred.uid.as_raw();
+                    self.policy.lookup(uid).unwrap_or_else(|err| {
+                        warn!("policy lookup for uid {uid} failed, treating as unknown: {err}");
+                        Arc::new(AppPolicy::unknown())
+                    })
+                }
                 Err(err) => {
-                    warn!("error getting client credentials, using the default policy: {err}");
-                    self.policy.default_policy()
+                    warn!("error getting client credentials, treating as unknown: {err}");
+                    Arc::new(AppPolicy::unknown())
                 }
             }
         };

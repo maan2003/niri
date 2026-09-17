@@ -2374,6 +2374,8 @@ dependencies = [
 name = "niri-policy"
 version = "26.4.0"
 dependencies = [
+ "clap",
+ "postcard",
  "serde",
  "toml",
 ]
