@@ -6,11 +6,10 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
 use std::iter::zip;
 use std::mem;
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -77,8 +76,14 @@ pub struct Tty {
     /// Set once the GPU process has a renderer (after the primary device was added).
     renderer_ready: bool,
     /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
-    primary_node: DrmNode,
-    primary_render_node: DrmNode,
+    /// Where we'd like the GPU process to render: the configured render node, else udev's
+    /// primary GPU. `None` lets the GPU process take the first device that works.
+    render_node_hint: Option<DrmNode>,
+    /// The render node the GPU process actually renders on, once it has a renderer.
+    render_node: Option<DrmNode>,
+    /// Devices the GPU process refused (no KMS, e.g. a render-only card). Not retried until
+    /// udev removes them.
+    unusable_devices: HashSet<DrmNode>,
     ignored_nodes: HashSet<DrmNode>,
     devices: HashMap<DrmNode, OutputDevice>,
     dmabuf_global: Option<DmabufGlobal>,
@@ -236,33 +241,36 @@ impl Tty {
             })
             .unwrap();
 
-        let (primary_node, primary_render_node) = primary_node_from_config(&config.borrow())
-            .ok_or(())
-            .or_else(|()| {
-                let primary_gpu_path = udev::primary_gpu(&seat_name)
-                    .context("error getting the primary GPU")?
-                    .context("couldn't find a GPU")?;
-                let primary_node = DrmNode::from_path(primary_gpu_path)
-                    .context("error opening the primary GPU DRM node")?;
-                let primary_render_node = primary_node
-                    .node_with_type(NodeType::Render)
-                    .and_then(Result::ok)
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "error getting the render node for the primary GPU; proceeding anyway"
-                        );
-                        primary_node
-                    });
-                Ok::<_, anyhow::Error>((primary_node, primary_render_node))
-            })?;
-
-        let mut node_path = String::new();
-        if let Some(path) = primary_render_node.dev_path() {
-            write!(node_path, "{path:?}").unwrap();
-        } else {
-            write!(node_path, "{primary_render_node}").unwrap();
+        let render_node_hint = render_node_from_config(&config.borrow()).or_else(|| {
+            let path = match udev::primary_gpu(&seat_name) {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                    warn!("couldn't find a primary GPU; letting the GPU process pick one");
+                    return None;
+                }
+                Err(err) => {
+                    warn!("error getting the primary GPU: {err:?}");
+                    return None;
+                }
+            };
+            match DrmNode::from_path(&path) {
+                Ok(node) => match node.node_with_type(NodeType::Render) {
+                    Some(Ok(render_node)) => Some(render_node),
+                    _ => {
+                        warn!("error getting the render node for the primary GPU {path:?}");
+                        Some(node)
+                    }
+                },
+                Err(err) => {
+                    warn!("error opening the primary GPU {path:?}: {err:?}");
+                    None
+                }
+            }
+        });
+        match &render_node_hint {
+            Some(node) => info!("preferred render node: {}", node_display(node)),
+            None => info!("no preferred render node"),
         }
-        info!("using as the render node: {node_path}");
 
         Ok(Self {
             config,
@@ -271,8 +279,9 @@ impl Tty {
             libinput,
             renderer,
             renderer_ready: false,
-            primary_node,
-            primary_render_node,
+            render_node_hint,
+            render_node: None,
+            unusable_devices: HashSet::new(),
             ignored_nodes: HashSet::new(),
             devices: HashMap::new(),
             dmabuf_global: None,
@@ -342,28 +351,28 @@ impl Tty {
         let udev = self.udev_dispatcher.clone();
         let udev = udev.as_source_ref();
 
-        // The primary device must come first: it brings up the renderer that display-only
-        // devices scan out from.
-        if let Some((primary_device_id, primary_device_path)) = udev
+        // Hand every device to the GPU process first, then scan connectors: an output on a
+        // display-only device needs the rendering device to be known, whatever the order udev
+        // lists them in.
+        let devices: Vec<_> = udev
             .device_list()
-            .find(|&(device_id, _)| device_id == self.primary_node.dev_id())
-        {
-            if let Err(err) = self.device_added(primary_device_id, primary_device_path, niri) {
-                warn!(
-                    "error adding primary node device, display-only devices may not work: {err:?}"
-                );
-            }
-        } else {
-            warn!("primary node is missing, display-only devices may not work");
-        };
+            .map(|(id, path)| (id, path.to_owned()))
+            .collect();
+        self.add_devices(niri, devices);
+    }
 
-        for (device_id, path) in udev.device_list() {
-            if device_id == self.primary_node.dev_id() {
-                continue;
+    /// Adds `devices` (any order), then scans the connectors of the ones that worked.
+    fn add_devices(&mut self, niri: &mut Niri, devices: Vec<(dev_t, PathBuf)>) {
+        let mut added = Vec::new();
+        for (device_id, path) in devices {
+            match self.device_added(device_id, &path, niri) {
+                Ok(true) => added.push(device_id),
+                Ok(false) => (),
+                Err(err) => warn!("error adding device {path:?}: {err:?}"),
             }
-            if let Err(err) = self.device_added(device_id, path, niri) {
-                warn!("error adding device: {err:?}");
-            }
+        }
+        for device_id in added {
+            self.device_changed(device_id, niri, true);
         }
     }
 
@@ -376,9 +385,7 @@ impl Tty {
                     return;
                 }
                 self.ignored_nodes = self.compute_ignored_nodes();
-                if let Err(err) = self.device_added(device_id, &path, niri) {
-                    warn!("error adding device: {err:?}");
-                }
+                self.add_devices(niri, vec![(device_id, path)]);
             }
             UdevEvent::Changed { device_id } => {
                 if !self.session.is_active() {
@@ -485,15 +492,8 @@ impl Tty {
                     }
                 }
 
-                // Add new devices, primary first.
-                let primary_device_id = self.primary_node.dev_id();
-                let primary_device_path = device_list.remove(&primary_device_id);
-                let primary = primary_device_path.map(|path| (primary_device_id, path));
-                for (device_id, path) in primary.into_iter().chain(device_list) {
-                    if let Err(err) = self.device_added(device_id, &path, niri) {
-                        warn!("error adding device: {err:?}");
-                    }
-                }
+                // Add new devices.
+                self.add_devices(niri, device_list.into_iter().collect());
 
                 if self.update_output_config_on_resume {
                     self.on_output_config_changed(niri);
@@ -509,30 +509,33 @@ impl Tty {
         }
     }
 
+    /// Opens the device and hands it to the GPU process. Returns whether it was added (false
+    /// when skipped); connectors are not scanned here. A device the GPU process rejects is
+    /// remembered as unusable and not retried until udev removes it.
     fn device_added(
         &mut self,
         device_id: dev_t,
         path: &Path,
         niri: &mut Niri,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         debug!("adding device: {device_id} {path:?}");
 
         let node = DrmNode::from_dev_id(device_id)?;
-        let is_primary = node == self.primary_node;
-        if is_primary {
-            debug!("this is the primary node");
-        }
         if node.ty() != NodeType::Primary {
             debug!("not a primary node, skipping");
-            return Ok(());
+            return Ok(false);
         }
         if self.ignored_nodes.contains(&node) {
             debug!("node is ignored, skipping");
-            return Ok(());
+            return Ok(false);
+        }
+        if self.unusable_devices.contains(&node) {
+            debug!("device is unusable, skipping");
+            return Ok(false);
         }
         if self.devices.contains_key(&node) {
             debug!("device already added");
-            return Ok(());
+            return Ok(false);
         }
 
         let _span = tracy_client::span!("Tty::device_added");
@@ -548,7 +551,7 @@ impl Tty {
             Request::AddDevice {
                 dev: device_id,
                 path: path.to_string_lossy().into_owned(),
-                primary_render_node: self.primary_render_node.dev_id(),
+                render_node_hint: self.render_node_hint.map(|n| n.dev_id()),
             },
             &[gpu_fd],
         );
@@ -559,14 +562,19 @@ impl Tty {
                 if let Err(err) = self.session.close(fd) {
                     warn!("error closing DRM device fd: {err:?}");
                 }
+                self.unusable_devices.insert(node);
                 return Err(err.context("GPU process failed to add device"));
             }
         };
 
         if let Some(caps) = caps {
-            debug!("the GPU process brought up the renderer");
+            let render_node = render_node
+                .and_then(|dev| DrmNode::from_dev_id(dev).ok())
+                .unwrap_or(node);
+            info!("the GPU process renders on {}", node_display(&render_node));
             self.renderer.set_caps(caps);
             self.renderer_ready = true;
+            self.render_node = Some(render_node);
 
             {
                 let config = self.config.borrow();
@@ -583,9 +591,8 @@ impl Tty {
             niri.update_shaders();
 
             if self.dmabuf_global.is_none() {
-                let render_dev = render_node.unwrap_or(self.primary_render_node.dev_id());
                 let formats = self.renderer.dmabuf_formats();
-                let default_feedback = DmabufFeedbackBuilder::new(render_dev, formats)
+                let default_feedback = DmabufFeedbackBuilder::new(render_node.dev_id(), formats)
                     .build()
                     .context("error building default dmabuf feedback")?;
                 let dmabuf_global = niri
@@ -605,9 +612,7 @@ impl Tty {
                 connectors: HashMap::new(),
             },
         );
-
-        self.device_changed(device_id, niri, true);
-        Ok(())
+        Ok(true)
     }
 
     fn device_changed(&mut self, device_id: dev_t, niri: &mut Niri, cleanup: bool) {
@@ -626,11 +631,11 @@ impl Tty {
             return;
         }
         if !self.devices.contains_key(&node) {
-            if let Some(path) = node.dev_path() {
+            if self.unusable_devices.contains(&node) {
+                debug!("change on an unusable device, ignoring");
+            } else if let Some(path) = node.dev_path() {
                 warn!("unknown device; trying to add");
-                if let Err(err) = self.device_added(device_id, &path, niri) {
-                    warn!("error adding device: {err:?}");
-                }
+                self.add_devices(niri, vec![(device_id, path)]);
             } else {
                 warn!("unknown device");
             }
@@ -786,6 +791,10 @@ impl Tty {
             debug!("not a primary node, skipping");
             return;
         }
+        if self.unusable_devices.remove(&node) {
+            debug!("unusable device removed");
+            return;
+        }
         let Some(device) = self.devices.get(&node) else {
             warn!("unknown device");
             return;
@@ -796,17 +805,16 @@ impl Tty {
             self.connector_disconnected(niri, output);
         }
 
-        // The renderer isn't necessarily on the primary node (Asahi renders through the display
-        // controller's card), so ask the GPU process whether it went away.
+        // Only the GPU process knows which device hosts the renderer.
         let renderer_dropped = match self.request(Request::RemoveDevice { dev: device_id }) {
             Ok(Event::DeviceRemoved { renderer_dropped }) => renderer_dropped,
             Ok(other) => {
                 warn!("unexpected reply to RemoveDevice: {other:?}");
-                node == self.primary_node
+                false
             }
             Err(err) => {
                 warn!("error removing device in GPU process: {err:?}");
-                node == self.primary_node
+                false
             }
         };
         let device = self.devices.remove(&node).unwrap();
@@ -814,6 +822,7 @@ impl Tty {
         if renderer_dropped && self.renderer_ready {
             debug!("the rendering device is gone; disabling the dmabuf global");
             self.renderer_ready = false;
+            self.render_node = None;
             // Cursor textures lived in the renderer that just went away.
             niri.cursor_manager.clear_cache();
             if let Some(global) = self.dmabuf_global.take() {
@@ -1235,7 +1244,7 @@ impl Tty {
     }
 
     pub fn primary_render_node(&mut self) -> Option<DrmNode> {
-        self.renderer_ready.then_some(self.primary_render_node)
+        self.render_node.filter(|_| self.renderer_ready)
     }
 
     pub fn render(
@@ -1494,7 +1503,7 @@ impl Tty {
         match self.renderer.import_dmabuf(dmabuf, None) {
             Ok(_texture) => {
                 if dmabuf.node().is_none() {
-                    dmabuf.set_node(Some(self.primary_render_node));
+                    dmabuf.set_node(self.render_node);
                 }
                 true
             }
@@ -1799,10 +1808,11 @@ impl Tty {
 
     fn compute_ignored_nodes(&self) -> HashSet<DrmNode> {
         let mut ignored_nodes = ignored_nodes_from_config(&self.config.borrow());
-        if ignored_nodes.remove(&self.primary_node)
-            || ignored_nodes.remove(&self.primary_render_node)
-        {
-            warn!("ignoring the primary node or render node is not allowed");
+        if let Some(hint) = self.render_node_hint {
+            let primary = hint.node_with_type(NodeType::Primary).and_then(Result::ok);
+            if ignored_nodes.remove(&hint) || primary.is_some_and(|p| ignored_nodes.remove(&p)) {
+                warn!("ignoring the render node is not allowed");
+            }
         }
         ignored_nodes
     }
@@ -1842,11 +1852,7 @@ impl Tty {
         for node in self.devices.keys() {
             device_list.remove(&node.dev_id());
         }
-        for (device_id, path) in device_list {
-            if let Err(err) = self.device_added(device_id, &path, niri) {
-                warn!("error adding device {path:?}: {err:?}");
-            }
-        }
+        self.add_devices(niri, device_list.into_iter().collect());
     }
 
     fn should_disable_laptop_panels(&self, is_lid_closed: bool) -> bool {
@@ -2092,49 +2098,45 @@ impl Connector {
     }
 }
 
-fn primary_node_from_render_node(path: &Path) -> Option<(DrmNode, DrmNode)> {
+/// The render node behind a configured DRM path (render or card node).
+fn render_node_from_path(path: &Path) -> Option<DrmNode> {
     match DrmNode::from_path(path) {
-        Ok(node) => {
-            if node.ty() == NodeType::Render {
-                match node.node_with_type(NodeType::Primary) {
-                    Some(Ok(primary_node)) => {
-                        return Some((primary_node, node));
-                    }
-                    Some(Err(err)) => {
-                        warn!("error opening primary node for render node {path:?}: {err:?}");
-                    }
-                    None => {
-                        warn!("error opening primary node for render node {path:?}");
-                    }
-                }
-            } else {
-                warn!("DRM node {path:?} is not a render node");
-                if let Some(Ok(render_node)) = node.node_with_type(NodeType::Render) {
-                    return Some((node, render_node));
-                }
-                warn!("could not get render node for DRM node {path:?}; proceeding anyway");
-                return Some((node, node));
+        Ok(node) if node.ty() == NodeType::Render => Some(node),
+        Ok(node) => match node.node_with_type(NodeType::Render) {
+            Some(Ok(render_node)) => Some(render_node),
+            _ => {
+                warn!("could not get render node for DRM node {path:?}; using it as is");
+                Some(node)
             }
-        }
+        },
         Err(err) => {
             warn!("error opening {path:?} as DRM node: {err:?}");
+            None
         }
     }
-    None
 }
 
-fn primary_node_from_config(config: &Config) -> Option<(DrmNode, DrmNode)> {
+fn render_node_from_config(config: &Config) -> Option<DrmNode> {
     let path = config.debug.render_drm_device.as_ref()?;
     debug!("attempting to use render node from config: {path:?}");
-    primary_node_from_render_node(path)
+    render_node_from_path(path)
+}
+
+fn node_display(node: &DrmNode) -> String {
+    match node.dev_path() {
+        Some(path) => format!("{path:?}"),
+        None => node.to_string(),
+    }
 }
 
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {
     let mut disabled_nodes = HashSet::new();
     for path in &config.debug.ignored_drm_devices {
-        if let Some((primary_node, render_node)) = primary_node_from_render_node(path) {
-            disabled_nodes.insert(primary_node);
+        if let Some(render_node) = render_node_from_path(path) {
             disabled_nodes.insert(render_node);
+            if let Some(Ok(primary_node)) = render_node.node_with_type(NodeType::Primary) {
+                disabled_nodes.insert(primary_node);
+            }
         }
     }
     disabled_nodes

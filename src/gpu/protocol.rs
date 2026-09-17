@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -569,15 +569,17 @@ pub enum Request {
     },
 
     // DRM/KMS. The core opens the device through libseat and hands over the fd.
-    /// Fd attached. Reply: `DeviceAdded`.
+    /// Fd attached. Reply: `DeviceAdded`. Devices may be added in any order.
     ///
-    /// The renderer is created on whichever device's EGL display resolves to
-    /// `primary_render_node`. That's not always the render node's own card: on Asahi the GPU's
-    /// card node has no KMS and Mesa renders through the display controller's node instead.
+    /// The GPU process owns the device model: the renderer is created on the first device
+    /// whose EGL display works and, when `render_node_hint` is set, resolves to that render
+    /// node. That's not always the render node's own card: on Asahi the GPU's card node has no
+    /// KMS and Mesa renders through the display controller's node instead. Every other device
+    /// is display-only and scans out buffers allocated on the rendering device.
     AddDevice {
         dev: DevId,
         path: String,
-        primary_render_node: DevId,
+        render_node_hint: Option<DevId>,
     },
     /// Reply: `DeviceRemoved`.
     RemoveDevice {
@@ -827,7 +829,7 @@ pub enum Event {
     ShaderSet {
         available: bool,
     },
-    /// `caps` is set when this device brought up the renderer.
+    /// `render_node` and `caps` are set when this device brought up the renderer.
     DeviceAdded {
         render_node: Option<DevId>,
         caps: Option<Caps>,

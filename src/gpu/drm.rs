@@ -26,10 +26,9 @@ use smithay::backend::drm::{
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
-use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::RenderElementPresentationState;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::DebugFlags;
+use smithay::backend::renderer::{Bind as _, Color32F, DebugFlags, Frame as _, Renderer as _};
 use smithay::output::OutputModeSource;
 use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::drm::control::atomic::AtomicModeReq;
@@ -39,7 +38,7 @@ use smithay::reexports::drm::control::{
     ResourceHandle,
 };
 use smithay::reexports::gbm::Modifier;
-use smithay::utils::{DeviceFd, Physical, Scale, Size, Transform};
+use smithay::utils::{DeviceFd, Physical, Rectangle, Scale, Size, Transform};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use super::convert;
@@ -65,7 +64,8 @@ type GbmDrmCompositor =
 #[derive(Default)]
 pub struct DrmState {
     devices: HashMap<DevId, Device>,
-    primary: Option<DevId>,
+    /// The device whose EGL display hosts the renderer, once there is one.
+    renderer_dev: Option<DevId>,
     debug_tint: bool,
 }
 
@@ -74,10 +74,9 @@ struct Device {
     node: DrmNode,
     drm: DrmDevice,
     gbm: GbmDevice<DeviceFd>,
-    allocator: GbmAllocator<DeviceFd>,
-    /// Set when the device renders on the primary render node (it owns or shares the renderer's
-    /// GPU); `None` means display-only, allocating from the rendering device.
-    render_node: Option<DrmNode>,
+    /// The render node Mesa uses for this device's EGL display; `None` when EGL doesn't work
+    /// here (display-only hardware, software renderers).
+    egl_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, Surface>,
     token: RegistrationToken,
@@ -117,8 +116,8 @@ struct CtmProps {
 }
 
 pub struct AddedDevice {
+    /// Set when this device brought up the renderer: the render node it renders on.
     pub render_node: Option<DevId>,
-    pub renderer_created: bool,
 }
 
 fn output_ref(dev: DevId, crtc: crtc::Handle) -> OutputRef {
@@ -168,25 +167,26 @@ impl DrmState {
         self.devices.keys().copied().collect()
     }
 
+    /// Takes over a DRM device the core opened. Devices come in any order: the renderer is
+    /// created on the first device whose EGL display works and matches `render_node_hint` (if
+    /// the core has one); which device a display-only output allocates from is decided when
+    /// the output is enabled.
     pub fn add_device(
         &mut self,
         exec: &mut Executor,
         fd: OwnedFd,
         dev: DevId,
-        primary_render_node: DevId,
+        render_node_hint: Option<DevId>,
         register: impl FnOnce(DrmDeviceNotifier, DevId) -> anyhow::Result<RegistrationToken>,
     ) -> anyhow::Result<AddedDevice> {
         ensure!(!self.devices.contains_key(&dev), "device already added");
         let node = DrmNode::from_dev_id(dev).context("error creating DrmNode")?;
         let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
-        // Render-only cards (no KMS) fail here, same as upstream niri. On Asahi that's the GPU's
-        // own card node; Mesa renders through the display controller's node instead, so the
-        // renderer comes up when that device is added below.
+        // Render-only cards (no KMS) fail here. On Asahi that's the GPU's own card node; Mesa
+        // renders through the display controller's node instead.
         let (drm, notifier) = DrmDevice::new(device_fd.clone(), false).context("DrmDevice::new")?;
         let gbm = GbmDevice::new(device_fd.device_fd()).context("GbmDevice::new")?;
 
-        // Like upstream's try_initialize_gpu: probe EGL on every device and let the one that
-        // resolves to the primary render node own the renderer.
         let try_initialize_gpu = || -> anyhow::Result<(EGLDisplay, DrmNode)> {
             let display = unsafe { EGLDisplay::new(gbm.clone()).context("EGLDisplay::new")? };
             let egl_device = EGLDevice::device_for_display(&display).context("EGLDevice")?;
@@ -202,13 +202,18 @@ impl DrmState {
             Ok((display, render_node))
         };
 
+        let mut egl_node = None;
         let mut render_node = None;
-        let mut renderer_created = false;
         match try_initialize_gpu() {
-            Ok((display, egl_render_node)) if egl_render_node.dev_id() == primary_render_node => {
-                debug!("device {node} renders on the primary render node {egl_render_node}");
-                render_node = Some(egl_render_node);
-                if !exec.has_renderer() {
+            Ok((display, node_for_egl)) => {
+                debug!("device {node} renders on {node_for_egl}");
+                egl_node = Some(node_for_egl);
+                let wanted = render_node_hint.is_none_or(|hint| hint == node_for_egl.dev_id());
+                if exec.has_renderer() {
+                    debug!("renderer already exists; using {node} as a secondary device");
+                } else if !wanted {
+                    debug!("{node_for_egl} is not the requested render node; not rendering here");
+                } else {
                     let context = EGLContext::new_with_priority(&display, ContextPriority::High)
                         .context("EGLContext::new")?;
                     let mut renderer =
@@ -216,33 +221,15 @@ impl DrmState {
                     resources::init(&mut renderer);
                     shaders::init(&mut renderer);
                     exec.set_renderer(renderer);
-                    renderer_created = true;
+                    self.renderer_dev = Some(dev);
+                    render_node = Some(node_for_egl.dev_id());
+                    info!("renderer created on {node} (render node {node_for_egl})");
                 }
-                if renderer_created || self.primary.is_none() {
-                    self.primary = Some(dev);
-                }
-            }
-            Ok((_, egl_render_node)) => {
-                // A secondary GPU. We have a single renderer, so treat it as display-only: its
-                // buffers come from the primary GPU and are imported for scanout.
-                debug!("device {node} renders on {egl_render_node}, using it as display-only");
             }
             Err(err) => {
                 debug!("failed to initialize EGL on {node}, using it as display-only: {err:?}");
             }
         }
-
-        let allocator_gbm = if render_node.is_some() {
-            gbm.clone()
-        } else if let Some(primary) = self.primary.and_then(|p| self.devices.get(&p)) {
-            primary.gbm.clone()
-        } else {
-            bail!("no allocator available for device (rendering device not added yet)");
-        };
-        let allocator = GbmAllocator::new(
-            allocator_gbm,
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
 
         let token = register(notifier, dev)?;
 
@@ -252,30 +239,31 @@ impl DrmState {
                 node,
                 drm,
                 gbm,
-                allocator,
-                render_node,
+                egl_node,
                 drm_scanner: DrmScanner::new(),
                 surfaces: HashMap::new(),
                 token,
             },
         );
 
-        Ok(AddedDevice {
-            render_node: render_node.map(|n| n.dev_id()),
-            renderer_created,
-        })
+        Ok(AddedDevice { render_node })
     }
 
-    /// Returns the device's event source token and whether it was the primary (rendering)
-    /// device, in which case the caller must drop the renderer too.
+    /// Returns the device's event source token and whether it hosted the renderer, in which
+    /// case the caller must drop the renderer too.
     pub fn remove_device(&mut self, dev: DevId) -> Option<(RegistrationToken, bool)> {
         let device = self.devices.remove(&dev)?;
-        let was_primary = self.primary == Some(dev);
-        if was_primary {
-            self.primary = None;
+        let was_renderer = self.renderer_dev == Some(dev);
+        if was_renderer {
+            self.renderer_dev = None;
         }
-        // Surfaces (and their DRM state) go away with the device.
-        Some((device.token, was_primary))
+        // The device may still be there (ignored by config); leave its CRTCs off.
+        for surface in device.surfaces.values() {
+            if let Err(err) = surface.compositor.surface().disable() {
+                debug!("error disabling output of removed device: {err:?}");
+            }
+        }
+        Some((device.token, was_renderer))
     }
 
     pub fn pause(&mut self) {
@@ -388,6 +376,8 @@ impl DrmState {
         let crtc = crtc_handle(output.crtc)?;
         let connector = connector_handle(connector)?;
         let renderer = exec.renderer()?;
+        let renderer_gbm = self.renderer_gbm().context("no rendering device")?;
+        let renderer_node = self.renderer_node();
         let device = self
             .devices
             .get_mut(&output.dev)
@@ -422,34 +412,20 @@ impl DrmState {
             }
         }
 
-        // Dropping a `DrmSurface` disables its CRTC (smithay clears the kernel state, which on
-        // Apple DCP even power-cycles the display controller). A surface created earlier would
-        // keep believing the CRTC is active and page-flip onto a disabled one (EINVAL). So every
-        // surface below is created right before the compositor that consumes it, and the format
-        // probe runs on the compositor that is actually used.
-        let create_surface =
-            |drm: &mut DrmDevice, vrr: Option<bool>| -> anyhow::Result<DrmSurface> {
-                let surface = drm
-                    .create_surface(crtc, mode, &[connector])
-                    .context("error creating DRM surface")?;
-                if let Some(vrr) = vrr {
-                    if let Err(err) = surface.use_vrr(vrr) {
-                        warn!("error setting VRR: {err:?}");
-                    }
-                }
-                Ok(surface)
-            };
-        let first_surface = create_surface(&mut device.drm, None)?;
+        let surface = device
+            .drm
+            .create_surface(crtc, mode, &[connector])
+            .context("error creating DRM surface")?;
 
-        let vrr_supported = match first_surface.vrr_supported(connector) {
+        let vrr_supported = match surface.vrr_supported(connector) {
             Ok(VrrSupport::Supported | VrrSupport::RequiresModeset) => {
-                if let Err(err) = first_surface.use_vrr(vrr) {
+                if let Err(err) = surface.use_vrr(vrr) {
                     warn!("error setting VRR: {err:?}");
                 }
                 true
             }
             Ok(VrrSupport::NotSupported) => {
-                let _ = first_surface.use_vrr(false);
+                let _ = surface.use_vrr(false);
                 false
             }
             Err(err) => {
@@ -457,12 +433,20 @@ impl DrmState {
                 false
             }
         };
+        let vrr_setting = vrr_supported && vrr;
 
-        // What `create_surface` must re-apply on any later surface.
-        let vrr_setting = Some(vrr_supported && vrr);
-        let mut surface = Some(first_surface);
-
-        let display_only = device.render_node.is_none();
+        // A device that renders on the renderer's GPU allocates its own scanout buffers; any
+        // other device is display-only and scans out buffers allocated on the rendering device.
+        let display_only = device.egl_node.is_none() || device.egl_node != renderer_node;
+        let allocator = GbmAllocator::new(
+            if display_only {
+                renderer_gbm
+            } else {
+                device.gbm.clone()
+            },
+            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+        );
+        let exporter_node = if display_only { None } else { device.egl_node };
         let render_formats = renderer
             .egl_context()
             .dmabuf_render_formats()
@@ -491,100 +475,61 @@ impl DrmState {
             transform: convert::transform(Transform::Normal),
         };
 
-        let make_compositor = |device: &Device,
-                               surface: DrmSurface,
-                               color_formats: &[Fourcc],
-                               render_formats: FormatSet|
+        // 10-bit formats go first on outputs that asked for them. The display side proves a
+        // format by allocating and test-committing; `buffer_test` proves the renderer can bind
+        // it, because some drivers scan out AR30 but can't render into it (or vice versa).
+        let color_formats: Vec<Fourcc> = if prefer_10bit {
+            TEN_BIT_COLOR_FORMATS
+                .into_iter()
+                .chain(SDR_COLOR_FORMATS)
+                .collect()
+        } else {
+            SDR_COLOR_FORMATS.to_vec()
+        };
+        let mode_size = mode_size(&mode);
+        let mut make_compositor = |device: &Device,
+                                   surface: DrmSurface,
+                                   render_formats: FormatSet|
          -> anyhow::Result<GbmDrmCompositor> {
-            DrmCompositor::new(
+            DrmCompositor::new_with_buffer_test(
                 mode_source(&mode, geometry),
                 surface,
                 None,
-                device.allocator.clone(),
-                GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                allocator.clone(),
+                GbmFramebufferExporter::new(device.gbm.clone(), exporter_node.into()),
                 color_formats.iter().copied(),
                 render_formats,
                 device.drm.cursor_size(),
                 Some(device.gbm.clone()),
+                |buffer: &GbmBuffer| test_render(renderer, buffer, mode_size),
             )
             .map_err(|err| anyhow!("{err:?}"))
         };
 
-        // 10-bit formats are probed one by one with a single-format compositor and render_frame:
-        // some drivers can render into AR30 but not AB30 (or vice versa), so treating 10-bit
-        // as a boolean would pick a broken format or fall back too far. The first format that
-        // works is kept as the real compositor.
-        let mut compositor = None;
-        if prefer_10bit {
-            let plane_formats: HashSet<Fourcc> = surface
-                .as_ref()
-                .unwrap()
-                .planes()
-                .primary
-                .iter()
-                .flat_map(|plane| plane.formats.iter().map(|format| format.code))
-                .collect();
-            for format in TEN_BIT_COLOR_FORMATS {
-                if !plane_formats.contains(&format) {
-                    debug!(?format, "10-bit format not supported by the primary plane");
-                    continue;
+        let mut compositor = match make_compositor(device, surface, render_formats.clone()) {
+            Ok(x) => x,
+            Err(err) => {
+                warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
+                let render_formats = render_formats
+                    .iter()
+                    .copied()
+                    .filter(|format| format.modifier == Modifier::Invalid)
+                    .collect::<FormatSet>();
+                let surface = device
+                    .drm
+                    .create_surface(crtc, mode, &[connector])
+                    .context("error creating DRM surface")?;
+                if let Err(err) = surface.use_vrr(vrr_setting) {
+                    warn!("error setting VRR: {err:?}");
                 }
-                let probe_surface = match surface.take() {
-                    Some(surface) => surface,
-                    None => create_surface(&mut device.drm, vrr_setting)?,
-                };
-                let mut probe =
-                    match make_compositor(device, probe_surface, &[format], render_formats.clone())
-                    {
-                        Ok(x) => x,
-                        Err(err) => {
-                            debug!(?format, "10-bit format not usable for scanout: {err:?}");
-                            continue;
-                        }
-                    };
-                let no_elements: [SolidColorRenderElement; 0] = [];
-                match probe.render_frame(renderer, &no_elements, [0.; 4], FrameFlags::empty()) {
-                    Ok(_) => {
-                        // The trial only rendered, never committed; drop what it left in the
-                        // swapchain.
-                        probe.reset_buffers();
-                        debug!(?format, "created 10-bit DRM compositor");
-                        compositor = Some(probe);
-                        break;
-                    }
-                    Err(err) => warn!(?format, "10-bit format is not renderable: {err:?}"),
-                }
-            }
-            if compositor.is_none() {
-                warn!("no usable 10-bit scanout format; using an 8-bit framebuffer");
-            }
-        }
-
-        let mut compositor = match compositor {
-            Some(compositor) => compositor,
-            None => {
-                let color_formats = SDR_COLOR_FORMATS;
-                debug!(?color_formats, "creating DRM compositor");
-                let sdr_surface = match surface.take() {
-                    Some(surface) => surface,
-                    None => create_surface(&mut device.drm, vrr_setting)?,
-                };
-                match make_compositor(device, sdr_surface, &color_formats, render_formats.clone()) {
-                    Ok(x) => x,
-                    Err(err) => {
-                        warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
-                        let render_formats = render_formats
-                            .iter()
-                            .copied()
-                            .filter(|format| format.modifier == Modifier::Invalid)
-                            .collect::<FormatSet>();
-                        let surface = create_surface(&mut device.drm, vrr_setting)?;
-                        make_compositor(device, surface, &color_formats, render_formats)
-                            .context("error creating DRM compositor")?
-                    }
-                }
+                make_compositor(device, surface, render_formats)
+                    .context("error creating DRM compositor")?
             }
         };
+        if prefer_10bit && !TEN_BIT_COLOR_FORMATS.contains(&compositor.format()) {
+            warn!("no usable 10-bit scanout format; using an 8-bit framebuffer");
+        }
+        debug!(format = ?compositor.format(), "created DRM compositor");
 
         // Stage the initial connector color state so it rides the initial modeset.
         if let Err(err) = compositor.use_color_state(connector_color_state(color)) {
@@ -627,7 +572,12 @@ impl DrmState {
     pub fn disable_output(&mut self, output: OutputRef) -> anyhow::Result<()> {
         let crtc = crtc_handle(output.crtc)?;
         let device = self.device(output.dev)?;
-        device.surfaces.remove(&crtc);
+        if let Some(surface) = device.surfaces.remove(&crtc) {
+            // Paused session: the next VT owner resets the CRTC anyway.
+            if let Err(err) = surface.compositor.surface().disable() {
+                debug!("error disabling CRTC: {err:?}");
+            }
+        }
         Ok(())
     }
 
@@ -763,15 +713,22 @@ impl DrmState {
         format: u32,
         modifiers: &[u64],
     ) -> anyhow::Result<Dmabuf> {
-        let gbm = self.primary_gbm().context("no primary device")?;
+        let gbm = self.renderer_gbm().context("no rendering device")?;
         let fourcc = Fourcc::try_from(format).map_err(|_| anyhow!("unknown fourcc {format:#x}"))?;
         allocate_gbm_dmabuf(&gbm, width, height, fourcc, modifiers)
     }
 
-    /// GBM handle of the primary (rendering) device, for allocating outside `DrmState`.
-    pub fn primary_gbm(&self) -> Option<GbmDevice<DeviceFd>> {
-        let device = self.primary.and_then(|p| self.devices.get(&p))?;
+    /// GBM handle of the rendering device, for allocating outside `DrmState`.
+    pub fn renderer_gbm(&self) -> Option<GbmDevice<DeviceFd>> {
+        let device = self.renderer_dev.and_then(|p| self.devices.get(&p))?;
         Some(device.gbm.clone())
+    }
+
+    /// The render node the renderer is on.
+    fn renderer_node(&self) -> Option<DrmNode> {
+        self.renderer_dev
+            .and_then(|p| self.devices.get(&p))
+            .and_then(|d| d.egl_node)
     }
 
     pub fn present(
@@ -1088,6 +1045,28 @@ impl Device {
 
 /// Allocates a GBM render buffer and exports it as a dmabuf. A lone `Invalid` modifier means
 /// "no modifiers" (implicit layout).
+/// Binds a candidate scanout buffer and clears it, so a format the renderer can't use is
+/// rejected before an output is built on it.
+fn test_render(
+    renderer: &mut GlesRenderer,
+    buffer: &GbmBuffer,
+    size: Size<i32, Physical>,
+) -> Result<(), String> {
+    let mut dmabuf = buffer.export().map_err(|err| format!("export: {err}"))?;
+    let mut fb = renderer
+        .bind(&mut dmabuf)
+        .map_err(|err| format!("bind: {err}"))?;
+    let mut frame = renderer
+        .render(&mut fb, size, Transform::Normal)
+        .map_err(|err| format!("render: {err}"))?;
+    frame
+        .clear(Color32F::TRANSPARENT, &[Rectangle::from_size(size)])
+        .map_err(|err| format!("clear: {err}"))?;
+    let sync = frame.finish().map_err(|err| format!("finish: {err}"))?;
+    sync.wait().map_err(|err| format!("wait: {err:?}"))?;
+    Ok(())
+}
+
 pub fn allocate_gbm_dmabuf(
     gbm: &GbmDevice<DeviceFd>,
     width: u32,
