@@ -2361,6 +2361,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "niri-forker"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "libc",
+ "niri-policy",
+ "rustix 1.1.4",
+ "serde",
+]
+
+[[package]]
+name = "niri-identity"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "niri-forker",
+ "niri-policy",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "niri-ipc"
 version = "26.4.0"
 dependencies = [
@@ -2374,7 +2396,6 @@ dependencies = [
 name = "niri-policy"
 version = "26.4.0"
 dependencies = [
- "clap",
  "postcard",
  "serde",
  "toml",

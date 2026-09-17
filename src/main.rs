@@ -291,12 +291,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     watcher::setup(&mut state, &config_path, config_includes);
 
-    // The compositor does not spawn processes; a launcher will.
-    if !cli.command.is_empty() {
-        spawn_disabled(&format!("command line {:?}", cli.command));
-    }
+    // The compositor does not spawn processes; the identity daemon launches apps for it.
+    state.niri.launch(
+        cli.command
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect(),
+    );
     for elem in spawn_at_startup {
-        spawn_disabled(&format!("spawn-at-startup {:?}", elem.command));
+        state.niri.launch(elem.command);
     }
     for elem in spawn_sh_at_startup {
         spawn_disabled(&format!("spawn-sh-at-startup {:?}", elem.command));
@@ -408,27 +411,27 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-/// Socket from `NIRI_POLICY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-policy.sock`. Nobody is
-/// trusted unless a daemon says so, so no daemon means no compositor.
+/// Socket from `NIRI_IDENTITY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-identity.sock`. Nobody is
+/// trusted unless the daemon says so, so no daemon means no compositor.
 fn connect_policy() -> PolicyClient {
-    let path = env::var_os("NIRI_POLICY_SOCKET")
+    let path = env::var_os("NIRI_IDENTITY_SOCKET")
         .map(PathBuf::from)
         .or_else(|| {
-            env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-policy.sock"))
+            env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-identity.sock"))
         });
     let Some(path) = path else {
-        error!("no policy daemon: set NIRI_POLICY_SOCKET or XDG_RUNTIME_DIR");
+        error!("no identity daemon: set NIRI_IDENTITY_SOCKET or XDG_RUNTIME_DIR");
         std::process::exit(1);
     };
     match PolicyClient::connect(path.clone()) {
         Ok(policy) => {
-            info!("connected to policy daemon at {}", path.display());
+            info!("connected to identity daemon at {}", path.display());
             policy
         }
         Err(err) => {
             error!(
-                "error connecting to policy daemon at {}: {err}; \
-                 run niri-policyd or set NIRI_POLICY_SOCKET",
+                "error connecting to identity daemon at {}: {err}; \
+                 run niri-identityd or set NIRI_IDENTITY_SOCKET",
                 path.display()
             );
             std::process::exit(1);

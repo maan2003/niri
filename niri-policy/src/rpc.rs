@@ -1,4 +1,4 @@
-//! Wire protocol between the compositor and the policy daemon: one Unix socket, requests and
+//! Wire protocol between the compositor and the identity daemon: one Unix socket, requests and
 //! responses in lock step, each message a little-endian `u32` length followed by a postcard
 //! payload.
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -25,12 +25,27 @@ pub enum Request {
     Lookup {
         uid: u32,
     },
+    /// Start an app. `command[0]` names the app in the daemon's registry; the rest are extra
+    /// arguments. `env` is what the compositor wants children to see (`WAYLAND_DISPLAY`, the
+    /// config's `environment {}` block); the daemon adds the identity-specific parts.
+    Launch {
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
-    Hello { version: u32 },
+    Hello {
+        version: u32,
+    },
     Policy(AppPolicy),
+    /// The app was started under this UID.
+    Launched {
+        uid: u32,
+    },
+    /// The request was understood and refused (unknown app, forker unavailable, ...).
+    Error(String),
 }
 
 pub fn write_msg<T: Serialize>(mut w: impl Write, msg: &T) -> io::Result<()> {

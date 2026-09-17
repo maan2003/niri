@@ -1,0 +1,19 @@
+[package]
+name = "niri-forker"
+version.workspace = true
+description = "Root forker: starts apps under the UIDs the identity daemon asks for, nothing else"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+libc = "0.2"
+niri-policy = { version = "26.4.0", path = "../niri-policy" }
+rustix = { version = "1.1.4", features = ["fs", "net", "process", "std"] }
+serde.workspace = true
+
+[[bin]]
+name = "niri-forker"
+path = "src/bin/niri-forker.rs"

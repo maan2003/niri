@@ -1,18 +1,13 @@
 [package]
 name = "niri-policy"
 version.workspace = true
-description = "Per-UID client policy: types, wire protocol, compositor client and a file-backed daemon"
+description = "Per-UID client policy: types, wire protocol and the compositor-side client"
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
 repository.workspace = true
 
 [dependencies]
-clap.workspace = true
 postcard = { version = "1.1.3", features = ["use-std"] }
 serde.workspace = true
 toml = "1"
-
-[[bin]]
-name = "niri-policyd"
-path = "src/bin/niri-policyd.rs"

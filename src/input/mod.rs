@@ -740,7 +740,7 @@ impl State {
                 self.niri.debug_toggle_damage();
             }
             Action::Spawn(command) => {
-                spawn_disabled(&format!("spawn {command:?}"));
+                self.niri.launch(command);
             }
             Action::SpawnSh(command) => {
                 spawn_disabled(&format!("spawn-sh {command:?}"));

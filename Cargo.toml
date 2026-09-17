@@ -3,6 +3,8 @@ members = [
     "niri-config",
     "niri-ipc",
     "niri-policy",
+    "niri-forker",
+    "niri-identity",
     "niri-visual-tests",
 ]
 

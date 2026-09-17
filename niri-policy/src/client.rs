@@ -11,8 +11,9 @@ use std::time::Duration;
 use crate::rpc::{self, Request, Response};
 use crate::AppPolicy;
 
-/// How long one lookup may take. The daemon is local and answers from memory; anything slower
-/// is a stuck daemon, and stalling the compositor on it is worse than failing closed.
+/// How long one request may take. Lookups are answered from memory; a launch is one fork
+/// request to the forker. Anything slower is a stuck daemon, and stalling the compositor on it is
+/// worse than failing.
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Source {
@@ -57,18 +58,31 @@ impl PolicyClient {
         if let Some(policy) = self.cache.get(&uid) {
             return Ok(policy.clone());
         }
-        let policy = Arc::new(self.ask(uid)?);
+        let policy = match self.request(&Request::Lookup { uid })? {
+            Response::Policy(policy) => Arc::new(policy),
+            other => return Err(unexpected("lookup", other)),
+        };
         self.cache.insert(uid, policy.clone());
         Ok(policy)
     }
 
-    fn ask(&mut self, uid: u32) -> io::Result<AppPolicy> {
+    /// Asks the daemon to start an app; returns the UID it runs as. A daemon-side refusal
+    /// (unknown app, no forker) comes back as an error too.
+    pub fn launch(&mut self, command: Vec<String>, env: Vec<(String, String)>) -> io::Result<u32> {
+        match self.request(&Request::Launch { command, env })? {
+            Response::Launched { uid } => Ok(uid),
+            Response::Error(err) => Err(io::Error::other(err)),
+            other => Err(unexpected("launch", other)),
+        }
+    }
+
+    fn request(&mut self, request: &Request) -> io::Result<Response> {
         match &mut self.source {
             Source::Socket { path, conn } => {
                 if conn.is_none() {
                     *conn = Some(open(path)?);
                 }
-                let res = roundtrip(conn.as_ref().unwrap(), uid);
+                let res = roundtrip(conn.as_ref().unwrap(), request);
                 if res.is_err() {
                     *conn = None;
                 }
@@ -78,7 +92,7 @@ impl PolicyClient {
                 let stream = conn
                     .as_ref()
                     .ok_or_else(|| io::Error::other("policy stream closed"))?;
-                let res = roundtrip(stream, uid);
+                let res = roundtrip(stream, request);
                 if res.is_err() {
                     *conn = None;
                 }
@@ -86,6 +100,13 @@ impl PolicyClient {
             }
         }
     }
+}
+
+fn unexpected(what: &str, response: Response) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unexpected reply to {what}: {response:?}"),
+    )
 }
 
 fn open(path: &PathBuf) -> io::Result<UnixStream> {
@@ -109,20 +130,11 @@ fn hello(stream: &UnixStream) -> io::Result<()> {
             "policy daemon speaks protocol {version}, we speak {}",
             rpc::VERSION
         ))),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected reply to hello: {other:?}"),
-        )),
+        other => Err(unexpected("hello", other)),
     }
 }
 
-fn roundtrip(stream: &UnixStream, uid: u32) -> io::Result<AppPolicy> {
-    rpc::write_msg(stream, &Request::Lookup { uid })?;
-    match rpc::read_msg::<Response>(stream)? {
-        Response::Policy(policy) => Ok(policy),
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unexpected reply to lookup: {other:?}"),
-        )),
-    }
+fn roundtrip(stream: &UnixStream, request: &Request) -> io::Result<Response> {
+    rpc::write_msg(stream, request)?;
+    rpc::read_msg::<Response>(stream)
 }

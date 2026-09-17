@@ -1,10 +1,9 @@
 //! Per-UID policy for Wayland clients.
 //!
-//! Identity is the UID of the connecting process (`SO_PEERCRED`); a policy daemon says what a
-//! UID may do. The compositor holds a [`client::PolicyClient`], asks it once per new
-//! connection and caches per UID. `niri-policyd` (this crate's binary) is the first daemon: it
-//! answers from a TOML file ([`PolicyStore`]). The identity daemon that allocates UIDs will
-//! replace it behind the same [`rpc`] protocol.
+//! Identity is the UID of the connecting process (`SO_PEERCRED`); the identity daemon
+//! (`niri-identityd`) says what a UID may do and starts apps under their UIDs. The compositor
+//! holds a [`client::PolicyClient`], asks it once per new connection (cached per UID) and sends
+//! it launch requests. [`PolicyStore`] is a file-backed answerer for tests and simple setups.
 //!
 //! The compositor applies the policy at one choke point: which optional globals a connection
 //! is shown. Everything a plain app needs (`wl_compositor`, `xdg_wm_base`, `wl_shm`, input,
@@ -312,7 +311,8 @@ mod tests {
             toml::from_str("[[app]]\nuid = 7\nname = \"seven\"\ngpu = true\n").unwrap();
         let store = PolicyStore::new(file).unwrap();
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || daemon::serve_connection(b, &store));
+        let server =
+            std::thread::spawn(move || daemon::serve_connection(b, &store as &dyn daemon::Handler));
 
         let mut client = PolicyClient::from_stream(a).unwrap();
         assert_eq!(client.lookup(7).unwrap().name, "seven");

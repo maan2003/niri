@@ -1,14 +1,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, mem, thread};
+use std::{env, fs, io, mem, thread};
 
 use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode;
 use anyhow::{bail, ensure, Context};
@@ -257,6 +257,8 @@ pub struct Niri {
     ///
     /// This is `None` when creating `Niri` without a Wayland socket.
     pub socket_name: Option<OsString>,
+    /// Absolute path of the world-connectable socket handed to launched apps.
+    pub apps_socket: Option<PathBuf>,
 
     pub start_time: Instant,
 
@@ -2901,6 +2903,22 @@ impl Niri {
             socket_name
         });
 
+        // A second, world-connectable socket for apps running as other UIDs, which cannot enter
+        // our XDG_RUNTIME_DIR. Anyone may connect; the policy decides what they get.
+        let apps_socket = create_wayland_socket
+            .then(|| env::var_os("NIRI_APPS_SOCKET").map(PathBuf::from))
+            .flatten()
+            .and_then(|path| match bind_apps_socket(&event_loop, &path) {
+                Ok(()) => {
+                    info!("listening on apps Wayland socket: {}", path.display());
+                    Some(path)
+                }
+                Err(err) => {
+                    warn!("error creating apps socket {}: {err:?}", path.display());
+                    None
+                }
+            });
+
         let ipc_server = match IpcServer::start(&event_loop, socket_name.as_deref()) {
             Ok(server) => Some(server),
             Err(err) => {
@@ -2946,6 +2964,7 @@ impl Niri {
             scheduler,
             stop_signal,
             socket_name,
+            apps_socket,
             display_handle,
             is_session_instance,
             start_time: Instant::now(),
@@ -3093,6 +3112,44 @@ impl Niri {
         niri.reset_pointer_inactivity_timer();
 
         niri
+    }
+
+    /// Asks the identity daemon to start `command` as its own UID, with the environment a child
+    /// of ours would have had.
+    pub fn launch(&mut self, command: Vec<String>) {
+        if command.is_empty() {
+            return;
+        }
+        let mut env = Vec::new();
+        let display = self
+            .apps_socket
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| {
+                self.socket_name
+                    .as_ref()
+                    .map(|s| s.to_string_lossy().into_owned())
+            });
+        if let Some(display) = display {
+            env.push(("WAYLAND_DISPLAY".to_owned(), display));
+        }
+        if let Some(ipc) = &self.ipc_server {
+            if let Some(path) = &ipc.socket_path {
+                env.push((
+                    niri_ipc::socket::SOCKET_PATH_ENV.to_owned(),
+                    path.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        for var in &CHILD_ENV.read().unwrap().0 {
+            if let Some(value) = &var.value {
+                env.push((var.name.clone(), value.clone()));
+            }
+        }
+        match self.policy.launch(command.clone(), env) {
+            Ok(uid) => info!("launched {command:?} as uid {uid}"),
+            Err(err) => warn!("error launching {command:?}: {err}"),
+        }
     }
 
     pub fn insert_client(&mut self, client: NewClient) {
@@ -7273,6 +7330,33 @@ impl Niri {
             self.queue_redraw(&output);
         }
     }
+}
+
+fn bind_apps_socket(event_loop: &LoopHandle<'static, State>, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::remove_file(path);
+    let listener = UnixListener::bind(path)?;
+    listener.set_nonblocking(true)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+    let source = Generic::new(listener, Interest::READ, Mode::Level);
+    event_loop.insert_source(source, |_, listener, state| {
+        loop {
+            match listener.accept() {
+                Ok((client, _)) => state.niri.insert_client(NewClient {
+                    client,
+                    restricted: false,
+                    credentials_unknown: false,
+                }),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    warn!("error accepting on the apps socket: {err}");
+                    break;
+                }
+            }
+        }
+        Ok(PostAction::Continue)
+    })?;
+    Ok(())
 }
 
 /// Global filter: the client's policy grants `global`, and it is not a security-context

@@ -18,7 +18,7 @@ use crate::niri::{NewClient, Niri};
 pub fn serve_policy(file: PolicyFile) -> PolicyClient {
     let store = PolicyStore::new(file).unwrap();
     let (ours, theirs) = UnixStream::pair().unwrap();
-    thread::spawn(move || daemon::serve_connection(theirs, &store));
+    thread::spawn(move || daemon::serve_connection(theirs, &store as &dyn daemon::Handler));
     PolicyClient::from_stream(ours).unwrap()
 }
 
