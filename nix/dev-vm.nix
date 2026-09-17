@@ -139,10 +139,12 @@ in
     exec = ["${pkgs.weston}/bin/weston-flower"]
 
     # A real browser: GPU, its own home, flags come from here and never from the caller.
+    # dbus-run-session gives it a private session bus in its own UID: compatibility, not a
+    # boundary (the sandbox already hides the system bus).
     [[app]]
     name = "chromium"
     uid = 100005
-    exec = ["${pkgs.chromium}/bin/chromium", "--ozone-platform=wayland", "--autoplay-policy=no-user-gesture-required", "file://${audioPage}"]
+    exec = ["${pkgs.dbus}/bin/dbus-run-session", "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon", "--", "${pkgs.chromium}/bin/chromium", "--ozone-platform=wayland", "--autoplay-policy=no-user-gesture-required", "file://${audioPage}"]
     gpu = true
     groups = ["render", "pipewire"]
 
