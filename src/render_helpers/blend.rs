@@ -7,7 +7,7 @@
 //! is encoded into the blend space at draw time by the shaders' `niri_blend` stage; surfaces
 //! that already carry a matching image description pass through numerically.
 //!
-//! The core only decides: the blend space travels in `Command::Begin`, the GPU process
+//! The core only decides: the blend space travels in `SceneFrame::blend`, the GPU process
 //! installs the blend texture shader frame-wide and encodes solid colors on the CPU. niri's
 //! own shader draws carry the blend uniforms explicitly (see [`FrameBlendState`]).
 //!

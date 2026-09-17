@@ -15,7 +15,7 @@ use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
 use zbus::object_server::SignalEmitter;
 
 use crate::dbus::mutter_screen_cast::CursorMode;
-use crate::gpu::protocol::{CastCursorMode, CursorMeta, Request};
+use crate::gpu::protocol::{CastCursorMode, CastInfo, CursorMeta, Request};
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{CastTarget, State};
@@ -328,7 +328,11 @@ impl Cast {
             location: (cursor_data.location.x, cursor_data.location.y),
             hotspot: (cursor_data.hotspot.x, cursor_data.hotspot.y),
         });
-        renderer.cast_frame_info(stream, scale.x, target_frame_time.as_nanos() as u64, cursor);
+        let info = CastInfo {
+            scale: scale.x,
+            target_time_ns: target_frame_time.as_nanos() as u64,
+            cursor,
+        };
 
         if self.cursor_mode == CursorMode::Metadata && !cursor_data.size.is_empty() {
             let target = renderer.cast_cursor_target(stream, cursor_data.size);
@@ -348,7 +352,7 @@ impl Cast {
         } else {
             &elements[cursor_data.elem_count..]
         };
-        let target = renderer.cast_target(stream, size);
+        let target = renderer.cast_target(stream, size, info);
         self.recorder
             .record(renderer, target, size, Transform::Normal, scale, elements)?;
         self.pending_frame_time = Some(target_frame_time);

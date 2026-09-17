@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -209,7 +209,7 @@ pub enum Target {
     Texture(TexId),
     /// A dmabuf previously imported under this id; bound directly (not via its texture).
     Dmabuf(TexId),
-    /// Recorded frames for outputs are kept by the GPU process and drawn by [`Request::Present`].
+    /// Frames for outputs are kept by the GPU process and drawn by [`Request::Present`].
     Output(OutputRef),
     /// A screencast stream's next PipeWire buffer; rendered when the frame ends.
     Cast(u64),
@@ -290,23 +290,133 @@ pub enum ElementKind {
     Unspecified,
 }
 
-/// What the GPU-side damage tracker needs to know about one element.
+/// One frame of a render target, described as a scene: nodes bottom to top, each made of
+/// draw ops. Every coordinate in a frame (node geometry, damage, opaque regions, op `dst`) is
+/// in frame coordinates: the untransformed `width` x `height` buffer. The GPU derives
+/// element-relative values where smithay wants them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ElementMeta {
-    /// Stable across frames for the same element; chosen by the core.
+pub struct SceneFrame {
+    pub target: Target,
+    pub width: i32,
+    pub height: i32,
+    pub transform: Transform,
+    /// Blend space of this frame. When set, default-program texture draws go through
+    /// `TexProgram::TextureHdr` and solid colors are encoded on the CPU.
+    pub blend: Option<BlendParams>,
+    /// Offscreen targets are cleared to this before drawing; outputs and casts clear
+    /// themselves to transparent.
+    pub clear: Option<[f32; 4]>,
+    /// Bumped whenever the core forgot its per-target history (new output geometry, failed
+    /// send). The GPU forgets its history too, so node damage is never applied to a stale
+    /// baseline.
+    pub generation: u64,
+    /// Present for `Target::Cast` frames.
+    pub cast: Option<CastInfo>,
+    pub nodes: Vec<Node>,
+}
+
+impl SceneFrame {
+    pub fn size(&self) -> (i32, i32) {
+        (self.width, self.height)
+    }
+}
+
+/// Per-frame parameters of a screencast frame.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CastInfo {
+    pub scale: f64,
+    /// The presentation time this frame was rendered for; echoed in `CastEvent::Rendered`.
+    pub target_time_ns: u64,
+    /// `None` in embedded/hidden cursor modes or when the pointer is not over the target.
+    pub cursor: Option<CursorMeta>,
+}
+
+impl Default for CastInfo {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            target_time_ns: 0,
+            cursor: None,
+        }
+    }
+}
+
+/// One scene element: what the GPU's damage tracker needs to know, plus how to draw it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Node {
+    /// Stable across frames of one target for the same element; chosen by the core. Ids with
+    /// [`ANONYMOUS_NODE`] set are one-off nodes for draws outside any element.
     pub id: u64,
     pub src: Rect<f64>,
-    /// In output coordinates.
     pub geometry: Rect<i32>,
-    /// Element-relative damage since the previous frame this id was sent in. `None` means
-    /// everything (new element or unknown).
+    /// Damage since the previous frame this id was in. `None` means everything (new element
+    /// or unknown).
     pub damage: Option<Vec<Rect<i32>>>,
-    /// Element-relative.
     pub opaque: Vec<Rect<i32>>,
     pub kind: ElementKind,
     /// Buffer transform, for direct scanout.
     pub transform: Transform,
-    pub framebuffer_effect: bool,
+    /// Framebuffer-effect ops (backdrop capture) run before the node is drawn.
+    pub capture: Vec<Op>,
+    pub draw: Vec<Op>,
+}
+
+/// High bit of a node id: the node was synthesized for draws outside any element and has no
+/// history.
+pub const ANONYMOUS_NODE: u64 = 1 << 63;
+
+/// A draw inside a node. Ops carry no damage: the GPU clips every op to the damage the
+/// tracker assigns its node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Op {
+    Solid {
+        dst: Rect<i32>,
+        color: [f32; 4],
+    },
+    Texture {
+        texture: TexId,
+        src: Rect<f64>,
+        dst: Rect<i32>,
+        opaque: Vec<Rect<i32>>,
+        transform: Transform,
+        alpha: f32,
+        program: Option<TexProgram>,
+        uniforms: Vec<Uniform>,
+    },
+    /// niri's custom pixel shaders (borders, shadows, resize/open/close animations).
+    Shader {
+        program: ShaderKind,
+        src: Rect<f64>,
+        dst: Rect<i32>,
+        scale: f32,
+        alpha: f32,
+        uniforms: Vec<Uniform>,
+        textures: Vec<(String, TexId)>,
+    },
+    /// Snapshot the framebuffer under `dst` (blurred if requested) for a later `Captured`.
+    Capture {
+        key: u64,
+        src: Rect<f64>,
+        dst: Rect<i32>,
+        scale: f32,
+        blur: Option<BlurParams>,
+    },
+    Captured {
+        key: u64,
+        dst: Rect<i32>,
+        uniforms: Vec<Uniform>,
+    },
+    /// `ops` drawn with `program` as the default texture program.
+    WithTexProgram {
+        program: TexProgram,
+        uniforms: Vec<Uniform>,
+        ops: Vec<Op>,
+    },
+    /// `ops` drawn with no default-program override at all (not even the frame's blend
+    /// program): content already encoded in the blend space passes through numerically.
+    Raw {
+        ops: Vec<Op>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,15 +456,6 @@ pub enum Command {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    /// Parameters for the next `Begin { Target::Cast(stream) }` frame.
-    CastFrameInfo {
-        stream: u64,
-        scale: f64,
-        /// The presentation time this frame was rendered for; echoed in `CastEvent::Rendered`.
-        target_time_ns: u64,
-        /// `None` in embedded/hidden cursor modes or when the pointer is not over the target.
-        cursor: Option<CursorMeta>,
-    },
     /// Shm buffer contents by pool fd (attached), so the core never maps client memory. With
     /// `damage` set, `id` is an existing texture to update in those regions; otherwise a new
     /// texture is created.
@@ -387,77 +488,9 @@ pub enum Command {
         flags: u32,
     },
 
-    // Frame commands; only valid between Begin and End.
-    Begin {
-        target: Target,
-        width: i32,
-        height: i32,
-        transform: Transform,
-        /// Blend space of this frame. When set, default-program texture draws go through
-        /// `TexProgram::TextureHdr` and solid colors are encoded on the CPU.
-        blend: Option<BlendParams>,
-    },
-    Clear {
-        color: [f32; 4],
-        at: Vec<Rect<i32>>,
-    },
-    DrawSolid {
-        dst: Rect<i32>,
-        damage: Vec<Rect<i32>>,
-        color: [f32; 4],
-    },
-    DrawTexture {
-        texture: TexId,
-        src: Rect<f64>,
-        dst: Rect<i32>,
-        damage: Vec<Rect<i32>>,
-        opaque: Vec<Rect<i32>>,
-        transform: Transform,
-        alpha: f32,
-        program: Option<TexProgram>,
-        uniforms: Vec<Uniform>,
-    },
-    OverrideTexProgram {
-        program: TexProgram,
-        uniforms: Vec<Uniform>,
-    },
-    ClearTexProgramOverride,
-    /// Temporarily drops the frame's tex program override (including the frame-wide blend
-    /// one) so content already encoded in the blend space passes through numerically.
-    SuspendTexProgramOverride,
-    RestoreTexProgramOverride,
-    /// niri's custom pixel shaders (borders, shadows, resize/open/close animations).
-    DrawShader {
-        program: ShaderKind,
-        src: Rect<f64>,
-        dst: Rect<i32>,
-        damage: Vec<Rect<i32>>,
-        scale: f32,
-        alpha: f32,
-        uniforms: Vec<Uniform>,
-        textures: Vec<(String, TexId)>,
-    },
-    /// Snapshot the framebuffer under `dst` (blurred if requested) for a later `DrawCaptured`.
-    CaptureFramebuffer {
-        key: u64,
-        src: Rect<f64>,
-        dst: Rect<i32>,
-        scale: f32,
-        blur: Option<BlurParams>,
-    },
-    DrawCaptured {
-        key: u64,
-        dst: Rect<i32>,
-        damage: Vec<Rect<i32>>,
-        uniforms: Vec<Uniform>,
-    },
-    /// Starts one scene element inside an output frame (`Begin { Target::Output }`). Commands
-    /// up to `BeginElementDraw` are its framebuffer capture, the rest up to `EndElement` its
-    /// draw. The GPU turns each element into a real smithay element for its DRM compositor.
-    BeginElement(ElementMeta),
-    BeginElementDraw,
-    EndElement,
-    End,
+    /// One rendered frame of a target. Output frames are kept for `Request::Present`, cast
+    /// frames go to their stream, texture/dmabuf frames render right away.
+    Frame(Box<SceneFrame>),
 
     // Valid anywhere.
     DestroyCapture {

@@ -60,8 +60,8 @@ use smithay::utils::{Buffer, DeviceFd, Physical, Point, Scale, Size, Transform};
 
 use super::drm::allocate_gbm_dmabuf;
 use super::exec::{Deferred, Executor, Tables};
-use super::protocol::{CastCursorMode, CastEvent, Command, CursorMeta};
-use super::scene::{self, split_elements, ElementTracks, SceneElement};
+use super::protocol::{CastCursorMode, CastEvent, CastInfo, CursorMeta, SceneFrame, Target};
+use super::scene::{self, NodeTracks, SceneElement};
 use super::server::Server;
 
 const SHM_BLOCKS: usize = 1;
@@ -103,14 +103,6 @@ pub struct StartParams {
     pub gbm: Option<GbmDevice<DeviceFd>>,
 }
 
-/// Per-frame parameters the core sends before the cast frame itself.
-#[derive(Debug, Clone, Copy)]
-struct FrameInfo {
-    scale: f64,
-    target_time_ns: u64,
-    cursor: Option<CursorMeta>,
-}
-
 pub struct Cast {
     stream_id: u64,
     loop_handle: LoopHandle<'static, Server>,
@@ -123,10 +115,10 @@ pub struct Cast {
     // Incremented once per successful frame, stored in buffer meta.
     sequence_counter: u64,
     inner: Rc<RefCell<CastInner>>,
-    tracks: ElementTracks,
-    cursor_tracks: ElementTracks,
-    pending_info: Option<FrameInfo>,
-    pending_cursor: Option<(Size<i32, Physical>, Vec<Command>)>,
+    tracks: NodeTracks,
+    cursor_tracks: NodeTracks,
+    /// Cursor bitmap frame for the next cast frame (metadata cursor mode).
+    pending_cursor: Option<SceneFrame>,
 }
 
 /// Mutable `Cast` state shared with PipeWire callbacks.
@@ -425,9 +417,10 @@ impl Casting {
         let tables = &exec.tables;
         for item in deferred {
             let stream = match &item {
-                Deferred::CastInfo { stream, .. }
-                | Deferred::CastCursor { stream, .. }
-                | Deferred::CastFrame { stream, .. } => *stream,
+                Deferred::CastCursor(frame) | Deferred::CastFrame(frame) => match frame.target {
+                    Target::Cast(stream) | Target::CastCursor(stream) => stream,
+                    _ => unreachable!(),
+                },
             };
             // The core may still record for a stream we just stopped.
             let Some(cast) = self.casts.get_mut(&stream) else {
@@ -435,28 +428,10 @@ impl Casting {
                 continue;
             };
             match item {
-                Deferred::CastInfo {
-                    scale,
-                    target_time_ns,
-                    cursor,
-                    ..
-                } => {
-                    cast.pending_info = Some(FrameInfo {
-                        scale,
-                        target_time_ns,
-                        cursor,
-                    });
-                }
-                Deferred::CastCursor { size, commands, .. } => {
-                    cast.pending_cursor = Some((size, commands));
-                }
-                Deferred::CastFrame { size, commands, .. } => {
-                    let info = cast.pending_info.take().unwrap_or(FrameInfo {
-                        scale: 1.0,
-                        target_time_ns: 0,
-                        cursor: None,
-                    });
-                    let sent = match cast.render_frame(renderer, tables, info, size, commands) {
+                Deferred::CastCursor(frame) => cast.pending_cursor = Some(*frame),
+                Deferred::CastFrame(frame) => {
+                    let info = frame.cast.unwrap_or_default();
+                    let sent = match cast.render_frame(renderer, tables, *frame) {
                         Ok(sent) => sent,
                         Err(err) => {
                             warn!("error rendering cast frame: {err:?}");
@@ -1061,9 +1036,8 @@ impl PipeWire {
             cursor_mode,
             sequence_counter: 0,
             inner,
-            tracks: ElementTracks::default(),
-            cursor_tracks: ElementTracks::default(),
-            pending_info: None,
+            tracks: NodeTracks::default(),
+            cursor_tracks: NodeTracks::default(),
             pending_cursor: None,
         })
     }
@@ -1156,36 +1130,41 @@ impl Cast {
         &mut self,
         renderer: &mut GlesRenderer,
         tables: &RefCell<Tables>,
-        info: FrameInfo,
-        size: Size<i32, Physical>,
-        commands: Vec<Command>,
+        frame: SceneFrame,
     ) -> anyhow::Result<bool> {
         let _span = tracy_client::span!("Cast::render_frame");
-        let (cursor_size, cursor_commands) = self.pending_cursor.take().unwrap_or_default();
+        let info: CastInfo = frame.cast.unwrap_or_default();
+        let size = Size::<i32, Physical>::from((frame.width, frame.height));
+        let cursor_frame = self.pending_cursor.take();
+        let cursor_size = cursor_frame
+            .as_ref()
+            .map(|f| Size::<i32, Physical>::from((f.width, f.height)))
+            .unwrap_or_default();
+        let cursor_nodes = cursor_frame
+            .as_ref()
+            .map(|f| f.nodes.as_slice())
+            .unwrap_or(&[]);
         let scale = Scale::from(info.scale);
         let cursor_location: Point<i32, Physical> = info
             .cursor
             .map(|c| Point::from(c.location))
             .unwrap_or_default();
 
-        let segments = split_elements(&commands);
-        self.tracks.update(&segments);
-        let cursor_segments = split_elements(&cursor_commands);
-        self.cursor_tracks.update(&cursor_segments);
+        self.tracks.update(frame.generation, &frame.nodes);
+        self.cursor_tracks.update(
+            cursor_frame.as_ref().map_or(0, |f| f.generation),
+            cursor_nodes,
+        );
         let (storages, cursor_storages) = {
             let tables = tables.borrow();
             (
-                scene::element_storages(&tables, &segments),
-                scene::element_storages(&tables, &cursor_segments),
+                scene::node_storages(&tables, &frame.nodes),
+                scene::node_storages(&tables, cursor_nodes),
             )
         };
-        let elements = scene::scene_elements(&self.tracks, &segments, &storages, tables);
-        let cursor_elements = scene::scene_elements(
-            &self.cursor_tracks,
-            &cursor_segments,
-            &cursor_storages,
-            tables,
-        );
+        let elements = scene::scene_elements(&self.tracks, &frame.nodes, &storages, tables);
+        let cursor_elements =
+            scene::scene_elements(&self.cursor_tracks, cursor_nodes, &cursor_storages, tables);
 
         let mut inner = self.inner.borrow_mut();
         let CastState::Ready {

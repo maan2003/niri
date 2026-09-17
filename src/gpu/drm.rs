@@ -49,7 +49,7 @@ use super::protocol::{
     BlendParams, ColorState, ConnectorInfo, DevId, ElementState, Event, HdrCaps, ModeDesc,
     OutputGeometry, OutputRef, PresentFlags, Presentation,
 };
-use super::scene::{self, split_elements, ElementTracks};
+use super::scene::{self, NodeTracks};
 
 /// Scanout formats for SDR outputs: 8-bit only, like upstream niri. Asking for a 10-bit
 /// framebuffer isn't free (some drivers, notably nvidia, hang the initial modeset on 2101010),
@@ -95,7 +95,7 @@ struct Surface {
     last_blend: Option<Option<BlendParams>>,
     geometry: OutputGeometry,
     /// Damage tracking state per core element id, so the DRM compositor sees real elements.
-    elements: ElementTracks,
+    elements: NodeTracks,
 }
 
 struct GammaProps {
@@ -611,7 +611,7 @@ impl DrmState {
                 pending_ctm: None,
                 last_blend: None,
                 geometry,
-                elements: ElementTracks::default(),
+                elements: NodeTracks::default(),
             },
         );
 
@@ -790,19 +790,20 @@ impl DrmState {
             .output_frames
             .remove(&output)
             .context("no frame recorded for this output")?;
-        let commands = frame_rec.commands;
         let blend = frame_rec.blend;
         if surface.last_blend != Some(blend) {
             surface.last_blend = Some(blend);
             surface.compositor.reset_buffers();
         }
-        let segments = split_elements(&commands);
 
-        surface.elements.update(&segments);
+        surface
+            .elements
+            .update(frame_rec.generation, &frame_rec.nodes);
         let id_map = surface.elements.id_map();
-        let storages = scene::element_storages(&exec.tables.borrow(), &segments);
-        // smithay wants elements top to bottom; the core recorded bottom to top.
-        let elements = scene::scene_elements(&surface.elements, &segments, &storages, &exec.tables);
+        let storages = scene::node_storages(&exec.tables.borrow(), &frame_rec.nodes);
+        // smithay wants elements top to bottom; the core sends bottom to top.
+        let elements =
+            scene::scene_elements(&surface.elements, &frame_rec.nodes, &storages, &exec.tables);
 
         let mut frame_flags = FrameFlags::empty();
         if flags.primary_scanout {

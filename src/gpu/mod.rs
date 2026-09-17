@@ -1,11 +1,12 @@
-//! Out-of-process rendering: the core records renderer commands, the GPU process
-//! (the only thing that touches Mesa) replays them.
+//! Out-of-process rendering: the core describes each frame as a scene of nodes, the GPU
+//! process (the only thing that touches Mesa) tracks damage and draws it.
 
 #[cfg(feature = "xdp-gnome-screencast")]
 pub mod cast;
 pub mod client;
 pub mod convert;
 pub mod cursor;
+pub mod draw;
 pub mod drm;
 pub mod exec;
 pub mod gl;

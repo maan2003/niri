@@ -1,4 +1,4 @@
-//! GPU-process side: replays recorded commands on a real `GlesRenderer`.
+//! GPU-process side: owns textures and runs core commands on a real `GlesRenderer`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -12,24 +12,23 @@ use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::format::get_bpp;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::renderer::element::memory::MemoryBuffer;
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
 use smithay::backend::renderer::{
-    Bind as _, Color32F, DebugFlags, ExportMem as _, Frame as _, FrameContext as _, ImportDma as _,
-    ImportMem as _, Offscreen as _, Renderer as _, Texture as _,
+    Bind as _, Color32F, DebugFlags, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
+    Offscreen as _, Renderer as _, Texture as _,
 };
 use smithay::utils::{Buffer, Physical, Rectangle, Size};
 use tracing::warn;
 
 use super::convert;
+use super::draw::draw_ops;
 use super::gl::blend;
 use super::gl::blur::Blur;
 use super::gl::capture::Capture;
-use super::gl::resources::Resources;
-use super::gl::shader::{self, DrawParams};
 use super::gl::shaders::Shaders;
 use super::protocol::{
-    BlendParams, Caps, Command, CursorFrameDesc, CursorMeta, DmabufDesc, Image, OutputRef,
-    PlaneDesc, Rect, ShaderKind, ShaderSupport, Target, TexId, TexProgram,
+    Caps, Command, CursorFrameDesc, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, SceneFrame,
+    ShaderKind, ShaderSupport, Target, TexId,
 };
 
 /// Objects the core refers to by id.
@@ -42,7 +41,7 @@ pub struct Tables {
     /// them on the cursor plane without going through GL.
     pub memory: HashMap<TexId, MemoryBuffer>,
     pools: ShmPools,
-    captures: HashMap<u64, Capture>,
+    pub(super) captures: HashMap<u64, Capture>,
     blurs: HashMap<u64, Blur>,
 }
 
@@ -152,56 +151,17 @@ const MAX_BLUR_CACHE: usize = 64;
 pub struct Executor {
     pub(super) renderer: Option<GlesRenderer>,
     pub tables: RefCell<Tables>,
-    /// Frames recorded for outputs, waiting for `Present`.
-    pub output_frames: HashMap<OutputRef, OutputFrame>,
-    /// Screencast work found in the last `execute`, in order; the server hands it to the
+    /// Frames sent for outputs, waiting for `Present`.
+    pub output_frames: HashMap<OutputRef, SceneFrame>,
+    /// Screencast frames found in the last `execute`, in order; the server hands them to the
     /// PipeWire side after the batch.
     pub deferred: Vec<Deferred>,
 }
 
-/// Commands whose effect lives outside the executor (screencast streams).
+/// Frames whose target lives outside the executor (screencast streams).
 pub enum Deferred {
-    CastInfo {
-        stream: u64,
-        scale: f64,
-        target_time_ns: u64,
-        cursor: Option<CursorMeta>,
-    },
-    CastCursor {
-        stream: u64,
-        size: Size<i32, Physical>,
-        commands: Vec<Command>,
-    },
-    CastFrame {
-        stream: u64,
-        size: Size<i32, Physical>,
-        commands: Vec<Command>,
-    },
-}
-
-#[derive(Default)]
-/// A recorded output frame, replayed by the DRM compositor at `Present`.
-pub struct OutputFrame {
-    pub blend: Option<BlendParams>,
-    pub commands: Vec<Command>,
-}
-
-struct TexPrograms {
-    clipped_surface: Option<GlesTexProgram>,
-    postprocess_and_clip: Option<GlesTexProgram>,
-    gradient_fade: Option<GlesTexProgram>,
-    texture_hdr: Option<GlesTexProgram>,
-}
-
-impl TexPrograms {
-    fn get(&self, program: TexProgram) -> Option<&GlesTexProgram> {
-        match program {
-            TexProgram::ClippedSurface => self.clipped_surface.as_ref(),
-            TexProgram::PostprocessAndClip => self.postprocess_and_clip.as_ref(),
-            TexProgram::GradientFade => self.gradient_fade.as_ref(),
-            TexProgram::TextureHdr => self.texture_hdr.as_ref(),
-        }
-    }
+    CastCursor(Box<SceneFrame>),
+    CastFrame(Box<SceneFrame>),
 }
 
 fn fourcc(format: u32) -> anyhow::Result<Fourcc> {
@@ -413,129 +373,19 @@ impl Executor {
         fds: &mut VecDeque<OwnedFd>,
     ) -> anyhow::Result<()> {
         let renderer = self.renderer.as_mut().context("no renderer yet")?;
-        let mut iter = commands.into_iter();
-        while let Some(cmd) = iter.next() {
+        for cmd in commands {
             match cmd {
-                Command::Begin {
-                    target: Target::Output(output),
-                    blend,
-                    ..
-                } => {
+                Command::Frame(frame) => match frame.target {
                     // Kept until Present; drawn by the DRM compositor with real damage.
-                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
-                    self.output_frames
-                        .insert(output, OutputFrame { blend, commands });
-                }
-                Command::Begin {
-                    target: Target::Cast(stream),
-                    width,
-                    height,
-                    ..
-                } => {
-                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
-                    self.deferred.push(Deferred::CastFrame {
-                        stream,
-                        size: Size::from((width, height)),
-                        commands,
-                    });
-                }
-                Command::Begin {
-                    target: Target::CastCursor(stream),
-                    width,
-                    height,
-                    ..
-                } => {
-                    let commands = collect_frame(renderer, &self.tables, &mut iter, fds)?;
-                    self.deferred.push(Deferred::CastCursor {
-                        stream,
-                        size: Size::from((width, height)),
-                        commands,
-                    });
-                }
-                Command::CastFrameInfo {
-                    stream,
-                    scale,
-                    target_time_ns,
-                    cursor,
-                } => self.deferred.push(Deferred::CastInfo {
-                    stream,
-                    scale,
-                    target_time_ns,
-                    cursor,
-                }),
-                Command::Begin {
-                    target: Target::Texture(target),
-                    width,
-                    height,
-                    transform,
-                    blend,
-                } => {
-                    let mut texture = self
-                        .tables
-                        .borrow()
-                        .textures
-                        .get(&target)
-                        .context("unknown target texture")?
-                        .clone();
-                    blend::apply(renderer, blend);
-                    let res = (|| {
-                        let mut fb = renderer.bind(&mut texture).context("bind")?;
-                        let mut frame = renderer
-                            .render(
-                                &mut fb,
-                                Size::from((width, height)),
-                                convert::to_transform(transform),
-                            )
-                            .context("render")?;
-                        let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
-                        let _sync = frame.finish().context("finish")?;
-                        res
-                    })();
-                    if blend.is_some() {
-                        blend::apply(renderer, None);
+                    Target::Output(output) => {
+                        self.output_frames.insert(output, *frame);
                     }
-                    res?;
-                }
-                Command::Begin {
-                    target: Target::Dmabuf(target),
-                    width,
-                    height,
-                    transform,
-                    blend,
-                } => {
-                    // Bind the dmabuf itself rather than its imported texture: external
-                    // (EGLImage) textures can't be framebuffer attachments.
-                    let mut dmabuf = self
-                        .tables
-                        .borrow()
-                        .dmabufs
-                        .get(&target)
-                        .context("unknown target dmabuf")?
-                        .clone();
-                    blend::apply(renderer, blend);
-                    let res = (|| {
-                        let mut fb = renderer.bind(&mut dmabuf).context("bind dmabuf")?;
-                        let mut frame = renderer
-                            .render(
-                                &mut fb,
-                                Size::from((width, height)),
-                                convert::to_transform(transform),
-                            )
-                            .context("render")?;
-                        let res = run_frame(&mut frame, &self.tables, &mut iter, None, fds);
-                        let sync = frame.finish().context("finish")?;
-                        res.map(|()| sync)
-                    })();
-                    if blend.is_some() {
-                        blend::apply(renderer, None);
+                    Target::Cast(_) => self.deferred.push(Deferred::CastFrame(frame)),
+                    Target::CastCursor(_) => self.deferred.push(Deferred::CastCursor(frame)),
+                    Target::Texture(_) | Target::Dmabuf(_) => {
+                        render_offscreen(renderer, &self.tables, &frame)?;
                     }
-                    let sync = res?;
-                    // The buffer leaves for another process (PipeWire consumer, image-copy
-                    // client) as soon as the core's Sync returns, so finish it here.
-                    if let Err(err) = sync.wait() {
-                        warn!("error waiting for dmabuf render: {err:?}");
-                    }
-                }
+                },
                 cmd => {
                     let mut tables = self.tables.borrow_mut();
                     execute_one(renderer, &mut tables, cmd, fds)?;
@@ -546,29 +396,76 @@ impl Executor {
     }
 }
 
-/// Gathers a recorded frame up to its `End` for later replay. Fd-bearing imports must consume
-/// their fds from this batch now, so they run immediately.
-fn collect_frame(
+/// Renders a texture/dmabuf frame right away: full clear and unclipped draws, in order.
+/// One-shot targets (screenshots, screencopy, effect buffers) have no damage history.
+fn render_offscreen(
     renderer: &mut GlesRenderer,
     tables: &RefCell<Tables>,
-    iter: &mut impl Iterator<Item = Command>,
-    fds: &mut VecDeque<OwnedFd>,
-) -> anyhow::Result<Vec<Command>> {
-    let mut frame = Vec::new();
-    loop {
-        match iter.next() {
-            None => bail!("unterminated frame"),
-            Some(Command::End) => break,
-            Some(cmd @ (Command::ImportShm { .. } | Command::ImportDmabuf { .. })) => {
-                let mut tables = tables.borrow_mut();
-                execute_one(renderer, &mut tables, cmd, fds)?;
-            }
-            Some(cmd) => frame.push(cmd),
+    frame: &SceneFrame,
+) -> anyhow::Result<()> {
+    let size = Size::<i32, Physical>::from((frame.width, frame.height));
+    let transform = convert::to_transform(frame.transform);
+    let draw = |renderer: &mut GlesRenderer, fb: &mut GlesTarget<'_>| -> anyhow::Result<_> {
+        let mut gl_frame = renderer.render(fb, size, transform).context("render")?;
+        if let Some([r, g, b, a]) = frame.clear {
+            let all = Rectangle::from_size(transform.transform_size(size));
+            gl_frame
+                .clear(Color32F::new(r, g, b, a), &[all])
+                .context("clear")?;
+        }
+        for node in &frame.nodes {
+            draw_ops(&mut gl_frame, tables, &node.capture, None)?;
+            draw_ops(&mut gl_frame, tables, &node.draw, None)?;
+        }
+        gl_frame.finish().context("finish")
+    };
+
+    blend::apply(renderer, frame.blend);
+    let res = match frame.target {
+        Target::Texture(id) => {
+            let mut texture = tables
+                .borrow()
+                .textures
+                .get(&id)
+                .context("unknown target texture")?
+                .clone();
+            renderer
+                .bind(&mut texture)
+                .context("bind")
+                .and_then(|mut fb| draw(renderer, &mut fb))
+                .map(|_sync| None)
+        }
+        Target::Dmabuf(id) => {
+            // Bind the dmabuf itself rather than its imported texture: external (EGLImage)
+            // textures can't be framebuffer attachments.
+            let mut dmabuf = tables
+                .borrow()
+                .dmabufs
+                .get(&id)
+                .context("unknown target dmabuf")?
+                .clone();
+            renderer
+                .bind(&mut dmabuf)
+                .context("bind dmabuf")
+                .and_then(|mut fb| draw(renderer, &mut fb))
+                .map(Some)
+        }
+        _ => unreachable!(),
+    };
+    if frame.blend.is_some() {
+        blend::apply(renderer, None);
+    }
+    if let Some(sync) = res? {
+        // The buffer leaves for another process (PipeWire consumer, image-copy client) as
+        // soon as the core's Sync returns, so finish it here.
+        if let Err(err) = sync.wait() {
+            warn!("error waiting for dmabuf render: {err:?}");
         }
     }
-    Ok(frame)
+    Ok(())
 }
 
+/// Commands other than frames.
 /// Commands valid outside a frame (and, via the frame's renderer guard, inside one).
 fn execute_one(
     renderer: &mut GlesRenderer,
@@ -805,297 +702,7 @@ fn execute_one(
         Command::SetDebugFlags { flags } => {
             renderer.set_debug_flags(DebugFlags::from_bits_truncate(flags));
         }
-        other => bail!("{other:?} is only valid inside a frame"),
+        Command::Frame(_) => bail!("frame inside a frame"),
     }
     Ok(())
-}
-
-/// Clips frame-relative rectangles (e.g. `Clear::at`) to `clip`.
-fn intersect(
-    damage: &[Rect<i32>],
-    clip: Option<&[Rectangle<i32, Physical>]>,
-) -> Vec<Rectangle<i32, Physical>> {
-    let damage = convert::to_rects::<Physical>(damage);
-    let Some(clip) = clip else {
-        return damage;
-    };
-    damage
-        .iter()
-        .flat_map(|d| clip.iter().filter_map(|c| d.intersection(*c)))
-        .collect()
-}
-
-/// Clips draw damage to `clip`. Draw commands carry their damage relative to `dst` (smithay's
-/// `render_texture_from_to` / `draw_solid` convention), while `clip` is frame-relative, so the
-/// damage is moved into frame space for the intersection and back afterwards.
-fn intersect_relative(
-    damage: &[Rect<i32>],
-    dst: Rect<i32>,
-    clip: Option<&[Rectangle<i32, Physical>]>,
-) -> Vec<Rectangle<i32, Physical>> {
-    let damage = convert::to_rects::<Physical>(damage);
-    let Some(clip) = clip else {
-        return damage;
-    };
-    let dst = convert::to_rect::<Physical>(dst);
-    damage
-        .iter()
-        .flat_map(|d| {
-            let mut d = *d;
-            d.loc += dst.loc;
-            clip.iter().filter_map(move |c| {
-                let mut i = d.intersection(*c)?;
-                i.loc -= dst.loc;
-                Some(i)
-            })
-        })
-        .collect()
-}
-
-/// Replays frame commands until `End`. `clip`, if given, restricts every draw to those
-/// (frame-relative) rectangles; the DRM compositor uses it to redraw only real damage.
-pub fn run_frame(
-    frame: &mut GlesFrame<'_, '_>,
-    tables: &RefCell<Tables>,
-    iter: &mut impl Iterator<Item = Command>,
-    clip: Option<&[Rectangle<i32, Physical>]>,
-    fds: &mut VecDeque<OwnedFd>,
-) -> anyhow::Result<()> {
-    let programs = {
-        let shaders = Shaders::get_from_frame(frame);
-        TexPrograms {
-            clipped_surface: shaders.clipped_surface.clone(),
-            postprocess_and_clip: shaders.postprocess_and_clip.clone(),
-            gradient_fade: shaders.gradient_fade.clone(),
-            texture_hdr: shaders.texture_hdr.clone(),
-        }
-    };
-    let resources = Resources::get(frame);
-    // Overrides replaced by OverrideTexProgram / SuspendTexProgramOverride, restored by the
-    // matching Clear / Restore, so the frame-wide blend override survives element overrides.
-    let mut override_stack = Vec::new();
-
-    loop {
-        let Some(cmd) = iter.next() else {
-            bail!("unterminated frame");
-        };
-        match cmd {
-            Command::End => return Ok(()),
-            Command::Clear { color, at } => {
-                let at = intersect(&at, clip);
-                if at.is_empty() {
-                    continue;
-                }
-                let [r, g, b, a] = color;
-                frame
-                    .clear(Color32F::new(r, g, b, a), &at)
-                    .context("clear")?;
-            }
-            Command::DrawSolid { dst, damage, color } => {
-                let damage = intersect_relative(&damage, dst, clip);
-                if damage.is_empty() {
-                    continue;
-                }
-                let [r, g, b, a] = color;
-                frame
-                    .draw_solid(convert::to_rect(dst), &damage, Color32F::new(r, g, b, a))
-                    .context("draw_solid")?;
-            }
-            Command::DrawTexture {
-                texture,
-                src,
-                dst,
-                damage,
-                opaque,
-                transform,
-                alpha,
-                program,
-                uniforms,
-            } => {
-                let damage = intersect_relative(&damage, dst, clip);
-                if damage.is_empty() {
-                    continue;
-                }
-                let tables = tables.borrow();
-                let texture = tables.textures.get(&texture).context("unknown texture")?;
-                let uniforms = convert::to_uniforms(uniforms);
-                frame
-                    .render_texture_from_to(
-                        texture,
-                        convert::to_rect_f64(src),
-                        convert::to_rect(dst),
-                        &damage,
-                        &convert::to_rects::<Physical>(&opaque),
-                        convert::to_transform(transform),
-                        alpha,
-                        program.and_then(|p| programs.get(p)),
-                        &uniforms,
-                    )
-                    .context("render_texture_from_to")?;
-            }
-            Command::OverrideTexProgram { program, uniforms } => {
-                override_stack.push(frame.take_tex_program_override());
-                if let Some(program) = programs.get(program) {
-                    frame.override_default_tex_program(
-                        program.clone(),
-                        convert::to_uniforms(uniforms),
-                    );
-                }
-            }
-            Command::ClearTexProgramOverride | Command::RestoreTexProgramOverride => {
-                frame.set_tex_program_override(override_stack.pop().flatten());
-            }
-            Command::SuspendTexProgramOverride => {
-                override_stack.push(frame.take_tex_program_override());
-            }
-            Command::DrawShader {
-                program,
-                src,
-                dst,
-                damage,
-                scale,
-                alpha,
-                uniforms,
-                textures,
-            } => {
-                let damage = intersect_relative(&damage, dst, clip);
-                if damage.is_empty() {
-                    continue;
-                }
-                let Some(shader) = Shaders::get_from_frame(frame).program(program) else {
-                    continue;
-                };
-                let tables = tables.borrow();
-                let textures = textures
-                    .into_iter()
-                    .map(|(name, id)| {
-                        tables
-                            .textures
-                            .get(&id)
-                            .cloned()
-                            .map(|t| (name, t))
-                            .context("unknown texture")
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let uniforms = convert::to_uniforms(uniforms);
-                shader::draw(
-                    frame,
-                    &shader,
-                    resources.as_ref().context("GL resources missing")?,
-                    &DrawParams {
-                        src: convert::to_rect_f64(src),
-                        dest: convert::to_rect(dst),
-                        damage: &damage,
-                        scale,
-                        alpha,
-                        uniforms: &uniforms,
-                        textures: &textures,
-                    },
-                )
-                .context("draw shader")?;
-            }
-            Command::CaptureFramebuffer {
-                key,
-                src,
-                dst,
-                scale,
-                blur,
-            } => {
-                let mut tables = tables.borrow_mut();
-                let capture = match tables.captures.entry(key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let mut guard = frame.renderer();
-                        e.insert(Capture::new(guard.as_mut()))
-                    }
-                };
-                capture
-                    .capture(
-                        frame,
-                        convert::to_rect_f64(src),
-                        convert::to_rect(dst),
-                        scale,
-                        blur.map(Into::into),
-                    )
-                    .context("capture framebuffer")?;
-            }
-            Command::DrawCaptured {
-                key,
-                dst,
-                damage,
-                uniforms,
-            } => {
-                let damage = intersect_relative(&damage, dst, clip);
-                if damage.is_empty() {
-                    continue;
-                }
-                let tables = tables.borrow();
-                let Some(capture) = tables.captures.get(&key) else {
-                    continue;
-                };
-                let uniforms = convert::to_uniforms(uniforms);
-                capture
-                    .draw(
-                        frame,
-                        convert::to_rect(dst),
-                        &damage,
-                        programs.postprocess_and_clip.as_ref(),
-                        &uniforms,
-                    )
-                    .context("draw captured")?;
-            }
-            Command::Begin { .. } => bail!("nested Begin"),
-            Command::BeginElement(_) | Command::BeginElementDraw | Command::EndElement => {
-                bail!("element marker outside an output frame")
-            }
-            cmd => {
-                // Texture management interleaved with drawing (e.g. a blur output created
-                // mid-frame): run it through the frame's renderer guard.
-                let mut guard = frame.renderer();
-                let mut tables = tables.borrow_mut();
-                execute_one(guard.as_mut(), &mut tables, cmd, fds)?;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod clip_tests {
-    use super::*;
-
-    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect<i32> {
-        convert::rect(Rectangle::<i32, Physical>::new(
-            (x, y).into(),
-            (w, h).into(),
-        ))
-    }
-
-    #[test]
-    fn relative_damage_is_clipped_in_frame_space() {
-        // A 100x100 element at (200, 300), fully damaged (dst-relative).
-        let damage = [rect(0, 0, 100, 100)];
-        let dst = rect(200, 300, 100, 100);
-        // Frame-space clip covering the element's bottom-right quarter.
-        let clip = [Rectangle::<i32, Physical>::new(
-            (250, 350).into(),
-            (100, 100).into(),
-        )];
-        let out = intersect_relative(&damage, dst, Some(&clip));
-        assert_eq!(
-            out,
-            vec![Rectangle::<i32, Physical>::new(
-                (50, 50).into(),
-                (50, 50).into()
-            )]
-        );
-        // Without a clip the damage passes through untouched.
-        let out = intersect_relative(&damage, dst, None);
-        assert_eq!(out, vec![Rectangle::new((0, 0).into(), (100, 100).into())]);
-        // A clip that misses the element yields nothing.
-        let clip = [Rectangle::<i32, Physical>::new(
-            (0, 0).into(),
-            (100, 100).into(),
-        )];
-        assert!(intersect_relative(&damage, dst, Some(&clip)).is_empty());
-    }
 }

@@ -1,5 +1,5 @@
 //! Blend-space setup for a frame: the renderer-level texture program override and the CPU
-//! encode for solid colors. The core decides the blend space per frame (`Command::Begin`).
+//! encode for solid colors. The core decides the blend space per frame (`SceneFrame::blend`).
 
 use smithay::backend::renderer::gles::{GlesRenderer, Uniform};
 use smithay::backend::renderer::Color32F;

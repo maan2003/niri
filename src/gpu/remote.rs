@@ -1,7 +1,9 @@
-//! A smithay renderer that records commands for the GPU process instead of touching GL.
+//! A smithay renderer that describes frames for the GPU process instead of touching GL.
 //!
-//! Every renderer call becomes a [`Command`]; they are batched and flushed on
-//! [`RemoteRenderer::flush`], before any synchronous read, or when the batch grows large.
+//! Resource calls become [`Command`]s right away. Draw calls are collected into a
+//! [`SceneFrame`] (nodes of ops) that is sent as one command when the frame finishes. Commands
+//! are batched and flushed on [`RemoteRenderer::flush`], before any synchronous read, or when
+//! the batch grows large.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -31,8 +33,9 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlendParams, BlurParams, Caps, Command, CursorFrameDesc, CursorMeta, ElementMeta, OutputRef,
-    Rect, Request, ShaderKind, ShaderSupport, Target, TexId, TexProgram, MAX_CURSOR_FRAMES,
+    BlendParams, BlurParams, Caps, CastInfo, Command, CursorFrameDesc, Node, Op, OutputRef, Rect,
+    Request, SceneFrame, ShaderKind, ShaderSupport, Target, TexId, TexProgram, ANONYMOUS_NODE,
+    MAX_CURSOR_FRAMES,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -69,8 +72,10 @@ struct Pending {
     commands: Vec<Command>,
     fds: Vec<OwnedFd>,
     bytes: usize,
-    /// `Begin`s without their `End` yet. A batch must not be cut inside a frame.
+    /// Frames being described right now. While one is open, destroys are held back so a
+    /// texture dropped mid-frame still exists when the frame runs.
     open_frames: usize,
+    held: Vec<Command>,
 }
 
 struct Shared {
@@ -104,9 +109,7 @@ impl Shared {
 
         let needs_flush = {
             let pending = self.pending.lock().unwrap();
-            pending.open_frames == 0
-                && !pending.fds.is_empty()
-                && pending.fds.len() + fds.len() > MAX_PENDING_FDS
+            !pending.fds.is_empty() && pending.fds.len() + fds.len() > MAX_PENDING_FDS
         };
         if needs_flush {
             if let Err(err) = self.flush() {
@@ -116,16 +119,17 @@ impl Shared {
 
         let over_budget = {
             let mut pending = self.pending.lock().unwrap();
-            match &cmd {
-                Command::Begin { .. } => pending.open_frames += 1,
-                Command::End => pending.open_frames = pending.open_frames.saturating_sub(1),
-                _ => (),
-            }
             pending.bytes += bytes;
-            pending.commands.push(cmd);
+            match cmd {
+                Command::DestroyTexture { .. } | Command::DestroyCapture { .. }
+                    if pending.open_frames > 0 =>
+                {
+                    pending.held.push(cmd);
+                }
+                cmd => pending.commands.push(cmd),
+            }
             pending.fds.extend(fds);
-            pending.open_frames == 0
-                && (pending.bytes > MAX_PENDING_BYTES || pending.fds.len() > MAX_PENDING_FDS)
+            pending.bytes > MAX_PENDING_BYTES || pending.fds.len() > MAX_PENDING_FDS
         };
         if over_budget {
             if let Err(err) = self.flush() {
@@ -147,6 +151,29 @@ impl Shared {
 
     fn alloc_id(&self) -> TexId {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn open_frame(&self) {
+        self.pending.lock().unwrap().open_frames += 1;
+    }
+
+    /// Sends the finished frame (if any) and lets the destroys held during it through.
+    fn close_frame(&self, frame: Option<SceneFrame>) {
+        if let Some(frame) = frame {
+            self.push(Command::Frame(Box::new(frame)));
+        }
+        let held = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.open_frames = pending.open_frames.saturating_sub(1);
+            if pending.open_frames == 0 {
+                mem::take(&mut pending.held)
+            } else {
+                Vec::new()
+            }
+        };
+        for cmd in held {
+            self.push(cmd);
+        }
     }
 }
 
@@ -270,6 +297,7 @@ pub struct RemoteTarget<'a> {
     target: Target,
     size: Size<i32, Buffer>,
     format: Option<Fourcc>,
+    cast: Option<CastInfo>,
     _keep: Option<RemoteTexture>,
     _marker: PhantomData<&'a mut ()>,
 }
@@ -329,7 +357,7 @@ impl TextureMapping for RemoteMapping {
 pub struct RemoteRenderer {
     shared: Arc<Shared>,
     debug_flags: DebugFlags,
-    /// Blend space for frames begun from now on (`None` = SDR); see `Command::Begin`.
+    /// Blend space for frames begun from now on (`None` = SDR); see `SceneFrame::blend`.
     frame_blend: Option<BlendParams>,
 }
 
@@ -402,7 +430,7 @@ impl RemoteRenderer {
         }
     }
 
-    /// A render target that scans out on `output`. The recorded frame is drawn when the
+    /// A render target that scans out on `output`. The frame is drawn when the
     /// core sends `Request::Present`.
     pub fn output_target(
         &self,
@@ -413,6 +441,7 @@ impl RemoteRenderer {
             target: Target::Output(output),
             size: Size::from((size.w, size.h)),
             format: None,
+            cast: None,
             _keep: None,
             _marker: PhantomData,
         }
@@ -445,28 +474,18 @@ impl RemoteRenderer {
         )
     }
 
-    /// Parameters for the next `cast_target` frame of `stream`.
-    pub fn cast_frame_info(
+    /// Target for a screencast stream's next buffer; the GPU renders it when the frame ends.
+    pub fn cast_target(
         &self,
         stream: u64,
-        scale: f64,
-        target_time_ns: u64,
-        cursor: Option<CursorMeta>,
-    ) {
-        self.shared.push(Command::CastFrameInfo {
-            stream,
-            scale,
-            target_time_ns,
-            cursor,
-        });
-    }
-
-    /// Target for a screencast stream's next buffer; the GPU renders it when the frame ends.
-    pub fn cast_target(&self, stream: u64, size: Size<i32, Physical>) -> RemoteTarget<'static> {
+        size: Size<i32, Physical>,
+        info: CastInfo,
+    ) -> RemoteTarget<'static> {
         RemoteTarget {
             target: Target::Cast(stream),
             size: Size::from((size.w, size.h)),
             format: None,
+            cast: Some(info),
             _keep: None,
             _marker: PhantomData,
         }
@@ -482,6 +501,7 @@ impl RemoteRenderer {
             target: Target::CastCursor(stream),
             size: Size::from((size.w, size.h)),
             format: None,
+            cast: None,
             _keep: None,
             _marker: PhantomData,
         }
@@ -588,6 +608,25 @@ pub struct RemoteFrame<'frame, 'buffer> {
     target: &'frame mut RemoteTarget<'buffer>,
     size: Size<i32, Physical>,
     transform: Transform,
+    scene: Option<SceneFrame>,
+    /// The node being described, if any.
+    node: Option<OpenNode>,
+    /// Open tex-program scopes, innermost last; ops go to the innermost one.
+    scopes: Vec<Scope>,
+    /// Ops outside any node; become an anonymous node.
+    loose: Vec<Op>,
+    anonymous: u64,
+}
+
+struct OpenNode {
+    node: Node,
+    /// Whether ops go to `draw` (after `begin_node_draw`) or `capture`.
+    in_draw: bool,
+}
+
+struct Scope {
+    program: Option<(TexProgram, Vec<GlesUniform<'static>>)>,
+    ops: Vec<Op>,
 }
 
 impl fmt::Debug for RemoteFrame<'_, '_> {
@@ -617,25 +656,123 @@ impl RemoteFrame<'_, '_> {
         self.target.target
     }
 
+    fn push_op(&mut self, op: Op) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.ops.push(op);
+        } else if let Some(open) = &mut self.node {
+            if open.in_draw {
+                open.node.draw.push(op);
+            } else {
+                open.node.capture.push(op);
+            }
+        } else {
+            self.loose.push(op);
+        }
+    }
+
+    /// Turns ops drawn outside any node into a one-off node covering them.
+    fn flush_loose(&mut self) {
+        if self.loose.is_empty() {
+            return;
+        }
+        let ops = mem::take(&mut self.loose);
+        let geometry = ops
+            .iter()
+            .filter_map(op_bounds)
+            .reduce(|a, b| a.merge(b))
+            .unwrap_or_default();
+        self.anonymous += 1;
+        self.scene.as_mut().unwrap().nodes.push(Node {
+            id: ANONYMOUS_NODE | self.anonymous,
+            src: convert::rect_f64(Rectangle::<f64, Buffer>::from_size(Size::from((
+                geometry.size.w as f64,
+                geometry.size.h as f64,
+            )))),
+            geometry: convert::rect(geometry),
+            damage: None,
+            opaque: Vec::new(),
+            kind: super::protocol::ElementKind::Unspecified,
+            transform: convert::transform(Transform::Normal),
+            capture: Vec::new(),
+            draw: ops,
+        });
+    }
+
+    /// Starts a scene node; ops until `begin_node_draw` are its framebuffer capture, the rest
+    /// until `end_node` its draw.
+    pub fn begin_node(&mut self, node: Node) {
+        if self.node.is_some() {
+            warn!("begin_node inside a node");
+            self.end_node();
+        }
+        self.flush_loose();
+        self.node = Some(OpenNode {
+            node,
+            in_draw: false,
+        });
+    }
+
+    pub fn begin_node_draw(&mut self) {
+        match &mut self.node {
+            Some(open) => open.in_draw = true,
+            None => warn!("begin_node_draw outside a node"),
+        }
+    }
+
+    pub fn end_node(&mut self) {
+        while !self.scopes.is_empty() {
+            warn!("tex program scope left open by an element");
+            self.close_scope();
+        }
+        match self.node.take() {
+            Some(open) => self.scene.as_mut().unwrap().nodes.push(open.node),
+            None => warn!("end_node outside a node"),
+        }
+    }
+
+    fn close_scope(&mut self) {
+        let Some(scope) = self.scopes.pop() else {
+            warn!("closing a tex program scope that was never opened");
+            return;
+        };
+        let op = match scope.program {
+            Some((program, uniforms)) => Op::WithTexProgram {
+                program,
+                uniforms: convert::uniforms(&uniforms),
+                ops: scope.ops,
+            },
+            None => Op::Raw { ops: scope.ops },
+        };
+        self.push_op(op);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_texture_from_to(
         &mut self,
         texture: &RemoteTexture,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         opaque_regions: &[Rectangle<i32, Physical>],
         transform: Transform,
         alpha: f32,
         program: Option<&RemoteTexProgram>,
         uniforms: &[GlesUniform<'_>],
     ) -> Result<(), RemoteError> {
-        self.renderer.shared.push(Command::DrawTexture {
+        // Opaque regions arrive dst-relative; the scene is in frame coordinates.
+        let opaque: Vec<_> = opaque_regions
+            .iter()
+            .map(|r| {
+                let mut r = *r;
+                r.loc += dst.loc;
+                r
+            })
+            .collect();
+        self.push_op(Op::Texture {
             texture: texture.id(),
             src: convert::rect_f64(src),
             dst: convert::rect(dst),
-            damage: convert::rects(damage),
-            opaque: convert::rects(opaque_regions),
+            opaque: convert::rects(&opaque),
             transform: convert::transform(transform),
             alpha,
             program: program.map(|p| p.0),
@@ -649,14 +786,14 @@ impl RemoteFrame<'_, '_> {
         program: RemoteTexProgram,
         uniforms: Vec<GlesUniform<'static>>,
     ) {
-        self.renderer.shared.push(Command::OverrideTexProgram {
-            program: program.0,
-            uniforms: convert::uniforms(&uniforms),
+        self.scopes.push(Scope {
+            program: Some((program.0, uniforms)),
+            ops: Vec::new(),
         });
     }
 
     pub fn clear_tex_program_override(&mut self) {
-        self.renderer.shared.push(Command::ClearTexProgramOverride);
+        self.close_scope();
     }
 
     /// The blend space this frame is composited in (`None` = SDR).
@@ -667,46 +804,32 @@ impl RemoteFrame<'_, '_> {
     /// Drops the current tex program override (including the frame-wide blend one) until
     /// `restore_tex_program_override`, so content already in the blend space passes through.
     pub fn suspend_tex_program_override(&mut self) {
-        self.renderer
-            .shared
-            .push(Command::SuspendTexProgramOverride);
+        self.scopes.push(Scope {
+            program: None,
+            ops: Vec::new(),
+        });
     }
 
     pub fn restore_tex_program_override(&mut self) {
-        self.renderer
-            .shared
-            .push(Command::RestoreTexProgramOverride);
+        self.close_scope();
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn begin_element(&mut self, meta: ElementMeta) {
-        self.renderer.shared.push(Command::BeginElement(meta));
-    }
-
-    pub fn begin_element_draw(&mut self) {
-        self.renderer.shared.push(Command::BeginElementDraw);
-    }
-
-    pub fn end_element(&mut self) {
-        self.renderer.shared.push(Command::EndElement);
-    }
-
     pub fn draw_shader(
         &mut self,
         program: ShaderKind,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         scale: f32,
         alpha: f32,
         uniforms: &[GlesUniform<'_>],
         textures: &[(String, RemoteTexture)],
     ) {
-        self.renderer.shared.push(Command::DrawShader {
+        self.push_op(Op::Shader {
             program,
             src: convert::rect_f64(src),
             dst: convert::rect(dst),
-            damage: convert::rects(damage),
             scale,
             alpha,
             uniforms: convert::uniforms(uniforms),
@@ -722,7 +845,7 @@ impl RemoteFrame<'_, '_> {
         scale: f32,
         blur: Option<BlurParams>,
     ) {
-        self.renderer.shared.push(Command::CaptureFramebuffer {
+        self.push_op(Op::Capture {
             key: capture.key(),
             src: convert::rect_f64(src),
             dst: convert::rect(dst),
@@ -735,15 +858,58 @@ impl RemoteFrame<'_, '_> {
         &mut self,
         capture: &CaptureHandle,
         dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         uniforms: &[GlesUniform<'_>],
     ) {
-        self.renderer.shared.push(Command::DrawCaptured {
+        self.push_op(Op::Captured {
             key: capture.key(),
             dst: convert::rect(dst),
-            damage: convert::rects(damage),
             uniforms: convert::uniforms(uniforms),
         });
+    }
+
+    /// Marks which history baseline the node damage in this frame refers to.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.scene.as_mut().unwrap().generation = generation;
+    }
+
+    /// Closes everything still open and takes the finished scene.
+    fn take_scene(&mut self) -> SceneFrame {
+        if self.node.is_some() {
+            warn!("frame finished inside a node");
+            self.end_node();
+        }
+        while !self.scopes.is_empty() {
+            warn!("tex program scope left open at the end of a frame");
+            self.close_scope();
+        }
+        self.flush_loose();
+        let mut scene = self.scene.take().unwrap();
+        scene.cast = self.target.cast;
+        scene
+    }
+}
+
+impl Drop for RemoteFrame<'_, '_> {
+    fn drop(&mut self) {
+        // Dropped without `finish` (an element failed): the frame never reaches the GPU.
+        if self.scene.is_some() {
+            self.renderer.shared.close_frame(None);
+        }
+    }
+}
+
+/// Frame-space bounds of an op's output, for anonymous nodes.
+fn op_bounds(op: &Op) -> Option<Rectangle<i32, Physical>> {
+    match op {
+        Op::Solid { dst, .. }
+        | Op::Texture { dst, .. }
+        | Op::Shader { dst, .. }
+        | Op::Captured { dst, .. } => Some(convert::to_rect(*dst)),
+        Op::Capture { .. } => None,
+        Op::WithTexProgram { ops, .. } | Op::Raw { ops } => {
+            ops.iter().filter_map(op_bounds).reduce(|a, b| a.merge(b))
+        }
     }
 }
 
@@ -779,27 +945,25 @@ impl Frame for RemoteFrame<'_, '_> {
         self.renderer.shared.context_id.clone()
     }
 
+    /// Offscreen frames are cleared whole before drawing; outputs and casts clear
+    /// themselves. `at` is ignored: the GPU owns damage.
     fn clear(
         &mut self,
         color: Color32F,
-        at: &[Rectangle<i32, Physical>],
+        _at: &[Rectangle<i32, Physical>],
     ) -> Result<(), RemoteError> {
-        self.renderer.shared.push(Command::Clear {
-            color: color.components(),
-            at: convert::rects(at),
-        });
+        self.scene.as_mut().unwrap().clear = Some(color.components());
         Ok(())
     }
 
     fn draw_solid(
         &mut self,
         dst: Rectangle<i32, Physical>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         color: Color32F,
     ) -> Result<(), RemoteError> {
-        self.renderer.shared.push(Command::DrawSolid {
+        self.push_op(Op::Solid {
             dst: convert::rect(dst),
-            damage: convert::rects(damage),
             color: color.components(),
         });
         Ok(())
@@ -841,8 +1005,9 @@ impl Frame for RemoteFrame<'_, '_> {
         Ok(())
     }
 
-    fn finish(self) -> Result<SyncPoint, RemoteError> {
-        self.renderer.shared.push(Command::End);
+    fn finish(mut self) -> Result<SyncPoint, RemoteError> {
+        let scene = self.take_scene();
+        self.renderer.shared.close_frame(Some(scene));
         if let Target::Dmabuf(_) = self.target.target {
             // The caller hands this buffer to another process right away (PipeWire, an
             // image-copy client), so make "signaled" true: run and finish it on the GPU now.
@@ -900,18 +1065,28 @@ impl Renderer for RemoteRenderer {
     where
         'buffer: 'frame,
     {
-        self.shared.push(Command::Begin {
+        self.shared.open_frame();
+        let scene = SceneFrame {
             target: framebuffer.target,
             width: output_size.w,
             height: output_size.h,
             transform: convert::transform(dst_transform),
             blend: self.frame_blend,
-        });
+            clear: None,
+            generation: 0,
+            cast: None,
+            nodes: Vec::new(),
+        };
         Ok(RemoteFrame {
             renderer: self,
             target: framebuffer,
             size: output_size,
             transform: dst_transform,
+            scene: Some(scene),
+            node: None,
+            scopes: Vec::new(),
+            loose: Vec::new(),
+            anonymous: 0,
         })
     }
 
@@ -926,6 +1101,7 @@ impl Bind<RemoteTexture> for RemoteRenderer {
             target: Target::Texture(target.id()),
             size: target.size(),
             format: target.format(),
+            cast: None,
             _keep: Some(target.clone()),
             _marker: PhantomData,
         })
@@ -988,6 +1164,7 @@ impl Bind<Dmabuf> for RemoteRenderer {
             target: Target::Dmabuf(texture.id()),
             size: texture.size(),
             format: texture.format(),
+            cast: None,
             _keep: Some(texture),
             _marker: PhantomData,
         })

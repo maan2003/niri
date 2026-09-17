@@ -1,9 +1,10 @@
-//! Scene elements replayed from core recordings, with per-element damage tracking.
+//! Scene nodes from core frames, with per-node damage tracking.
 //!
-//! The core wraps every element it records in `BeginElement … EndElement` markers. Here each
-//! segment becomes a real smithay element, so `DrmCompositor` and `OutputDamageTracker` see
-//! per-element damage, opaque regions, kinds and (for plain buffer copies) the underlying
-//! buffer for direct scanout.
+//! The core describes every frame as a [`SceneFrame`]: nodes bottom to top, each carrying the
+//! damage smithay computed for that element since the previous frame. Here each node becomes
+//! a real smithay element, so `DrmCompositor` and `OutputDamageTracker` see per-element
+//! damage, opaque regions, kinds and (for plain buffer copies) the underlying buffer for
+//! direct scanout. The tracks keep enough damage history for buffer ages.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -18,13 +19,14 @@ use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
 use super::convert;
-use super::exec::{run_frame, Tables};
-use super::protocol::{Command, ElementKind, ElementMeta};
+use super::draw::draw_ops;
+use super::exec::Tables;
+use super::protocol::{ElementKind, Node, Op};
 
 /// How many past frames of damage we remember for buffer ages.
 pub const DAMAGE_HISTORY: usize = 8;
 
-pub struct ElementTrack {
+pub struct NodeTrack {
     pub id: Id,
     commit: CommitCounter,
     /// Element-relative damage of recent commits, newest last.
@@ -32,34 +34,42 @@ pub struct ElementTrack {
     seen: bool,
 }
 
-/// Damage tracking state for one render target, keyed by the core's element ids.
+/// Damage tracking state for one render target, keyed by the core's node ids.
 #[derive(Default)]
-pub struct ElementTracks {
-    tracks: HashMap<u64, ElementTrack>,
+pub struct NodeTracks {
+    generation: u64,
+    tracks: HashMap<u64, NodeTrack>,
 }
 
-impl ElementTracks {
-    /// Advances per-element commits by the damage the core reported and forgets elements that
-    /// are not in this frame.
-    pub fn update(&mut self, segments: &[Segment<'_>]) {
-        for seg in segments {
-            let track = self
-                .tracks
-                .entry(seg.meta.id)
-                .or_insert_with(|| ElementTrack {
-                    id: Id::new(),
-                    commit: CommitCounter::default(),
-                    history: VecDeque::new(),
-                    seen: false,
-                });
+impl NodeTracks {
+    /// Advances per-node commits by the damage the core reported and forgets nodes that are
+    /// not in this frame. A new `generation` drops all history first.
+    pub fn update(&mut self, generation: u64, nodes: &[Node]) {
+        if generation != self.generation {
+            self.generation = generation;
+            self.tracks.clear();
+        }
+        for node in nodes {
+            let track = self.tracks.entry(node.id).or_insert_with(|| NodeTrack {
+                id: Id::new(),
+                commit: CommitCounter::default(),
+                history: VecDeque::new(),
+                seen: false,
+            });
             track.seen = true;
-            let damage = match &seg.meta.damage {
-                None => {
-                    let size = convert::to_rect::<Physical>(seg.meta.geometry).size;
-                    Some(vec![Rectangle::from_size(size)])
-                }
+            let geometry = convert::to_rect::<Physical>(node.geometry);
+            let damage = match &node.damage {
+                None => Some(vec![Rectangle::from_size(geometry.size)]),
                 Some(d) if d.is_empty() => None,
-                Some(d) => Some(convert::to_rects(d)),
+                Some(d) => Some(
+                    d.iter()
+                        .map(|r| {
+                            let mut r = convert::to_rect::<Physical>(*r);
+                            r.loc -= geometry.loc;
+                            r
+                        })
+                        .collect(),
+                ),
             };
             if let Some(damage) = damage {
                 track.commit.increment();
@@ -76,7 +86,7 @@ impl ElementTracks {
         self.tracks.clear();
     }
 
-    /// smithay element id to core element id.
+    /// smithay element id to core node id.
     pub fn id_map(&self) -> HashMap<Id, u64> {
         self.tracks
             .iter()
@@ -85,22 +95,20 @@ impl ElementTracks {
     }
 }
 
-/// Builds smithay elements for `segments`, top to bottom (the core records bottom to top).
-/// `tracks` must have been updated with these segments.
+/// Builds smithay elements for `nodes`, top to bottom (the core sends bottom to top).
+/// `tracks` must have been updated with these nodes.
 pub fn scene_elements<'a>(
-    tracks: &'a ElementTracks,
-    segments: &'a [Segment<'a>],
+    tracks: &'a NodeTracks,
+    nodes: &'a [Node],
     storages: &'a [Option<Storage>],
     tables: &'a RefCell<Tables>,
 ) -> Vec<SceneElement<'a>> {
-    let mut elements: Vec<SceneElement> = segments
+    let mut elements: Vec<SceneElement> = nodes
         .iter()
         .zip(storages)
-        .map(|(seg, storage)| SceneElement {
-            track: &tracks.tracks[&seg.meta.id],
-            meta: seg.meta,
-            capture: seg.capture,
-            draw: seg.draw,
+        .map(|(node, storage)| SceneElement {
+            track: &tracks.tracks[&node.id],
+            node,
             storage: storage.as_ref(),
             tables,
         })
@@ -109,28 +117,22 @@ pub fn scene_elements<'a>(
     elements
 }
 
-pub fn element_storages(tables: &Tables, segments: &[Segment<'_>]) -> Vec<Option<Storage>> {
-    segments
+pub fn node_storages(tables: &Tables, nodes: &[Node]) -> Vec<Option<Storage>> {
+    nodes
         .iter()
-        .map(|seg| element_storage(tables, seg))
+        .map(|node| node_storage(tables, node))
         .collect()
 }
 
-pub struct Segment<'a> {
-    pub meta: &'a ElementMeta,
-    pub capture: &'a [Command],
-    pub draw: &'a [Command],
-}
-
-/// What an element is made of, when it is a plain copy of one buffer. Lets the DRM compositor
+/// What a node is made of, when it is a plain copy of one buffer. Lets the DRM compositor
 /// scan the buffer out directly or copy it to the cursor plane.
 pub enum Storage {
     Dmabuf(Dmabuf),
     Memory(MemoryBuffer),
 }
 
-fn element_storage(tables: &Tables, seg: &Segment<'_>) -> Option<Storage> {
-    let [Command::DrawTexture {
+fn node_storage(tables: &Tables, node: &Node) -> Option<Storage> {
+    let [Op::Texture {
         texture,
         src,
         dst,
@@ -139,17 +141,18 @@ fn element_storage(tables: &Tables, seg: &Segment<'_>) -> Option<Storage> {
         program,
         uniforms,
         ..
-    }] = seg.draw
+    }] = node.draw.as_slice()
     else {
         return None;
     };
     // Anything but an untinted 1:1 copy of the whole element must be rendered.
-    if *alpha != 1.0
+    if !node.capture.is_empty()
+        || *alpha != 1.0
         || program.is_some()
         || !uniforms.is_empty()
-        || *src != seg.meta.src
-        || *dst != seg.meta.geometry
-        || *transform != seg.meta.transform
+        || *src != node.src
+        || *dst != node.geometry
+        || *transform != node.transform
     {
         return None;
     }
@@ -162,52 +165,11 @@ fn element_storage(tables: &Tables, seg: &Segment<'_>) -> Option<Storage> {
     None
 }
 
-/// Splits an output frame recording into its `BeginElement … EndElement` segments.
-pub fn split_elements(commands: &[Command]) -> Vec<Segment<'_>> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < commands.len() {
-        let Command::BeginElement(meta) = &commands[i] else {
-            debug!("ignoring command outside an element: {:?}", commands[i]);
-            i += 1;
-            continue;
-        };
-        let start = i + 1;
-        let mut draw_start = None;
-        let mut j = start;
-        loop {
-            match commands.get(j) {
-                None => {
-                    warn!("unterminated element in frame recording");
-                    return out;
-                }
-                Some(Command::BeginElementDraw) => draw_start = Some(j),
-                Some(Command::EndElement) => break,
-                Some(_) => (),
-            }
-            j += 1;
-        }
-        let (capture, draw) = match draw_start {
-            Some(k) => (&commands[start..k], &commands[k + 1..j]),
-            None => (&commands[start..start], &commands[start..j]),
-        };
-        out.push(Segment {
-            meta,
-            capture,
-            draw,
-        });
-        i = j + 1;
-    }
-    out
-}
-
-/// One core element, replayed from its recorded commands. Damage and opaque regions come from
-/// the core, so the DRM compositor tracks and culls exactly like in-process smithay would.
+/// One core node as a smithay element. Damage and opaque regions come from the core, so the
+/// DRM compositor tracks and culls exactly like in-process smithay would.
 pub struct SceneElement<'a> {
-    track: &'a ElementTrack,
-    meta: &'a ElementMeta,
-    capture: &'a [Command],
-    draw: &'a [Command],
+    track: &'a NodeTrack,
+    node: &'a Node,
     storage: Option<&'a Storage>,
     tables: &'a RefCell<Tables>,
 }
@@ -222,15 +184,15 @@ impl Element for SceneElement<'_> {
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        convert::to_rect_f64(self.meta.src)
+        convert::to_rect_f64(self.node.src)
     }
 
     fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        convert::to_rect(self.meta.geometry)
+        convert::to_rect(self.node.geometry)
     }
 
     fn transform(&self) -> Transform {
-        convert::to_transform(self.meta.transform)
+        convert::to_transform(self.node.transform)
     }
 
     fn damage_since(
@@ -260,12 +222,23 @@ impl Element for SceneElement<'_> {
         DamageSet::from_slice(&rects)
     }
 
-    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        OpaqueRegions::from_slice(&convert::to_rects(&self.meta.opaque))
+    fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        let loc = self.geometry(scale).loc;
+        let rects: Vec<_> = self
+            .node
+            .opaque
+            .iter()
+            .map(|r| {
+                let mut r = convert::to_rect::<Physical>(*r);
+                r.loc -= loc;
+                r
+            })
+            .collect();
+        OpaqueRegions::from_slice(&rects)
     }
 
     fn kind(&self) -> Kind {
-        match self.meta.kind {
+        match self.node.kind {
             ElementKind::Cursor => Kind::Cursor,
             ElementKind::ScanoutCandidate => Kind::ScanoutCandidate,
             ElementKind::Unspecified => Kind::Unspecified,
@@ -273,7 +246,7 @@ impl Element for SceneElement<'_> {
     }
 
     fn is_framebuffer_effect(&self) -> bool {
-        self.meta.framebuffer_effect
+        !self.node.capture.is_empty()
     }
 }
 
@@ -287,7 +260,7 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
-        // The recording used output coordinates; damage arrives element-relative.
+        // Ops are in frame coordinates; damage arrives element-relative.
         let clip: Vec<_> = damage
             .iter()
             .map(|d| {
@@ -296,19 +269,8 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
                 d
             })
             .collect();
-        let mut iter = self
-            .draw
-            .iter()
-            .cloned()
-            .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(
-            frame,
-            self.tables,
-            &mut iter,
-            Some(&clip),
-            &mut VecDeque::new(),
-        ) {
-            warn!("error replaying element: {err:#}");
+        if let Err(err) = draw_ops(frame, self.tables, &self.node.draw, Some(&clip)) {
+            warn!("error drawing node: {err:#}");
         }
         Ok(())
     }
@@ -320,13 +282,8 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
         _dst: Rectangle<i32, Physical>,
         _cache: &UserDataMap,
     ) -> Result<(), GlesError> {
-        let mut iter = self
-            .capture
-            .iter()
-            .cloned()
-            .chain(std::iter::once(Command::End));
-        if let Err(err) = run_frame(frame, self.tables, &mut iter, None, &mut VecDeque::new()) {
-            warn!("error replaying element capture: {err:#}");
+        if let Err(err) = draw_ops(frame, self.tables, &self.node.capture, None) {
+            warn!("error capturing for node: {err:#}");
         }
         Ok(())
     }
@@ -336,5 +293,152 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
             Storage::Dmabuf(dmabuf) => Some(UnderlyingStorage::Dmabuf(dmabuf)),
             Storage::Memory(mem) => Some(UnderlyingStorage::Memory(mem)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smithay::backend::allocator::Fourcc;
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::{Bind as _, Color32F, ExportMem as _, Offscreen as _};
+    use smithay::utils::Size;
+
+    use super::*;
+    use crate::gpu::protocol::{Rect, Transform as PTransform};
+    use crate::gpu::server::new_surfaceless_renderer;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect<i32> {
+        convert::rect(Rectangle::<i32, Physical>::new(
+            (x, y).into(),
+            (w, h).into(),
+        ))
+    }
+
+    fn solid_node(
+        id: u64,
+        geometry: Rect<i32>,
+        damage: Option<Vec<Rect<i32>>>,
+        color: [f32; 4],
+    ) -> Node {
+        Node {
+            id,
+            src: convert::rect_f64(Rectangle::<f64, Buffer>::from_size(Size::from((
+                geometry.w as f64,
+                geometry.h as f64,
+            )))),
+            geometry,
+            damage,
+            opaque: vec![geometry],
+            kind: ElementKind::Unspecified,
+            transform: PTransform::Normal,
+            capture: Vec::new(),
+            draw: vec![Op::Solid {
+                dst: geometry,
+                color,
+            }],
+        }
+    }
+
+    /// Frame-space node damage must reach the op clipped and dst-relative: a node that
+    /// changes color with partial damage repaints only the damaged part.
+    #[test]
+    fn node_damage_clips_ops_in_frame_space() {
+        let Ok(mut renderer) = new_surfaceless_renderer() else {
+            eprintln!("no EGL (llvmpipe) available, skipping");
+            return;
+        };
+        let tables = RefCell::new(Tables::default());
+        let size = Size::<i32, Physical>::from((64, 64));
+        let mut texture = renderer
+            .create_buffer(Fourcc::Abgr8888, Size::<i32, Buffer>::from((64, 64)))
+            .unwrap();
+        let mut tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
+        let mut tracks = NodeTracks::default();
+
+        let red = [1., 0., 0., 1.];
+        let blue = [0., 0., 1., 1.];
+        let geometry = rect(10, 10, 40, 40);
+
+        let mut render = |renderer: &mut GlesRenderer,
+                          texture: &mut smithay::backend::renderer::gles::GlesTexture,
+                          tracks: &mut NodeTracks,
+                          generation: u64,
+                          nodes: Vec<Node>,
+                          age: usize| {
+            tracks.update(generation, &nodes);
+            let storages = node_storages(&tables.borrow(), &nodes);
+            let elements = scene_elements(tracks, &nodes, &storages, &tables);
+            let mut fb = renderer.bind(texture).unwrap();
+            tracker
+                .render_output(renderer, &mut fb, age, &elements, Color32F::TRANSPARENT)
+                .unwrap();
+        };
+        let pixel = |renderer: &mut GlesRenderer, texture: &_, x: i32, y: i32| -> [u8; 4] {
+            let mapping = renderer
+                .copy_texture(
+                    texture,
+                    Rectangle::new((x, y).into(), (1, 1).into()),
+                    Fourcc::Abgr8888,
+                )
+                .unwrap();
+            renderer.map_texture(&mapping).unwrap()[..4]
+                .try_into()
+                .unwrap()
+        };
+
+        // New node: everything red.
+        render(
+            &mut renderer,
+            &mut texture,
+            &mut tracks,
+            1,
+            vec![solid_node(1, geometry, None, red)],
+            0,
+        );
+        assert_eq!(pixel(&mut renderer, &texture, 15, 15), [255, 0, 0, 255]);
+        assert_eq!(pixel(&mut renderer, &texture, 5, 5), [0, 0, 0, 0]);
+
+        // Same node turns blue, but only a frame-space sub-rectangle is damaged.
+        let damage = Some(vec![rect(30, 30, 10, 10)]);
+        render(
+            &mut renderer,
+            &mut texture,
+            &mut tracks,
+            1,
+            vec![solid_node(1, geometry, damage, blue)],
+            1,
+        );
+        assert_eq!(
+            pixel(&mut renderer, &texture, 35, 35),
+            [0, 0, 255, 255],
+            "damaged part"
+        );
+        assert_eq!(
+            pixel(&mut renderer, &texture, 15, 15),
+            [255, 0, 0, 255],
+            "undamaged part"
+        );
+
+        // No damage reported: nothing repaints even though the color changed.
+        render(
+            &mut renderer,
+            &mut texture,
+            &mut tracks,
+            1,
+            vec![solid_node(1, geometry, Some(vec![]), red)],
+            1,
+        );
+        assert_eq!(pixel(&mut renderer, &texture, 35, 35), [0, 0, 255, 255]);
+
+        // New generation: history dropped, the node is fully redrawn.
+        render(
+            &mut renderer,
+            &mut texture,
+            &mut tracks,
+            2,
+            vec![solid_node(1, geometry, Some(vec![]), red)],
+            1,
+        );
+        assert_eq!(pixel(&mut renderer, &texture, 35, 35), [255, 0, 0, 255]);
     }
 }
