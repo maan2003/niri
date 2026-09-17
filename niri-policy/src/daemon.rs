@@ -25,9 +25,24 @@ impl Handler for PolicyStore {
     }
 }
 
+/// Serves our own UID only: the compositor and the daemon belong to the same human, and
+/// nothing else may look up policy or launch. Socket permissions say the same; this does not
+/// rely on them.
 pub fn serve<H: Handler + 'static>(listener: UnixListener, handler: Arc<H>) -> io::Result<()> {
+    let me = rustix::process::getuid();
     loop {
         let (stream, _) = listener.accept()?;
+        match rustix::net::sockopt::socket_peercred(&stream) {
+            Ok(peer) if peer.uid == me => {}
+            Ok(peer) => {
+                eprintln!("policy daemon: refusing uid {}", peer.uid.as_raw());
+                continue;
+            }
+            Err(err) => {
+                eprintln!("policy daemon: no peer credentials: {err}");
+                continue;
+            }
+        }
         let handler = handler.clone();
         thread::spawn(move || {
             // A peer hanging up is the normal end of a connection.

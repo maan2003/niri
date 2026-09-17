@@ -29,6 +29,10 @@ struct Args {
     /// Per-UID `HOME` parent.
     #[arg(long, default_value = "/var/lib/niri-apps")]
     home_base: PathBuf,
+    /// An entry of `/run` apps may see (a directory to bind mount or a symlink to recreate).
+    /// Repeatable. Apps get a fresh `/run` with only these plus their own runtime directory.
+    #[arg(long = "expose")]
+    expose: Vec<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -73,6 +77,7 @@ fn main() -> ExitCode {
         allowed,
         runtime_base: args.runtime_base,
         home_base: args.home_base,
+        expose: args.expose,
     };
     if let Err(err) = server.serve(listener) {
         eprintln!("niri-forker: {err}");

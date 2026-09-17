@@ -3,7 +3,7 @@
 //! and turns `Launch { app }` into a forker request. Android's PackageManager plus
 //! ActivityManager, in one small process per human user.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 /// `identity.toml`.
 ///
 /// ```toml
+/// [env]
+/// PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
+///
 /// [[app]]
 /// name = "session"      # the human; not launchable, just identified
 /// uid = 1000
@@ -32,6 +35,11 @@ pub struct Config {
     /// Forker socket; the command line's `--forker` wins if both are given.
     #[serde(default)]
     pub forker: Option<PathBuf>,
+    /// Environment every app gets, from the system configuration: where the system put the
+    /// PipeWire socket, for example. On top of `PATH` and friends, under the compositor's
+    /// `WAYLAND_DISPLAY`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppConfig>,
 }
@@ -153,6 +161,7 @@ impl Handler for Identity {
             .ok_or_else(|| format!("unknown app {name:?}; add it to identity.toml"))?;
         let argv = app.exec.clone().unwrap_or_else(|| vec![app.name.clone()]);
         let mut full_env = self.base_env.clone();
+        full_env.extend(self.config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         full_env.extend(env.iter().cloned());
         let request = niri_forker::Request {
             uid: app.uid,

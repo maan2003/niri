@@ -6,6 +6,8 @@ let
     ${pkgs.coreutils}/bin/id > "$HOME/id.txt"
     ${pkgs.coreutils}/bin/cat /proc/self/cgroup > "$HOME/cgroup.txt"
     ${pkgs.coreutils}/bin/env > "$HOME/env.txt"
+    ${pkgs.coreutils}/bin/ls -la /run /tmp /dev/shm > "$HOME/run.txt" 2>&1
+    ${pkgs.procps}/bin/ps -eo user,pid,cmd > "$HOME/ps.txt" 2>&1
     ${pkgs.wayland-utils}/bin/wayland-info > "$HOME/globals.txt" 2> "$HOME/wayland-info.err"
     ${pkgs.coreutils}/bin/touch "$HOME/done"
   '';
@@ -126,6 +128,7 @@ in
   '';
 
   environment.etc."niri/config.kdl".text = ''
+    hotkey-overlay { skip-at-startup; }
     spawn-at-startup "hello"
     spawn-at-startup "gpu-probe"
     spawn-at-startup "flower"
@@ -143,7 +146,7 @@ in
   systemd.services.niri-forker = {
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      ExecStart = "${niri}/bin/niri-forker --allow 1000:100000:1000:render --socket /run/niri/forker.sock --runtime-base /run/niri-app-runtime --home-base /var/lib/niri-apps";
+      ExecStart = "${niri}/bin/niri-forker --allow 1000:100000:1000:render --socket /run/niri/forker.sock --runtime-base /run/niri-app-runtime --home-base /var/lib/niri-apps --expose /run/niri-wayland --expose /run/opengl-driver --expose /run/current-system";
       RuntimeDirectory = "niri";
       RuntimeDirectoryMode = "0755";
       # So the forker may create a cgroup per app under its own.

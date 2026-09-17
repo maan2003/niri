@@ -2397,6 +2397,7 @@ name = "niri-policy"
 version = "26.4.0"
 dependencies = [
  "postcard",
+ "rustix 1.1.4",
  "serde",
  "toml",
 ]

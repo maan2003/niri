@@ -5,6 +5,8 @@
 //!
 //! Zygote on Android has the same shape: root, forks on command, only `system` may connect.
 
+use std::ffi::{CStr, CString};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -117,6 +119,9 @@ pub struct Server {
     pub runtime_base: PathBuf,
     /// `<home_base>/<uid>` becomes the child's `HOME` and working directory.
     pub home_base: PathBuf,
+    /// Entries of `/run` an app may see, e.g. the apps' Wayland socket directory or the
+    /// `opengl-driver` symlink. Everything else under `/run` is hidden (see [`Sandbox`]).
+    pub expose: Vec<PathBuf>,
 }
 
 impl Server {
@@ -193,11 +198,17 @@ impl Server {
         command.stdin(Stdio::null());
 
         let gid = if as_self { peer.gid.as_raw() } else { uid };
+        let mut sandbox = None;
         if !as_self {
             let runtime = self.owned_dir(&self.runtime_base, uid, gid)?;
             let home = self.owned_dir(&self.home_base, uid, gid)?;
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
             command.current_dir(&home);
+            if we_are_root {
+                let mut expose = self.expose.clone();
+                expose.push(runtime);
+                sandbox = Some(Sandbox::plan(&expose)?);
+            }
         }
         let mut all_gids = vec![gid];
         all_gids.extend(gids);
@@ -205,6 +216,9 @@ impl Server {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
+                if let Some(sandbox) = &sandbox {
+                    sandbox.apply()?;
+                }
                 if let Some(procs) = &cgroup_procs {
                     // "0" means the writing process itself.
                     let mut procs = procs;
@@ -243,6 +257,168 @@ impl Server {
             Err(err) => eprintln!("niri-forker: waiting for {name} (pid {pid}): {err}"),
         });
         Ok(pid)
+    }
+}
+
+/// The app's private view of the filesystem, decided before fork and applied between fork and
+/// exec (only syscalls on pre-built strings; nothing allocates there). Same UID plus this is
+/// the floor every app gets; what it may reach on top is groups and sockets.
+///
+/// - a new mount namespace, so none of it leaks out;
+/// - `/tmp` and `/dev/shm` are fresh tmpfs: no shared scratch space between apps;
+/// - `/proc` shows only the app's own processes;
+/// - `/run` is a fresh, read-only tmpfs holding only the exposed entries: no system D-Bus,
+///   no forker or identity sockets, no other app's runtime directory, no setuid wrappers.
+struct Sandbox {
+    /// Directories to create in the staging tmpfs, parents first.
+    dirs: Vec<CString>,
+    /// `(source, target)` bind mounts into the staging tmpfs.
+    binds: Vec<(CString, CString)>,
+    /// `(link target, link path)` symlinks recreated in the staging tmpfs.
+    symlinks: Vec<(CString, CString)>,
+}
+
+const STAGE: &str = "/tmp/.run";
+
+impl Sandbox {
+    fn plan(expose: &[PathBuf]) -> Result<Self, String> {
+        let cstr = |p: &Path| {
+            CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("NUL in {}", p.display()))
+        };
+        let mut dirs = Vec::new();
+        let mut binds = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for path in expose {
+            let rel = path
+                .strip_prefix("/run")
+                .map_err(|_| format!("--expose {}: not under /run", path.display()))?;
+            if rel.as_os_str().is_empty() {
+                return Err("--expose /run: exposing everything defeats the sandbox".to_owned());
+            }
+            let staged = Path::new(STAGE).join(rel);
+            // Parents inside the stage, outermost first.
+            let mut parents: Vec<_> = staged.ancestors().skip(1).collect();
+            parents.reverse();
+            for parent in parents {
+                if parent.starts_with(STAGE) && seen.insert(parent.to_owned()) {
+                    dirs.push(cstr(parent)?);
+                }
+            }
+            let meta = std::fs::symlink_metadata(path)
+                .map_err(|e| format!("--expose {}: {e}", path.display()))?;
+            if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(path)
+                    .map_err(|e| format!("readlink {}: {e}", path.display()))?;
+                symlinks.push((cstr(&target)?, cstr(&staged)?));
+            } else if meta.is_dir() {
+                if seen.insert(staged.clone()) {
+                    dirs.push(cstr(&staged)?);
+                }
+                binds.push((cstr(path)?, cstr(&staged)?));
+            } else {
+                return Err(format!(
+                    "--expose {}: only directories and symlinks",
+                    path.display()
+                ));
+            }
+        }
+        Ok(Self {
+            dirs,
+            binds,
+            symlinks,
+        })
+    }
+
+    /// Runs as root in the child. On failure the step's name goes to stderr (the forker's
+    /// journal) and the errno comes back to the parent.
+    fn apply(&self) -> io::Result<()> {
+        // Written by hand rather than through a helper closure so every string is a literal.
+        fn fail(step: &'static str) -> io::Result<()> {
+            let err = io::Error::last_os_error();
+            let msg = b"niri-forker: sandbox: ";
+            // SAFETY: plain write(2) of static bytes.
+            unsafe {
+                libc::write(2, msg.as_ptr().cast(), msg.len());
+                libc::write(2, step.as_ptr().cast(), step.len());
+                libc::write(2, b"\n".as_ptr().cast(), 1);
+            }
+            Err(err)
+        }
+        let root = c"/";
+        let tmpfs = c"tmpfs";
+        let mode1777 = c"mode=1777";
+        let mode0755 = c"mode=0755";
+        let proc_ = c"proc";
+        let hidepid = c"hidepid=invisible";
+        let tmp = c"/tmp";
+        let shm = c"/dev/shm";
+        let procdir = c"/proc";
+        let stage = c"/tmp/.run";
+        let run = c"/run";
+        let none: *const libc::c_char = std::ptr::null();
+        let mnt = |src: &CStr, dst: &CStr, fstype: *const libc::c_char, flags: libc::c_ulong, data: *const libc::c_char| {
+            // SAFETY: all pointers are valid C strings (or null where the kernel allows it).
+            unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype, flags, data.cast()) }
+        };
+        let nodev = libc::MS_NOSUID | libc::MS_NODEV;
+        // SAFETY: syscalls only.
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                return fail("unshare(CLONE_NEWNS)");
+            }
+        }
+        if mnt(c"none", root, none, libc::MS_REC | libc::MS_PRIVATE, none) != 0 {
+            return fail("make / private");
+        }
+        if mnt(tmpfs, tmp, tmpfs.as_ptr(), nodev, mode1777.as_ptr()) != 0 {
+            return fail("tmpfs on /tmp");
+        }
+        if mnt(tmpfs, shm, tmpfs.as_ptr(), nodev, mode1777.as_ptr()) != 0 {
+            return fail("tmpfs on /dev/shm");
+        }
+        if mnt(proc_, procdir, proc_.as_ptr(), nodev | libc::MS_NOEXEC, hidepid.as_ptr()) != 0 {
+            return fail("proc with hidepid");
+        }
+        // SAFETY: syscalls on static strings.
+        unsafe {
+            if libc::mkdir(stage.as_ptr(), 0o755) != 0 {
+                return fail("mkdir stage");
+            }
+        }
+        if mnt(tmpfs, stage, tmpfs.as_ptr(), nodev, mode0755.as_ptr()) != 0 {
+            return fail("tmpfs on stage");
+        }
+        for dir in &self.dirs {
+            // SAFETY: valid C string; EEXIST is fine (shared parents).
+            let rc = unsafe { libc::mkdir(dir.as_ptr(), 0o755) };
+            if rc != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return fail("mkdir in stage");
+            }
+        }
+        for (src, dst) in &self.binds {
+            if mnt(src, dst, none, libc::MS_BIND | libc::MS_REC, none) != 0 {
+                return fail("bind mount into stage");
+            }
+        }
+        for (target, link) in &self.symlinks {
+            // SAFETY: valid C strings.
+            if unsafe { libc::symlink(target.as_ptr(), link.as_ptr()) } != 0 {
+                return fail("symlink in stage");
+            }
+        }
+        if mnt(stage, run, none, libc::MS_MOVE, none) != 0 {
+            return fail("move stage to /run");
+        }
+        // SAFETY: syscall on a static string; the stage directory is empty after the move.
+        unsafe {
+            libc::rmdir(stage.as_ptr());
+        }
+        // The tmpfs itself read-only; the bind mounts inside keep their own flags.
+        if mnt(c"none", run, none, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | nodev, none) != 0 {
+            return fail("remount /run read-only");
+        }
+        Ok(())
     }
 }
 
@@ -312,6 +488,7 @@ mod tests {
             }],
             runtime_base: dir.join("run"),
             home_base: dir.join("home"),
+            expose: Vec::new(),
         };
         let handle = thread::spawn(move || {
             let _ = server.serve(listener);
