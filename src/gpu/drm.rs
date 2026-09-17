@@ -16,11 +16,13 @@ use smithay::backend::allocator::dmabuf::{AsDmabuf as _, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement};
+use smithay::backend::drm::compositor::{
+    DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement,
+};
 use smithay::backend::drm::exporter::gbm::GbmFramebufferExporter;
 use smithay::backend::drm::{
-    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEventMetadata,
-    DrmEventTime, DrmNode, HdrOutputMetadata, VrrSupport,
+    Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmError,
+    DrmEventMetadata, DrmEventTime, DrmNode, DrmSurface, HdrOutputMetadata, VrrSupport,
 };
 use smithay::backend::egl::context::ContextPriority;
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
@@ -420,20 +422,34 @@ impl DrmState {
             }
         }
 
-        let surface = device
-            .drm
-            .create_surface(crtc, mode, &[connector])
-            .context("error creating DRM surface")?;
+        // Dropping a `DrmSurface` disables its CRTC (smithay clears the kernel state, which on
+        // Apple DCP even power-cycles the display controller). A surface created earlier would
+        // keep believing the CRTC is active and page-flip onto a disabled one (EINVAL). So every
+        // surface below is created right before the compositor that consumes it, and the format
+        // probe runs on the compositor that is actually used.
+        let create_surface =
+            |drm: &mut DrmDevice, vrr: Option<bool>| -> anyhow::Result<DrmSurface> {
+                let surface = drm
+                    .create_surface(crtc, mode, &[connector])
+                    .context("error creating DRM surface")?;
+                if let Some(vrr) = vrr {
+                    if let Err(err) = surface.use_vrr(vrr) {
+                        warn!("error setting VRR: {err:?}");
+                    }
+                }
+                Ok(surface)
+            };
+        let first_surface = create_surface(&mut device.drm, None)?;
 
-        let vrr_supported = match surface.vrr_supported(connector) {
+        let vrr_supported = match first_surface.vrr_supported(connector) {
             Ok(VrrSupport::Supported | VrrSupport::RequiresModeset) => {
-                if let Err(err) = surface.use_vrr(vrr) {
+                if let Err(err) = first_surface.use_vrr(vrr) {
                     warn!("error setting VRR: {err:?}");
                 }
                 true
             }
             Ok(VrrSupport::NotSupported) => {
-                let _ = surface.use_vrr(false);
+                let _ = first_surface.use_vrr(false);
                 false
             }
             Err(err) => {
@@ -441,6 +457,10 @@ impl DrmState {
                 false
             }
         };
+
+        // What `create_surface` must re-apply on any later surface.
+        let vrr_setting = Some(vrr_supported && vrr);
+        let mut surface = Some(first_surface);
 
         let display_only = device.render_node.is_none();
         let render_formats = renderer
@@ -471,86 +491,98 @@ impl DrmState {
             transform: convert::transform(Transform::Normal),
         };
 
-        // 10-bit formats are probed one by one with a throwaway compositor and render_frame:
+        let make_compositor = |device: &Device,
+                               surface: DrmSurface,
+                               color_formats: &[Fourcc],
+                               render_formats: FormatSet|
+         -> anyhow::Result<GbmDrmCompositor> {
+            DrmCompositor::new(
+                mode_source(&mode, geometry),
+                surface,
+                None,
+                device.allocator.clone(),
+                GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
+                color_formats.iter().copied(),
+                render_formats,
+                device.drm.cursor_size(),
+                Some(device.gbm.clone()),
+            )
+            .map_err(|err| anyhow!("{err:?}"))
+        };
+
+        // 10-bit formats are probed one by one with a single-format compositor and render_frame:
         // some drivers can render into AR30 but not AB30 (or vice versa), so treating 10-bit
-        // as a boolean would pick a broken format or fall back too far.
-        let mut color_formats = Vec::new();
+        // as a boolean would pick a broken format or fall back too far. The first format that
+        // works is kept as the real compositor.
+        let mut compositor = None;
         if prefer_10bit {
+            let plane_formats: HashSet<Fourcc> = surface
+                .as_ref()
+                .unwrap()
+                .planes()
+                .primary
+                .iter()
+                .flat_map(|plane| plane.formats.iter().map(|format| format.code))
+                .collect();
             for format in TEN_BIT_COLOR_FORMATS {
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector])
-                    .context("error creating DRM surface")?;
-                let mut compositor: GbmDrmCompositor = match DrmCompositor::new(
-                    mode_source(&mode, geometry),
-                    surface,
-                    None,
-                    device.allocator.clone(),
-                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    std::iter::once(format),
-                    render_formats.clone(),
-                    device.drm.cursor_size(),
-                    Some(device.gbm.clone()),
-                ) {
-                    Ok(x) => x,
-                    Err(err) => {
-                        debug!(?format, "10-bit format not usable for scanout: {err:?}");
-                        continue;
-                    }
+                if !plane_formats.contains(&format) {
+                    debug!(?format, "10-bit format not supported by the primary plane");
+                    continue;
+                }
+                let probe_surface = match surface.take() {
+                    Some(surface) => surface,
+                    None => create_surface(&mut device.drm, vrr_setting)?,
                 };
+                let mut probe =
+                    match make_compositor(device, probe_surface, &[format], render_formats.clone())
+                    {
+                        Ok(x) => x,
+                        Err(err) => {
+                            debug!(?format, "10-bit format not usable for scanout: {err:?}");
+                            continue;
+                        }
+                    };
                 let no_elements: [SolidColorRenderElement; 0] = [];
-                match compositor.render_frame(renderer, &no_elements, [0.; 4], FrameFlags::empty())
-                {
-                    Ok(_) => color_formats.push(format),
+                match probe.render_frame(renderer, &no_elements, [0.; 4], FrameFlags::empty()) {
+                    Ok(_) => {
+                        // The trial only rendered, never committed; drop what it left in the
+                        // swapchain.
+                        probe.reset_buffers();
+                        debug!(?format, "created 10-bit DRM compositor");
+                        compositor = Some(probe);
+                        break;
+                    }
                     Err(err) => warn!(?format, "10-bit format is not renderable: {err:?}"),
                 }
-                // The trial only rendered, never committed; drop what it left in the swapchain.
-                compositor.reset_buffers();
             }
-            if color_formats.is_empty() {
+            if compositor.is_none() {
                 warn!("no usable 10-bit scanout format; using an 8-bit framebuffer");
             }
         }
-        color_formats.extend(SDR_COLOR_FORMATS);
-        debug!(?color_formats, "creating DRM compositor");
-        let color_formats = color_formats.into_iter();
 
-        let res = DrmCompositor::new(
-            mode_source(&mode, geometry),
-            surface,
-            None,
-            device.allocator.clone(),
-            GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-            color_formats.clone(),
-            render_formats.clone(),
-            device.drm.cursor_size(),
-            Some(device.gbm.clone()),
-        );
-        let mut compositor = match res {
-            Ok(x) => x,
-            Err(err) => {
-                warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
-                let render_formats = render_formats
-                    .iter()
-                    .copied()
-                    .filter(|format| format.modifier == Modifier::Invalid)
-                    .collect::<FormatSet>();
-                let surface = device
-                    .drm
-                    .create_surface(crtc, mode, &[connector])
-                    .context("error creating DRM surface")?;
-                DrmCompositor::new(
-                    mode_source(&mode, geometry),
-                    surface,
-                    None,
-                    device.allocator.clone(),
-                    GbmFramebufferExporter::new(device.gbm.clone(), device.render_node.into()),
-                    color_formats,
-                    render_formats,
-                    device.drm.cursor_size(),
-                    Some(device.gbm.clone()),
-                )
-                .context("error creating DRM compositor")?
+        let mut compositor = match compositor {
+            Some(compositor) => compositor,
+            None => {
+                let color_formats = SDR_COLOR_FORMATS;
+                debug!(?color_formats, "creating DRM compositor");
+                let sdr_surface = match surface.take() {
+                    Some(surface) => surface,
+                    None => create_surface(&mut device.drm, vrr_setting)?,
+                };
+                match make_compositor(device, sdr_surface, &color_formats, render_formats.clone()) {
+                    Ok(x) => x,
+                    Err(err) => {
+                        warn!("error creating DRM compositor, will try with invalid modifier: {err:?}");
+                        let render_formats = render_formats
+                            .iter()
+                            .copied()
+                            .filter(|format| format.modifier == Modifier::Invalid)
+                            .collect::<FormatSet>();
+                        let surface = create_surface(&mut device.drm, vrr_setting)?;
+                        make_compositor(device, surface, &color_formats, render_formats)
+                            .context("error creating DRM compositor")?
+                    }
+                }
             }
         };
 
@@ -829,10 +861,23 @@ impl DrmState {
             return Ok((false, states));
         }
         drop(res);
-        surface
-            .compositor
-            .queue_frame(frame)
-            .map_err(|err| anyhow!("error queueing frame: {err}"))?;
+        if let Err(err) = surface.compositor.queue_frame(frame) {
+            // Anything but "a flip is still pending" means the compositor's idea of the CRTC
+            // state is stale (e.g. something else disabled it); re-read it so the next frame
+            // does a full commit instead of failing the same way forever.
+            let busy = matches!(
+                &err,
+                FrameError::DrmError(DrmError::Access(access))
+                    if access.source.raw_os_error() == Some(libc::EBUSY)
+            );
+            if !busy {
+                warn!("error queueing frame, resetting the DRM surface state: {err}");
+                if let Err(err) = surface.compositor.reset_state() {
+                    warn!("error resetting DrmCompositor state: {err:?}");
+                }
+            }
+            bail!("error queueing frame: {err}");
+        }
         Ok((true, states))
     }
 
