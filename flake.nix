@@ -43,6 +43,7 @@
             root = ./.;
             fileset = lib.fileset.unions [
               ./niri-config
+              ./niri-bridge
               ./niri-forker
               ./niri-identity
               ./niri-ipc
@@ -81,6 +82,8 @@
             "niri-forker"
             "-p"
             "niri-identity"
+            "-p"
+            "niri-bridge"
           ];
 
           nativeBuildInputs = [

@@ -1,0 +1,20 @@
+[package]
+name = "niri-bridge"
+version.workspace = true
+description = "Desktop services for sandboxed apps: a UID-keyed server on the human's side, a shim on each app's private bus"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+niri-policy = { version = "26.4.0", path = "../niri-policy" }
+rustix = { version = "1.1.4", features = ["net", "process", "std"] }
+serde.workspace = true
+zbus = "5"
+
+[[bin]]
+name = "niri-bridge"
+path = "src/main.rs"

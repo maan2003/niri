@@ -172,9 +172,14 @@ impl Identity {
             .find(|(k, _)| k == niri_policy::env::APPS_WAYLAND_DISPLAY)
             .map(|(_, v)| v.clone());
         full_env.retain(|(k, _)| k != niri_policy::env::APPS_WAYLAND_DISPLAY);
+        // The human's session bus is for the human's tools only; other apps get a private
+        // bus of their own (or none).
+        full_env.retain(|(k, _)| k != "DBUS_SESSION_BUS_ADDRESS");
         if app.uid == me {
-            if let Ok(home) = std::env::var("HOME") {
-                full_env.push(("HOME".to_owned(), home));
+            for key in ["HOME", "DBUS_SESSION_BUS_ADDRESS"] {
+                if let Ok(value) = std::env::var(key) {
+                    full_env.push((key.to_owned(), value));
+                }
             }
         } else {
             full_env.retain(|(k, _)| k != "XDG_RUNTIME_DIR");
@@ -273,13 +278,20 @@ mod tests {
                 niri_policy::env::APPS_WAYLAND_DISPLAY.to_owned(),
                 "/run/niri-wayland/wayland".to_owned(),
             ),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".to_owned(),
+                "unix:path=/x".to_owned(),
+            ),
         ];
         let get = |env: &[(String, String)], k: &str| {
             env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
         };
         let human = id.env_for(id.app("session").unwrap(), &sent, 1000);
         assert_eq!(get(&human, "WAYLAND_DISPLAY").as_deref(), Some("wayland-1"));
-        assert_eq!(get(&human, "XDG_RUNTIME_DIR").as_deref(), Some("/run/user/1000"));
+        assert_eq!(
+            get(&human, "XDG_RUNTIME_DIR").as_deref(),
+            Some("/run/user/1000")
+        );
         assert!(get(&human, niri_policy::env::APPS_WAYLAND_DISPLAY).is_none());
         let app = id.env_for(id.app("firefox").unwrap(), &sent, 1000);
         assert_eq!(
@@ -288,6 +300,7 @@ mod tests {
         );
         assert!(get(&app, "XDG_RUNTIME_DIR").is_none());
         assert!(get(&app, niri_policy::env::APPS_WAYLAND_DISPLAY).is_none());
+        assert!(get(&app, "DBUS_SESSION_BUS_ADDRESS").is_none());
     }
 
     #[test]

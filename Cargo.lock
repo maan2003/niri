@@ -2343,6 +2343,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "niri-bridge"
+version = "26.4.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "niri-policy",
+ "rustix 1.1.4",
+ "serde",
+ "zbus",
+]
+
+[[package]]
 name = "niri-config"
 version = "26.4.0"
 dependencies = [

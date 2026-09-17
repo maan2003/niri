@@ -5,6 +5,7 @@ members = [
     "niri-policy",
     "niri-forker",
     "niri-identity",
+    "niri-bridge",
     "niri-visual-tests",
 ]
 

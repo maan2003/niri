@@ -74,11 +74,22 @@ in
       spawn-at-startup "flower"
       spawn-at-startup "sneaky"
       spawn-at-startup "hello" "extra-argument"
+      spawn-at-startup "mako"
+      spawn-at-startup "notify-test"
     '';
     apps = {
       # The launcher: the human's own tool, trusted, runs as the human (Mod+D in the stock
       # binds). It starts apps through `niri msg`, so the compositor does the launching.
       fuzzel = { uid = 1000; trusted = true; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; };
+      # Notification daemon: the human's tool on the human's bus; apps reach it only through
+      # the bridge, which names them.
+      mako = { uid = 1000; trusted = true; exec = [ "${pkgs.mako}/bin/mako" ]; };
+      # Sends one notification from inside the sandbox over its private bus.
+      notify-test = {
+        uid = 100007;
+        bus = true;
+        exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
+      };
       hello = { uid = 100001; exec = [ "${probe}" ]; };
       gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; };
@@ -88,8 +99,8 @@ in
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {
         uid = 100005;
+        bus = true;
         exec = [
-          "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon" "--"
           "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
           "--autoplay-policy=no-user-gesture-required" "file://${audioPage}"
         ];

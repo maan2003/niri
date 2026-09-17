@@ -9,7 +9,12 @@ let
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
     inherit (app) uid groups trusted gpu network globals;
-    exec = app.exec;
+    # A private bus is a compat shim: the bridge on it forwards to the human's side, which
+    # keys everything on the app's UID.
+    exec = lib.optionals app.bus [
+      "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon" "--"
+      "${cfg.package}/bin/niri-bridge" "app" "--"
+    ] ++ app.exec;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   identityFile = toml.generate "identity.toml" {
     forker = "/run/niri/forker.sock";
@@ -23,6 +28,8 @@ let
     ] ++ appEntries;
   };
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
+  sessionBus = "unix:path=/run/niri-session/bus";
+  bridgeSocket = "/run/niri-bridge/bridge.sock";
   humanUid = config.users.users.${cfg.user}.uid;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   # Apps in the range get a passwd entry; the human's own tools share the human's. Decided by
@@ -66,7 +73,7 @@ in
     };
     expose = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "/run/niri-wayland" "/run/opengl-driver" "/run/current-system" "/run/pipewire" "/run/pulse" ];
+      default = [ "/run/niri-wayland" "/run/niri-bridge" "/run/opengl-driver" "/run/current-system" "/run/pipewire" "/run/pulse" ];
       description = "Entries of /run apps may see; the rest of /run is hidden.";
     };
     env = lib.mkOption {
@@ -74,6 +81,7 @@ in
       default = {
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         PULSE_SERVER = "unix:/run/pulse/native";
+        NIRI_BRIDGE_SOCKET = bridgeSocket;
         XDG_DATA_DIRS = "/run/current-system/sw/share";
       };
       description = "Environment every app gets.";
@@ -101,6 +109,11 @@ in
             type = lib.types.bool;
             default = false;
             description = "Keep the host network; otherwise an empty network namespace.";
+          };
+          bus = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Give the app a private session bus with the bridge shim on it (notifications).";
           };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
@@ -164,10 +177,23 @@ in
       };
     };
 
+    # The human's session bus: the compositor, the bridge and the human's tools share it;
+    # sandboxed apps never see it.
+    systemd.services.niri-session-bus = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        User = cfg.user;
+        ExecStart = "${pkgs.dbus}/bin/dbus-daemon --session --nofork --nopidfile --address=${sessionBus}";
+        RuntimeDirectory = "niri-session";
+        RuntimeDirectoryMode = "0700";
+      };
+    };
+
     systemd.services.niri-identity = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "niri-forker.service" ];
-      requires = [ "niri-forker.service" ];
+      after = [ "niri-forker.service" "niri-session-bus.service" ];
+      requires = [ "niri-forker.service" "niri-session-bus.service" ];
+      environment.DBUS_SESSION_BUS_ADDRESS = sessionBus;
       serviceConfig = {
         User = cfg.user;
         ExecStart = "${cfg.package}/bin/niri-identityd --config /etc/niri/identity.toml --socket /run/niri-identity/identity.sock";
@@ -175,11 +201,28 @@ in
       };
     };
 
+    systemd.services.niri-bridge = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "niri-identity.service" ];
+      requires = [ "niri-identity.service" ];
+      environment = {
+        DBUS_SESSION_BUS_ADDRESS = sessionBus;
+        NIRI_IDENTITY_SOCKET = "/run/niri-identity/identity.sock";
+      };
+      serviceConfig = {
+        User = cfg.user;
+        ExecStart = "${cfg.package}/bin/niri-bridge serve --socket ${bridgeSocket}";
+        RuntimeDirectory = "niri-bridge";
+        RuntimeDirectoryMode = "0755";
+      };
+    };
+
     systemd.services.niri = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "niri-identity.service" "seatd.service" ];
+      after = [ "niri-identity.service" "niri-bridge.service" "seatd.service" ];
       requires = [ "niri-identity.service" "seatd.service" ];
       environment = {
+        DBUS_SESSION_BUS_ADDRESS = sessionBus;
         LIBSEAT_BACKEND = "seatd";
         NIRI_IDENTITY_SOCKET = "/run/niri-identity/identity.sock";
         NIRI_APPS_SOCKET = "/run/niri-wayland/wayland";
