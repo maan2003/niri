@@ -5,8 +5,11 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::mem;
+use std::os::fd::AsFd as _;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{env, mem};
 
 use anyhow::Context as _;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -99,6 +102,9 @@ impl State {
             signal_ctx,
         } = params;
 
+        // The sandboxed GPU process cannot connect to PipeWire itself; it gets a connected
+        // socket with every start and uses it if it has no connection.
+        let pipewire = connect_pipewire();
         let cursor_mode = self
             .backend
             .with_primary_renderer(|renderer| {
@@ -110,6 +116,7 @@ impl State {
                     to_gpu_cursor_mode(cursor_mode),
                     allow_dmabuf,
                     force_invalid_modifier,
+                    pipewire.as_ref().map(|s| s.as_fd()),
                 )
             })
             .context("no renderer")??;
@@ -859,4 +866,32 @@ niri_render_elements! {
         Pointer = PointerRenderElements<R>,
         RelocatedPointer = RelocateRenderElement<PointerRenderElements<R>>,
     }
+}
+
+/// Connects to the PipeWire daemon the way libpipewire would: `$PIPEWIRE_REMOTE` (a name or
+/// an absolute path, default `pipewire-0`) under `$PIPEWIRE_RUNTIME_DIR` or `$XDG_RUNTIME_DIR`.
+fn connect_pipewire() -> Option<UnixStream> {
+    let remote = env::var_os("PIPEWIRE_REMOTE").unwrap_or_else(|| "pipewire-0".into());
+    let path = if Path::new(&remote).is_absolute() {
+        PathBuf::from(remote)
+    } else {
+        let dir = env::var_os("PIPEWIRE_RUNTIME_DIR").or_else(|| env::var_os("XDG_RUNTIME_DIR"));
+        let Some(dir) = dir else {
+            warn!("cannot find the PipeWire socket: XDG_RUNTIME_DIR is not set");
+            return None;
+        };
+        Path::new(&dir).join(remote)
+    };
+
+    let stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(err) => {
+            warn!("error connecting to PipeWire at {path:?}: {err}");
+            return None;
+        }
+    };
+    if let Err(err) = stream.set_nonblocking(true) {
+        warn!("error making the PipeWire socket non-blocking: {err}");
+    }
+    Some(stream)
 }

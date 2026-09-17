@@ -105,7 +105,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error!("unknown gpu process mode {mode:?}");
                     std::process::exit(1);
                 };
-                if let Err(err) = niri::gpu::server::run(fd, mode) {
+                let sandbox = niri::gpu::sandbox::enabled();
+                if sandbox {
+                    if let Err(err) = niri::gpu::sandbox::restrict_filesystem() {
+                        error!("gpu process: error applying Landlock: {err:?}");
+                        std::process::exit(1);
+                    }
+                } else {
+                    warn!(
+                        "gpu process: sandbox disabled ({}=0)",
+                        niri::gpu::sandbox::DISABLE_ENV
+                    );
+                }
+                if let Err(err) = niri::gpu::server::run(fd, mode, sandbox) {
                     error!("gpu process failed: {err:?}");
                     std::process::exit(1);
                 }

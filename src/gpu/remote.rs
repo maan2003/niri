@@ -6,8 +6,9 @@
 //! the batch grows large.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::marker::PhantomData;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::{fmt, mem};
@@ -193,11 +194,10 @@ impl GpuHandle {
         self.shared.context_id.clone()
     }
 
-    /// Loads an Xcursor icon in the GPU process; returns each frame with its texture.
+    /// Uploads an Xcursor icon file to the GPU process; returns each frame with its texture.
     pub fn load_cursor(
         &self,
-        theme: &str,
-        names: &[String],
+        icon: Option<&File>,
         size: i32,
         fallback: bool,
     ) -> anyhow::Result<Vec<(CursorFrameDesc, RemoteTexture)>> {
@@ -206,12 +206,12 @@ impl GpuHandle {
             .shared
             .next_id
             .fetch_add(MAX_CURSOR_FRAMES, Ordering::Relaxed);
-        let frames = self
-            .shared
-            .client
-            .lock()
-            .unwrap()
-            .load_cursor(theme, names, size, fallback, first_id)?;
+        let frames = self.shared.client.lock().unwrap().load_cursor(
+            icon.map(AsFd::as_fd),
+            size,
+            fallback,
+            first_id,
+        )?;
         Ok(frames
             .into_iter()
             .enumerate()

@@ -214,10 +214,9 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
         );
     }
 
-    // Cursor loading happens GPU-side; a missing theme yields the built-in arrow.
+    // Cursor parsing happens GPU-side; without an icon file the built-in arrow is used.
     let gpu = renderer.gpu_handle();
-    let names = ["default".to_owned()];
-    let frames = gpu.load_cursor("niri-no-such-theme", &names, 24, true)?;
+    let frames = gpu.load_cursor(None, 24, true)?;
     assert_eq!(frames.len(), 1, "fallback cursor has one frame");
     let (desc, cursor_tex) = &frames[0];
     assert_eq!(
@@ -226,8 +225,7 @@ pub fn run_smoke(client: GpuClient) -> anyhow::Result<()> {
     );
     assert_eq!(cursor_tex.size(), Size::from((64, 64)));
     assert!(
-        gpu.load_cursor("niri-no-such-theme", &names, 24, false)
-            .is_err(),
+        gpu.load_cursor(None, 24, false).is_err(),
         "no fallback requested"
     );
     // The fallback arrow is opaque at its hotspot corner region.

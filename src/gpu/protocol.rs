@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -661,8 +661,9 @@ pub enum Request {
         frame: u64,
         flags: PresentFlags,
     },
-    /// Creates a PipeWire screencast stream. Reply: `CastStarted` with the effective cursor
-    /// mode (metadata needs a recent PipeWire).
+    /// Creates a PipeWire screencast stream. A connected PipeWire socket may be attached as
+    /// fd; the GPU process uses it if it has no connection yet (it cannot connect itself).
+    /// Reply: `CastStarted` with the effective cursor mode (metadata needs a recent PipeWire).
     CastStart {
         stream: u64,
         width: i32,
@@ -690,16 +691,18 @@ pub enum Request {
     CastStop {
         stream: u64,
     },
-    /// Loads an Xcursor icon (first of `names` that exists in `theme`, closest to `size`) and
-    /// uploads its frames as Argb8888 textures `first_id`, `first_id + 1`, … Reply: `Cursor`.
-    /// With `fallback`, a built-in arrow is used when nothing loads.
+    /// Parses the Xcursor icon file attached as fd (the core finds and opens it; the GPU
+    /// process has no filesystem), keeps the frames closest to `size` and uploads them as
+    /// Argb8888 textures `first_id`, `first_id + 1`, … Reply: `Cursor`. With `fallback`, a
+    /// built-in arrow is used when there is no fd or it does not parse.
     LoadCursor {
-        theme: String,
-        names: Vec<String>,
         size: i32,
         fallback: bool,
         first_id: TexId,
     },
+    /// Applies the seccomp sandbox: from here on the GPU process can only use the fds it holds
+    /// or receives. Sent once the initial devices are added (Mesa is up). Reply: Ack.
+    Lockdown,
     /// Encodes `region` of a texture as PNG (RGBA) on a GPU-process thread. One-way; the
     /// result arrives as `GpuEvent::Png { token }`.
     EncodePng {

@@ -1,12 +1,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
 use std::rc::Rc;
 
 use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Logical, Physical, Point, Transform};
 use smithay::wayland::compositor::with_states;
+use xcursor::CursorTheme;
 
 use crate::gpu::protocol::CursorFrameDesc;
 use crate::gpu::remote::{GpuHandle, RemoteTexture};
@@ -20,6 +22,8 @@ type XCursorCache = HashMap<(CursorIcon, i32), Option<Rc<XCursor>>>;
 /// handle per frame.
 pub struct CursorManager {
     theme: String,
+    /// Where icon files live; the core opens them and hands the fd to the GPU process.
+    xcursor: CursorTheme,
     size: u8,
     gpu: Option<GpuHandle>,
     current_cursor: CursorImageStatus,
@@ -32,6 +36,7 @@ impl CursorManager {
 
         Self {
             theme: theme.to_owned(),
+            xcursor: CursorTheme::load(theme),
             size,
             gpu,
             current_cursor: CursorImageStatus::default_named(),
@@ -43,6 +48,7 @@ impl CursorManager {
     pub fn reload(&mut self, theme: &str, size: u8) {
         Self::ensure_env(theme, size);
         self.theme = theme.to_owned();
+        self.xcursor = CursorTheme::load(theme);
         self.size = size;
         self.named_cursor_cache.get_mut().clear();
     }
@@ -132,7 +138,22 @@ impl CursorManager {
                 // The default cursor must always have a fallback.
                 let fallback = *icon == CursorIcon::Default;
 
-                match gpu.load_cursor(&self.theme, &names, size, fallback) {
+                let file = names.iter().find_map(|name| {
+                    let path = self.xcursor.load_icon(name)?;
+                    match File::open(&path) {
+                        Ok(file) => Some(file),
+                        Err(err) => {
+                            warn!("error opening cursor icon {path:?}: {err}");
+                            None
+                        }
+                    }
+                });
+                if file.is_none() && !fallback {
+                    warn!("no icon {} in cursor theme {}", icon.name(), self.theme);
+                    return None;
+                }
+
+                match gpu.load_cursor(file.as_ref(), size, fallback) {
                     Ok(frames) => Some(Rc::new(XCursor::new(gpu, frames, *scale))),
                     Err(err) => {
                         warn!("error loading xcursor {}@{size}: {err:?}", icon.name());

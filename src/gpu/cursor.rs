@@ -1,65 +1,38 @@
-//! Xcursor theme loading for the GPU process. Theme files come from disk and are parsed here,
-//! so the core never touches them; it only learns frame sizes, hotspots and delays.
+//! Xcursor icon parsing for the GPU process. The core finds and opens the theme file (this
+//! process has no filesystem access) and only learns frame sizes, hotspots and delays back.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::os::fd::OwnedFd;
 
 use anyhow::{anyhow, ensure, Context};
 use xcursor::parser::{parse_xcursor, Image};
-use xcursor::CursorTheme;
 
 use super::protocol::MAX_CURSOR_FRAMES;
 
 /// Some default looking `left_ptr` icon.
 static FALLBACK_CURSOR_DATA: &[u8] = include_bytes!("../../resources/cursor.rgba");
 
-#[derive(Default)]
-pub struct CursorThemes {
-    themes: HashMap<String, CursorTheme>,
-}
+/// Parses `icon`, keeping the frames closest to `size`.
+pub fn load_cursor(icon: Option<OwnedFd>, size: i32, fallback: bool) -> anyhow::Result<Vec<Image>> {
+    let res = match icon {
+        Some(fd) => parse_icon(File::from(fd), size),
+        None => Err(anyhow!("no icon file")),
+    };
 
-impl CursorThemes {
-    /// Loads the first of `names` that exists, picking the frames closest to `size`.
-    pub fn load(
-        &mut self,
-        theme: &str,
-        names: &[String],
-        size: i32,
-        fallback: bool,
-    ) -> anyhow::Result<Vec<Image>> {
-        let theme = self
-            .themes
-            .entry(theme.to_owned())
-            .or_insert_with(|| CursorTheme::load(theme));
-
-        let mut res = Err(anyhow!("no cursor names given"));
-        for name in names {
-            res = load_xcursor(theme, name, size);
-            if res.is_ok() {
-                break;
-            }
+    match res {
+        Ok(images) => Ok(images),
+        Err(err) if fallback => {
+            warn!("error loading xcursor @{size}, using fallback: {err:?}");
+            Ok(fallback_cursor())
         }
-
-        match res {
-            Ok(images) => Ok(images),
-            Err(err) if fallback => {
-                warn!("error loading xcursor {names:?}@{size}, using fallback: {err:?}");
-                Ok(fallback_cursor())
-            }
-            Err(err) => Err(err),
-        }
+        Err(err) => Err(err),
     }
 }
 
-fn load_xcursor(theme: &CursorTheme, name: &str, size: i32) -> anyhow::Result<Vec<Image>> {
-    let _span = tracy_client::span!("load_xcursor");
+fn parse_icon(mut file: File, size: i32) -> anyhow::Result<Vec<Image>> {
+    let _span = tracy_client::span!("parse_icon");
 
-    let path = theme
-        .load_icon(name)
-        .ok_or_else(|| anyhow!("no icon {name}"))?;
-
-    let mut file = File::open(path).context("error opening cursor icon file")?;
     let mut buf = vec![];
     file.read_to_end(&mut buf)
         .context("error reading cursor icon file")?;

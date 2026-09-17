@@ -13,6 +13,7 @@ pub mod gl;
 pub mod protocol;
 pub mod record;
 pub mod remote;
+pub mod sandbox;
 pub mod scene;
 pub mod server;
 pub mod testing;

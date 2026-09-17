@@ -359,6 +359,18 @@ impl Tty {
             .map(|(id, path)| (id, path.to_owned()))
             .collect();
         self.add_devices(niri, devices);
+        self.lockdown_gpu();
+    }
+
+    /// Seals the GPU process once the initial devices are in: Mesa is up (or never will be
+    /// for these devices). Devices hot-plugged from now on can still scan out, but cannot
+    /// bring up a renderer. A GPU process that cannot be confined is a fatal error; set
+    /// `NIRI_GPU_SANDBOX=0` to run without the sandbox.
+    fn lockdown_gpu(&mut self) {
+        if let Err(err) = self.renderer.client().lockdown() {
+            error!("error locking down the GPU process: {err:?}");
+            std::process::exit(1);
+        }
     }
 
     /// Adds `devices` (any order), then scans the connectors of the ones that worked.
@@ -494,6 +506,9 @@ impl Tty {
 
                 // Add new devices.
                 self.add_devices(niri, device_list.into_iter().collect());
+
+                // For a compositor started on an inactive VT this is the first enumeration.
+                self.lockdown_gpu();
 
                 if self.update_output_config_on_resume {
                     self.on_output_config_changed(niri);

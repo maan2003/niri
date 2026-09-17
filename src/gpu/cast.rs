@@ -16,9 +16,8 @@ use std::rc::Rc;
 use std::time::Duration;
 use std::{mem, slice};
 
-use anyhow::{bail, ensure, Context as _};
+use anyhow::{anyhow, bail, ensure, Context as _};
 use calloop::channel::{Channel as CalloopChannel, Sender};
-use calloop::RegistrationToken;
 use pipewire::context::ContextRc;
 use pipewire::core::{CoreRc, PW_ID_CORE};
 use pipewire::loop_::Timeout;
@@ -82,14 +81,16 @@ pub struct Casting {
     // Casts are declared (and so dropped) before PipeWire to prevent a double-free.
     casts: HashMap<u64, Cast>,
     pw: Option<PipeWire>,
+    /// Created at startup, before the sandbox closes: this is where PipeWire loads its modules
+    /// and config. `None` when that failed (no screencasting then).
+    context: Option<ContextRc>,
     loop_handle: LoopHandle<'static, Server>,
     tx: Sender<CastEvent>,
 }
 
+/// A connection to the PipeWire daemon over a socket the core handed us.
 struct PipeWire {
-    _context: ContextRc,
     core: CoreRc,
-    token: RegistrationToken,
 }
 
 pub struct StartParams {
@@ -310,29 +311,68 @@ impl Casting {
                 }
             })
             .unwrap();
+        let context = match Self::new_context(&loop_handle) {
+            Ok(context) => Some(context),
+            Err(err) => {
+                warn!("error initializing PipeWire, screencasting unavailable: {err:?}");
+                None
+            }
+        };
         Self {
             casts: HashMap::new(),
             pw: None,
+            context,
             loop_handle,
             tx,
         }
     }
 
+    fn new_context(loop_handle: &LoopHandle<'static, Server>) -> anyhow::Result<ContextRc> {
+        let main_loop = MainLoopRc::new(None).context("error creating MainLoop")?;
+        let context = ContextRc::new(&main_loop, None).context("error creating Context")?;
+
+        struct AsFdWrapper(MainLoopRc);
+        impl AsFd for AsFdWrapper {
+            fn as_fd(&self) -> BorrowedFd<'_> {
+                self.0.loop_().fd()
+            }
+        }
+        let generic = Generic::new(AsFdWrapper(main_loop), Interest::READ, Mode::Level);
+        loop_handle
+            .insert_source(generic, move |_, wrapper, _| {
+                let _span = tracy_client::span!("pipewire iteration");
+                wrapper.0.loop_().iterate(Timeout::None);
+                Ok(PostAction::Continue)
+            })
+            .map_err(|err| anyhow!("error registering PipeWire loop: {err}"))?;
+        Ok(context)
+    }
+
+    /// Connects to the daemon over `socket`, unless already connected (then it is just closed).
+    pub fn connect(&mut self, socket: OwnedFd) -> anyhow::Result<()> {
+        if self.pw.is_some() {
+            return Ok(());
+        }
+        let context = self
+            .context
+            .as_ref()
+            .context("PipeWire failed to initialize")?;
+        let pw = PipeWire::connect(context, socket, self.tx.clone())
+            .context("error connecting to PipeWire")?;
+        self.pw = Some(pw);
+        Ok(())
+    }
+
     /// Drops every stream and the PipeWire connection (after a fatal connection error).
     pub fn reset(&mut self) {
         self.casts.clear();
-        if let Some(pw) = self.pw.take() {
-            self.loop_handle.remove(pw.token);
-        }
+        self.pw = None;
     }
 
     fn pipewire(&mut self) -> anyhow::Result<&PipeWire> {
-        if self.pw.is_none() {
-            let pw = PipeWire::new(&self.loop_handle, self.tx.clone())
-                .context("error initializing PipeWire")?;
-            self.pw = Some(pw);
-        }
-        Ok(self.pw.as_ref().unwrap())
+        self.pw
+            .as_ref()
+            .context("no PipeWire connection (the core provided no socket)")
     }
 
     /// Returns the effective cursor mode.
@@ -446,13 +486,14 @@ impl Casting {
 }
 
 impl PipeWire {
-    fn new(
-        loop_handle: &LoopHandle<'static, Server>,
+    fn connect(
+        context: &ContextRc,
+        socket: OwnedFd,
         tx: Sender<CastEvent>,
     ) -> anyhow::Result<Self> {
-        let main_loop = MainLoopRc::new(None).context("error creating MainLoop")?;
-        let context = ContextRc::new(&main_loop, None).context("error creating Context")?;
-        let core = context.connect_rc(None).context("error creating Core")?;
+        let core = context
+            .connect_fd_rc(socket, None)
+            .context("error creating Core")?;
 
         let listener = core
             .add_listener_local()
@@ -469,26 +510,7 @@ impl PipeWire {
             .register();
         mem::forget(listener);
 
-        struct AsFdWrapper(MainLoopRc);
-        impl AsFd for AsFdWrapper {
-            fn as_fd(&self) -> BorrowedFd<'_> {
-                self.0.loop_().fd()
-            }
-        }
-        let generic = Generic::new(AsFdWrapper(main_loop), Interest::READ, Mode::Level);
-        let token = loop_handle
-            .insert_source(generic, move |_, wrapper, _| {
-                let _span = tracy_client::span!("pipewire iteration");
-                wrapper.0.loop_().iterate(Timeout::None);
-                Ok(PostAction::Continue)
-            })
-            .unwrap();
-
-        Ok(Self {
-            _context: context,
-            core,
-            token,
-        })
+        Ok(Self { core })
     }
 
     fn start_cast(

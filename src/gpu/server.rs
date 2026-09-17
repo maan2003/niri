@@ -24,7 +24,6 @@ use smithay::utils::Size;
 #[cfg(feature = "xdp-gnome-screencast")]
 use super::cast::{Casting, StartParams};
 use super::client::Mode;
-use super::cursor::CursorThemes;
 use super::drm::DrmState;
 use super::exec::Executor;
 use super::gl::{resources, shaders};
@@ -32,6 +31,7 @@ use super::gl::{resources, shaders};
 use super::protocol::CastEvent;
 use super::protocol::{Event, GpuEvent, Request, PROTOCOL_VERSION};
 use super::transport::Channel;
+use super::{cursor, sandbox};
 
 pub fn new_surfaceless_renderer() -> anyhow::Result<GlesRenderer> {
     let mut renderer = unsafe {
@@ -55,12 +55,14 @@ pub(super) struct Server {
     signal: LoopSignal,
     /// Fds to attach to the reply of the request being handled.
     reply_fds: Vec<OwnedFd>,
-    cursors: CursorThemes,
+    /// Whether `Lockdown` applies seccomp. Off when the server runs on a thread of the core.
+    sandbox: bool,
     /// Events from worker threads (PNG encoding), forwarded to the core.
     bg: Sender<GpuEvent>,
 }
 
-pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
+/// `sandbox`: honor `Request::Lockdown` (only makes sense in a process of our own).
+pub fn run(fd: OwnedFd, mode: Mode, sandbox: bool) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<'static, Server> =
         EventLoop::try_new().context("error creating event loop")?;
 
@@ -104,7 +106,7 @@ pub fn run(fd: OwnedFd, mode: Mode) -> anyhow::Result<()> {
         loop_handle: event_loop.handle(),
         signal: event_loop.get_signal(),
         reply_fds: Vec::new(),
-        cursors: CursorThemes::default(),
+        sandbox,
         bg,
     };
 
@@ -206,16 +208,24 @@ impl Server {
                 Event::Image(exec.read_texture(id, region, format)?)
             }
             Request::LoadCursor {
-                theme,
-                names,
                 size,
                 fallback,
                 first_id,
             } => {
-                let images = self.cursors.load(&theme, &names, size, fallback)?;
+                let images = cursor::load_cursor(fds.pop_front(), size, fallback)?;
                 Event::Cursor {
                     frames: exec.import_cursor(&images, first_id)?,
                 }
+            }
+            Request::Lockdown => {
+                if self.sandbox {
+                    sandbox::lockdown().context("error applying seccomp sandbox")?;
+                    // Applying it twice would just stack filters.
+                    self.sandbox = false;
+                } else {
+                    debug!("Lockdown ignored: GPU server runs in-process");
+                }
+                Event::Ack
             }
             Request::EncodePng { token, id, region } => {
                 let image = match exec.read_texture(id, region, Fourcc::Abgr8888 as u32) {
@@ -261,6 +271,9 @@ impl Server {
                 allow_dmabuf,
                 force_invalid_modifier,
             } => {
+                if let Some(socket) = fds.pop_front() {
+                    self.casting.connect(socket)?;
+                }
                 let gbm = if allow_dmabuf {
                     drm.renderer_gbm()
                 } else {

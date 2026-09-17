@@ -53,6 +53,7 @@ pub struct GpuClient {
     /// Called when an event is queued while a reply was awaited. The socket is no longer
     /// readable by then, so a level-triggered poll would not notice; this wakes the loop.
     waker: Option<Box<dyn Fn() + Send>>,
+    locked_down: bool,
 }
 
 impl GpuClient {
@@ -73,6 +74,9 @@ impl GpuClient {
             .arg(CHILD_SOCKET_FD.to_string())
             .arg("--mode")
             .arg(mode.as_str())
+            // No home directory in the sandbox, so no shader cache on disk.
+            .env("MESA_SHADER_CACHE_DISABLE", "true")
+            .env("MESA_GLSL_CACHE_DISABLE", "true")
             .stdin(Stdio::null());
         unsafe {
             cmd.pre_exec(move || {
@@ -92,6 +96,7 @@ impl GpuClient {
             caps: None,
             events: VecDeque::new(),
             waker: None,
+            locked_down: false,
         };
         client.handshake()?;
         Ok(client)
@@ -102,7 +107,7 @@ impl GpuClient {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
             .name("gpu-server".into())
-            .spawn(move || super::server::run(theirs.into_fd(), mode))?;
+            .spawn(move || super::server::run(theirs.into_fd(), mode, false))?;
         let mut client = Self {
             chan: ours,
             child: None,
@@ -110,6 +115,7 @@ impl GpuClient {
             caps: None,
             events: VecDeque::new(),
             waker: None,
+            locked_down: false,
         };
         client.handshake()?;
         Ok(client)
@@ -256,6 +262,7 @@ impl GpuClient {
         cursor_mode: CastCursorMode,
         allow_dmabuf: bool,
         force_invalid_modifier: bool,
+        pipewire: Option<BorrowedFd<'_>>,
     ) -> anyhow::Result<CastCursorMode> {
         let req = Request::CastStart {
             stream,
@@ -267,7 +274,8 @@ impl GpuClient {
             allow_dmabuf,
             force_invalid_modifier,
         };
-        match self.request(&req, &[])? {
+        let fds: Vec<BorrowedFd<'_>> = pipewire.into_iter().collect();
+        match self.request(&req, &fds)? {
             Event::CastStarted { cursor_mode } => Ok(cursor_mode),
             other => Err(anyhow!("expected CastStarted, got {other:?}")),
         }
@@ -288,22 +296,32 @@ impl GpuClient {
         Self::expect_ack(self.request(&req, &[])?)
     }
 
+    /// Seals the GPU process with seccomp; see `Request::Lockdown`. A no-op after the first
+    /// success, so every "the devices are in" site can call it.
+    pub fn lockdown(&mut self) -> anyhow::Result<()> {
+        if self.locked_down {
+            return Ok(());
+        }
+        Self::expect_ack(self.request(&Request::Lockdown, &[])?)?;
+        self.locked_down = true;
+        Ok(())
+    }
+
+    /// `icon` is the opened Xcursor file, if one was found.
     pub fn load_cursor(
         &mut self,
-        theme: &str,
-        names: &[String],
+        icon: Option<BorrowedFd<'_>>,
         size: i32,
         fallback: bool,
         first_id: TexId,
     ) -> anyhow::Result<Vec<CursorFrameDesc>> {
         let req = Request::LoadCursor {
-            theme: theme.to_owned(),
-            names: names.to_vec(),
             size,
             fallback,
             first_id,
         };
-        match self.request(&req, &[])? {
+        let fds: Vec<BorrowedFd<'_>> = icon.into_iter().collect();
+        match self.request(&req, &fds)? {
             Event::Cursor { frames } => Ok(frames),
             other => Err(anyhow!("expected Cursor, got {other:?}")),
         }
