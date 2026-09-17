@@ -77,6 +77,12 @@ in
     isSystemUser = true;
   };
   users.groups.app-sneaky.gid = 100004;
+  users.users.app-chromium = {
+    uid = 100005;
+    group = "app-chromium";
+    isSystemUser = true;
+  };
+  users.groups.app-chromium.gid = 100005;
 
   environment.etc."niri/identity.toml".text = ''
     forker = "/run/niri/forker.sock"
@@ -102,6 +108,14 @@ in
     name = "flower"
     uid = 100003
     exec = ["${pkgs.weston}/bin/weston-flower"]
+
+    # A real browser: GPU, its own home, flags come from here and never from the caller.
+    [[app]]
+    name = "chromium"
+    uid = 100005
+    exec = ["${pkgs.chromium}/bin/chromium", "--ozone-platform=wayland", "https://example.com"]
+    gpu = true
+    groups = ["render"]
 
     # Asks for a group the forker was not told to hand out: must be refused.
     [[app]]
