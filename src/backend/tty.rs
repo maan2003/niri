@@ -76,9 +76,8 @@ pub struct Tty {
     renderer: RemoteRenderer,
     /// Set once the GPU process has a renderer (after the primary device was added).
     renderer_ready: bool,
-    /// Our executable, for (re)spawning the GPU process. `None` runs it in-process
-    /// (`NIRI_GPU_THREAD`), which can't be respawned.
-    gpu_exe: Option<PathBuf>,
+    /// Our executable, for (re)spawning the GPU process.
+    gpu_exe: PathBuf,
     /// The GPU process socket in the event loop.
     gpu_source: RegistrationToken,
     /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
@@ -250,15 +249,11 @@ impl Tty {
         let ignored_nodes = compute_ignored_nodes(&config.borrow(), render_node_hint);
 
         // The GPU process gets every device we can open right now and seals itself once
-        // they're in. NIRI_GPU_THREAD runs it in-process instead, for debugging.
-        let gpu_exe = if std::env::var_os("NIRI_GPU_THREAD").is_some() {
-            None
-        } else {
-            Some(std::env::current_exe().context("error getting our executable path")?)
-        };
+        // they're in.
+        let gpu_exe = std::env::current_exe().context("error getting our executable path")?;
         let mut session = session;
         let (mut client, pending_devices, unusable_devices) = spawn_gpu(
-            gpu_exe.as_deref(),
+            &gpu_exe,
             &mut session,
             &udev_dispatcher,
             &ignored_nodes,
@@ -371,17 +366,6 @@ impl Tty {
         // rendering device to be known, whatever the order udev lists them in.
         let pending = mem::take(&mut self.pending_devices);
         self.register_devices(niri, pending);
-
-        if self.gpu_exe.is_none() {
-            // In-process server: it gets its devices at runtime.
-            let udev = self.udev_dispatcher.clone();
-            let udev = udev.as_source_ref();
-            let devices: Vec<_> = udev
-                .device_list()
-                .map(|(id, path)| (id, path.to_owned()))
-                .collect();
-            self.add_devices(niri, devices);
-        }
     }
 
     /// Registers devices the GPU process accepted, then scans their connectors.
@@ -413,7 +397,7 @@ impl Tty {
         self.unusable_devices.clear();
 
         let res = spawn_gpu(
-            self.gpu_exe.as_deref(),
+            &self.gpu_exe,
             &mut self.session,
             &self.udev_dispatcher,
             &self.ignored_nodes,
@@ -453,7 +437,7 @@ impl Tty {
 
     /// Adds `devices` (any order), then scans the connectors of the ones that worked.
     fn add_devices(&mut self, niri: &mut Niri, devices: Vec<(dev_t, PathBuf)>) {
-        if !self.renderer_ready && self.gpu_exe.is_some() {
+        if !self.renderer_ready {
             // The sealed GPU process can only render on a device it was started with. Restart
             // it if these are new to it (a device it already failed on stays failed).
             let new = devices.iter().any(|(dev_id, _)| {
@@ -527,7 +511,7 @@ impl Tty {
 
                 self.ignored_nodes = self.compute_ignored_nodes();
 
-                if !self.renderer_ready && self.gpu_exe.is_some() {
+                if !self.renderer_ready {
                     // Started on an inactive VT (or the rendering device is gone): the sealed
                     // GPU process cannot bring up a renderer, so start over with a fresh one.
                     self.respawn_gpu(niri);
@@ -2283,21 +2267,15 @@ fn open_device(
 
 /// Opens every usable DRM device (when the session is active) and starts the GPU process with
 /// them. Returns the client, the devices it accepted, and the ones it rejected (closed here,
-/// not to be retried). `exe: None` runs the server in-process instead, without devices.
+/// not to be retried).
 fn spawn_gpu(
-    exe: Option<&Path>,
+    exe: &Path,
     session: &mut LibSeatSession,
     udev: &Dispatcher<'static, UdevBackend, State>,
     ignored_nodes: &HashSet<DrmNode>,
     render_node_hint: Option<DrmNode>,
 ) -> anyhow::Result<(GpuClient, Vec<PendingDevice>, HashSet<DrmNode>)> {
     let _span = tracy_client::span!("spawn_gpu");
-
-    let Some(exe) = exe else {
-        warn!("running the GPU server in-process (NIRI_GPU_THREAD)");
-        let client = GpuClient::spawn_thread(GpuMode::Drm)?;
-        return Ok((client, Vec::new(), HashSet::new()));
-    };
 
     let mut opened = Vec::new();
     if session.is_active() {
