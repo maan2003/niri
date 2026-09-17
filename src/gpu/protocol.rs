@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -537,11 +537,16 @@ pub enum Request {
 
     // DRM/KMS. The core opens the device through libseat and hands over the fd.
     /// Fd attached. Reply: `DeviceAdded`.
+    ///
+    /// The renderer is created on whichever device's EGL display resolves to
+    /// `primary_render_node`. That's not always the render node's own card: on Asahi the GPU's
+    /// card node has no KMS and Mesa renders through the display controller's node instead.
     AddDevice {
         dev: DevId,
         path: String,
-        primary: bool,
+        primary_render_node: DevId,
     },
+    /// Reply: `DeviceRemoved`.
     RemoveDevice {
         dev: DevId,
     },
@@ -793,6 +798,10 @@ pub enum Event {
     DeviceAdded {
         render_node: Option<DevId>,
         caps: Option<Caps>,
+    },
+    /// `renderer_dropped` is set when the removed device owned the renderer.
+    DeviceRemoved {
+        renderer_dropped: bool,
     },
     Scan {
         connected: Vec<ConnectorInfo>,

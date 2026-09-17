@@ -326,34 +326,40 @@ impl Server {
                 available: exec.set_custom_shader(kind, src.as_deref())?,
             },
 
-            Request::AddDevice { dev, path, primary } => {
+            Request::AddDevice {
+                dev,
+                path,
+                primary_render_node,
+            } => {
                 let fd = fds.pop_front().context("AddDevice needs the device fd")?;
-                debug!("adding DRM device {dev} ({path}), primary: {primary}");
+                debug!(
+                    "adding DRM device {dev} ({path}), primary render node: {primary_render_node}"
+                );
                 let loop_handle = self.loop_handle.clone();
-                let added = drm.add_device(exec, fd, dev, primary, |notifier, dev| {
-                    loop_handle
-                        .insert_source(
-                            notifier,
-                            move |event, meta, server: &mut Server| match event {
-                                DrmEvent::VBlank(crtc) => {
-                                    let meta = meta.expect("VBlank events must have metadata");
-                                    if let Some(event) = server.drm.on_vblank(dev, crtc, meta) {
-                                        if let Err(err) = server.chan.send(&event, &[]) {
-                                            warn!("error sending vblank to core: {err}");
+                let added =
+                    drm.add_device(exec, fd, dev, primary_render_node, |notifier, dev| {
+                        loop_handle
+                            .insert_source(notifier, move |event, meta, server: &mut Server| {
+                                match event {
+                                    DrmEvent::VBlank(crtc) => {
+                                        let meta = meta.expect("VBlank events must have metadata");
+                                        if let Some(event) = server.drm.on_vblank(dev, crtc, meta) {
+                                            if let Err(err) = server.chan.send(&event, &[]) {
+                                                warn!("error sending vblank to core: {err}");
+                                            }
                                         }
                                     }
+                                    DrmEvent::Error(error) => {
+                                        warn!("DRM error: {error}");
+                                        server.notify(GpuEvent::DeviceError {
+                                            dev,
+                                            message: error.to_string(),
+                                        });
+                                    }
                                 }
-                                DrmEvent::Error(error) => {
-                                    warn!("DRM error: {error}");
-                                    server.notify(GpuEvent::DeviceError {
-                                        dev,
-                                        message: error.to_string(),
-                                    });
-                                }
-                            },
-                        )
-                        .map_err(|err| anyhow::anyhow!("error registering DRM notifier: {err}"))
-                })?;
+                            })
+                            .map_err(|err| anyhow::anyhow!("error registering DRM notifier: {err}"))
+                    })?;
                 let caps = if added.renderer_created {
                     Some(exec.caps()?)
                 } else {
@@ -365,15 +371,17 @@ impl Server {
                 }
             }
             Request::RemoveDevice { dev } => {
+                let mut renderer_dropped = false;
                 if let Some((token, was_primary)) = drm.remove_device(dev) {
                     self.loop_handle.remove(token);
                     if was_primary {
                         // The renderer's EGL display belongs to this device; a re-added
                         // primary creates a fresh one and reports caps again.
                         exec.clear_renderer();
+                        renderer_dropped = true;
                     }
                 }
-                Event::Ack
+                Event::DeviceRemoved { renderer_dropped }
             }
             Request::PauseDevices => {
                 drm.pause();

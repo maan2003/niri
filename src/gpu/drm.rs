@@ -73,7 +73,8 @@ struct Device {
     drm: DrmDevice,
     gbm: GbmDevice<DeviceFd>,
     allocator: GbmAllocator<DeviceFd>,
-    /// Set for the device that owns the renderer; others are display-only.
+    /// Set when the device renders on the primary render node (it owns or shares the renderer's
+    /// GPU); `None` means display-only, allocating from the rendering device.
     render_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, Surface>,
@@ -170,50 +171,71 @@ impl DrmState {
         exec: &mut Executor,
         fd: OwnedFd,
         dev: DevId,
-        primary: bool,
+        primary_render_node: DevId,
         register: impl FnOnce(DrmDeviceNotifier, DevId) -> anyhow::Result<RegistrationToken>,
     ) -> anyhow::Result<AddedDevice> {
         ensure!(!self.devices.contains_key(&dev), "device already added");
         let node = DrmNode::from_dev_id(dev).context("error creating DrmNode")?;
         let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
+        // Render-only cards (no KMS) fail here, same as upstream niri. On Asahi that's the GPU's
+        // own card node; Mesa renders through the display controller's node instead, so the
+        // renderer comes up when that device is added below.
         let (drm, notifier) = DrmDevice::new(device_fd.clone(), false).context("DrmDevice::new")?;
         let gbm = GbmDevice::new(device_fd.device_fd()).context("GbmDevice::new")?;
 
-        let mut render_node = None;
-        let mut renderer_created = false;
-        if primary {
+        // Like upstream's try_initialize_gpu: probe EGL on every device and let the one that
+        // resolves to the primary render node own the renderer.
+        let try_initialize_gpu = || -> anyhow::Result<(EGLDisplay, DrmNode)> {
             let display = unsafe { EGLDisplay::new(gbm.clone()).context("EGLDisplay::new")? };
             let egl_device = EGLDevice::device_for_display(&display).context("EGLDevice")?;
             ensure!(
                 !egl_device.is_software(),
                 "software EGL renderers are skipped"
             );
-            render_node = Some(
-                egl_device
-                    .try_get_render_node()
-                    .ok()
-                    .flatten()
-                    .unwrap_or(node),
-            );
-            if !exec.has_renderer() {
-                let context = EGLContext::new_with_priority(&display, ContextPriority::High)
-                    .context("EGLContext::new")?;
-                let mut renderer =
-                    unsafe { GlesRenderer::new(context).context("GlesRenderer::new")? };
-                resources::init(&mut renderer);
-                shaders::init(&mut renderer);
-                exec.set_renderer(renderer);
-                renderer_created = true;
+            let render_node = egl_device
+                .try_get_render_node()
+                .ok()
+                .flatten()
+                .unwrap_or(node);
+            Ok((display, render_node))
+        };
+
+        let mut render_node = None;
+        let mut renderer_created = false;
+        match try_initialize_gpu() {
+            Ok((display, egl_render_node)) if egl_render_node.dev_id() == primary_render_node => {
+                debug!("device {node} renders on the primary render node {egl_render_node}");
+                render_node = Some(egl_render_node);
+                if !exec.has_renderer() {
+                    let context = EGLContext::new_with_priority(&display, ContextPriority::High)
+                        .context("EGLContext::new")?;
+                    let mut renderer =
+                        unsafe { GlesRenderer::new(context).context("GlesRenderer::new")? };
+                    resources::init(&mut renderer);
+                    shaders::init(&mut renderer);
+                    exec.set_renderer(renderer);
+                    renderer_created = true;
+                }
+                if renderer_created || self.primary.is_none() {
+                    self.primary = Some(dev);
+                }
             }
-            self.primary = Some(dev);
+            Ok((_, egl_render_node)) => {
+                // A secondary GPU. We have a single renderer, so treat it as display-only: its
+                // buffers come from the primary GPU and are imported for scanout.
+                debug!("device {node} renders on {egl_render_node}, using it as display-only");
+            }
+            Err(err) => {
+                debug!("failed to initialize EGL on {node}, using it as display-only: {err:?}");
+            }
         }
 
-        let allocator_gbm = if primary {
+        let allocator_gbm = if render_node.is_some() {
             gbm.clone()
         } else if let Some(primary) = self.primary.and_then(|p| self.devices.get(&p)) {
             primary.gbm.clone()
         } else {
-            bail!("no allocator available for device (primary device not added yet)");
+            bail!("no allocator available for device (rendering device not added yet)");
         };
         let allocator = GbmAllocator::new(
             allocator_gbm,

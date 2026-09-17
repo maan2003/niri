@@ -548,7 +548,7 @@ impl Tty {
             Request::AddDevice {
                 dev: device_id,
                 path: path.to_string_lossy().into_owned(),
-                primary: is_primary,
+                primary_render_node: self.primary_render_node.dev_id(),
             },
             &[gpu_fd],
         );
@@ -796,13 +796,23 @@ impl Tty {
             self.connector_disconnected(niri, output);
         }
 
-        if let Err(err) = self.request_ack(Request::RemoveDevice { dev: device_id }) {
-            warn!("error removing device in GPU process: {err:?}");
-        }
+        // The renderer isn't necessarily on the primary node (Asahi renders through the display
+        // controller's card), so ask the GPU process whether it went away.
+        let renderer_dropped = match self.request(Request::RemoveDevice { dev: device_id }) {
+            Ok(Event::DeviceRemoved { renderer_dropped }) => renderer_dropped,
+            Ok(other) => {
+                warn!("unexpected reply to RemoveDevice: {other:?}");
+                node == self.primary_node
+            }
+            Err(err) => {
+                warn!("error removing device in GPU process: {err:?}");
+                node == self.primary_node
+            }
+        };
         let device = self.devices.remove(&node).unwrap();
 
-        if node == self.primary_node {
-            debug!("the primary device is gone; disabling the dmabuf global");
+        if renderer_dropped && self.renderer_ready {
+            debug!("the rendering device is gone; disabling the dmabuf global");
             self.renderer_ready = false;
             // Cursor textures lived in the renderer that just went away.
             niri.cursor_manager.clear_cache();
