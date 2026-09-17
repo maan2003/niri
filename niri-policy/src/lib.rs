@@ -267,6 +267,14 @@ pub mod client;
 pub mod daemon;
 pub mod rpc;
 
+/// Environment names the compositor and the identity daemon agree on.
+pub mod env {
+    /// The absolute path of the compositor's apps socket, sent beside the session's own
+    /// `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`. The identity daemon makes it the
+    /// `WAYLAND_DISPLAY` of every app that is not the human.
+    pub const APPS_WAYLAND_DISPLAY: &str = "NIRI_APPS_WAYLAND_DISPLAY";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

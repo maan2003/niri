@@ -47,7 +47,7 @@ pub fn fork(socket: &Path, request: &Request) -> io::Result<u32> {
 }
 
 /// Who may ask, for which UIDs, and which supplementary groups they may hand out. A peer may
-/// always fork as itself.
+/// always fork as itself (the child still goes through the UID switch: it is never root).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowed {
     pub peer: u32,
@@ -212,6 +212,9 @@ impl Server {
         }
         let mut all_gids = vec![gid];
         all_gids.extend(gids);
+        // Root always becomes the requested UID, including a peer forking "as itself": the
+        // child must never keep our privileges. Unprivileged (tests) has nothing to drop.
+        let switch_uid = we_are_root;
 
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
@@ -225,7 +228,7 @@ impl Server {
                     use std::io::Write as _;
                     procs.write_all(b"0")?;
                 }
-                if !as_self {
+                if switch_uid {
                     if libc::setgroups(all_gids.len(), all_gids.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }

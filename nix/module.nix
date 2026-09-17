@@ -23,7 +23,25 @@ let
     ] ++ appEntries;
   };
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
-  appUsers = lib.filterAttrs (_: app: app.uid != null) cfg.apps;
+  humanUid = config.users.users.${cfg.user}.uid;
+  inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
+  # Apps in the range get a passwd entry; the human's own tools share the human's. Decided by
+  # the range, not by looking up the human's uid, which would recurse through `users.users`.
+  appUsers = lib.filterAttrs (_: app: inRange app.uid) cfg.apps;
+  # One launcher entry per app. A launcher runs these as the human; the compositor then asks
+  # the identity daemon, so the entry carries a name and nothing else.
+  desktopEntries = pkgs.runCommand "niri-desktop-entries" { } (
+    lib.concatStrings (lib.mapAttrsToList (name: app: ''
+      mkdir -p $out/share/applications
+      cat > $out/share/applications/${name}.desktop <<EOF
+      [Desktop Entry]
+      Type=Application
+      Name=${name}
+      Exec=${cfg.package}/bin/niri msg action spawn -- ${name}
+      ${lib.optionalString (app.icon != null) "Icon=${app.icon}"}
+      EOF
+    '') cfg.apps)
+  );
 in
 {
   options.services.niri-desktop = {
@@ -56,6 +74,7 @@ in
       default = {
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         PULSE_SERVER = "unix:/run/pulse/native";
+        XDG_DATA_DIRS = "/run/current-system/sw/share";
       };
       description = "Environment every app gets.";
     };
@@ -87,12 +106,16 @@ in
 
   config = lib.mkIf cfg.enable {
     assertions = lib.mapAttrsToList (name: app: {
-      assertion = app.uid >= cfg.uidRange.start && app.uid < rangeEnd;
-      message = "services.niri-desktop.apps.${name}.uid ${toString app.uid} is outside ${toString cfg.uidRange.start}..${toString rangeEnd}";
+      assertion = app.uid == humanUid || inRange app.uid;
+      message = "services.niri-desktop.apps.${name}.uid ${toString app.uid} is outside ${toString cfg.uidRange.start}..${toString rangeEnd} and not the human's";
     }) cfg.apps ++ [
       {
-        assertion = lib.length (lib.unique (map (a: a.uid) (lib.attrValues cfg.apps))) == lib.length (lib.attrValues cfg.apps);
+        assertion = lib.length (lib.unique (map (a: a.uid) (lib.attrValues appUsers))) == lib.length (lib.attrValues appUsers);
         message = "services.niri-desktop.apps: two apps share a uid";
+      }
+      {
+        assertion = lib.all (a: a.trusted) (lib.attrValues (lib.filterAttrs (_: a: a.uid == humanUid) cfg.apps));
+        message = "services.niri-desktop.apps: an app on the human's uid must be trusted";
       }
     ];
 
@@ -117,7 +140,7 @@ in
 
     environment.etc."niri/identity.toml".source = identityFile;
     environment.etc."niri/config.kdl".text = cfg.config;
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [ cfg.package desktopEntries ];
 
     systemd.services.niri-forker = {
       wantedBy = [ "multi-user.target" ];

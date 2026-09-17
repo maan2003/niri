@@ -19,7 +19,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
-use niri_policy::{AppPolicy, Global as PolicyGlobal, PolicyClient};
+use niri_policy::{env as niri_identity_env, AppPolicy, Global as PolicyGlobal, PolicyClient};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{InputTime, Keycode};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -3123,17 +3123,22 @@ impl Niri {
         };
         let app = app.clone();
         let mut env = Vec::new();
-        let display = self
-            .apps_socket
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| {
-                self.socket_name
-                    .as_ref()
-                    .map(|s| s.to_string_lossy().into_owned())
-            });
-        if let Some(display) = display {
-            env.push(("WAYLAND_DISPLAY".to_owned(), display));
+        // Our own session: the human's tools (launcher, bar) run as us and use these. The
+        // identity daemon swaps in the apps socket for everyone else.
+        if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
+            env.push(("XDG_RUNTIME_DIR".to_owned(), runtime_dir));
+        }
+        if let Some(name) = &self.socket_name {
+            env.push((
+                "WAYLAND_DISPLAY".to_owned(),
+                name.to_string_lossy().into_owned(),
+            ));
+        }
+        if let Some(path) = &self.apps_socket {
+            env.push((
+                niri_identity_env::APPS_WAYLAND_DISPLAY.to_owned(),
+                path.to_string_lossy().into_owned(),
+            ));
         }
         if let Some(ipc) = &self.ipc_server {
             if let Some(path) = &ipc.socket_path {

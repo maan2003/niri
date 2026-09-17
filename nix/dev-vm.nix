@@ -66,8 +66,8 @@ in
   services.niri-desktop = {
     enable = true;
     user = "alice";
-    config = ''
-      hotkey-overlay { skip-at-startup; }
+    # niri's stock binds (its spawn lines name apps that do not exist here and are refused).
+    config = builtins.replaceStrings [ "// skip-at-startup" ] [ "skip-at-startup" ] (builtins.readFile ../resources/default-config.kdl) + ''
       spawn-at-startup "hello"
       spawn-at-startup "gpu-probe"
       spawn-at-startup "flower"
@@ -75,6 +75,9 @@ in
       spawn-at-startup "hello" "extra-argument"
     '';
     apps = {
+      # The launcher: the human's own tool, trusted, runs as the human (Mod+D in the stock
+      # binds). It starts apps through `niri msg`, so the compositor does the launching.
+      fuzzel = { uid = 1000; trusted = true; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; };
       hello = { uid = 100001; exec = [ "${probe}" ]; };
       gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; };

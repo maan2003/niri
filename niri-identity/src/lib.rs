@@ -107,11 +107,21 @@ pub fn load_config(path: &Path) -> Result<Config, Error> {
         if !names.insert(&app.name) {
             return Err(Error::Config(format!("app {:?} listed twice", app.name)));
         }
+        // A UID is one identity. The exception is the human's own tools (launcher, bar):
+        // they may share the human's UID, but then every entry on it must be trusted, so a
+        // lookup can never confuse an untrusted app with a trusted one.
         if !uids.insert(app.uid) {
-            return Err(Error::Config(format!(
-                "uid {} used by more than one app",
-                app.uid
-            )));
+            let all_trusted = config
+                .apps
+                .iter()
+                .filter(|a| a.uid == app.uid)
+                .all(|a| a.trusted);
+            if !all_trusted {
+                return Err(Error::Config(format!(
+                    "uid {} used by more than one app; only trusted apps may share a UID",
+                    app.uid
+                )));
+            }
         }
         if app.exec.as_ref().is_some_and(|e| e.is_empty()) {
             return Err(Error::Config(format!(
@@ -143,6 +153,34 @@ impl Identity {
     fn app(&self, name: &str) -> Option<&AppConfig> {
         self.config.apps.iter().find(|a| a.name == name)
     }
+
+    /// The child's environment: ours (`PATH`..), the config's `[env]`, then the compositor's.
+    /// The compositor sends its own session (`XDG_RUNTIME_DIR`, a relative `WAYLAND_DISPLAY`)
+    /// plus the apps socket path. The human's tools keep the session and get our `HOME`;
+    /// every other app gets the apps socket as `WAYLAND_DISPLAY` (the forker sets its
+    /// `HOME` and `XDG_RUNTIME_DIR`).
+    fn env_for(&self, app: &AppConfig, env: &[(String, String)], me: u32) -> Vec<(String, String)> {
+        let mut full_env = self.base_env.clone();
+        full_env.extend(self.config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        full_env.extend(env.iter().cloned());
+        let apps_display = full_env
+            .iter()
+            .find(|(k, _)| k == niri_policy::env::APPS_WAYLAND_DISPLAY)
+            .map(|(_, v)| v.clone());
+        full_env.retain(|(k, _)| k != niri_policy::env::APPS_WAYLAND_DISPLAY);
+        if app.uid == me {
+            if let Ok(home) = std::env::var("HOME") {
+                full_env.push(("HOME".to_owned(), home));
+            }
+        } else {
+            full_env.retain(|(k, _)| k != "XDG_RUNTIME_DIR");
+            if let Some(display) = apps_display {
+                full_env.retain(|(k, _)| k != "WAYLAND_DISPLAY");
+                full_env.push(("WAYLAND_DISPLAY".to_owned(), display));
+            }
+        }
+        full_env
+    }
 }
 
 impl Handler for Identity {
@@ -160,9 +198,7 @@ impl Handler for Identity {
             .app(name)
             .ok_or_else(|| format!("unknown app {name:?}; add it to identity.toml"))?;
         let argv = app.exec.clone().unwrap_or_else(|| vec![app.name.clone()]);
-        let mut full_env = self.base_env.clone();
-        full_env.extend(self.config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        full_env.extend(env.iter().cloned());
+        let full_env = self.env_for(app, env, rustix::process::getuid().as_raw());
         let request = niri_forker::Request {
             uid: app.uid,
             groups: app.groups.clone(),
@@ -199,6 +235,54 @@ mod tests {
             PathBuf::from("/nonexistent/forker.sock"),
             Vec::new(),
         )
+    }
+
+    #[test]
+    fn trusted_apps_may_share_a_uid_untrusted_may_not() {
+        let dir = std::env::temp_dir().join(format!("niri-identity-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.toml");
+        std::fs::write(
+            &path,
+            "[[app]]\nname = \"session\"\nuid = 1000\ntrusted = true\n[[app]]\nname = \"launcher\"\nuid = 1000\ntrusted = true\n",
+        )
+        .unwrap();
+        assert!(load_config(&path).is_ok());
+        std::fs::write(
+            &path,
+            "[[app]]\nname = \"session\"\nuid = 1000\ntrusted = true\n[[app]]\nname = \"sneaky\"\nuid = 1000\n",
+        )
+        .unwrap();
+        let err = load_config(&path).unwrap_err().to_string();
+        assert!(err.contains("only trusted"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_for_the_human_apps_socket_for_the_rest() {
+        let id = identity();
+        let sent = vec![
+            ("XDG_RUNTIME_DIR".to_owned(), "/run/user/1000".to_owned()),
+            ("WAYLAND_DISPLAY".to_owned(), "wayland-1".to_owned()),
+            (
+                niri_policy::env::APPS_WAYLAND_DISPLAY.to_owned(),
+                "/run/niri-wayland/wayland".to_owned(),
+            ),
+        ];
+        let get = |env: &[(String, String)], k: &str| {
+            env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let human = id.env_for(id.app("session").unwrap(), &sent, 1000);
+        assert_eq!(get(&human, "WAYLAND_DISPLAY").as_deref(), Some("wayland-1"));
+        assert_eq!(get(&human, "XDG_RUNTIME_DIR").as_deref(), Some("/run/user/1000"));
+        assert!(get(&human, niri_policy::env::APPS_WAYLAND_DISPLAY).is_none());
+        let app = id.env_for(id.app("firefox").unwrap(), &sent, 1000);
+        assert_eq!(
+            get(&app, "WAYLAND_DISPLAY").as_deref(),
+            Some("/run/niri-wayland/wayland")
+        );
+        assert!(get(&app, "XDG_RUNTIME_DIR").is_none());
+        assert!(get(&app, niri_policy::env::APPS_WAYLAND_DISPLAY).is_none());
     }
 
     #[test]
