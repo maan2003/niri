@@ -276,5 +276,14 @@
       overlays.default = final: _: {
         niri = final.callPackage niri-package { };
       };
+
+      # `services.niri-desktop`: the multi-UID desktop from one app list (nix/module.nix).
+      nixosModules.default =
+        { pkgs, ... }:
+        {
+          imports = [
+            (import ./nix/module.nix { niri = self.packages.${pkgs.stdenv.hostPlatform.system}.niri; })
+          ];
+        };
     };
 }
