@@ -6,6 +6,7 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
 use niri_config::Config;
+use niri_policy::PolicyStore;
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
@@ -29,10 +30,14 @@ impl Fixture {
     }
 
     pub fn with_config(config: Config) -> Self {
+        Self::with_policy(config, PolicyStore::permissive())
+    }
+
+    pub fn with_policy(config: Config, policy: PolicyStore) -> Self {
         let event_loop = EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
 
-        let server = Server::new(config);
+        let server = Server::with_policy(config, policy);
         let fd = server.event_loop.as_fd().try_clone_to_owned().unwrap();
         let source = Generic::new(fd, Interest::READ, Mode::Level);
         handle

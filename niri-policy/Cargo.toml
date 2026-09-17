@@ -1,0 +1,12 @@
+[package]
+name = "niri-policy"
+version.workspace = true
+description = "Per-UID client policy shared by the compositor and the identity daemon"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml = "1"

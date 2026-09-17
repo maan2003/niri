@@ -2309,6 +2309,7 @@ dependencies = [
  "memmap2",
  "niri-config",
  "niri-ipc",
+ "niri-policy",
  "ordered-float",
  "pango",
  "pangocairo",
@@ -2367,6 +2368,14 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "niri-policy"
+version = "26.4.0"
+dependencies = [
+ "serde",
+ "toml",
 ]
 
 [[package]]

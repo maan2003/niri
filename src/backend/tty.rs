@@ -20,6 +20,7 @@ use libc::dev_t;
 use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
+use niri_policy::Global as PolicyGlobal;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
@@ -60,7 +61,7 @@ use crate::gpu::protocol::{
 };
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
-use crate::niri::{Niri, RedrawState, State};
+use crate::niri::{client_allows, Niri, RedrawState, State};
 use crate::render_helpers::blend::{BlendSpace, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{shaders, RenderCtx, RenderTarget};
@@ -704,9 +705,10 @@ impl Tty {
                     .context("error building default dmabuf feedback")?;
                 let dmabuf_global = niri
                     .dmabuf_state
-                    .create_global_with_default_feedback::<State>(
+                    .create_global_with_filter_and_default_feedback::<State, _>(
                         &niri.display_handle,
                         &default_feedback,
+                        client_allows(PolicyGlobal::Dmabuf),
                     );
                 self.dmabuf_global = Some(dmabuf_global);
             }

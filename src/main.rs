@@ -21,12 +21,13 @@ use niri::dbus;
 use niri::ipc::client::handle_msg;
 use niri::niri::State;
 use niri::utils::spawning::{
-    spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
-    REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
+    spawn_disabled, store_and_increase_nofile_rlimit, CHILD_ENV, REMOVE_ENV_RUST_BACKTRACE,
+    REMOVE_ENV_RUST_LIB_BACKTRACE,
 };
-use niri::utils::{cause_panic, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
+use niri::utils::{cause_panic, version, watcher, IS_SYSTEMD_SERVICE};
 use niri_config::{Config, ConfigPath};
 use niri_ipc::socket::SOCKET_PATH_ENV;
+use niri_policy::PolicyStore;
 use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
@@ -209,6 +210,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spawn_sh_at_startup = mem::take(&mut config.spawn_sh_at_startup);
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
+    let policy = load_policy();
+
     store_and_increase_nofile_rlimit();
 
     // Create the main event loop.
@@ -225,6 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = State::new(
         config,
+        policy,
         event_loop.handle(),
         event_loop.get_signal(),
         display,
@@ -249,17 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("IPC listening on: {}", socket_path.to_string_lossy());
     }
 
-    // Setup xwayland-satellite integration.
-    xwayland::satellite::setup(&mut state);
-    if let Some(satellite) = &state.niri.satellite {
-        let name = satellite.display_name();
-        *CHILD_DISPLAY.write().unwrap() = Some(name.to_owned());
-        env::set_var("DISPLAY", name);
-        info!("listening on X11 socket: {name}");
-    } else {
-        // Avoid spawning children in the host X11.
-        env::remove_var("DISPLAY");
-    }
+    // X11 is not supported; keep the host DISPLAY out of the session environment.
+    env::remove_var("DISPLAY");
 
     if cli.session {
         // We're starting as a session. Import our variables.
@@ -296,14 +291,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     watcher::setup(&mut state, &config_path, config_includes);
 
-    // Spawn commands from cli and auto-start.
-    spawn(cli.command, None);
-
+    // The compositor does not spawn processes; a launcher will.
+    if !cli.command.is_empty() {
+        spawn_disabled(&format!("command line {:?}", cli.command));
+    }
     for elem in spawn_at_startup {
-        spawn(elem.command, None);
+        spawn_disabled(&format!("spawn-at-startup {:?}", elem.command));
     }
     for elem in spawn_sh_at_startup {
-        spawn_sh(elem.command, None);
+        spawn_disabled(&format!("spawn-sh-at-startup {:?}", elem.command));
     }
 
     // Show the config error notification right away if needed.
@@ -409,6 +405,31 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     } else {
         // Couldn't find the home directory, or whatever.
         ConfigPath::Explicit(system_path)
+    }
+}
+
+/// Path from `NIRI_POLICY`, else `/etc/niri/policy.toml`. No file at all means a single-user
+/// setup: everyone is trusted, as before. A file that fails to load is fatal, never permissive.
+fn load_policy() -> PolicyStore {
+    let path = env::var_os("NIRI_POLICY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/niri/policy.toml"));
+    if !path.exists() {
+        warn!(
+            "no policy file at {}; every client is trusted",
+            path.display()
+        );
+        return PolicyStore::permissive();
+    }
+    match PolicyStore::load(&path) {
+        Ok(policy) => {
+            info!("loaded client policy from {}", path.display());
+            policy
+        }
+        Err(err) => {
+            error!("error loading policy file {}: {err}", path.display());
+            std::process::exit(1);
+        }
     }
 }
 

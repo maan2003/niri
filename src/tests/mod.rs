@@ -9,6 +9,7 @@ mod color_management;
 mod floating;
 mod fullscreen;
 mod layer_shell;
+mod policy;
 mod remove_output;
 mod transactions;
 mod virtual_pointer;

@@ -19,6 +19,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
+use niri_policy::{AppPolicy, Global as PolicyGlobal, PolicyStore};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{InputTime, Keycode};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -182,14 +183,13 @@ use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
 use crate::ui::screenshot_ui::{OutputScreenshot, ScreenshotUi, ScreenshotUiRenderElement};
 use crate::utils::scale::{closest_representable_scale, guess_monitor_scale};
-use crate::utils::spawning::{CHILD_DISPLAY, CHILD_ENV};
+use crate::utils::spawning::CHILD_ENV;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
-use crate::utils::xwayland::satellite::Satellite;
 use crate::utils::{
     center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
     logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
-    send_scale_transform, xwayland,
+    send_scale_transform,
 };
 use crate::window::mapped::MappedId;
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
@@ -233,6 +233,8 @@ pub enum PendingScreenshot {
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
+    /// Per-UID client policy; consulted once per new connection.
+    pub policy: PolicyStore,
 
     /// Output config from the config file.
     ///
@@ -463,8 +465,6 @@ pub struct Niri {
 
     pub ipc_server: Option<IpcServer>,
     pub ipc_outputs_changed: bool,
-
-    pub satellite: Option<Satellite>,
 
     #[cfg(feature = "xdp-gnome-screencast")]
     pub casting: Screencasting,
@@ -760,8 +760,10 @@ pub struct State {
 }
 
 impl State {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Config,
+        policy: PolicyStore,
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
@@ -794,6 +796,7 @@ impl State {
 
         let mut niri = Niri::new(
             config.clone(),
+            policy,
             event_loop,
             stop_signal,
             display,
@@ -1641,7 +1644,6 @@ impl State {
         let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
         let mut recent_windows_changed = false;
-        let mut xwls_changed = false;
         let mut old_config = self.niri.config.borrow_mut();
 
         // Reload the cursor.
@@ -1769,10 +1771,6 @@ impl State {
             recent_windows_changed = true;
         }
 
-        if config.xwayland_satellite != old_config.xwayland_satellite {
-            xwls_changed = true;
-        }
-
         *old_config = config;
 
         if let Some(outputs) = preserved_output_config {
@@ -1849,30 +1847,6 @@ impl State {
 
         if recent_windows_changed {
             self.niri.window_mru_ui.update_config();
-        }
-
-        if xwls_changed {
-            // If xwl-s was previously working and is now off, we don't try to kill it or stop
-            // watching the sockets, for simplicity's sake.
-            let was_working = self.niri.satellite.is_some();
-
-            // Try to start, or restart in case the user corrected the path or something.
-            xwayland::satellite::setup(self);
-
-            let config = self.niri.config.borrow();
-            let display_name = (!config.xwayland_satellite.off)
-                .then_some(self.niri.satellite.as_ref())
-                .flatten()
-                .map(|satellite| satellite.display_name().to_owned());
-
-            if let Some(name) = &display_name {
-                if !was_working {
-                    info!("listening on X11 socket: {name}");
-                }
-            }
-
-            // This won't change the systemd environment, but oh well.
-            *CHILD_DISPLAY.write().unwrap() = display_name;
         }
 
         // Can't really update xdg-decoration settings since we have to hide the globals for CSD
@@ -2640,8 +2614,10 @@ impl Niri {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Rc<RefCell<Config>>,
+        policy: PolicyStore,
         event_loop: LoopHandle<'static, State>,
         stop_signal: LoopSignal,
         display: Display<State>,
@@ -2668,9 +2644,7 @@ impl Niri {
 
         let (blocker_cleared_tx, blocker_cleared_rx) = mpsc::channel();
 
-        fn client_is_unrestricted(client: &Client) -> bool {
-            !client.get_data::<ClientState>().unwrap().restricted
-        }
+        use client_allows as allows;
 
         let compositor_state = CompositorState::new_v6::<State>(&display_handle);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<State>(
@@ -2697,10 +2671,12 @@ impl Niri {
         );
         let layer_shell_state = WlrLayerShellState::new_with_filter::<State, _>(
             &display_handle,
-            client_is_unrestricted,
+            allows(PolicyGlobal::LayerShell),
         );
-        let session_lock_state =
-            SessionLockManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let session_lock_state = SessionLockManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::SessionLock),
+        );
         let shm_state = ShmState::new::<State>(
             &display_handle,
             vec![wl_shm::Format::Xbgr8888, wl_shm::Format::Abgr8888],
@@ -2728,44 +2704,60 @@ impl Niri {
         let wlr_data_control_state = WlrDataControlState::new::<State, _>(
             &display_handle,
             Some(&primary_selection_state),
-            client_is_unrestricted,
+            allows(PolicyGlobal::DataControl),
         );
         let ext_data_control_state = ExtDataControlState::new::<State, _>(
             &display_handle,
             Some(&primary_selection_state),
-            client_is_unrestricted,
+            allows(PolicyGlobal::DataControl),
         );
         let presentation_state =
             PresentationState::new::<State>(&display_handle, Monotonic::ID as u32);
-        let security_context_state =
-            SecurityContextState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let security_context_state = SecurityContextState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::SecurityContext),
+        );
 
         let text_input_state = TextInputManagerState::new::<State>(&display_handle);
-        let input_method_state =
-            InputMethodManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let input_method_state = InputMethodManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::InputMethod),
+        );
         let keyboard_shortcuts_inhibit_state =
             KeyboardShortcutsInhibitState::new::<State>(&display_handle);
-        let virtual_keyboard_state =
-            VirtualKeyboardManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
-        let virtual_pointer_state =
-            VirtualPointerManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
-        let foreign_toplevel_state =
-            ForeignToplevelManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
-        let ext_workspace_state =
-            ExtWorkspaceManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
-        let mut output_management_state =
-            OutputManagementManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let virtual_keyboard_state = VirtualKeyboardManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::VirtualKeyboard),
+        );
+        let virtual_pointer_state = VirtualPointerManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::VirtualPointer),
+        );
+        let foreign_toplevel_state = ForeignToplevelManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::ForeignToplevel),
+        );
+        let ext_workspace_state = ExtWorkspaceManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::Workspaces),
+        );
+        let mut output_management_state = OutputManagementManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::OutputManagement),
+        );
         output_management_state.on_config_changed(config_.outputs.clone());
-        let screencopy_state =
-            ScreencopyManagerState::new::<State, _>(&display_handle, client_is_unrestricted);
+        let screencopy_state = ScreencopyManagerState::new::<State, _>(
+            &display_handle,
+            allows(PolicyGlobal::Screencopy),
+        );
         let image_capture_source_state = ImageCaptureSourceState::new();
         let output_capture_source_state = OutputCaptureSourceState::new_with_filter::<State, _>(
             &display_handle,
-            client_is_unrestricted,
+            allows(PolicyGlobal::ImageCopyCapture),
         );
         let image_copy_capture_state = ImageCopyCaptureState::new_with_filter::<State, _>(
             &display_handle,
-            client_is_unrestricted,
+            allows(PolicyGlobal::ImageCopyCapture),
         );
         let viewporter_state = ViewporterState::new::<State>(&display_handle);
         let background_effect_state = BackgroundEffectState::new::<State>(&display_handle);
@@ -2774,7 +2766,7 @@ impl Niri {
         let is_tty = matches!(backend, Backend::Tty(_));
         let gamma_control_manager_state =
             GammaControlManagerState::new::<State, _>(&display_handle, move |client| {
-                is_tty && !client.get_data::<ClientState>().unwrap().restricted
+                is_tty && allows(PolicyGlobal::GammaControl)(client)
             });
         // Advertise color management only when at least one output opts into HDR or wide-gamut
         // P3 in the config. This keeps it fully opt-in and off by default — with no `hdr` or
@@ -3092,10 +3084,10 @@ impl Niri {
             ipc_server,
             ipc_outputs_changed: false,
 
-            satellite: None,
-
             #[cfg(feature = "xdp-gnome-screencast")]
             casting: screencasting,
+
+            policy,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -3110,6 +3102,23 @@ impl Niri {
             credentials_unknown,
         } = client;
 
+        // Identity is the peer UID; PIDs are reused and never used for this.
+        let policy = if credentials_unknown {
+            self.policy.default_policy()
+        } else {
+            match rustix::net::sockopt::socket_peercred(&client) {
+                Ok(cred) => self.policy.lookup(cred.uid.as_raw()),
+                Err(err) => {
+                    warn!("error getting client credentials, using the default policy: {err}");
+                    self.policy.default_policy()
+                }
+            }
+        };
+        debug!(
+            "new client: policy {:?} (trusted: {}, gpu: {})",
+            policy.name, policy.trusted, policy.gpu
+        );
+
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
             compositor_state: Default::default(),
@@ -3117,6 +3126,7 @@ impl Niri {
             primary_selection_disabled: config.clipboard.disable_primary,
             restricted,
             credentials_unknown,
+            policy,
         });
 
         if let Err(err) = self.display_handle.insert_client(client, data) {
@@ -7258,6 +7268,15 @@ impl Niri {
     }
 }
 
+/// Global filter: the client's policy grants `global`, and it is not a security-context
+/// (sandboxed) connection, which sees nothing optional regardless.
+pub fn client_allows(global: PolicyGlobal) -> impl Fn(&Client) -> bool + Clone + Send + Sync {
+    move |client: &Client| {
+        let data = client.get_data::<ClientState>().unwrap();
+        !data.restricted && data.policy.allows(global)
+    }
+}
+
 pub struct NewClient {
     pub client: UnixStream,
     pub restricted: bool,
@@ -7272,6 +7291,8 @@ pub struct ClientState {
     pub restricted: bool,
     /// We cannot retrieve this client's socket credentials.
     pub credentials_unknown: bool,
+    /// What this client's UID may do; decides which optional globals it sees.
+    pub policy: Arc<AppPolicy>,
 }
 
 impl ClientData for ClientState {
