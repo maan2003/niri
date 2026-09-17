@@ -2,11 +2,17 @@
 { niri }:
 { pkgs, lib, modulesPath, ... }:
 let
+  # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire.
+  audioPage = pkgs.writeText "audio.html" ''
+    <title>audio test</title>
+    <audio autoplay loop src="file://${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga"></audio>
+  '';
   probe = pkgs.writeShellScript "probe" ''
     ${pkgs.coreutils}/bin/id > "$HOME/id.txt"
     ${pkgs.coreutils}/bin/cat /proc/self/cgroup > "$HOME/cgroup.txt"
     ${pkgs.coreutils}/bin/env > "$HOME/env.txt"
     ${pkgs.coreutils}/bin/ls -la /run /tmp /dev/shm > "$HOME/run.txt" 2>&1
+    ${pkgs.pipewire}/bin/pw-cli info 0 > "$HOME/pipewire.txt" 2>&1 || echo "pw-cli failed: $?" >> "$HOME/pipewire.txt"
     ${pkgs.procps}/bin/ps -eo user,pid,cmd > "$HOME/ps.txt" 2>&1
     ${pkgs.wayland-utils}/bin/wayland-info > "$HOME/globals.txt" 2> "$HOME/wayland-info.err"
     ${pkgs.coreutils}/bin/touch "$HOME/done"
@@ -24,6 +30,8 @@ in
     graphics = true;
     qemu.options = [
       "-vga none" "-device virtio-gpu-gl-pci"
+      # A sound card whose output is discarded; enough for PipeWire to have a real sink.
+      "-audiodev none,id=snd0" "-device ich9-intel-hda" "-device hda-duplex,audiodev=snd0"
       "-monitor unix:/tmp/niri-vm/monitor,server,nowait"
     ];
     forwardPorts = [
@@ -48,6 +56,15 @@ in
   services.seatd.enable = true;
   hardware.graphics.enable = true;
   fonts.enableDefaultPackages = true;
+
+  # One PipeWire for the machine, as its own user. Its sockets are group `pipewire`, so audio
+  # is a group the forker hands out, and the socket directory is exposed into the sandbox.
+  services.pipewire = {
+    enable = true;
+    systemWide = true;
+    pulse.enable = true;
+    alsa.enable = true;
+  };
 
   users.users.alice = {
     isNormalUser = true;
@@ -79,6 +96,12 @@ in
     isSystemUser = true;
   };
   users.groups.app-sneaky.gid = 100004;
+  users.users.app-beep = {
+    uid = 100006;
+    group = "app-beep";
+    isSystemUser = true;
+  };
+  users.groups.app-beep.gid = 100006;
   users.users.app-chromium = {
     uid = 100005;
     group = "app-chromium";
@@ -88,6 +111,10 @@ in
 
   environment.etc."niri/identity.toml".text = ''
     forker = "/run/niri/forker.sock"
+
+    [env]
+    PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
+    PULSE_SERVER = "unix:/run/pulse/native"
 
     [[app]]
     name = "session"
@@ -115,9 +142,16 @@ in
     [[app]]
     name = "chromium"
     uid = 100005
-    exec = ["${pkgs.chromium}/bin/chromium", "--ozone-platform=wayland", "https://example.com"]
+    exec = ["${pkgs.chromium}/bin/chromium", "--ozone-platform=wayland", "--autoplay-policy=no-user-gesture-required", "file://${audioPage}"]
     gpu = true
-    groups = ["render"]
+    groups = ["render", "pipewire"]
+
+    # Plays a sound: audio is just the `pipewire` group plus the exposed socket directory.
+    [[app]]
+    name = "beep"
+    uid = 100006
+    exec = ["${pkgs.pipewire}/bin/pw-play", "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga"]
+    groups = ["pipewire"]
 
     # Asks for a group the forker was not told to hand out: must be refused.
     [[app]]
@@ -146,7 +180,7 @@ in
   systemd.services.niri-forker = {
     wantedBy = [ "multi-user.target" ];
     serviceConfig = {
-      ExecStart = "${niri}/bin/niri-forker --allow 1000:100000:1000:render --socket /run/niri/forker.sock --runtime-base /run/niri-app-runtime --home-base /var/lib/niri-apps --expose /run/niri-wayland --expose /run/opengl-driver --expose /run/current-system";
+      ExecStart = "${niri}/bin/niri-forker --allow 1000:100000:1000:render,pipewire --socket /run/niri/forker.sock --runtime-base /run/niri-app-runtime --home-base /var/lib/niri-apps --expose /run/niri-wayland --expose /run/opengl-driver --expose /run/current-system --expose /run/pipewire --expose /run/pulse";
       RuntimeDirectory = "niri";
       RuntimeDirectoryMode = "0755";
       # So the forker may create a cgroup per app under its own.
