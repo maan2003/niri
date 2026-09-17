@@ -810,6 +810,7 @@ fn execute_one(
     Ok(())
 }
 
+/// Clips frame-relative rectangles (e.g. `Clear::at`) to `clip`.
 fn intersect(
     damage: &[Rect<i32>],
     clip: Option<&[Rectangle<i32, Physical>]>,
@@ -821,6 +822,33 @@ fn intersect(
     damage
         .iter()
         .flat_map(|d| clip.iter().filter_map(|c| d.intersection(*c)))
+        .collect()
+}
+
+/// Clips draw damage to `clip`. Draw commands carry their damage relative to `dst` (smithay's
+/// `render_texture_from_to` / `draw_solid` convention), while `clip` is frame-relative, so the
+/// damage is moved into frame space for the intersection and back afterwards.
+fn intersect_relative(
+    damage: &[Rect<i32>],
+    dst: Rect<i32>,
+    clip: Option<&[Rectangle<i32, Physical>]>,
+) -> Vec<Rectangle<i32, Physical>> {
+    let damage = convert::to_rects::<Physical>(damage);
+    let Some(clip) = clip else {
+        return damage;
+    };
+    let dst = convert::to_rect::<Physical>(dst);
+    damage
+        .iter()
+        .flat_map(|d| {
+            let mut d = *d;
+            d.loc += dst.loc;
+            clip.iter().filter_map(move |c| {
+                let mut i = d.intersection(*c)?;
+                i.loc -= dst.loc;
+                Some(i)
+            })
+        })
         .collect()
 }
 
@@ -864,7 +892,7 @@ pub fn run_frame(
                     .context("clear")?;
             }
             Command::DrawSolid { dst, damage, color } => {
-                let damage = intersect(&damage, clip);
+                let damage = intersect_relative(&damage, dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
@@ -884,7 +912,7 @@ pub fn run_frame(
                 program,
                 uniforms,
             } => {
-                let damage = intersect(&damage, clip);
+                let damage = intersect_relative(&damage, dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
@@ -930,7 +958,7 @@ pub fn run_frame(
                 uniforms,
                 textures,
             } => {
-                let damage = intersect(&damage, clip);
+                let damage = intersect_relative(&damage, dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
@@ -997,7 +1025,7 @@ pub fn run_frame(
                 damage,
                 uniforms,
             } => {
-                let damage = intersect(&damage, clip);
+                let damage = intersect_relative(&damage, dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
@@ -1028,5 +1056,46 @@ pub fn run_frame(
                 execute_one(guard.as_mut(), &mut tables, cmd, fds)?;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect<i32> {
+        convert::rect(Rectangle::<i32, Physical>::new(
+            (x, y).into(),
+            (w, h).into(),
+        ))
+    }
+
+    #[test]
+    fn relative_damage_is_clipped_in_frame_space() {
+        // A 100x100 element at (200, 300), fully damaged (dst-relative).
+        let damage = [rect(0, 0, 100, 100)];
+        let dst = rect(200, 300, 100, 100);
+        // Frame-space clip covering the element's bottom-right quarter.
+        let clip = [Rectangle::<i32, Physical>::new(
+            (250, 350).into(),
+            (100, 100).into(),
+        )];
+        let out = intersect_relative(&damage, dst, Some(&clip));
+        assert_eq!(
+            out,
+            vec![Rectangle::<i32, Physical>::new(
+                (50, 50).into(),
+                (50, 50).into()
+            )]
+        );
+        // Without a clip the damage passes through untouched.
+        let out = intersect_relative(&damage, dst, None);
+        assert_eq!(out, vec![Rectangle::new((0, 0).into(), (100, 100).into())]);
+        // A clip that misses the element yields nothing.
+        let clip = [Rectangle::<i32, Physical>::new(
+            (0, 0).into(),
+            (100, 100).into(),
+        )];
+        assert!(intersect_relative(&damage, dst, Some(&clip)).is_empty());
     }
 }
