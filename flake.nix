@@ -43,7 +43,10 @@
             root = ./.;
             fileset = lib.fileset.unions [
               ./niri-config
+              ./niri-forker
+              ./niri-identity
               ./niri-ipc
+              ./niri-policy
               ./niri-visual-tests
               ./resources
               ./src
@@ -59,12 +62,26 @@
           '';
 
           cargoLock = {
-            # NOTE: This is only used for Git dependencies
-            allowBuiltinFetchGit = true;
             lockFile = ./Cargo.lock;
+            # The smithay fork pin lives on a branch, not master, so builtins.fetchGit cannot
+            # find it by rev; fetch it by hash instead.
+            outputHashes = {
+              "smithay-0.7.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
+              "smithay-drm-extras-0.1.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
+            };
           };
 
           strictDeps = true;
+
+          # The identity daemon and forker ship with the compositor.
+          cargoBuildFlags = [
+            "-p"
+            "niri"
+            "-p"
+            "niri-forker"
+            "-p"
+            "niri-identity"
+          ];
 
           nativeBuildInputs = [
             rustPlatform.bindgenHook
@@ -236,6 +253,23 @@
           );
 
           default = niri;
+        }
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          # A development VM with the whole stack: seatd, virtio-gpu, root forker, identity
+          # daemon and the compositor on the tty backend. Host /src/niri is shared in for
+          # iterating on host-built binaries. `nix build .#dev-vm && ./result/bin/run-*-vm`.
+          dev-vm =
+            (lib.nixosSystem {
+              inherit system;
+              modules = [
+                (import ./nix/dev-vm.nix {
+                  niri = self.packages.${system}.niri-debug.overrideAttrs (_: {
+                    # Tests need an EGL display; the VM only needs the binaries.
+                    doCheck = false;
+                  });
+                })
+              ];
+            }).config.system.build.vm;
         }
       );
 
