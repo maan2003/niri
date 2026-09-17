@@ -14,8 +14,9 @@ use niri_forker::{Allowed, Server};
     about = "Start apps under their own UIDs on request"
 )]
 struct Args {
-    /// `peer:start:count`: peer UID allowed to ask, and the UID range it may ask for.
-    /// Repeatable. A peer may always fork as itself.
+    /// `peer:start:count[:group,group]`: peer UID allowed to ask, the UID range it may ask
+    /// for, and the supplementary groups it may hand out. Repeatable. A peer may always fork
+    /// as itself.
     #[arg(long = "allow", required = true)]
     allowed: Vec<String>,
     /// Socket path (world-connectable; the `--allow` list is the gate). Ignored under systemd

@@ -66,10 +66,10 @@ impl PolicyClient {
         Ok(policy)
     }
 
-    /// Asks the daemon to start an app; returns the UID it runs as. A daemon-side refusal
-    /// (unknown app, no forker) comes back as an error too.
-    pub fn launch(&mut self, command: Vec<String>, env: Vec<(String, String)>) -> io::Result<u32> {
-        match self.request(&Request::Launch { command, env })? {
+    /// Asks the daemon to start the named app; returns the UID it runs as. A daemon-side
+    /// refusal (unknown app, no forker) comes back as an error too.
+    pub fn launch(&mut self, app: String, env: Vec<(String, String)>) -> io::Result<u32> {
+        match self.request(&Request::Launch { app, env })? {
             Response::Launched { uid } => Ok(uid),
             Response::Error(err) => Err(io::Error::other(err)),
             other => Err(unexpected("launch", other)),

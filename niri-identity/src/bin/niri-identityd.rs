@@ -17,10 +17,6 @@ use niri_policy::daemon;
 struct Args {
     #[arg(long, default_value = "/etc/niri/identity.toml")]
     config: PathBuf,
-    /// Where allocated UIDs are remembered. Defaults to
-    /// `$XDG_STATE_HOME/niri-identity/uids.toml`.
-    #[arg(long)]
-    state: Option<PathBuf>,
     /// Socket the compositor connects to. Ignored under systemd socket activation
     /// (`LISTEN_FDS`). Defaults to `$XDG_RUNTIME_DIR/niri-identity.sock`.
     #[arg(long)]
@@ -44,24 +40,13 @@ fn main() -> ExitCode {
         .forker
         .or_else(|| config.forker.clone())
         .unwrap_or_else(|| PathBuf::from("/run/niri/forker.sock"));
-    let state = args.state.or_else(state_path);
-    let Some(state) = state else {
-        eprintln!("niri-identityd: --state not given and neither XDG_STATE_HOME nor HOME is set");
-        return ExitCode::FAILURE;
-    };
     // What every app starts with; the compositor adds its display variables per launch.
     let base_env: Vec<(String, String)> = ["PATH", "LANG", "TZ", "TERM"]
         .iter()
         .filter_map(|k| env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
 
-    let identity = match Identity::new(config, state, forker, base_env) {
-        Ok(identity) => Arc::new(identity),
-        Err(err) => {
-            eprintln!("niri-identityd: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let identity = Arc::new(Identity::new(config, forker, base_env));
 
     let listener = if env::var("LISTEN_FDS").ok().as_deref() == Some("1") {
         // SAFETY: systemd hands us fd 3 as the listening socket and nothing else owns it.
@@ -90,11 +75,4 @@ fn main() -> ExitCode {
 
 fn socket_path() -> Option<PathBuf> {
     env::var_os("XDG_RUNTIME_DIR").map(|d| PathBuf::from(d).join("niri-identity.sock"))
-}
-
-fn state_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("niri-identity/uids.toml"))
 }

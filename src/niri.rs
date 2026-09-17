@@ -3114,12 +3114,14 @@ impl Niri {
         niri
     }
 
-    /// Asks the identity daemon to start `command` as its own UID, with the environment a child
-    /// of ours would have had.
+    /// Asks the identity daemon to start the named app as its own UID, with the environment a
+    /// child of ours would have had. Only a name: arguments come from the app's manifest.
     pub fn launch(&mut self, command: Vec<String>) {
-        if command.is_empty() {
+        let [app] = command.as_slice() else {
+            warn!("spawn takes exactly one app name, got {command:?}");
             return;
-        }
+        };
+        let app = app.clone();
         let mut env = Vec::new();
         let display = self
             .apps_socket
@@ -3146,9 +3148,9 @@ impl Niri {
                 env.push((var.name.clone(), value.clone()));
             }
         }
-        match self.policy.launch(command.clone(), env) {
-            Ok(uid) => info!("launched {command:?} as uid {uid}"),
-            Err(err) => warn!("error launching {command:?}: {err}"),
+        match self.policy.launch(app.clone(), env) {
+            Ok(uid) => info!("launched {app:?} as uid {uid}"),
+            Err(err) => warn!("error launching {app:?}: {err}"),
         }
     }
 

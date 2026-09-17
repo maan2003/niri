@@ -1,7 +1,7 @@
-//! The one root piece of app launching, kept dumb on purpose: it takes `{uid, argv, env}` from
-//! an allowed peer, checks the UID is in that peer's range, becomes the UID and execs. No config
-//! files, no policy, no idea what an "app" is. The identity daemon is the brain; a bug here is
-//! reachable only through it.
+//! The one root piece of app launching, kept dumb on purpose: it takes `{uid, groups, argv,
+//! env}` from an allowed peer, checks the UID and groups are ones that peer may hand out, puts
+//! the child in a per-UID cgroup, becomes the UID and execs. No config files, no policy, no idea
+//! what an "app" is. The identity daemon is the brain; a bug here is reachable only through it.
 //!
 //! Zygote on Android has the same shape: root, forks on command, only `system` may connect.
 
@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub uid: u32,
+    /// Supplementary group names (`render` for the GPU). Each must be on the peer's allow list.
+    pub groups: Vec<String>,
     /// `argv[0]` is looked up in `PATH` from `env`.
     pub argv: Vec<String>,
     /// The child's whole environment, plus `HOME` and `XDG_RUNTIME_DIR` which the forker sets
@@ -42,32 +44,71 @@ pub fn fork(socket: &Path, request: &Request) -> io::Result<u32> {
     }
 }
 
-/// Who may ask, and for which UIDs. A peer may always fork as itself.
+/// Who may ask, for which UIDs, and which supplementary groups they may hand out. A peer may
+/// always fork as itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowed {
     pub peer: u32,
     pub start: u32,
     pub count: u32,
+    /// Group names resolved at startup, so a request can only name what is listed here.
+    pub groups: Vec<(String, u32)>,
 }
 
 impl Allowed {
-    /// `peer:start:count`, e.g. `1000:100000:65536`.
+    /// `peer:start:count[:group,group]`, e.g. `1000:100000:65536:render`.
     pub fn parse(s: &str) -> Result<Self, String> {
         let parts: Vec<_> = s.split(':').collect();
-        let [peer, start, count] = parts.as_slice() else {
-            return Err(format!("expected peer:start:count, got {s:?}"));
+        let (peer, start, count, groups) = match parts.as_slice() {
+            [peer, start, count] => (peer, start, count, ""),
+            [peer, start, count, groups] => (peer, start, count, *groups),
+            _ => return Err(format!("expected peer:start:count[:groups], got {s:?}")),
         };
         let num = |x: &str| x.parse::<u32>().map_err(|e| format!("{x:?}: {e}"));
+        let groups = groups
+            .split(',')
+            .filter(|g| !g.is_empty())
+            .map(|name| Ok((name.to_owned(), group_id(name)?)))
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             peer: num(peer)?,
             start: num(start)?,
             count: num(count)?,
+            groups,
         })
     }
 
     fn covers(&self, uid: u32) -> bool {
         self.start <= uid && (uid as u64) < self.start as u64 + self.count as u64
     }
+}
+
+/// `getgrnam_r`, so `--allow` and requests can use names.
+pub fn group_id(name: &str) -> Result<u32, String> {
+    let cname = std::ffi::CString::new(name).map_err(|_| format!("bad group name {name:?}"))?;
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; buf outlives the use of `grp`.
+    let rc = unsafe {
+        libc::getgrnam_r(
+            cname.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getgrnam {name:?}: {}",
+            io::Error::from_raw_os_error(rc)
+        ));
+    }
+    if result.is_null() {
+        return Err(format!("no such group {name:?}"));
+    }
+    Ok(grp.gr_gid)
 }
 
 pub struct Server {
@@ -127,6 +168,22 @@ impl Server {
         if !as_self && !we_are_root {
             return Err("forker is not root, can only fork as the peer itself".to_owned());
         }
+        let mut gids = Vec::new();
+        for name in &request.groups {
+            let (_, gid) = allowed
+                .groups
+                .iter()
+                .find(|(n, _)| n == name)
+                .ok_or_else(|| format!("group {name:?} is not on the peer's allow list"))?;
+            gids.push(*gid);
+        }
+        // One cgroup per app UID under our own delegated subtree, so killing an app is killing
+        // a cgroup. Only as root; unprivileged (tests) has no subtree to write.
+        let cgroup_procs = if we_are_root {
+            Some(app_cgroup_procs(uid)?)
+        } else {
+            None
+        };
 
         let mut command = Command::new(&request.argv[0]);
         command
@@ -142,12 +199,20 @@ impl Server {
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
             command.current_dir(&home);
         }
+        let mut all_gids = vec![gid];
+        all_gids.extend(gids);
 
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
+                if let Some(procs) = &cgroup_procs {
+                    // "0" means the writing process itself.
+                    let mut procs = procs;
+                    use std::io::Write as _;
+                    procs.write_all(b"0")?;
+                }
                 if !as_self {
-                    if libc::setgroups(1, &gid) != 0 {
+                    if libc::setgroups(all_gids.len(), all_gids.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                     if libc::setresgid(gid, gid, gid) != 0 {
@@ -179,7 +244,34 @@ impl Server {
         });
         Ok(pid)
     }
+}
 
+/// `cgroup.procs` of `<our cgroup>/app-<uid>`, created if needed. Requires cgroup v2 and a
+/// delegated subtree (`Delegate=yes` on the forker's unit).
+fn app_cgroup_procs(uid: u32) -> Result<std::fs::File, String> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("/proc/self/cgroup: {e}"))?;
+    // cgroup v2: a single line "0::/path".
+    let path = own
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .ok_or_else(|| "not on cgroup v2".to_owned())?
+        .trim();
+    let dir = PathBuf::from("/sys/fs/cgroup")
+        .join(path.trim_start_matches('/'))
+        .join(format!("app-{uid}"));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("mkdir {}: {e}", dir.display())),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("cgroup.procs"))
+        .map_err(|e| format!("open {}/cgroup.procs: {e}", dir.display()))
+}
+
+impl Server {
     /// `<base>/<uid>`, mode 0700, owned by the UID. Created on first launch.
     fn owned_dir(&self, base: &Path, uid: u32, gid: u32) -> Result<PathBuf, String> {
         let dir = base.join(uid.to_string());
@@ -216,6 +308,7 @@ mod tests {
                 peer: rustix::process::getuid().as_raw(),
                 start: 0,
                 count: 0,
+                groups: Vec::new(),
             }],
             runtime_base: dir.join("run"),
             home_base: dir.join("home"),
@@ -239,6 +332,7 @@ mod tests {
             &socket,
             &Request {
                 uid,
+                groups: Vec::new(),
                 argv: vec!["sh".into(), "-c".into(), "exit 0".into()],
                 env: vec![("PATH".into(), path.clone())],
             },
@@ -249,7 +343,20 @@ mod tests {
         let err = fork(
             &socket,
             &Request {
+                uid,
+                groups: vec!["render".into()],
+                argv: vec!["sh".into()],
+                env: vec![("PATH".into(), path.clone())],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("allow list"), "{err}");
+
+        let err = fork(
+            &socket,
+            &Request {
                 uid: uid.wrapping_add(1),
+                groups: Vec::new(),
                 argv: vec!["sh".into()],
                 env: vec![("PATH".into(), path)],
             },
@@ -266,9 +373,14 @@ mod tests {
             Allowed {
                 peer: 1000,
                 start: 100000,
-                count: 65536
+                count: 65536,
+                groups: Vec::new(),
             }
         );
         assert!(Allowed::parse("1000:100000").is_err());
+        assert!(Allowed::parse("1000:1:1:no-such-group-xyz").is_err());
+        // Every system has group 0.
+        let root = Allowed::parse("1000:1:1:root").unwrap();
+        assert_eq!(root.groups, vec![("root".to_owned(), 0)]);
     }
 }

@@ -292,12 +292,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     watcher::setup(&mut state, &config_path, config_includes);
 
     // The compositor does not spawn processes; the identity daemon launches apps for it.
-    state.niri.launch(
-        cli.command
-            .into_iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect(),
-    );
+    if !cli.command.is_empty() {
+        state.niri.launch(
+            cli.command
+                .into_iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect(),
+        );
+    }
     for elem in spawn_at_startup {
         state.niri.launch(elem.command);
     }

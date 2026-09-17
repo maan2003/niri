@@ -10,8 +10,8 @@ use crate::{AppPolicy, PolicyStore};
 /// What a daemon must answer. `lookup` never fails: an unknown UID gets the daemon's default.
 pub trait Handler: Send + Sync {
     fn lookup(&self, uid: u32) -> AppPolicy;
-    /// Start `command` (see [`Request::Launch`]); returns the UID it runs as.
-    fn launch(&self, command: &[String], env: &[(String, String)]) -> Result<u32, String>;
+    /// Start the named app (see [`Request::Launch`]); returns the UID it runs as.
+    fn launch(&self, app: &str, env: &[(String, String)]) -> Result<u32, String>;
 }
 
 /// A file-backed store answers lookups and cannot launch anything.
@@ -20,7 +20,7 @@ impl Handler for PolicyStore {
         (*PolicyStore::lookup(self, uid)).clone()
     }
 
-    fn launch(&self, _command: &[String], _env: &[(String, String)]) -> Result<u32, String> {
+    fn launch(&self, _app: &str, _env: &[(String, String)]) -> Result<u32, String> {
         Err("this policy daemon does not launch apps".to_owned())
     }
 }
@@ -49,7 +49,7 @@ pub fn serve_connection(stream: UnixStream, handler: &dyn Handler) -> io::Result
                 version: rpc::VERSION,
             },
             Request::Lookup { uid } => Response::Policy(handler.lookup(uid)),
-            Request::Launch { command, env } => match handler.launch(&command, &env) {
+            Request::Launch { app, env } => match handler.launch(&app, &env) {
                 Ok(uid) => Response::Launched { uid },
                 Err(err) => Response::Error(err),
             },

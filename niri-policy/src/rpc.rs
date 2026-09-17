@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -25,11 +25,11 @@ pub enum Request {
     Lookup {
         uid: u32,
     },
-    /// Start an app. `command[0]` names the app in the daemon's registry; the rest are extra
-    /// arguments. `env` is what the compositor wants children to see (`WAYLAND_DISPLAY`, the
-    /// config's `environment {}` block); the daemon adds the identity-specific parts.
+    /// Start an app by manifest name. Arguments come from the manifest, never from here. `env`
+    /// is what the compositor wants children to see (`WAYLAND_DISPLAY`, the config's
+    /// `environment {}` block); the daemon adds the identity-specific parts.
     Launch {
-        command: Vec<String>,
+        app: String,
         env: Vec<(String, String)>,
     },
 }
