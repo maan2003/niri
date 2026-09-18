@@ -4,14 +4,8 @@
 { niri }:
 { config, pkgs, lib, modulesPath, ... }:
 let
-  # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire.
-  portalWrapper = pkgs.writeShellScript "portal" ''
-    # The backend's .portal file comes from its share dir; which backend to use comes from
-    # /etc/xdg/xdg-desktop-portal/portals.conf (the module writes it).
-    export XDG_DATA_DIRS=${pkgs.xdg-desktop-portal-gnome}/share:$XDG_DATA_DIRS
-    export XDG_CURRENT_DESKTOP=niri
-    exec ${config.services.drv.portalPackage}/libexec/xdg-desktop-portal --verbose
-  '';
+  # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire,
+  # and shares the screen on a click.
   sharePage = pkgs.writeText "share.html" ''
     <!doctype html><title>share</title>
     <body style="margin:0;background:#224">
@@ -105,10 +99,7 @@ in
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
     # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
-    config = builtins.replaceStrings [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" ] [ "skip-at-startup" "{ show-launcher; }" ] (builtins.readFile ../resources/default-config.kdl) + ''
-      // The screencast and introspection D-Bus services the GNOME portal backend needs.
-      debug { dbus-interfaces-in-non-session-instances; }
-    '';
+    config = builtins.replaceStrings [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" ] [ "skip-at-startup" "{ show-launcher; }" ] (builtins.readFile ../resources/default-config.kdl);
     apps = {
       # Notification daemon on the services' bus; apps reach it only through the bridge, which
       # names them.
@@ -118,27 +109,6 @@ in
         globals = [ "layer-shell" ];
         servicesBus = true;
         sessionBusNames = [ "org.freedesktop.Notifications" ];
-        autostart = true; menu = false;
-      };
-      # Portals on the services' bus: the frontend and the GNOME backend (niri speaks its
-      # Mutter screencast API). The frontend hands screencast consumers a PipeWire fd
-      # (OpenPipeWireRemote), so it needs the socket itself.
-      portal = {
-        uid = 100012;
-        exec = [ "${portalWrapper}" ];
-        groups = [ "pipewire" ];
-        servicesBus = true;
-        sessionBusNames = [ "org.freedesktop.portal.Desktop" ];
-        autostart = true; menu = false;
-      };
-      # The only holder of the screencast grant: it shows the consent dialog and opens one
-      # session per consent.
-      portal-gnome = {
-        uid = 100013;
-        exec = [ "${pkgs.xdg-desktop-portal-gnome}/libexec/xdg-desktop-portal-gnome" ];
-        servicesBus = true;
-        sessionBusNames = [ "org.freedesktop.impl.portal.desktop.gnome" ];
-        grants = [ "screencast" ];
         autostart = true; menu = false;
       };
       # Sends one notification from inside the sandbox over its private bus. Not autostarted:

@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
 use drv_bridge::{
-    rewrite_handle, rewrite_structure, sender_component, tokens_owned_by, unique_from_component,
-    APP_ID_PREFIX, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH,
+    sender_component, unique_from_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME,
+    PORTAL_PATH,
 };
 use drv_os::fds::Kind;
 use drv_policy::seq;
@@ -23,7 +23,6 @@ use drv_portal::protocol::{self, Kind as ChooserKind};
 use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
-use zbus::zvariant::serialized::Context;
 use zbus::zvariant::{Array, ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, Value};
 use zbus::AuthMechanism;
 
@@ -84,27 +83,6 @@ fn raw_body(msg: &Message) -> anyhow::Result<RawBody> {
     ))
 }
 
-/// The body of `msg` with portal handles owned by `from` renamed to `to`. Also reports the
-/// tokens of handles owned by `from` (before renaming).
-fn rewritten_body(
-    msg: &Message,
-    from: &str,
-    to: &str,
-    tokens: &mut Vec<String>,
-) -> anyhow::Result<RawBody> {
-    let body = msg.body();
-    if body.is_empty() {
-        return Ok((Vec::new(), body.signature().clone(), Vec::new()));
-    }
-    let structure: Structure = body.deserialize().context("body")?;
-    tokens_owned_by(&Value::Structure(structure.try_clone()?), from, tokens);
-    let structure = rewrite_structure(structure, from, to)?;
-    let context = Context::new_dbus(body.data().context().endian(), 0);
-    let data = zbus::zvariant::to_bytes(context, &structure)?;
-    let fds = dup_fds(data.fds())?;
-    Ok((data.bytes().to_vec(), body.signature().clone(), fds))
-}
-
 fn with_body(builder: Builder<'_>, (bytes, signature, fds): RawBody) -> zbus::Result<Message> {
     // Safety: the bytes were a body of the same signature in another message.
     unsafe { builder.build_raw_body(&bytes, signature, fds) }
@@ -136,16 +114,18 @@ const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 /// What we claim `org.freedesktop.portal.FileChooser` is (`current_name`, `current_folder`).
 const FILE_CHOOSER_VERSION: u32 = 4;
-/// What we claim `org.freedesktop.portal.ScreenCast` is. Restore tokens are accepted and
-/// ignored: every share is a fresh consent.
+/// What we claim `org.freedesktop.portal.ScreenCast` is. Restore tokens last the app's run.
 const SCREEN_CAST_VERSION: u32 = 4;
+const SETTINGS: &str = "org.freedesktop.portal.Settings";
+const SETTINGS_VERSION: u32 = 2;
 /// `AvailableSourceTypes`: monitors, for now.
 const SOURCE_TYPES: u32 = 1;
 /// `AvailableCursorModes`: hidden, embedded, metadata.
 const CURSOR_MODES: u32 = 1 | 2 | 4;
 
-/// A PipeWire connection an app may have: it sees the core and the one node, nothing
-/// else. The permissions live in the daemon, so they hold whatever the app does with the fd.
+/// A PipeWire connection an app may have: it sees the core, the one node and the factory
+/// for its own stream node, nothing else. The permissions live in the daemon, so they hold
+/// whatever the app does with the fd.
 fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
     use pipewire::context::ContextRc;
     use pipewire::core::PW_ID_CORE;
@@ -251,18 +231,6 @@ fn caller_of(hdr: &Header<'_>) -> anyhow::Result<String> {
         Some(BusName::Unique(name)) => Ok(sender_component(name.as_str())),
         _ => bail!("no caller"),
     }
-}
-
-fn is_portal_call(hdr: &Header<'_>) -> bool {
-    let on_portal_path = hdr.path().is_some_and(|p| {
-        p.as_str() == PORTAL_PATH || p.as_str().starts_with(&format!("{PORTAL_PATH}/"))
-    });
-    on_portal_path
-        && hdr.interface().is_some_and(|i| {
-            i.starts_with("org.freedesktop.portal.") || i.as_str() == PROPERTIES
-                || i.as_str() == "org.freedesktop.DBus.Properties"
-                || i.as_str() == "org.freedesktop.DBus.Introspectable"
-        })
 }
 
 // ---------------------------------------------------------------- the human's side
@@ -491,18 +459,13 @@ struct AppLink {
     uid: u32,
     portal: Arc<Portal>,
     p2p: Connection,
+    /// The human's session bus, for the notification daemon.
     bus: Connection,
-    /// The sender component of `bus`'s unique name.
-    me: String,
     state: Mutex<LinkState>,
 }
 
 #[derive(Default)]
 struct LinkState {
-    /// Calls forwarded to the bus, by their serial there, with the app's call they answer.
-    pending: HashMap<NonZeroU32, Message>,
-    /// Portal handle token → the app-side sender component that owns it.
-    owners: HashMap<String, String>,
     /// Request handles we answer ourselves (the file chooser, `Start`), by path, with the
     /// id at drv-portal: `Request.Close` on one cancels there.
     ours: HashMap<String, u64>,
@@ -521,24 +484,7 @@ impl AppLink {
             .build_message_iterator()
             .context("peer-to-peer handshake")?;
         let p2p = Connection::from(zbus::Connection::from(p2p_iter.inner()));
-        let bus_iter = zbus::blocking::connection::Builder::session()?
-            .build_message_iterator()
-            .context("the human's session bus")?;
-        let bus = Connection::from(zbus::Connection::from(bus_iter.inner()));
-        let me = sender_component(bus.unique_name().context("no unique name")?.as_str());
-
-        // Tell the portal frontend who this connection speaks for; its dialogs and its
-        // permission store then use the manifest name.
-        let app_id = format!("{APP_ID_PREFIX}{}", app.name);
-        if let Err(err) = bus.call_method(
-            Some(PORTAL_NAME),
-            PORTAL_PATH,
-            Some("org.freedesktop.host.portal.Registry"),
-            "Register",
-            &(&app_id, HashMap::<&str, Value<'_>>::new()),
-        ) {
-            eprintln!("bridge: {}: portal registry: {err}", app.name);
-        }
+        let bus = Connection::session().context("the human's session bus")?;
 
         let link = Arc::new(AppLink {
             app,
@@ -546,20 +492,8 @@ impl AppLink {
             portal,
             p2p,
             bus,
-            me,
             state: Mutex::new(LinkState::default()),
         });
-        let from_bus = {
-            let link = link.clone();
-            std::thread::spawn(move || {
-                for msg in bus_iter {
-                    let Ok(msg) = msg else { break };
-                    if let Err(err) = link.on_bus_message(&msg) {
-                        eprintln!("bridge: {}: from bus: {err:#}", link.app.name);
-                    }
-                }
-            })
-        };
         for msg in p2p_iter {
             let Ok(msg) = msg else { break };
             if let Err(err) = link.on_app_message(&msg) {
@@ -577,10 +511,6 @@ impl AppLink {
             link.portal.cancel(id);
         }
         link.portal.forget(&link.app.name, link.uid);
-        // Dropping our bus connection ends the other thread; sessions the portal still holds
-        // for this connection go away with it.
-        zbus::block_on(link.bus.inner().clone().close())?;
-        let _ = from_bus.join();
         Ok(())
     }
 
@@ -593,23 +523,20 @@ impl AppLink {
             Ok(Ours::Reply(reply)) => reply,
             Ok(Ours::Done) => return Ok(()),
             Err(err) => failed(&hdr, format!("{err:#}"))?,
-            Ok(Ours::No) if is_portal_call(&hdr) => match self.forward_to_portal(msg, &hdr) {
-                Ok(()) => return Ok(()),
-                Err(err) => failed(&hdr, format!("{err:#}"))?,
-            },
             Ok(Ours::No) => self.other(msg, &hdr)?,
         };
         self.p2p.send(&reply)?;
         Ok(())
     }
 
-    /// Not a portal call: notifications, or nothing.
+    /// Notifications, the settings apps read at startup, or nothing: there is no other
+    /// portal behind the bridge.
     fn other(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Message> {
-        Ok(if hdr
-            .interface()
-            .is_some_and(|i| i.as_str() == NOTIFICATIONS_NAME)
-        {
+        let interface = hdr.interface().map(|i| i.as_str()).unwrap_or_default();
+        Ok(if interface == NOTIFICATIONS_NAME {
             self.notification(msg, hdr)?
+        } else if interface == SETTINGS && hdr.path().is_some_and(|p| p.as_str() == PORTAL_PATH) {
+            self.settings(msg, hdr)?
         } else {
             Message::error(hdr, "org.freedesktop.DBus.Error.UnknownMethod")?.build(&format!(
                 "the bridge does not carry {}.{}",
@@ -619,8 +546,49 @@ impl AppLink {
         })
     }
 
-    /// What we answer without xdg-desktop-portal: the file chooser and the screencast
-    /// (drv-portal's), their properties, their sessions, and `Close` on a request of ours.
+    /// `org.freedesktop.portal.Settings`: how the desktop looks, the same for every app.
+    fn settings(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Message> {
+        // 1 is "prefer dark", which the desktop is.
+        let all: [(&str, &str, Value<'static>); 2] = [
+            ("org.freedesktop.appearance", "color-scheme", Value::U32(1)),
+            ("org.freedesktop.appearance", "contrast", Value::U32(0)),
+        ];
+        let member = hdr.member().context("no member")?.as_str();
+        Ok(match member {
+            // `Read` wraps the value in a second variant, a mistake `ReadOne` corrected.
+            "Read" | "ReadOne" => {
+                let (namespace, key): (String, String) = msg.body().deserialize()?;
+                match all.into_iter().find(|(ns, k, _)| *ns == namespace && *k == key) {
+                    Some((_, _, value)) if member == "Read" => {
+                        Message::method_return(hdr)?.build(&Value::Value(Box::new(value)))?
+                    }
+                    Some((_, _, value)) => Message::method_return(hdr)?.build(&value)?,
+                    None => Message::error(hdr, "org.freedesktop.portal.Error.NotFound")?
+                        .build(&format!("no setting {namespace} {key}"))?,
+                }
+            }
+            "ReadAll" => {
+                let (patterns,): (Vec<String>,) = msg.body().deserialize()?;
+                let wanted = |ns: &str| {
+                    patterns.iter().any(|p| {
+                        p.is_empty() || p == ns || p.strip_suffix('*').is_some_and(|prefix| ns.starts_with(prefix))
+                    })
+                };
+                let mut out: HashMap<&str, HashMap<&str, Value<'_>>> = HashMap::new();
+                for (ns, key, value) in all {
+                    if wanted(ns) {
+                        out.entry(ns).or_default().insert(key, value);
+                    }
+                }
+                Message::method_return(hdr)?.build(&out)?
+            }
+            other => Message::error(hdr, "org.freedesktop.DBus.Error.UnknownMethod")?
+                .build(&format!("no {other} on {SETTINGS}"))?,
+        })
+    }
+
+    /// What we answer ourselves: the file chooser and the screencast (drv-portal's), their
+    /// properties, their sessions, and `Close` on a request of ours.
     fn ours(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Ours> {
         let path = hdr.path().context("no path")?.as_str().to_owned();
         let interface = hdr.interface().map(|i| i.as_str().to_owned()).unwrap_or_default();
@@ -635,6 +603,7 @@ impl AppLink {
             let props = |iface: &str| -> Option<Vec<(&'static str, Value<'static>)>> {
                 match iface {
                     FILE_CHOOSER => Some(vec![("version", Value::U32(FILE_CHOOSER_VERSION))]),
+                    SETTINGS => Some(vec![("version", Value::U32(SETTINGS_VERSION))]),
                     SCREEN_CAST => Some(vec![
                         ("version", Value::U32(SCREEN_CAST_VERSION)),
                         ("AvailableSourceTypes", Value::U32(SOURCE_TYPES)),
@@ -911,109 +880,6 @@ impl AppLink {
         })?;
         self.state.lock().unwrap().ours.insert(handle.clone(), id);
         Ok(Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)
-    }
-
-    fn forward_to_portal(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<()> {
-        // The shim put the app-side caller's unique name in the destination field.
-        let caller = match hdr.destination() {
-            Some(BusName::Unique(name)) => sender_component(name.as_str()),
-            _ => bail!("no caller"),
-        };
-        let path = hdr.path().context("no path")?.as_str();
-        let path = rewrite_handle(path, &caller, &self.me).unwrap_or_else(|| path.to_owned());
-        let mut tokens = Vec::new();
-        let body = rewritten_body(msg, &caller, &self.me, &mut tokens)?;
-        let mut builder = Message::method_call(path, hdr.member().context("no member")?.clone())?
-            .destination(PORTAL_NAME)?;
-        if let Some(interface) = hdr.interface() {
-            builder = builder.interface(interface.clone())?;
-        }
-        let forwarded = with_body(builder, body)?;
-        // Which portals apps still need from xdg-desktop-portal, for retiring it.
-        let iface = hdr.interface().map_or("", |i| i.as_str());
-        let about = if iface == PROPERTIES {
-            msg.body()
-                .deserialize::<(String, String)>()
-                .map(|(i, p)| format!(" {i}.{p}"))
-                .or_else(|_| msg.body().deserialize::<(String,)>().map(|(i,)| format!(" {i}")))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        eprintln!(
-            "bridge: {}: forwards {iface}.{}{about} to xdg-desktop-portal",
-            self.app.name,
-            hdr.member().map_or("", |m| m.as_str())
-        );
-        {
-            let mut state = self.state.lock().unwrap();
-            state
-                .pending
-                .insert(forwarded.primary_header().serial_num(), msg.clone());
-            for token in tokens {
-                state.owners.insert(token, caller.clone());
-            }
-        }
-        self.bus.send(&forwarded)?;
-        Ok(())
-    }
-
-    fn on_bus_message(&self, msg: &Message) -> anyhow::Result<()> {
-        let hdr = msg.header();
-        match hdr.message_type() {
-            MessageType::MethodReturn | MessageType::Error => {
-                let Some(serial) = hdr.reply_serial() else {
-                    return Ok(());
-                };
-                let Some(call) = self.state.lock().unwrap().pending.remove(&serial) else {
-                    return Ok(());
-                };
-                let call_hdr = call.header();
-                let caller = match call_hdr.destination() {
-                    Some(BusName::Unique(name)) => sender_component(name.as_str()),
-                    _ => bail!("pending call without caller"),
-                };
-                let mut tokens = Vec::new();
-                let body = rewritten_body(msg, &self.me, &caller, &mut tokens)?;
-                {
-                    let mut state = self.state.lock().unwrap();
-                    for token in tokens {
-                        state.owners.insert(token, caller.clone());
-                    }
-                }
-                self.p2p.send(&mirrored_reply(&call_hdr, &hdr, body)?)?;
-            }
-            MessageType::Signal => {
-                let path = hdr.path().context("no path")?.as_str();
-                let Some((_, owner, token)) = drv_bridge::handle_parts(path) else {
-                    return Ok(());
-                };
-                if owner != self.me {
-                    return Ok(());
-                }
-                let Some(caller) = self.state.lock().unwrap().owners.get(token).cloned() else {
-                    return Ok(());
-                };
-                let new_path = rewrite_handle(path, &self.me, &caller).context("handle")?;
-                let mut tokens = Vec::new();
-                let body = rewritten_body(msg, &self.me, &caller, &mut tokens)?;
-                {
-                    let mut state = self.state.lock().unwrap();
-                    for token in tokens {
-                        state.owners.insert(token, caller.clone());
-                    }
-                }
-                let builder = Message::signal(
-                    new_path,
-                    hdr.interface().context("no interface")?.clone(),
-                    hdr.member().context("no member")?.clone(),
-                )?
-                .destination(unique_from_component(&caller))?;
-                self.p2p.send(&with_body(builder, body)?)?;
-            }
-            MessageType::MethodCall => {}
-        }
-        Ok(())
     }
 
     fn notification(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Message> {

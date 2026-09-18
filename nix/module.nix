@@ -41,17 +41,10 @@ let
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
-  # Names only the compositor owns, and only screencast-granted users may call.
-  compositorNames = [
-    "org.gnome.Mutter.ScreenCast" "org.gnome.Mutter.ServiceChannel" "org.gnome.Mutter.DisplayConfig"
-    "org.gnome.Shell.Screenshot" "org.gnome.Shell.Introspect" "org.freedesktop.ScreenSaver"
-    "org.freedesktop.a11y.Manager"
-  ];
   # Everything any app may ask to see; the spawner refuses anything else.
   optionalExpose = lib.unique (lib.concatMap (a: lib.optional a.servicesBus "/run/drv-session" ++ a.expose) (lib.attrValues cfg.apps));
   xmlRules = f: names: lib.concatMapStrings (n: "    ${f n}\n") names;
-  # The services' bus: distinct UIDs, so the bus itself says who may own what. Defense in
-  # depth: the compositor checks its callers' grants too.
+  # The services' bus: distinct UIDs, so the bus itself says who may own what.
   sessionBusConfig = pkgs.writeText "drv-session-bus.conf" ''
     <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
      "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -64,16 +57,10 @@ let
         <allow send_destination="*"/>
         <allow receive_sender="*"/>
         <deny own="*"/>
-    ${xmlRules (n: "<deny send_destination=\"${n}\"/>") compositorNames}
-      </policy>
-      <policy user="drv-compositor">
-    ${xmlRules (n: "<allow own=\"${n}\"/>") compositorNames}
       </policy>
     ${lib.concatStrings (lib.mapAttrsToList (name: app: ''
       <policy user="app-${name}">
     ${xmlRules (n: "<allow own=\"${n}\"/>") app.sessionBusNames}
-    ${lib.optionalString (lib.elem "screencast" app.grants)
-        (xmlRules (n: "<allow send_destination=\"${n}\"/>") compositorNames)}
       </policy>
     '') cfg.apps)}
     </busconfig>
@@ -86,15 +73,6 @@ in
       type = lib.types.package;
       default = niri;
       description = "niri build with drv-supervisor, drv-appd, drv-forker, drv and drv-bridge.";
-    };
-    portalPackage = lib.mkOption {
-      type = lib.types.package;
-      # The portal cannot look into its callers' /proc across UIDs; the patch makes it treat
-      # them as host apps instead of refusing them.
-      default = pkgs.xdg-desktop-portal.overrideAttrs (old: {
-        patches = (old.patches or [ ]) ++ [ ./xdg-desktop-portal-cross-uid.patch ];
-      });
-      description = "xdg-desktop-portal frontend, patched for callers on other UIDs.";
     };
     ids = {
       appd = lib.mkOption { type = lib.types.int; default = 901; };
@@ -184,7 +162,7 @@ in
           servicesBus = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "A desktop service: sees the services' bus (notification daemon, portals).";
+            description = "A desktop service: sees the services' bus (the notification daemon).";
           };
           expose = lib.mkOption {
             type = lib.types.listOf lib.types.str;
@@ -194,13 +172,13 @@ in
           sessionBusNames = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
-            description = "Names the app may own on the services' bus (a notification daemon, a portal).";
+            description = "Names the app may own on the services' bus (a notification daemon).";
           };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           grants = lib.mkOption {
-            type = lib.types.listOf (lib.types.enum [ "lookup" "screencast" ]);
+            type = lib.types.listOf (lib.types.enum [ "lookup" ]);
             default = [ ];
-            description = "Non-Wayland capabilities; `screencast` is for the portal backend only.";
+            description = "Non-Wayland capabilities.";
           };
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
@@ -310,11 +288,10 @@ in
     boot.kernelParams = [ "drm_kms_helper.blank_on_resume=1" ];
 
     environment.etc."drv/config.kdl".text = cfg.config;
-    environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
     environment.systemPackages = [ cfg.package ];
 
-    # The services' bus: the compositor, the bridge, the notification daemon and the portals,
-    # each its own UID. Sandboxed apps never see it.
+    # The services' bus: the compositor, the bridge and the notification daemon, each its own
+    # UID. Sandboxed apps never see it.
     systemd.services.drv-session-bus = {
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
@@ -407,10 +384,10 @@ in
           "--portal-exec '${cfg.package}/bin/drv-portal --files ${cfg.files} --docs /run/drv-doc'"
           "--portal-env RUST_BACKTRACE=1"
           "--docs /run/drv-doc"
-          # The bridge: the apps' desktop services, keyed on the peer UID. Notifications and
-          # the rest of the portals still go to the services' bus; the file chooser and the
-          # screencast go down its supervisor link to drv-portal. PipeWire is for the
-          # screencast remotes: a connection per share that sees the one node.
+          # The bridge: the apps' desktop services, keyed on the peer UID. Notifications go
+          # to the services' bus; the file chooser and the screencast go down its supervisor
+          # link to drv-portal; settings it answers itself. PipeWire is for the screencast
+          # remotes: a connection per share that sees the one node.
           "--bridge-user drv-bridge"
           "--bridge-exec '${cfg.package}/bin/drv-bridge serve'"
           "--bridge-socket ${bridgeSocket}"
