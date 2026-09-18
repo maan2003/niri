@@ -78,6 +78,7 @@ pub struct Config {
     pub screenshot_path: ScreenshotPath,
     pub clipboard: Clipboard,
     pub hotkey_overlay: HotkeyOverlay,
+    pub lock: Lock,
     pub config_notification: ConfigNotification,
     pub animations: Animations,
     pub blur: Blur,
@@ -195,6 +196,7 @@ where
                 "cursor" => m_merge!(cursor),
                 "clipboard" => m_merge!(clipboard),
                 "hotkey-overlay" => m_merge!(hotkey_overlay),
+                "lock" => m_merge!(lock),
                 "config-notification" => m_merge!(config_notification),
                 "animations" => m_merge!(animations),
                 "blur" => m_merge!(blur),
@@ -1204,6 +1206,7 @@ mod tests {
                                 ),
                             },
                         ),
+                        wide_gamut_p3: false,
                         mode: Some(
                             Mode {
                                 custom: false,
@@ -1232,6 +1235,7 @@ mod tests {
                             },
                         ),
                         backdrop_color: None,
+                        ctm: None,
                         hot_corners: Some(
                             HotCorners {
                                 off: true,
@@ -1251,6 +1255,7 @@ mod tests {
                         position: None,
                         max_bpc: None,
                         hdr: None,
+                        wide_gamut_p3: false,
                         mode: Some(
                             Mode {
                                 custom: true,
@@ -1268,6 +1273,7 @@ mod tests {
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
+                        ctm: None,
                         hot_corners: None,
                         layout: None,
                     },
@@ -1279,6 +1285,7 @@ mod tests {
                         position: None,
                         max_bpc: None,
                         hdr: None,
+                        wide_gamut_p3: false,
                         mode: None,
                         modeline: Some(
                             Modeline {
@@ -1299,6 +1306,7 @@ mod tests {
                         focus_at_startup: false,
                         background_color: None,
                         backdrop_color: None,
+                        ctm: None,
                         hot_corners: None,
                         layout: None,
                     },
@@ -1542,6 +1550,9 @@ mod tests {
             hotkey_overlay: HotkeyOverlay {
                 skip_at_startup: true,
                 hide_not_bound: false,
+            },
+            lock: Lock {
+                app: None,
             },
             config_notification: ConfigNotification {
                 disable_failed: false,

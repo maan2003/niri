@@ -131,7 +131,9 @@ impl Session for DrvSeatSession {
     type Error = Error;
 
     fn open(&mut self, path: &Path, _flags: OFlags) -> Result<OwnedFd, Self::Error> {
-        let path = path.to_str().ok_or_else(|| Error("non-UTF-8 path".into()))?;
+        let path = path
+            .to_str()
+            .ok_or_else(|| Error("non-UTF-8 path".into()))?;
         let request = Request::Open {
             path: path.to_owned(),
         };

@@ -808,7 +808,11 @@ impl Niri {
 
     fn cast_session_ids(&self) -> HashSet<CastSessionId> {
         let casts = self.casting.casts.iter().map(|cast| cast.session_id);
-        let pending = self.casting.pending_dynamic_casts.iter().map(|p| p.session_id);
+        let pending = self
+            .casting
+            .pending_dynamic_casts
+            .iter()
+            .map(|p| p.session_id);
         casts.chain(pending).collect()
     }
 

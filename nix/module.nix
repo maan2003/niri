@@ -12,6 +12,7 @@ let
   sessionBus = "unix:path=/run/drv-session/bus";
   identitySocket = "/run/drv/identity.sock";
   seatSocket = "/run/drv-seat/seat.sock";
+  authSocket = "/run/drv-auth/auth.sock";
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
@@ -110,6 +111,13 @@ in
       bridge = lib.mkOption { type = lib.types.int; default = 903; };
       bus = lib.mkOption { type = lib.types.int; default = 904; };
       gpu = lib.mkOption { type = lib.types.int; default = 905; };
+      auth = lib.mkOption { type = lib.types.int; default = 906; };
+      lock = lib.mkOption { type = lib.types.int; default = 100999; description = "UID of the lock app."; };
+    };
+    idleTimeout = lib.mkOption {
+      type = lib.types.int;
+      default = 300;
+      description = "Seconds without input before the session locks again.";
     };
     uidRange = {
       start = lib.mkOption { type = lib.types.int; default = 100000; };
@@ -222,6 +230,7 @@ in
       drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
       # The GPU process, forked by drv-seatd. Mesa opens render nodes itself.
       drv-gpu = { uid = cfg.ids.gpu; group = "drv-gpu"; isSystemUser = true; extraGroups = [ "render" ]; };
+      drv-auth = { uid = cfg.ids.auth; group = "drv-auth"; isSystemUser = true; };
     };
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
       drv-identity.gid = cfg.ids.identity;
@@ -229,6 +238,7 @@ in
       drv-bridge.gid = cfg.ids.bridge;
       drv-bus.gid = cfg.ids.bus;
       drv-gpu.gid = cfg.ids.gpu;
+      drv-auth.gid = cfg.ids.auth;
       render = { };
     };
 
@@ -241,7 +251,21 @@ in
     };
 
     environment.etc."drv/identity.toml".source = identityFile;
-    environment.etc."drv/config.kdl".text = cfg.config;
+    environment.etc."drv/config.kdl".text = cfg.config + ''
+
+      // The lock screen app, launched by the compositor whenever the session is locked.
+      lock { app "lock"; }
+    '';
+
+    # The lock screen: draws and takes the PIN, nothing more. The only app with the
+    # session-lock global and the only UID drv-authd verifies for.
+    services.drv.apps.lock = {
+      uid = cfg.ids.lock;
+      exec = [ "${cfg.package}/bin/drv-lock" ];
+      globals = [ "session-lock" ];
+      env.DRV_AUTH_SOCKET = authSocket;
+      expose = [ "/run/drv-auth" ];
+    };
     environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
     environment.systemPackages = [ cfg.package desktopEntries ];
 
@@ -317,9 +341,25 @@ in
       };
     };
 
+    # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd set-pin`) and
+    # pushes the unlock straight to the compositor; the lock app only asks.
+    systemd.services.drv-authd = {
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        User = "drv-auth";
+        ExecStart = "${cfg.package}/bin/drv-authd serve --socket ${authSocket} --state-dir /var/lib/drv-auth --verifier-user app-lock --compositor-user drv-compositor --idle-timeout ${toString cfg.idleTimeout}";
+        StateDirectory = "drv-auth";
+        StateDirectoryMode = "0700";
+        RuntimeDirectory = "drv-auth";
+        RuntimeDirectoryMode = "0711";
+        Restart = "on-failure";
+        RestartSec = 1;
+      };
+    };
+
     systemd.services.drv-compositor = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-spawnd.service" "drv-session-bus.service" "drv-bridge.service" "drv-seatd.service" ];
+      after = [ "drv-spawnd.service" "drv-session-bus.service" "drv-bridge.service" "drv-seatd.service" "drv-authd.service" ];
       # Apps autostart once the compositor's socket exists; the desktop services among them
       # (`servicesBus`) need the bus, which is up before us.
       requires = [ "drv-spawnd.service" "drv-session-bus.service" "drv-seatd.service" ];
@@ -328,6 +368,7 @@ in
         # Screencasts go to the system PipeWire, like everyone's audio.
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         DRV_SEAT_SOCKET = seatSocket;
+        DRV_AUTH_SOCKET = authSocket;
         DRV_IDENTITY_SOCKET = identitySocket;
         DRV_APPS_SOCKET = "/run/drv-wayland/wayland";
         XDG_RUNTIME_DIR = "/run/drv-compositor";

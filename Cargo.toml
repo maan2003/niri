@@ -4,6 +4,8 @@ members = [
     "niri-ipc",
     "drv-policy",
     "drv-seat",
+    "drv-auth",
+    "drv-lock",
     "drv-spawn",
     "drv-identity",
     "drv-bridge",
@@ -89,6 +91,7 @@ niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
 drv-policy = { version = "26.4.0", path = "drv-policy" }
 drv-seat = { version = "26.4.0", path = "drv-seat" }
+drv-auth = { version = "26.4.0", path = "drv-auth" }
 ordered-float = "5"
 pango = { version = "0.21.5", features = ["v1_44"] }
 pangocairo = "0.21.5"

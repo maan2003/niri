@@ -2292,6 +2292,9 @@ impl State {
             Action::StopAllCasts => {
                 self.niri.stop_all_casts();
             }
+            Action::LockSession => {
+                self.niri.lock_now();
+            }
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();

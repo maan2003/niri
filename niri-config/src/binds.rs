@@ -363,6 +363,7 @@ pub enum Action {
     #[knuffel(skip)]
     StopCast(u64),
     StopAllCasts,
+    LockSession,
     ToggleOverview,
     OpenOverview,
     CloseOverview,
@@ -699,6 +700,7 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::ClearDynamicCastTarget {} => Self::ClearDynamicCastTarget,
             niri_ipc::Action::StopCast { session_id } => Self::StopCast(session_id),
             niri_ipc::Action::StopAllCasts {} => Self::StopAllCasts,
+            niri_ipc::Action::LockSession {} => Self::LockSession,
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,

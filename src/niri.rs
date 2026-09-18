@@ -176,9 +176,9 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::ui::cast_indicator::CastIndicator;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
-use crate::ui::cast_indicator::CastIndicator;
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
@@ -188,8 +188,8 @@ use crate::utils::spawning::CHILD_ENV;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, is_mapped,
-    logical_output, make_screenshot_path, output_matches_name, output_size, panel_orientation,
+    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, logical_output,
+    make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform,
 };
 use crate::window::mapped::MappedId;
@@ -439,6 +439,15 @@ pub struct Niri {
     pub mods_with_finger_scroll_binds: HashSet<Modifiers>,
 
     pub lock_state: LockState,
+    /// The session is unlocked until this monotonic time; `None` is locked. Only an `Unlock`
+    /// from drv-authd sets it, so a lock client never unlocks anything by itself.
+    pub lease_until: Option<Duration>,
+    pub lease_idle_timeout: Duration,
+    /// A visible idle-inhibiting surface keeps extending the lease.
+    pub idle_inhibited: bool,
+    pub lock_app_launched_at: Option<Duration>,
+    pub auth_link: Option<RegistrationToken>,
+    pub auth_connect_attempted_at: Option<Duration>,
 
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
@@ -608,10 +617,7 @@ pub struct PointContents {
 pub enum LockState {
     #[default]
     Unlocked,
-    WaitingForSurfaces {
-        confirmation: SessionLocker,
-        deadline_token: RegistrationToken,
-    },
+    /// A lock client attached; `locked` goes out once every output rendered a locked frame.
     Locking(SessionLocker),
     Locked(ExtSessionLockV1),
 }
@@ -1703,7 +1709,9 @@ impl State {
             self.niri
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
-            self.niri.cast_indicator.on_hotkey_config_updated(new_mod_key);
+            self.niri
+                .cast_indicator
+                .on_hotkey_config_updated(new_mod_key);
             self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
             self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
             self.niri.mods_with_tablet_stylus_binds =
@@ -2941,6 +2949,17 @@ impl Niri {
             })
             .unwrap();
 
+        // The lock: expire the lease, relaunch the lock app, reconnect to drv-authd.
+        event_loop
+            .insert_source(
+                Timer::from_duration(Duration::from_secs(1)),
+                |_, _, state| {
+                    state.niri.lock_tick();
+                    TimeoutAction::ToDuration(Duration::from_secs(1))
+                },
+            )
+            .unwrap();
+
         event_loop
             .insert_source(
                 Timer::from_duration(Duration::from_secs(60)),
@@ -3075,6 +3094,12 @@ impl Niri {
             mods_with_finger_scroll_binds,
 
             lock_state: LockState::Unlocked,
+            lease_until: None,
+            lease_idle_timeout: Duration::from_secs(300),
+            idle_inhibited: false,
+            lock_app_launched_at: None,
+            auth_link: None,
+            auth_connect_attempted_at: None,
             locked_hint: None,
 
             screenshot_ui,
@@ -3477,7 +3502,6 @@ impl Niri {
             }
             lock_state => {
                 self.lock_state = lock_state;
-                self.maybe_continue_to_locking();
             }
         }
 
@@ -4522,6 +4546,7 @@ impl Niri {
                     surface_primary_scanout_output(surface, states).is_some()
                 })
             });
+        self.idle_inhibited = is_inhibited;
         self.idle_notifier_state.set_is_inhibited(is_inhibited);
     }
 
@@ -4760,7 +4785,12 @@ impl Niri {
 
         // If the session is locked, draw the lock surface.
         if self.is_locked() {
-            if let Some(surface) = state.lock_surface.as_ref() {
+            // Casts and screenshots of a locked session are black.
+            let lock_surface = state
+                .lock_surface
+                .as_ref()
+                .filter(|_| matches!(ctx.target, RenderTarget::Output));
+            if let Some(surface) = lock_surface {
                 push_elements_from_surface_tree(
                     ctx.renderer,
                     surface.wl_surface(),
@@ -6674,136 +6704,173 @@ impl Niri {
     }
 
     pub fn is_locked(&self) -> bool {
-        match self.lock_state {
-            LockState::Unlocked | LockState::WaitingForSurfaces { .. } => false,
-            LockState::Locking(_) | LockState::Locked(_) => true,
-        }
+        self.lease_until.is_none()
     }
 
+    /// A client asks to lock: fine only while we are locked ourselves, otherwise `finished`.
     pub fn lock(&mut self, confirmation: SessionLocker) {
-        // Check if another client is in the process of locking.
-        if matches!(
-            self.lock_state,
-            LockState::WaitingForSurfaces { .. } | LockState::Locking(_)
-        ) {
-            info!("refusing lock as another client is currently locking");
+        if !self.is_locked() {
+            info!("refusing lock: the session is not locked");
             return;
         }
 
-        // Check if we're already locked with an active client.
-        if let LockState::Locked(lock) = &self.lock_state {
-            if lock.is_alive() {
+        match &self.lock_state {
+            LockState::Locking(_) => {
+                info!("refusing lock as another client is currently locking");
+                return;
+            }
+            LockState::Locked(lock) if lock.is_alive() => {
                 info!("refusing lock as already locked with an active client");
                 return;
             }
-
-            // If the client had died, continue with the new lock.
-            info!("locking session (replacing existing dead lock)");
-
-            // Since the session was already locked, we know that the outputs are blanked, and
-            // can lock right away.
-            let lock = confirmation.ext_session_lock().clone();
-            confirmation.lock();
-            self.lock_state = LockState::Locked(lock);
-
-            return;
+            _ => (),
         }
 
-        info!("locking session");
-
+        info!("lock client attached");
         if self.output_state.is_empty() {
-            // There are no outputs, lock the session right away.
-            self.screenshot_ui.close();
-            self.cursor_manager
-                .set_cursor_image(CursorImageStatus::default_named());
-
             let lock = confirmation.ext_session_lock().clone();
             confirmation.lock();
             self.lock_state = LockState::Locked(lock);
         } else {
-            // There are outputs which we need to redraw before locking. But before we do that,
-            // let's wait for the lock surfaces.
-            //
-            // Give them a second; swaylock can take its time to paint a big enough image.
-            let timer = Timer::from_duration(Duration::from_millis(1000));
-            let deadline_token = self
-                .event_loop
-                .insert_source(timer, |_, _, state| {
-                    trace!("lock deadline expired, continuing");
-                    state.niri.continue_to_locking();
-                    TimeoutAction::Drop
-                })
-                .unwrap();
-
-            self.lock_state = LockState::WaitingForSurfaces {
-                confirmation,
-                deadline_token,
-            };
+            // `locked` goes out once every output has rendered a locked frame.
+            self.lock_state = LockState::Locking(confirmation);
+            self.queue_redraw_all();
         }
     }
 
-    pub fn maybe_continue_to_locking(&mut self) {
-        if !matches!(self.lock_state, LockState::WaitingForSurfaces { .. }) {
-            // Not waiting.
+    /// Lock now: no lease, black outputs, launch the lock app.
+    pub fn lock_now(&mut self) {
+        if self.is_locked() {
             return;
         }
-
-        // Check if there are any outputs whose lock surfaces had not had a commit yet.
-        for state in self.output_state.values() {
-            let Some(surface) = &state.lock_surface else {
-                // Surface not created yet.
-                return;
-            };
-
-            if !is_mapped(surface.wl_surface()) {
-                return;
-            }
-        }
-
-        // All good.
-        trace!("lock surfaces are ready, continuing");
-        self.continue_to_locking();
+        info!("locking session");
+        self.lease_until = None;
+        self.screenshot_ui.close();
+        self.cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+        self.cancel_mru();
+        self.queue_redraw_all();
+        self.lock_tick();
     }
 
-    fn continue_to_locking(&mut self) {
-        match mem::take(&mut self.lock_state) {
-            LockState::WaitingForSurfaces {
-                confirmation,
-                deadline_token,
-            } => {
-                self.event_loop.remove(deadline_token);
+    /// drv-authd verified the PIN: unlock and send the lock client away.
+    pub fn unlock_with_lease(&mut self, idle_timeout: Duration) {
+        info!("unlocked by drv-authd; locking again after {idle_timeout:?} of inactivity");
+        self.lease_idle_timeout = idle_timeout;
+        self.lease_until = Some(get_monotonic_time() + idle_timeout);
+        if let LockState::Locked(lock) = &self.lock_state {
+            if lock.is_alive() {
+                lock.finished();
+            }
+        }
+        self.drop_lock_client();
+    }
 
-                self.screenshot_ui.close();
-                self.cursor_manager
-                    .set_cursor_image(CursorImageStatus::default_named());
-                self.cancel_mru();
+    fn touch_lease(&mut self) {
+        if self.lease_until.is_some() {
+            self.lease_until = Some(get_monotonic_time() + self.lease_idle_timeout);
+        }
+    }
 
-                if self.output_state.is_empty() {
-                    // There are no outputs, lock the session right away.
-                    let lock = confirmation.ext_session_lock().clone();
-                    confirmation.lock();
-                    self.lock_state = LockState::Locked(lock);
+    fn lock_client_alive(&self) -> bool {
+        match &self.lock_state {
+            LockState::Unlocked => false,
+            LockState::Locking(_) => true,
+            LockState::Locked(lock) => lock.is_alive(),
+        }
+    }
+
+    pub fn lock_tick(&mut self) {
+        let now = get_monotonic_time();
+        if let Some(until) = self.lease_until {
+            if now >= until {
+                if self.idle_inhibited {
+                    self.lease_until = Some(now + self.lease_idle_timeout);
                 } else {
-                    // There are outputs which we need to redraw before locking.
-                    self.lock_state = LockState::Locking(confirmation);
-                    self.queue_redraw_all();
+                    self.lock_now();
+                    return;
                 }
             }
-            other => {
-                error!("continue_to_locking() called with wrong lock state: {other:?}",);
-                self.lock_state = other;
-            }
+        }
+
+        if self.auth_link.is_none() {
+            self.connect_auth(now);
+        }
+
+        if !self.is_locked() || self.lock_client_alive() {
+            return;
+        }
+        let Some(app) = self.config.borrow().lock.app.clone() else {
+            return;
+        };
+        if self
+            .lock_app_launched_at
+            .is_some_and(|t| now - t < Duration::from_secs(3))
+        {
+            return;
+        }
+        self.lock_app_launched_at = Some(now);
+        match self.policy.launch(app.clone()) {
+            Ok(_) => debug!("launched lock app {app}"),
+            Err(err) => warn!("launching lock app {app}: {err}"),
         }
     }
 
-    pub fn unlock(&mut self) {
-        info!("unlocking session");
-
-        let prev = mem::take(&mut self.lock_state);
-        if let LockState::WaitingForSurfaces { deadline_token, .. } = prev {
-            self.event_loop.remove(deadline_token);
+    /// Sit on a connection to drv-authd for `Unlock` events; retried from `lock_tick`.
+    fn connect_auth(&mut self, now: Duration) {
+        if self
+            .auth_connect_attempted_at
+            .is_some_and(|t| now - t < Duration::from_secs(3))
+        {
+            return;
         }
+        self.auth_connect_attempted_at = Some(now);
 
+        let path = drv_auth::socket_path();
+        let sock = match drv_auth::connect_as(&path, drv_auth::Role::Compositor) {
+            Ok(sock) => sock,
+            Err(err) => {
+                warn!("connecting to drv-authd at {}: {err}", path.display());
+                return;
+            }
+        };
+        if let Err(err) = rustix::io::ioctl_fionbio(&sock, true) {
+            warn!("drv-authd socket nonblocking: {err}");
+            return;
+        }
+        let source = Generic::new(sock, Interest::READ, Mode::Level);
+        let token = self
+            .event_loop
+            .insert_source(source, |_, sock, state| match drv_auth::recv_event(&sock) {
+                Ok(drv_auth::Event::Unlock { idle_timeout_ms }) => {
+                    state
+                        .niri
+                        .unlock_with_lease(Duration::from_millis(idle_timeout_ms));
+                    state.niri.activate_monitors(&mut state.backend);
+                    state.niri.notify_activity();
+                    Ok(PostAction::Continue)
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(PostAction::Continue),
+                Err(err) => {
+                    warn!("drv-authd connection lost: {err}");
+                    state.niri.auth_link = None;
+                    Ok(PostAction::Remove)
+                }
+            })
+            .unwrap();
+        self.auth_link = Some(token);
+        info!("connected to drv-authd");
+    }
+
+    /// The lock client released its lock. Without a lease from drv-authd we stay locked and
+    /// launch it again.
+    pub fn unlock(&mut self) {
+        info!("lock client released its lock");
+        self.drop_lock_client();
+    }
+
+    fn drop_lock_client(&mut self) {
+        let _prev = mem::take(&mut self.lock_state);
         for output_state in self.output_state.values_mut() {
             output_state.lock_surface = None;
         }
@@ -6895,7 +6962,6 @@ impl Niri {
                 error!("tried to add a lock surface on an unlocked session");
                 return;
             }
-            LockState::WaitingForSurfaces { confirmation, .. } => confirmation.ext_session_lock(),
             LockState::Locking(confirmation) => confirmation.ext_session_lock(),
             LockState::Locked(lock) => lock,
         };
@@ -7272,6 +7338,7 @@ impl Niri {
         let _span = tracy_client::span!("Niri::notify_activity");
 
         self.idle_notifier_state.notify_activity(&self.seat);
+        self.touch_lease();
 
         self.notified_activity_this_iteration = true;
     }

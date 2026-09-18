@@ -27,8 +27,6 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::ImportDma as _;
 use smithay::backend::session::{Event as SessionEvent, Session};
-
-use super::seat::DrvSeatSession;
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -51,6 +49,7 @@ use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal};
 use smithay::wayland::presentation::Refresh;
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 
+use super::seat::DrvSeatSession;
 use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
@@ -2299,7 +2298,8 @@ fn spawn_gpu(
         .start_gpu(&fds, render_node_hint.map(|n| n.dev_id()))
         .context("error starting the GPU process")?;
     debug!("GPU process started by the seat daemon, pid {pid}");
-    let mut client = GpuClient::from_socket(socket).context("error connecting to the GPU process")?;
+    let mut client =
+        GpuClient::from_socket(socket).context("error connecting to the GPU process")?;
 
     let results: HashMap<DevId, DeviceResult> = client
         .take_device_results()

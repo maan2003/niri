@@ -912,6 +912,8 @@ pub enum Action {
     ///
     /// Bind this to a key: the "Screen is being shared" indicator names it.
     StopAllCasts {},
+    /// Lock the session now.
+    LockSession {},
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
     /// Open the Overview.

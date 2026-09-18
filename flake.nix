@@ -49,6 +49,8 @@
               ./niri-ipc
               ./drv-policy
               ./drv-seat
+            ./drv-auth
+            ./drv-lock
               ./niri-visual-tests
               ./resources
               ./src
@@ -88,6 +90,10 @@
             "drv-bridge"
             "-p"
             "drv-seat"
+            "-p"
+            "drv-auth"
+            "-p"
+            "drv-lock"
           ];
 
           nativeBuildInputs = [

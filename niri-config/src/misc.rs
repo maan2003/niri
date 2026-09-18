@@ -84,6 +84,24 @@ impl MergeWith<HotkeyOverlayPart> for HotkeyOverlay {
     }
 }
 
+/// The lock screen: which app to launch whenever the session is locked.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Lock {
+    pub app: Option<String>,
+}
+
+#[derive(knuffel::Decode, Debug, Default, Clone, PartialEq, Eq)]
+pub struct LockPart {
+    #[knuffel(child, unwrap(argument))]
+    pub app: Option<String>,
+}
+
+impl MergeWith<LockPart> for Lock {
+    fn merge_with(&mut self, part: &LockPart) {
+        merge_clone_opt!((self, part), app);
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigNotification {
     pub disable_failed: bool,

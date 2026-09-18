@@ -20,7 +20,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use super::xdg_shell::add_mapped_toplevel_pre_commit_hook;
 use crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT;
 use crate::layout::{ActivateWindow, AddWindowTarget, LayoutElement as _};
-use crate::niri::{CastTarget, ClientState, LockState, State};
+use crate::niri::{CastTarget, ClientState, State};
 use crate::utils::transaction::Transaction;
 use crate::utils::{is_mapped, send_scale_transform};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped};
@@ -463,12 +463,7 @@ impl CompositorHandler for State {
         for (output, state) in &self.niri.output_state {
             if let Some(lock_surface) = &state.lock_surface {
                 if lock_surface.wl_surface() == &root_surface {
-                    if matches!(self.niri.lock_state, LockState::WaitingForSurfaces { .. }) {
-                        self.niri.maybe_continue_to_locking();
-                    } else {
-                        self.niri.queue_redraw(&output.clone());
-                    }
-
+                    self.niri.queue_redraw(&output.clone());
                     return;
                 }
             }

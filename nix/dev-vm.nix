@@ -86,6 +86,11 @@ in
     uid = 1000;
   };
 
+  # Dev PIN 1234, enrolled once. Real installs run `drv-authd set-pin` by hand.
+  systemd.services.drv-authd.preStart = ''
+    [ -e /var/lib/drv-auth/pin ] || printf 1234 | ${config.services.drv.package}/bin/drv-authd set-pin --state-dir /var/lib/drv-auth
+  '';
+
   services.drv = {
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
