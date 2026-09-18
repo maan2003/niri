@@ -12,6 +12,7 @@ use crate::gpu::remote::RemoteRenderer;
 use crate::niri::Niri;
 use crate::utils::id::IdCounter;
 
+pub mod seat;
 pub mod tty;
 pub use tty::Tty;
 

@@ -11,6 +11,7 @@ let
   bridgeSocket = "/run/drv-bridge/bridge.sock";
   sessionBus = "unix:path=/run/drv-session/bus";
   identitySocket = "/run/drv/identity.sock";
+  seatSocket = "/run/drv-seat/seat.sock";
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
@@ -213,8 +214,8 @@ in
         uid = cfg.ids.compositor;
         group = "drv-compositor";
         isSystemUser = true;
-        # Until a seat daemon hands out the devices.
-        extraGroups = [ "seat" "video" "input" "pipewire" ];
+        # Devices come from drv-seatd; PipeWire is for screencasts.
+        extraGroups = [ "pipewire" ];
       };
       drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; };
       drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
@@ -227,7 +228,6 @@ in
       render = { };
     };
 
-    services.seatd.enable = true;
     hardware.graphics.enable = true;
     services.pipewire = {
       enable = true;
@@ -294,17 +294,31 @@ in
       };
     };
 
+    # The only process on the seat: opens DRM and evdev nodes as root through libseat's builtin
+    # backend and hands the fds to the compositor, which it checks by UID.
+    systemd.services.drv-seatd = {
+      wantedBy = [ "multi-user.target" ];
+      environment.LIBSEAT_BACKEND = "builtin";
+      serviceConfig = {
+        ExecStart = "${cfg.package}/bin/drv-seatd --socket ${seatSocket} --client drv-compositor";
+        RuntimeDirectory = "drv-seat";
+        RuntimeDirectoryMode = "0711";
+        Restart = "on-failure";
+        RestartSec = 1;
+      };
+    };
+
     systemd.services.drv-compositor = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-spawnd.service" "drv-session-bus.service" "drv-bridge.service" "seatd.service" ];
+      after = [ "drv-spawnd.service" "drv-session-bus.service" "drv-bridge.service" "drv-seatd.service" ];
       # Apps autostart once the compositor's socket exists; the desktop services among them
       # (`servicesBus`) need the bus, which is up before us.
-      requires = [ "drv-spawnd.service" "drv-session-bus.service" "seatd.service" ];
+      requires = [ "drv-spawnd.service" "drv-session-bus.service" "drv-seatd.service" ];
       environment = {
         DBUS_SESSION_BUS_ADDRESS = sessionBus;
         # Screencasts go to the system PipeWire, like everyone's audio.
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
-        LIBSEAT_BACKEND = "seatd";
+        DRV_SEAT_SOCKET = seatSocket;
         DRV_IDENTITY_SOCKET = identitySocket;
         DRV_APPS_SOCKET = "/run/drv-wayland/wayland";
         XDG_RUNTIME_DIR = "/run/drv-compositor";

@@ -26,8 +26,9 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::ImportDma as _;
-use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
+
+use super::seat::DrvSeatSession;
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -69,7 +70,7 @@ use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOri
 
 pub struct Tty {
     config: Rc<RefCell<Config>>,
-    session: LibSeatSession,
+    session: DrvSeatSession,
     udev_dispatcher: Dispatcher<'static, UdevBackend, State>,
     libinput: Libinput,
     event_loop: LoopHandle<'static, State>,
@@ -173,11 +174,11 @@ impl Tty {
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("Tty::new");
 
-        let (session, notifier) = LibSeatSession::new().context(
-            "Error creating a session. This might mean that you're trying to run niri on a TTY \
-             that is already busy, for example if you're running this inside tmux that had been \
-             originally started on a different TTY",
-        )?;
+        let seat_socket = std::env::var_os(drv_seat::SOCKET_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(drv_seat::DEFAULT_SOCKET));
+        let (session, notifier) = DrvSeatSession::connect(&seat_socket)
+            .with_context(|| format!("error connecting to the seat daemon at {seat_socket:?}"))?;
         let seat_name = session.seat();
 
         let udev_backend =
@@ -2244,7 +2245,7 @@ fn compute_ignored_nodes(config: &Config, render_node_hint: Option<DrmNode>) -> 
 
 /// Checks that `path` is a primary node we're not ignoring and opens it through the session.
 fn open_device(
-    session: &mut LibSeatSession,
+    session: &mut DrvSeatSession,
     ignored_nodes: &HashSet<DrmNode>,
     device_id: dev_t,
     path: &Path,
@@ -2261,7 +2262,7 @@ fn open_device(
 
     let open_flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK;
     let fd = {
-        let _span = tracy_client::span!("LibSeatSession::open");
+        let _span = tracy_client::span!("DrvSeatSession::open");
         session.open(path, open_flags)
     }?;
     Ok(Some((node, fd)))
@@ -2272,7 +2273,7 @@ fn open_device(
 /// not to be retried).
 fn spawn_gpu(
     exe: &Path,
-    session: &mut LibSeatSession,
+    session: &mut DrvSeatSession,
     udev: &Dispatcher<'static, UdevBackend, State>,
     ignored_nodes: &HashSet<DrmNode>,
     render_node_hint: Option<DrmNode>,

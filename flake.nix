@@ -48,6 +48,7 @@
               ./drv-identity
               ./niri-ipc
               ./drv-policy
+              ./drv-seat
               ./niri-visual-tests
               ./resources
               ./src
@@ -85,6 +86,8 @@
             "drv-identity"
             "-p"
             "drv-bridge"
+            "-p"
+            "drv-seat"
           ];
 
           nativeBuildInputs = [
