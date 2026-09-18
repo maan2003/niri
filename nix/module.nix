@@ -94,6 +94,15 @@ in
       default = niri;
       description = "niri build with drv-spawnd, drv and drv-bridge.";
     };
+    portalPackage = lib.mkOption {
+      type = lib.types.package;
+      # The portal cannot look into its callers' /proc across UIDs; the patch makes it treat
+      # them as host apps instead of refusing them.
+      default = pkgs.xdg-desktop-portal.overrideAttrs (old: {
+        patches = (old.patches or [ ]) ++ [ ./xdg-desktop-portal-cross-uid.patch ];
+      });
+      description = "xdg-desktop-portal frontend, patched for callers on other UIDs.";
+    };
     ids = {
       identity = lib.mkOption { type = lib.types.int; default = 901; };
       compositor = lib.mkOption { type = lib.types.int; default = 902; };

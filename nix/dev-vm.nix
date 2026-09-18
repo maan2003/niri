@@ -2,7 +2,7 @@
 # iterate. The desktop itself comes from nix/module.nix; this file is the machine and the
 # probe apps.
 { niri }:
-{ pkgs, lib, modulesPath, ... }:
+{ config, pkgs, lib, modulesPath, ... }:
 let
   # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire.
   portalWrapper = pkgs.writeShellScript "portal" ''
@@ -10,7 +10,7 @@ let
     # /etc/xdg/xdg-desktop-portal/portals.conf (the module writes it).
     export XDG_DATA_DIRS=${pkgs.xdg-desktop-portal-gnome}/share:$XDG_DATA_DIRS
     export XDG_CURRENT_DESKTOP=niri
-    exec ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal --verbose
+    exec ${config.services.drv.portalPackage}/libexec/xdg-desktop-portal --verbose
   '';
   sharePage = pkgs.writeText "share.html" ''
     <!doctype html><title>share</title>
@@ -96,7 +96,7 @@ in
     apps = {
       # The launcher (Mod+D in the stock binds): an app like any other. Its entries run
       # `drv launch`, straight to the identity daemon.
-      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; };
+      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; globals = [ "layer-shell" ]; };
       # Notification daemon on the services' bus; apps reach it only through the bridge, which
       # names them.
       mako = {
@@ -128,12 +128,12 @@ in
         grants = [ "screencast" ];
         autostart = true;
       };
-      # Sends one notification from inside the sandbox over its private bus.
+      # Sends one notification from inside the sandbox over its private bus. Not autostarted:
+      # it would race the notification daemon; `drv launch notify-test`.
       notify-test = {
         uid = 100007;
         bus = true;
         exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
-        autostart = true;
       };
       hello = { uid = 100001; exec = [ "${probe}" ]; autostart = true; };
       gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; };
