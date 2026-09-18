@@ -579,6 +579,17 @@ fn main() {
         )
         .expect("timer");
 
+    // Fontconfig and Pango load their configuration and caches on the first render: do that
+    // now, on a scrap buffer, so from here on they only need to read font files.
+    let mut scrap = [0u8; 16];
+    render(&mut scrap, 2, 2, 8, &Text { prompt: String::new(), message: String::new() });
+    if drv_os::seccomp::enabled() {
+        let mut allow = drv_os::seccomp::Allowlist::base().expect("seccomp baseline");
+        allow.read_files().expect("seccomp rules");
+        allow.apply("drv-lock").expect("seccomp filter");
+        eprintln!("drv-lock: seccomp: syscall allowlist applied");
+    }
+
     loop {
         if let Err(err) = event_loop.dispatch(None, &mut app) {
             // The compositor went away; the supervisor restarts the whole group, us included.

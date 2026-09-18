@@ -1,6 +1,8 @@
 //! Users, groups, fds and owned directories: the handful of libc calls every privileged piece
 //! needs, in one place.
 
+pub mod seccomp;
+
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};

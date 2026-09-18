@@ -1006,6 +1006,7 @@ name = "drv-appd"
 version = "26.4.0"
 dependencies = [
  "clap",
+ "drv-os",
  "drv-policy",
  "rustix 1.1.4",
  "serde",
@@ -1018,6 +1019,7 @@ version = "26.4.0"
 dependencies = [
  "argon2",
  "clap",
+ "drv-os",
  "drv-policy",
  "libc",
  "postcard",
@@ -1055,6 +1057,7 @@ name = "drv-lock"
 version = "26.4.0"
 dependencies = [
  "drv-auth",
+ "drv-os",
  "drv-policy",
  "pangocairo",
  "smithay-client-toolkit",
@@ -1068,6 +1071,7 @@ version = "26.4.0"
 dependencies = [
  "libc",
  "rustix 1.1.4",
+ "seccompiler",
 ]
 
 [[package]]
@@ -2479,6 +2483,7 @@ dependencies = [
  "directories",
  "drm-ffi",
  "drv-auth",
+ "drv-os",
  "drv-policy",
  "drv-seat",
  "fastrand",
@@ -2508,7 +2513,6 @@ dependencies = [
  "rayon",
  "rustix 1.1.4",
  "sd-notify",
- "seccompiler",
  "serde",
  "serde_bytes",
  "serde_json",

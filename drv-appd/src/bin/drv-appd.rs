@@ -68,6 +68,15 @@ fn run(args: Args) -> Result<(), String> {
         }
     });
 
+    // From here on: our fds and what arrives on them, new connections on the listener,
+    // threads, and reading files (`/proc/net/unix` for autostart).
+    if drv_os::seccomp::enabled() {
+        let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
+        allow.read_files().map_err(|e| e.to_string())?;
+        allow.accept();
+        allow.apply("drv-appd").map_err(|e| e.to_string())?;
+        eprintln!("drv-appd: seccomp: syscall allowlist applied");
+    }
     drv_policy::daemon::serve(listener, appd).map_err(|e| format!("serving: {e}"))
 }
 

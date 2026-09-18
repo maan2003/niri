@@ -100,6 +100,13 @@ fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
     if !store.has_pin() {
         eprintln!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
     }
+    // From here on: the wire and what arrives on it, threads, and the state directory.
+    if drv_os::seccomp::enabled() {
+        let mut allow = drv_os::seccomp::Allowlist::base()?;
+        allow.write_files()?;
+        allow.apply("drv-authd")?;
+        eprintln!("seccomp: syscall allowlist applied");
+    }
     let shared = Arc::new(Shared {
         auth: Mutex::new(Auth::new(store)),
         compositor: Mutex::new(None),
