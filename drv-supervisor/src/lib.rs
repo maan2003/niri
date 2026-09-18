@@ -11,11 +11,13 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
+use drv_os::sandbox::Sandbox;
 use drv_os::{dup_high, ensure_owned_dir};
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
-/// A service the supervisor forks and keeps running: its own user, no sandbox (it is trusted
-/// and needs the real `/run`), its environment exactly as listed.
+/// A service the supervisor forks and keeps running: its own user, the same sandbox an app
+/// gets (`drv_os::sandbox`: private `/tmp`, `/dev/shm` and `/proc`, a `/run` holding only
+/// `expose`, no network unless `network`), its environment exactly as listed.
 pub struct Service {
     pub name: String,
     pub uid: u32,
@@ -29,6 +31,10 @@ pub struct Service {
     /// Capabilities a non-root service keeps (ambient, so they survive the exec): its whole
     /// bounding set, so nothing it runs can have more.
     pub caps: CapabilitySet,
+    /// Entries under `/run` it sees; everything else under `/run` is gone.
+    pub expose: Vec<PathBuf>,
+    /// Keeps the host's network namespace (the forker: apps with `network` get it from there).
+    pub network: bool,
 }
 
 /// A capability by its kernel name without the `CAP_` prefix (`sys_tty_config`).
@@ -150,6 +156,8 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
         return Err(format!("service {}: empty command", service.name));
     }
     let (fd_env, placed) = drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
+    let sandbox = Sandbox::plan(&service.expose, service.network)
+        .map_err(|e| format!("{}: {e}", service.name))?;
     // Copies above the target numbers, so the dup2s in the child never clobber each other
     // and are never a same-fd no-op (which would keep close-on-exec set).
     let mut dups = Vec::new();
@@ -166,7 +174,7 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
     let (uid, gid, caps) = (service.uid, service.gid, service.caps);
     let groups = service.groups.clone();
     let child_dups = dups.clone();
-    // SAFETY: only dup2, credential and capability syscalls between fork and exec.
+    // SAFETY: only dup2, mount, credential and capability syscalls between fork and exec.
     unsafe {
         command.pre_exec(move || {
             for (high, target) in &child_dups {
@@ -174,6 +182,8 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
                     return Err(io::Error::last_os_error());
                 }
             }
+            // While CAP_SYS_ADMIN is still ours.
+            sandbox.apply()?;
             if uid != 0 {
                 become_user(uid, gid, &groups, caps)?;
             }

@@ -3,10 +3,9 @@ name = "drv-menu"
 version = "26.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "The app menu: runs a dmenu-style program and launches the chosen name through drv-appd."
+description = "The app menu: lists what drv-appd can launch and launches the pick by name."
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
 drv-os = { version = "26.4.0", path = "../drv-os" }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
-libc = "0.2"
+drv-ui = { version = "26.4.0", path = "../drv-ui" }

@@ -54,6 +54,7 @@
             ./drv-auth
             ./drv-lock
             ./drv-menu
+            ./drv-ui
               ./niri-visual-tests
               ./resources
               ./src

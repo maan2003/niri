@@ -6859,6 +6859,7 @@ impl Niri {
                 }
                 Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
             },
+            Peer::MenuClient => self.insert_menu(sock),
             Peer::Menu => {
                 let sock = std::os::unix::net::UnixStream::from(sock);
                 if let Err(err) = sock.set_nonblocking(true) {
@@ -6924,6 +6925,30 @@ impl Niri {
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
             Ok(_) => info!("locker attached"),
             Err(err) => warn!("error inserting the locker: {err}"),
+        }
+    }
+
+    /// drv-menu's Wayland connection, from the supervisor: a layer-shell client and nothing
+    /// else, no lookup.
+    fn insert_menu(&mut self, sock: OwnedFd) {
+        let config = self.config.borrow();
+        let data = Arc::new(ClientState {
+            compositor_state: Default::default(),
+            can_view_decoration_globals: config.prefer_no_csd,
+            primary_selection_disabled: config.clipboard.disable_primary,
+            restricted: false,
+            credentials_unknown: false,
+            policy: Arc::new(AppPolicy {
+                name: "menu".to_owned(),
+                gpu: false,
+                globals: vec![PolicyGlobal::LayerShell],
+                grants: Vec::new(),
+                icon: None,
+            }),
+        });
+        match self.display_handle.insert_client(UnixStream::from(sock), data) {
+            Ok(_) => info!("menu client attached"),
+            Err(err) => warn!("error inserting the menu client: {err}"),
         }
     }
 

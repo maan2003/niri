@@ -1059,10 +1059,7 @@ version = "26.4.0"
 dependencies = [
  "drv-auth",
  "drv-os",
- "drv-policy",
- "pangocairo",
- "smithay-client-toolkit",
- "wayland-client",
+ "drv-ui",
  "zeroize",
 ]
 
@@ -1070,10 +1067,9 @@ dependencies = [
 name = "drv-menu"
 version = "26.4.0"
 dependencies = [
- "clap",
  "drv-os",
  "drv-policy",
- "libc",
+ "drv-ui",
 ]
 
 [[package]]
@@ -1119,6 +1115,16 @@ dependencies = [
  "drv-policy",
  "libc",
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "drv-ui"
+version = "26.4.0"
+dependencies = [
+ "drv-os",
+ "pangocairo",
+ "smithay-client-toolkit",
+ "wayland-client",
 ]
 
 [[package]]

@@ -29,12 +29,18 @@ struct Args {
     /// drv-appd's command line, whitespace-separated.
     #[arg(long)]
     appd_exec: String,
+    /// An entry under `/run` drv-appd sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "appd-expose")]
+    appd_expose: Vec<PathBuf>,
     /// System user drv-forker runs as.
     #[arg(long)]
     forker_user: String,
     /// drv-forker's command line, whitespace-separated.
     #[arg(long)]
     forker_exec: String,
+    /// An entry under `/run` drv-forker sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "forker-expose")]
+    forker_expose: Vec<PathBuf>,
     /// A capability drv-forker keeps, by name (`setuid`, `setgid`, `setpcap`, `sys_admin`,
     /// `chown` for the UID switch, the sandbox and the apps' directories). Repeatable.
     #[arg(long = "forker-cap")]
@@ -49,6 +55,9 @@ struct Args {
     /// The auth daemon's command line, whitespace-separated.
     #[arg(long)]
     authd_exec: String,
+    /// An entry under `/run` the auth daemon sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "authd-expose")]
+    authd_expose: Vec<PathBuf>,
     /// `PATH:MODE` (octal): a directory the auth daemon owns, created before it starts.
     #[arg(long = "authd-dir")]
     authd_dirs: Vec<String>,
@@ -58,6 +67,9 @@ struct Args {
     /// The seat daemon's command line, whitespace-separated.
     #[arg(long)]
     seatd_exec: String,
+    /// An entry under `/run` the seat daemon sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "seatd-expose")]
+    seatd_expose: Vec<PathBuf>,
     /// A capability the seat daemon keeps, by name (`sys_tty_config` for the VT ioctls).
     /// Repeatable.
     #[arg(long = "seatd-cap")]
@@ -71,6 +83,9 @@ struct Args {
     /// The compositor's command line, whitespace-separated.
     #[arg(long)]
     compositor_exec: String,
+    /// An entry under `/run` the compositor sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "compositor-expose")]
+    compositor_expose: Vec<PathBuf>,
     /// `NAME=VALUE` in the compositor's environment. Repeatable; it gets nothing else.
     #[arg(long = "compositor-env")]
     compositor_env: Vec<String>,
@@ -83,6 +98,9 @@ struct Args {
     /// The GPU process's command line, whitespace-separated (`niri gpu-process --mode drm`).
     #[arg(long)]
     gpu_exec: String,
+    /// An entry under `/run` the GPU process sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "gpu-expose")]
+    gpu_expose: Vec<PathBuf>,
     /// `NAME=VALUE` in the GPU process's environment. Repeatable; it gets nothing else.
     #[arg(long = "gpu-env")]
     gpu_env: Vec<String>,
@@ -92,6 +110,9 @@ struct Args {
     /// The locker's command line, whitespace-separated.
     #[arg(long)]
     locker_exec: String,
+    /// An entry under `/run` the locker sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "locker-expose")]
+    locker_expose: Vec<PathBuf>,
     /// `NAME=VALUE` in the locker's environment. Repeatable; it gets nothing else.
     #[arg(long = "locker-env")]
     locker_env: Vec<String>,
@@ -101,6 +122,9 @@ struct Args {
     /// The menu's command line, whitespace-separated (`drv-menu <program> --dmenu`).
     #[arg(long)]
     menu_exec: String,
+    /// An entry under `/run` the menu sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "menu-expose")]
+    menu_expose: Vec<PathBuf>,
     /// `NAME=VALUE` in the menu's environment. Repeatable; it gets nothing else.
     #[arg(long = "menu-env")]
     menu_env: Vec<String>,
@@ -140,9 +164,9 @@ struct Set {
 
 fn supervise(args: Args) -> Result<(), String> {
     let set = Set {
-        seatd: service("drv-seatd", &args.seatd_user, &args.seatd_exec, &args.seatd_env, &[], &args.seatd_caps)?,
-        authd: service("drv-authd", &args.authd_user, &args.authd_exec, &[], &args.authd_dirs, &[])?,
-        gpu: service("compositor-gpu", &args.gpu_user, &args.gpu_exec, &args.gpu_env, &[], &[])?,
+        seatd: service("drv-seatd", &args.seatd_user, &args.seatd_exec, &args.seatd_env, &[], &args.seatd_caps, &args.seatd_expose)?,
+        authd: service("drv-authd", &args.authd_user, &args.authd_exec, &[], &args.authd_dirs, &[], &args.authd_expose)?,
+        gpu: service("compositor-gpu", &args.gpu_user, &args.gpu_exec, &args.gpu_env, &[], &[], &args.gpu_expose)?,
         compositor: service(
             "compositor",
             &args.compositor_user,
@@ -150,9 +174,10 @@ fn supervise(args: Args) -> Result<(), String> {
             &args.compositor_env,
             &args.compositor_dirs,
             &[],
+            &args.compositor_expose,
         )?,
-        locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[])?,
-        menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[])?,
+        locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[], &args.locker_expose)?,
+        menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[], &args.menu_expose)?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -160,8 +185,9 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &args.forker_dirs,
             &args.forker_caps,
+            &args.forker_expose,
         )?,
-        appd: service("drv-appd", &args.appd_user, &args.appd_exec, &[], &[], &[])?,
+        appd: service("drv-appd", &args.appd_user, &args.appd_exec, &[], &[], &[], &args.appd_expose)?,
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switch stays ours.
@@ -197,6 +223,7 @@ struct Links {
     compositor_locker: (OwnedFd, OwnedFd),
     compositor_appd: (OwnedFd, OwnedFd),
     compositor_menu: (OwnedFd, OwnedFd),
+    menu_client: (OwnedFd, OwnedFd),
     menu_appd: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
@@ -213,6 +240,7 @@ impl Links {
             compositor_locker: stream()?,
             compositor_appd: stream()?,
             compositor_menu: stream()?,
+            menu_client: stream()?,
             menu_appd: stream()?,
             locker_auth: seq()?,
             appd_forker: seq()?,
@@ -246,6 +274,7 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("locker", l.compositor_locker.0.as_fd()),
                 ("appd", l.compositor_appd.0.as_fd()),
                 ("menu", l.compositor_menu.0.as_fd()),
+                ("menu-client", l.menu_client.0.as_fd()),
             ],
         ),
         (
@@ -261,6 +290,7 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
             &set.menu,
             vec![
                 ("compositor", l.compositor_menu.1.as_fd()),
+                ("wayland", l.menu_client.1.as_fd()),
                 ("appd", l.menu_appd.0.as_fd()),
             ],
         ),
@@ -347,6 +377,7 @@ fn service(
     env: &[String],
     dirs: &[String],
     caps: &[String],
+    expose: &[PathBuf],
 ) -> Result<Service, String> {
     let (uid, gid) = user_ids(user)?;
     if uid == 0 {
@@ -386,5 +417,9 @@ fn service(
         env,
         dirs,
         caps: capset,
+        expose: expose.to_vec(),
+        // Only the forker keeps the network: apps with `network` get it from the forker's
+        // namespace. Nobody else in the set talks to anything but its fds and sockets.
+        network: name == "drv-forker",
     })
 }

@@ -6,8 +6,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use clap::Parser;
 use drv_appd::{load_config, Appd};
@@ -34,18 +32,15 @@ fn run(args: Args) -> Result<(), String> {
         .unwrap_or_default();
     let appd = Arc::new(Appd::new(config, Arc::new(Channel::new(channel)), base_env));
 
-    appd.serve_launcher("the compositor".to_owned(), compositor);
-    appd.serve_launcher("the menu".to_owned(), menu);
+    // The compositor's Hello on its channel (sent once its apps socket listens) starts the
+    // autostart apps; they live as long as the set does.
+    appd.serve_launcher("the compositor".to_owned(), compositor, true);
+    appd.serve_launcher("the menu".to_owned(), menu, false);
 
-    // Autostart once the compositor's socket listens; the apps live as long as the set does.
-    let autostart = appd.clone();
-    thread::spawn(move || autostart.autostart(Duration::from_secs(60)));
-
-    // From here on: our fds and what arrives on them, new connections on the listener,
-    // threads, and reading files (`/proc/net/unix` for autostart).
+    // From here on: our fds and what arrives on them, new connections on the listener, and
+    // threads.
     if drv_os::seccomp::enabled() {
         let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
-        allow.read_files().map_err(|e| e.to_string())?;
         allow.accept();
         allow.apply("drv-appd").map_err(|e| e.to_string())?;
         eprintln!("drv-appd: seccomp: syscall allowlist applied");

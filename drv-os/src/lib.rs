@@ -2,6 +2,7 @@
 //! needs, in one place.
 
 pub mod fds;
+pub mod sandbox;
 pub mod seccomp;
 
 use std::ffi::CString;

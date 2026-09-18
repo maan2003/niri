@@ -20,6 +20,8 @@ pub enum Peer {
     Appd,
     /// The poke line to drv-menu: a byte per `show-launcher`.
     Menu,
+    /// drv-menu's Wayland connection.
+    MenuClient,
 }
 
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
@@ -72,6 +74,7 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
         (Peer::Locker, "locker", Kind::Stream),
         (Peer::Appd, "appd", Kind::Stream),
         (Peer::Menu, "menu", Kind::Stream),
+        (Peer::MenuClient, "menu-client", Kind::Stream),
     ] {
         match fds.socket(name, kind) {
             Ok(fd) => out.push((peer, fd)),

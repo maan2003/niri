@@ -112,7 +112,7 @@ in
         globals = [ "layer-shell" ];
         servicesBus = true;
         sessionBusNames = [ "org.freedesktop.Notifications" ];
-        autostart = true;
+        autostart = true; menu = false;
       };
       # Portals on the services' bus: the frontend and the GNOME backend (niri speaks its
       # Mutter screencast API). The frontend hands screencast consumers a PipeWire fd
@@ -123,7 +123,7 @@ in
         groups = [ "pipewire" ];
         servicesBus = true;
         sessionBusNames = [ "org.freedesktop.portal.Desktop" ];
-        autostart = true;
+        autostart = true; menu = false;
       };
       # The only holder of the screencast grant: it shows the consent dialog and opens one
       # session per consent.
@@ -133,7 +133,7 @@ in
         servicesBus = true;
         sessionBusNames = [ "org.freedesktop.impl.portal.desktop.gnome" ];
         grants = [ "screencast" ];
-        autostart = true;
+        autostart = true; menu = false;
       };
       # Sends one notification from inside the sandbox over its private bus. Not autostarted:
       # it would race the notification daemon; `drv launch notify-test`.
@@ -142,11 +142,11 @@ in
         bus = true;
         exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
       };
-      hello = { uid = 100001; exec = [ "${probe}" ]; autostart = true; };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; };
+      hello = { uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false; };
+      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; menu = false; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
       # Asks for a group the spawner was not told to hand out: must be refused.
-      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; };
+      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; menu = false; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {

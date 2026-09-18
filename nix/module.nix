@@ -22,7 +22,7 @@ let
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart;
+    inherit (app) uid groups gpu network globals grants autostart menu;
     env = lib.optionalAttrs app.servicesBus { DBUS_SESSION_BUS_ADDRESS = sessionBus; } // app.env;
     expose = lib.optional app.servicesBus "/run/drv-session" ++ app.expose;
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
@@ -39,7 +39,6 @@ let
       # Services: identified, never launched. They may ask who other UIDs are.
       { name = "compositor"; uid = cfg.ids.compositor; grants = [ "lookup" ]; }
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
-      { name = "menu"; uid = cfg.ids.menu; globals = [ "layer-shell" ]; }
     ] ++ appEntries;
   };
   # Names only the compositor owns, and only screencast-granted users may call.
@@ -109,11 +108,6 @@ in
       forker = lib.mkOption { type = lib.types.int; default = 909; };
       supervisor = lib.mkOption { type = lib.types.int; default = 910; };
       menu = lib.mkOption { type = lib.types.int; default = 911; };
-    };
-    menu = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ "${pkgs.fuzzel}/bin/fuzzel" "--dmenu" ];
-      description = "The dmenu-style program drv-menu runs on `show-launcher`: names on stdin, the choice on stdout.";
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -203,6 +197,11 @@ in
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
+          menu = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "Listed by the app menu.";
+          };
         };
       }));
     };
@@ -247,8 +246,8 @@ in
       drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
       # The supervisor: the capabilities its unit grants it (below), nothing else.
       drv-supervisor = { uid = cfg.ids.supervisor; group = "drv-supervisor"; isSystemUser = true; };
-      # The app menu: a launcher because the supervisor handed it a channel, a Wayland client
-      # like any app (the manifest lists it with layer-shell).
+      # The app menu: a launcher because the supervisor handed it a channel; its Wayland
+      # connection is a supervisor fd too.
       drv-menu = { uid = cfg.ids.menu; group = "drv-menu"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
@@ -332,7 +331,16 @@ in
           "--forker-exec '${forkerExec}'"
           "--forker-dir /run/drv-apps:0711"
           "--forker-dir /var/lib/drv-apps:0711"
-        ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ] ++ [
+        ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ]
+          # Every member of the set gets the apps' sandbox (drv_os::sandbox): its /run holds
+          # only what is listed for it. The forker's must hold what it binds for the apps.
+          ++ map (p: "--forker-expose ${p}") (lib.unique ([ "/run/drv-apps" ] ++ cfg.expose ++ optionalExpose))
+          ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
+          # udev: libinput initialises the evdev devices seatd hands over from udev's database.
+          ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/drv-session" "/run/pipewire" ]
+          # Mesa's drivers live behind this symlink.
+          ++ map (p: "--gpu-expose ${p}") [ "/run/opengl-driver" ]
+          ++ [
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
           # The only process on the seat: opens DRM and evdev nodes through libseat's builtin
@@ -362,12 +370,11 @@ in
           "--locker-user drv-lock"
           "--locker-exec '${cfg.package}/bin/drv-lock'"
           "--locker-env RUST_BACKTRACE=1"
-          # The app menu: holds a launch channel to drv-appd and runs the program below when
-          # the compositor's `show-launcher` bind pokes it. Its Wayland connection is the apps'
-          # socket, as drv-menu.
+          # The app menu: draws the launchable names and launches the pick down its channel
+          # to drv-appd when the compositor's `show-launcher` bind pokes it. Its Wayland
+          # connection is a supervisor fd; it needs nothing under /run.
           "--menu-user drv-menu"
-          "--menu-exec '${cfg.package}/bin/drv-menu ${lib.concatStringsSep " " cfg.menu}'"
-          "--menu-env WAYLAND_DISPLAY=/run/drv-wayland/wayland"
+          "--menu-exec '${cfg.package}/bin/drv-menu'"
           "--menu-env RUST_BACKTRACE=1"
         ] ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.

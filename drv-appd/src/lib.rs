@@ -12,7 +12,6 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use drv_policy::daemon::{self, Handler};
 use drv_policy::forker::{self, Launch};
@@ -55,6 +54,10 @@ pub struct Config {
     pub apps: Vec<AppConfig>,
 }
 
+fn yes() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AppConfig {
@@ -88,6 +91,9 @@ pub struct AppConfig {
     /// Started by the daemon once the compositor's socket exists, in manifest order.
     #[serde(default)]
     pub autostart: bool,
+    /// Listed by the menu. Off for daemons and probes that autostart.
+    #[serde(default = "yes")]
+    pub menu: bool,
 }
 
 impl AppConfig {
@@ -168,6 +174,7 @@ pub struct Appd {
     forker: Arc<dyn Forker>,
     /// Environment every launched app gets first: `PATH` and friends from our own environment.
     base_env: Vec<(String, String)>,
+    autostarted: std::sync::Once,
 }
 
 impl Appd {
@@ -176,6 +183,7 @@ impl Appd {
             config,
             forker,
             base_env,
+            autostarted: std::sync::Once::new(),
         }
     }
 
@@ -192,7 +200,7 @@ impl Appd {
         self.config
             .apps
             .iter()
-            .filter(|a| a.exec.is_some())
+            .filter(|a| a.exec.is_some() && a.menu)
             .map(|a| a.name.clone())
             .collect()
     }
@@ -230,10 +238,13 @@ impl Appd {
 
     /// Serves launches on `sock` (a stream socket speaking `rpc`) for `who`, on a thread,
     /// until the other end closes. Lookups are refused there: the public socket answers them.
-    pub fn serve_launcher(self: &Arc<Self>, who: String, sock: OwnedFd) {
+    /// With `autostart`, the peer's `Hello` starts the autostart apps: the compositor says it
+    /// once its apps socket listens.
+    pub fn serve_launcher(self: &Arc<Self>, who: String, sock: OwnedFd, autostart: bool) {
         let launcher = Launcher {
             appd: self.clone(),
             who,
+            autostart,
         };
         std::thread::spawn(move || {
             let stream = UnixStream::from(sock);
@@ -243,44 +254,18 @@ impl Appd {
         });
     }
 
-    /// Starts every `autostart` app in manifest order, once the compositor's socket is
-    /// listening (the file alone may be a dead compositor's). Waits up to `timeout` for that.
-    /// Once per start of the set: the apps die with it.
-    pub fn autostart(self: &Arc<Self>, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        while !socket_listening(&self.config.wayland_socket) {
-            if Instant::now() > deadline {
-                eprintln!(
-                    "drv-appd: nothing listening at {} after {timeout:?}; not autostarting",
-                    self.config.wayland_socket.display()
-                );
-                return;
+    /// Starts every `autostart` app in manifest order. Once per start of the set: the apps
+    /// die with it.
+    pub fn autostart(self: &Arc<Self>) {
+        self.autostarted.call_once(|| {
+            for app in self.config.apps.iter().filter(|a| a.autostart) {
+                match self.start(app) {
+                    Ok(uid) => eprintln!("drv-appd: autostarted {:?} as uid {uid}", app.name),
+                    Err(err) => eprintln!("drv-appd: autostart {:?}: {err}", app.name),
+                }
             }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        for app in self.config.apps.iter().filter(|a| a.autostart) {
-            match self.start(app) {
-                Ok(uid) => eprintln!("drv-appd: autostarted {:?} as uid {uid}", app.name),
-                Err(err) => eprintln!("drv-appd: autostart {:?}: {err}", app.name),
-            }
-        }
+        });
     }
-}
-
-/// Whether some process is listening on the unix socket at `path`, per `/proc/net/unix`
-/// (no connection is made, so the compositor never sees us).
-fn socket_listening(path: &Path) -> bool {
-    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
-        return false;
-    };
-    let path = path.to_string_lossy();
-    table.lines().skip(1).any(|line| {
-        let mut fields = line.split_whitespace();
-        // Num RefCount Protocol Flags Type St Inode Path
-        let flags = fields.nth(3);
-        let sock_path = fields.nth(3);
-        flags == Some("00010000") && sock_path == Some(path.as_ref())
-    })
 }
 
 impl Handler for Appd {
@@ -315,6 +300,7 @@ impl Handler for Appd {
 pub struct Launcher {
     appd: Arc<Appd>,
     who: String,
+    autostart: bool,
 }
 
 impl Handler for Launcher {
@@ -336,6 +322,12 @@ impl Handler for Launcher {
 
     fn apps(&self, _peer: u32) -> Result<Vec<String>, String> {
         Ok(self.appd.launchable())
+    }
+
+    fn hello(&self, _peer: u32) {
+        if self.autostart {
+            self.appd.autostart();
+        }
     }
 }
 
@@ -392,6 +384,7 @@ mod tests {
         Launcher {
             appd: id.clone(),
             who: "test".to_owned(),
+            autostart: false,
         }
     }
 

@@ -19,6 +19,8 @@ pub trait Handler: Send + Sync {
     fn launch(&self, peer: u32, app: &str) -> Result<u32, String>;
     /// The names `launch` accepts (see [`Request::Apps`]).
     fn apps(&self, peer: u32) -> Result<Vec<String>, String>;
+    /// The peer's `Hello`, before the version goes back. A hook, not a decision.
+    fn hello(&self, _peer: u32) {}
 }
 
 /// A file-backed store answers lookups and cannot launch anything.
@@ -67,9 +69,12 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
             Err(err) => return Err(err),
         };
         let response = match request {
-            Request::Hello { .. } => Response::Hello {
-                version: rpc::VERSION,
-            },
+            Request::Hello { .. } => {
+                handler.hello(peer);
+                Response::Hello {
+                    version: rpc::VERSION,
+                }
+            }
             Request::Lookup { uid } => match handler.lookup(peer, uid) {
                 Ok(policy) => Response::Policy(policy),
                 Err(err) => Response::Error(err),
