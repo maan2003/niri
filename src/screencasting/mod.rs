@@ -170,10 +170,15 @@ impl State {
                         continue;
                     };
                     cast.node_id = Some(node_id);
+                    let (width, height) = cast.size().map_or((0, 0), |s| (s.w, s.h));
                     let cast = cast.portal_cast;
                     debug!("telling drv-portal cast {cast} is node {node_id}");
-                    self.niri
-                        .tell_portal(drv_portal::compositor::ToPortal::Started { cast, node_id });
+                    self.niri.tell_portal(drv_portal::compositor::ToPortal::Started {
+                        cast,
+                        node_id,
+                        width,
+                        height,
+                    });
                 }
                 CastEvent::State {
                     stream,
@@ -532,7 +537,7 @@ impl State {
     /// drv-portal's cast line. It speaks only after the person consented, so what it asks
     /// for is started as is; the app behind it never reaches us.
     pub fn on_portal_msg(&mut self, msg: drv_portal::compositor::ToCompositor) {
-        use drv_portal::compositor::{Cursor, Output, ToCompositor, ToPortal, VERSION};
+        use drv_portal::compositor::{Cursor, Output, Source, ToCompositor, ToPortal, Window, VERSION};
         match msg {
             ToCompositor::Hello { version } => {
                 if version != VERSION {
@@ -562,7 +567,25 @@ impl State {
                 list.sort_by(|a, b| a.name.cmp(&b.name));
                 self.niri.tell_portal(ToPortal::Outputs(list));
             }
-            ToCompositor::Start { cast, output, cursor } => {
+            ToCompositor::Windows => {
+                use crate::niri::ClientState;
+                use crate::utils::with_toplevel_role;
+                use smithay::reexports::wayland_server::Resource as _;
+                let mut list = Vec::new();
+                self.niri.layout.with_windows(|mapped, _, _, _| {
+                    let toplevel = mapped.toplevel();
+                    // The client's policy name: the compositor's word, not the window's.
+                    let app = toplevel
+                        .wl_surface()
+                        .client()
+                        .and_then(|c| c.get_data::<ClientState>().map(|d| d.policy.name.clone()))
+                        .unwrap_or_default();
+                    let title = with_toplevel_role(toplevel, |role| role.title.clone().unwrap_or_default());
+                    list.push(Window { id: mapped.id().get(), title, app });
+                });
+                self.niri.tell_portal(ToPortal::Windows(list));
+            }
+            ToCompositor::Start { cast, source, cursor } => {
                 let session_id = CastSessionId::next();
                 let stream_id = CastStreamId::next();
                 self.niri.casting.portal_casts.insert(session_id, cast);
@@ -571,10 +594,14 @@ impl State {
                     Cursor::Embedded => CursorMode::Embedded,
                     Cursor::Metadata => CursorMode::Metadata,
                 };
+                let target = match source {
+                    Source::Screen(name) => StreamTargetId::Output { name },
+                    Source::Window(id) => StreamTargetId::Window { id },
+                };
                 self.on_screen_cast_msg(ScreenCastToNiri::StartCast {
                     session_id,
                     stream_id,
-                    target: StreamTargetId::Output { name: output },
+                    target,
                     cursor_mode,
                     portal_cast: cast,
                 });

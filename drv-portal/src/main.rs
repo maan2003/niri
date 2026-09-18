@@ -3,8 +3,8 @@
 //! ask the person on a layer-shell surface (fd `wayland`). A file comes from the tree we own
 //! (`--files`) and is answered as a path under the documents mount, which we serve on fd
 //! `fuse` (see `docs`): the app never sees the tree, only the file it was given, and only as
-//! the UID it was given to. A screen is started at the compositor over fd `compositor`
-//! (`drv_portal::compositor`), and the app gets the PipeWire node, nothing else. Sealed with
+//! the UID it was given to. A screen or a window is started at the compositor over fd
+//! `compositor` (`drv_portal::compositor`), and the app gets the PipeWire node, nothing else. Sealed with
 //! seccomp once the fonts are warm.
 
 mod docs;
@@ -22,8 +22,8 @@ use std::thread;
 use clap::Parser;
 use drv_os::fds::Kind;
 use drv_policy::seq;
-use drv_portal::compositor::{self, Output, ToCompositor, ToPortal};
-use drv_portal::protocol::{Cursor, Kind as Ask, Request, Response, VERSION};
+use drv_portal::compositor::{self, Output, ToCompositor, ToPortal, Window};
+use drv_portal::protocol::{Cursor, Kind as Ask, Request, Response, Source, VERSION};
 use drv_ui::sctk::reexports::calloop::generic::Generic;
 use drv_ui::sctk::reexports::calloop::{Interest, Mode, PostAction};
 use drv_ui::sctk::seat::keyboard::{KeyEvent, Keysym};
@@ -64,29 +64,33 @@ struct Pending {
 
 enum What {
     Choose(Ask),
-    Cast(Cursor),
+    Cast { cursor: Cursor, screens: bool, windows: bool },
 }
 
 struct Entry {
     name: String,
     dir: bool,
-    /// Shown after the name: make, model and size for a screen.
+    /// Shown after the name: make, model and size for a screen; the title for a window.
     detail: String,
+    /// What a cast entry stands for.
+    source: Option<Source>,
 }
 
 /// A cast the person consented to, from `Start` until the compositor says `Stopped`.
 struct Live {
     app: String,
     uid: u32,
-    output: Output,
+    source: Source,
+    /// For the log: the screen's name, or the window's app and title.
+    label: String,
     token: String,
 }
 
-/// A screen the person let an app share, good for that app until the bridge says it is gone.
+/// A source the person let an app share, good for that app until the bridge says it is gone.
 struct Consent {
     app: String,
     uid: u32,
-    output: String,
+    source: Source,
 }
 
 /// The dialog that is up.
@@ -108,7 +112,7 @@ impl Dialog {
     }
 
     fn casting(&self) -> bool {
-        matches!(self.req.what, What::Cast(_))
+        matches!(self.req.what, What::Cast { .. })
     }
 
     /// Entries that pass the filter, as indices into `entries`.
@@ -120,7 +124,9 @@ impl Dialog {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.name.to_lowercase().contains(&filter))
+            .filter(|(_, e)| {
+                e.name.to_lowercase().contains(&filter) || e.detail.to_lowercase().contains(&filter)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -144,6 +150,7 @@ struct App {
     dialog: Option<Dialog>,
     /// What the compositor last said it has; asked again with every cast request.
     outputs: Vec<Output>,
+    windows: Vec<Window>,
     /// Casts by the bridge's request id.
     casts: HashMap<u64, Live>,
     /// Consents by token.
@@ -164,19 +171,20 @@ impl App {
                 self.queue.push_back(Pending { id, app, uid, title, what: What::Choose(kind) });
                 self.next(qh);
             }
-            Request::Cast { id, app, uid, cursor, again } => {
+            Request::Cast { id, app, uid, cursor, screens, windows, again } => {
                 self.tell(ToCompositor::Outputs);
+                self.tell(ToCompositor::Windows);
                 if let Some(token) = again {
                     let standing = self.consents.get(&token).filter(|c| c.app == app && c.uid == uid);
-                    if let Some(output) = standing.and_then(|c| self.outputs.iter().find(|o| o.name == c.output)).cloned() {
-                        eprintln!("drv-portal: {app} (uid {uid}) shares {} again", output.name);
-                        let name = output.name.clone();
-                        self.casts.insert(id, Live { app, uid, output, token });
-                        self.tell(ToCompositor::Start { cast: id, output: name, cursor });
+                    if let Some((source, label)) = standing.and_then(|c| self.label(&c.source).map(|l| (c.source.clone(), l))) {
+                        eprintln!("drv-portal: {app} (uid {uid}) shares {label} again");
+                        self.casts.insert(id, Live { app, uid, source: source.clone(), label, token });
+                        self.tell(ToCompositor::Start { cast: id, source, cursor });
                         return;
                     }
                 }
-                self.queue.push_back(Pending { id, app, uid, title: String::new(), what: What::Cast(cursor) });
+                let what = What::Cast { cursor, screens, windows };
+                self.queue.push_back(Pending { id, app, uid, title: String::new(), what });
                 self.next(qh);
             }
             Request::Forget { app, uid } => {
@@ -190,7 +198,7 @@ impl App {
                     self.next(qh);
                 }
                 if let Some(live) = self.casts.remove(&id) {
-                    eprintln!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.output.name);
+                    eprintln!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.label);
                     self.tell(ToCompositor::Stop { cast: id });
                 }
             }
@@ -206,22 +214,21 @@ impl App {
             }
             ToPortal::Outputs(outputs) => {
                 self.outputs = outputs;
-                if self.dialog.as_ref().is_some_and(|d| d.casting()) {
-                    let mut d = self.dialog.take().unwrap();
-                    self.list(&mut d);
-                    self.dialog = Some(d);
-                    self.draw();
-                }
+                self.relist();
             }
-            ToPortal::Started { cast, node_id } => match self.casts.get(&cast) {
+            ToPortal::Windows(windows) => {
+                self.windows = windows;
+                self.relist();
+            }
+            ToPortal::Started { cast, node_id, width, height } => match self.casts.get(&cast) {
                 Some(live) => {
-                    eprintln!("drv-portal: {} (uid {}) shares {} on PipeWire node {node_id}", live.app, live.uid, live.output.name);
+                    eprintln!("drv-portal: {} (uid {}) shares {} on PipeWire node {node_id}", live.app, live.uid, live.label);
                     self.send(Response::Cast {
                         id: cast,
                         node_id,
-                        output: live.output.name.clone(),
-                        width: live.output.width,
-                        height: live.output.height,
+                        source: live.source.clone(),
+                        width,
+                        height,
                         token: live.token.clone(),
                     });
                 }
@@ -230,7 +237,7 @@ impl App {
             },
             ToPortal::Stopped { cast } => {
                 if let Some(live) = self.casts.remove(&cast) {
-                    eprintln!("drv-portal: the cast of {} for {} ended", live.output.name, live.app);
+                    eprintln!("drv-portal: the cast of {} for {} ended", live.label, live.app);
                     self.send(Response::Closed { id: cast });
                 }
             }
@@ -246,6 +253,32 @@ impl App {
     fn tell(&self, msg: ToCompositor) {
         if let Err(err) = seq::send(&self.compositor, &msg, &[]) {
             eprintln!("drv-portal: to the compositor: {err}");
+        }
+    }
+
+    /// How a source reads in the log, if the compositor still has it.
+    fn label(&self, source: &Source) -> Option<String> {
+        match source {
+            Source::Screen(name) => self
+                .outputs
+                .iter()
+                .find(|o| o.name == *name && o.width != 0 && o.height != 0)
+                .map(|o| o.name.clone()),
+            Source::Window(id) => self
+                .windows
+                .iter()
+                .find(|w| w.id == *id)
+                .map(|w| format!("{}'s window {:?}", w.app, w.title)),
+        }
+    }
+
+    /// The compositor's lists changed: a cast dialog shows the new ones.
+    fn relist(&mut self) {
+        if self.dialog.as_ref().is_some_and(|d| d.casting()) {
+            let mut d = self.dialog.take().unwrap();
+            self.list(&mut d);
+            self.dialog = Some(d);
+            self.draw();
         }
     }
 
@@ -289,18 +322,28 @@ impl App {
         self.layer = Some(layer);
     }
 
-    /// Fills `d.entries`: the screens for a cast; otherwise its directory, files and
-    /// directories, no dotfiles, and no symlinks, which could lead out of the tree.
+    /// Fills `d.entries`: the screens and windows for a cast; otherwise its directory,
+    /// files and directories, no dotfiles, and no symlinks, which could lead out of the tree.
     fn list(&self, d: &mut Dialog) {
         d.entries.clear();
         d.note = None;
-        if d.casting() {
-            for o in &self.outputs {
-                if o.width == 0 || o.height == 0 {
-                    continue;
+        if let What::Cast { screens, windows, .. } = d.req.what {
+            if screens {
+                for o in &self.outputs {
+                    if o.width == 0 || o.height == 0 {
+                        continue;
+                    }
+                    let detail = format!("{} {}  {}x{}", o.make, o.model, o.width, o.height);
+                    let source = Some(Source::Screen(o.name.clone()));
+                    d.entries.push(Entry { name: o.name.clone(), dir: false, detail, source });
                 }
-                let detail = format!("{} {}  {}x{}", o.make, o.model, o.width, o.height);
-                d.entries.push(Entry { name: o.name.clone(), dir: false, detail });
+            }
+            if windows {
+                for w in &self.windows {
+                    // The app's name is ours; the title is the window's own word.
+                    let source = Some(Source::Window(w.id));
+                    d.entries.push(Entry { name: w.app.clone(), dir: false, detail: w.title.clone(), source });
+                }
             }
             d.reset_selection();
             return;
@@ -313,7 +356,7 @@ impl App {
                     if name.starts_with('.') || !(ft.is_dir() || ft.is_file()) {
                         continue;
                     }
-                    d.entries.push(Entry { name, dir: ft.is_dir(), detail: String::new() });
+                    d.entries.push(Entry { name, dir: ft.is_dir(), detail: String::new(), source: None });
                 }
                 d.entries.sort_by(|a, b| {
                     b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
@@ -336,8 +379,9 @@ impl App {
         let shown = d.shown();
         let picked = d.selected.and_then(|i| shown.get(i)).map(|&i| (d.entries[i].name.clone(), d.entries[i].dir));
         if d.casting() {
-            if let Some((name, _)) = picked {
-                self.start_cast(qh, name);
+            let source = d.selected.and_then(|i| shown.get(i)).and_then(|&i| d.entries[i].source.clone());
+            if let Some(source) = source {
+                self.start_cast(qh, source);
             }
             return;
         }
@@ -403,24 +447,25 @@ impl App {
         self.finish(qh, Response::Chosen { id: id_req, paths: vec![doc.to_string_lossy().into_owned()] });
     }
 
-    /// The person picked a screen: the compositor starts the cast; the bridge hears when
+    /// The person picked a source: the compositor starts the cast; the bridge hears when
     /// the node exists.
-    fn start_cast(&mut self, qh: &QueueHandle<Self>, name: String) {
+    fn start_cast(&mut self, qh: &QueueHandle<Self>, source: Source) {
+        let label = self.label(&source);
         let Some(d) = self.dialog.as_mut() else { return };
-        let What::Cast(cursor) = d.req.what else { return };
-        let Some(output) = self.outputs.iter().find(|o| o.name == name).cloned() else {
-            d.note = Some(format!("{name} is gone"));
+        let What::Cast { cursor, .. } = d.req.what else { return };
+        let Some(label) = label else {
+            d.note = Some("that is gone".to_owned());
             self.draw();
             return;
         };
         let id = d.req.id;
-        eprintln!("drv-portal: {} (uid {}) may share {name}", d.req.app, d.req.uid);
+        eprintln!("drv-portal: {} (uid {}) may share {label}", d.req.app, d.req.uid);
         // Tokens only mean something with the app they were given to, so plain counting does.
         self.next_token += 1;
         let token = format!("drv{}", self.next_token);
-        self.consents.insert(token.clone(), Consent { app: d.req.app.clone(), uid: d.req.uid, output: name.clone() });
-        self.casts.insert(id, Live { app: d.req.app.clone(), uid: d.req.uid, output, token });
-        self.tell(ToCompositor::Start { cast: id, output: name, cursor });
+        self.consents.insert(token.clone(), Consent { app: d.req.app.clone(), uid: d.req.uid, source: source.clone() });
+        self.casts.insert(id, Live { app: d.req.app.clone(), uid: d.req.uid, source: source.clone(), label, token });
+        self.tell(ToCompositor::Start { cast: id, source, cursor });
         self.dialog = None;
         self.layer = None;
         self.next(qh);
@@ -476,7 +521,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
         p.text(PAD, PAD + 30., 14., &d.req.title, Align::Left, dim);
     }
     let line = if d.casting() {
-        "which screen it may see, until you stop it (Mod+Shift+Esc stops them all)".to_owned()
+        "what it may see, until you stop it (Mod+Shift+Esc stops them all)".to_owned()
     } else {
         format!("/{}", d.dir.display())
     };
@@ -486,7 +531,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     let bottom = p.height - PAD - 2. * ROW;
     let rows = ((bottom - top) / ROW).max(0.) as usize;
     if shown.is_empty() {
-        let what = if d.casting() { "no screen is on" } else { "nothing here" };
+        let what = if d.casting() { "nothing to share" } else { "nothing here" };
         p.text(PAD, top, 16., what, Align::Left, dim);
     }
     // Scroll so the selection stays on screen.
@@ -649,6 +694,7 @@ fn run() -> Result<(), String> {
         queue: VecDeque::new(),
         dialog: None,
         outputs: Vec::new(),
+        windows: Vec::new(),
         casts: HashMap::new(),
         consents: HashMap::new(),
         next_token: 0,

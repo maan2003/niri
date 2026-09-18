@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Kind {
@@ -13,6 +13,14 @@ pub enum Kind {
     Open,
     /// A file to write, created if the person names a new one.
     Save { name: String },
+}
+
+/// What a cast shows: a whole screen by connector name, or one window by the compositor's
+/// id for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    Screen(String),
+    Window(u64),
 }
 
 /// How the app wants the pointer in a screencast (the portal's `cursor_mode`).
@@ -34,13 +42,16 @@ pub enum Request {
         title: String,
         kind: Kind,
     },
-    /// Ask the person for a screen to share with `app`. `Cast` answers when it streams;
-    /// `Closed` follows when it ends on our side.
+    /// Ask the person for a screen or a window to share with `app`. `Cast` answers when it
+    /// streams; `Closed` follows when it ends on our side.
     Cast {
         id: u64,
         app: String,
         uid: u32,
         cursor: Cursor,
+        /// What the app will take: whole screens, windows, or both.
+        screens: bool,
+        windows: bool,
         /// A token from an earlier `Cast` answer to this app: the same screen again, with
         /// no dialog, if the consent still stands.
         again: Option<String>,
@@ -57,12 +68,13 @@ pub enum Response {
     Hello { version: u32 },
     /// The pick, as paths under the documents mount that `uid` alone may open.
     Chosen { id: u64, paths: Vec<String> },
-    /// The screen streams on this PipeWire node. The bridge restricts the app's PipeWire
+    /// The source streams on this PipeWire node. The bridge restricts the app's PipeWire
     /// connection to it.
     Cast {
         id: u64,
         node_id: u32,
-        output: String,
+        source: Source,
+        /// The stream's size in pixels.
         width: i32,
         height: i32,
         /// Names this consent in a later `Cast { again }` by the same app.

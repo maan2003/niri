@@ -121,7 +121,7 @@ fn run(result: &str, out: &mut String) -> anyhow::Result<()> {
     let session_path = OwnedObjectPath::try_from(session.as_str())?;
 
     let (code, _) = ask(&conn, "SelectSources", "probe_select", |mut o| {
-        o.insert("types", Value::U32(1));
+        o.insert("types", Value::U32(1 | 2));
         o.insert("cursor_mode", Value::U32(2));
         vec![Value::from(session_path.clone()), Value::from(o)]
     })?;

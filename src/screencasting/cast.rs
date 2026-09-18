@@ -103,6 +103,13 @@ impl<'a, E: Element> CursorData<'a, E> {
     }
 }
 
+impl Cast {
+    /// The stream's size in pixels, once configured.
+    pub fn size(&self) -> Option<Size<i32, Physical>> {
+        self.configured.map(|(size, _)| size)
+    }
+}
+
 pub fn to_gpu_cursor_mode(mode: CursorMode) -> CastCursorMode {
     match mode {
         CursorMode::Hidden => CastCursorMode::Hidden,

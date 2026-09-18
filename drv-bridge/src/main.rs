@@ -118,8 +118,8 @@ const FILE_CHOOSER_VERSION: u32 = 4;
 const SCREEN_CAST_VERSION: u32 = 4;
 const SETTINGS: &str = "org.freedesktop.portal.Settings";
 const SETTINGS_VERSION: u32 = 2;
-/// `AvailableSourceTypes`: monitors, for now.
-const SOURCE_TYPES: u32 = 1;
+/// `AvailableSourceTypes`: monitors and windows.
+const SOURCE_TYPES: u32 = 1 | 2;
 /// `AvailableCursorModes`: hidden, embedded, metadata.
 const CURSOR_MODES: u32 = 1 | 2 | 4;
 
@@ -387,14 +387,13 @@ impl Portal {
         Ok(id)
     }
 
-    /// Asks for a screen for `app`. `on` hears `Cast` once the node streams, then `Closed`
-    /// when it ends; or `Cancelled`/`Failed` instead.
+    /// Asks for a screen or a window for `app`. `on` hears `Cast` once the node streams,
+    /// then `Closed` when it ends; or `Cancelled`/`Failed` instead.
     fn cast(
         &self,
         app: &str,
         uid: u32,
-        cursor: protocol::Cursor,
-        again: Option<String>,
+        session: &CastSession,
         on: impl Fn(protocol::Response) + Send + Sync + 'static,
     ) -> anyhow::Result<u64> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -403,8 +402,10 @@ impl Portal {
             id,
             app: app.to_owned(),
             uid,
-            cursor,
-            again,
+            cursor: session.cursor,
+            screens: session.screens,
+            windows: session.windows,
+            again: session.again.clone(),
         };
         if let Err(err) = seq::send(&self.sock, &req, &[]) {
             self.casts.lock().unwrap().remove(&id);
@@ -434,6 +435,9 @@ impl Portal {
 /// A screencast session of one app: from `CreateSession` to `Close`, or the cast's end.
 struct CastSession {
     cursor: protocol::Cursor,
+    /// `SelectSources.types`: whole screens (bit 1), windows (bit 2).
+    screens: bool,
+    windows: bool,
     /// The app asked for a restore token (any `persist_mode`); it gets one that lasts while
     /// it runs.
     persist: bool,
@@ -701,6 +705,8 @@ impl AppLink {
                     session.clone(),
                     CastSession {
                         cursor: protocol::Cursor::Embedded,
+                        screens: true,
+                        windows: false,
                         persist: false,
                         again: None,
                         portal_id: None,
@@ -724,10 +730,17 @@ impl AppLink {
                 };
                 let persist = options.get("persist_mode").cloned().and_then(|v| u32::try_from(v).ok()).unwrap_or(0) != 0;
                 let again = options.get("restore_token").cloned().and_then(|v| String::try_from(v).ok());
+                // Bit 1 monitors, bit 2 windows (4, virtual, we do not have); nothing asked
+                // means monitors.
+                let types = options.get("types").cloned().and_then(|v| u32::try_from(v).ok()).unwrap_or(1);
+                let windows = types & 2 != 0;
+                let screens = types & 1 != 0 || !windows;
                 {
                     let mut state = self.state.lock().unwrap();
                     let s = state.sessions.get_mut(session.as_str()).context("no such session")?;
                     s.cursor = cursor;
+                    s.screens = screens;
+                    s.windows = windows;
                     s.persist = persist;
                     s.again = again;
                 }
@@ -739,19 +752,19 @@ impl AppLink {
             "Start" => {
                 let (session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
                     msg.body().deserialize()?;
-                let (cursor, again) = {
+                let asked = {
                     let state = self.state.lock().unwrap();
                     let s = state.sessions.get(session.as_str()).context("no such session")?;
                     anyhow::ensure!(s.portal_id.is_none(), "the session was started already");
-                    (s.cursor, s.again.clone())
+                    CastSession { again: s.again.clone(), ..*s }
                 };
                 let handle = self.handle(msg, &caller, &options, "handle_token");
                 let link = self.clone();
                 let session_path = session.as_str().to_owned();
                 let (caller2, handle2) = (caller.clone(), handle.clone());
-                let id = self.portal.cast(&self.app.name, self.uid, cursor, again, move |resp| {
+                let id = self.portal.cast(&self.app.name, self.uid, &asked, move |resp| {
                     let res = match resp {
-                        protocol::Response::Cast { node_id, output, width, height, token, .. } => {
+                        protocol::Response::Cast { node_id, source, width, height, token, .. } => {
                             let mut state = link.state.lock().unwrap();
                             state.ours.remove(&handle2);
                             let persist = match state.sessions.get_mut(&session_path) {
@@ -763,8 +776,12 @@ impl AppLink {
                             };
                             drop(state);
                             let mut stream: HashMap<&str, Value<'_>> = HashMap::new();
-                            stream.insert("source_type", Value::U32(1));
-                            stream.insert("id", Value::from(output));
+                            let (source_type, source_id) = match source {
+                                protocol::Source::Screen(name) => (1, name),
+                                protocol::Source::Window(id) => (2, id.to_string()),
+                            };
+                            stream.insert("source_type", Value::U32(source_type));
+                            stream.insert("id", Value::from(source_id));
                             stream.insert("position", Value::from((0i32, 0i32)));
                             stream.insert("size", Value::from((width, height)));
                             // `a(ua{sv})` as the spec has it; a Vec of Values would go
