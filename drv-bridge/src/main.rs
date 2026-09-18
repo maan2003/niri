@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
-use niri_bridge::{
+use drv_bridge::{
     rewrite_handle, rewrite_structure, sender_component, tokens_owned_by, unique_from_component,
     APP_ID_PREFIX, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH,
 };
-use niri_policy::{AppPolicy, PolicyClient};
+use drv_policy::{AppPolicy, PolicyClient};
 use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
@@ -36,13 +36,13 @@ enum Cmd {
     Serve {
         #[arg(long)]
         socket: PathBuf,
-        #[arg(long, env = "NIRI_IDENTITY_SOCKET")]
+        #[arg(long, env = "DRV_IDENTITY_SOCKET")]
         identity: PathBuf,
     },
     /// Run in the app's UID on its private bus: claim the desktop names, forward to the server,
     /// then run the app.
     App {
-        #[arg(long, env = niri_bridge::SOCKET_ENV)]
+        #[arg(long, env = drv_bridge::SOCKET_ENV)]
         socket: PathBuf,
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
@@ -363,7 +363,7 @@ impl AppLink {
             }
             MessageType::Signal => {
                 let path = hdr.path().context("no path")?.as_str();
-                let Some((_, owner, token)) = niri_bridge::handle_parts(path) else {
+                let Some((_, owner, token)) = drv_bridge::handle_parts(path) else {
                     return Ok(());
                 };
                 if owner != self.me {
@@ -399,8 +399,8 @@ impl AppLink {
         Ok(match member {
             "GetCapabilities" => Message::method_return(hdr)?.build(&vec!["body"])?,
             "GetServerInformation" => Message::method_return(hdr)?.build(&(
-                "niri-bridge",
-                "niri",
+                "drv-bridge",
+                "drv",
                 env!("CARGO_PKG_VERSION"),
                 "1.2",
             ))?,
@@ -482,7 +482,7 @@ fn app(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
             for msg in bus_iter {
                 let Ok(msg) = msg else { break };
                 if let Err(err) = shim.on_app_message(&msg) {
-                    eprintln!("niri-bridge: from app: {err:#}");
+                    eprintln!("drv-bridge: from app: {err:#}");
                 }
             }
         });
@@ -493,10 +493,10 @@ fn app(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
             for msg in server_iter {
                 let Ok(msg) = msg else { break };
                 if let Err(err) = shim.on_server_message(&msg) {
-                    eprintln!("niri-bridge: from server: {err:#}");
+                    eprintln!("drv-bridge: from server: {err:#}");
                 }
             }
-            eprintln!("niri-bridge: lost the bridge server");
+            eprintln!("drv-bridge: lost the bridge server");
         });
     }
 

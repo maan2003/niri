@@ -43,11 +43,11 @@
             root = ./.;
             fileset = lib.fileset.unions [
               ./niri-config
-              ./niri-bridge
-              ./niri-forker
-              ./niri-identity
+              ./drv-bridge
+              ./drv-spawn
+              ./drv-identity
               ./niri-ipc
-              ./niri-policy
+              ./drv-policy
               ./niri-visual-tests
               ./resources
               ./src
@@ -74,16 +74,17 @@
 
           strictDeps = true;
 
-          # The identity daemon and forker ship with the compositor.
+          # The spawner (with the identity daemon inside), the drv CLI and the bridge ship with the
+          # compositor.
           cargoBuildFlags = [
             "-p"
             "niri"
             "-p"
-            "niri-forker"
+            "drv-spawn"
             "-p"
-            "niri-identity"
+            "drv-identity"
             "-p"
-            "niri-bridge"
+            "drv-bridge"
           ];
 
           nativeBuildInputs = [
@@ -258,8 +259,8 @@
           default = niri;
         }
         // lib.optionalAttrs (system == "x86_64-linux") {
-          # A development VM with the whole stack: seatd, virtio-gpu, root forker, identity
-          # daemon and the compositor on the tty backend. Host /src/niri is shared in for
+          # A development VM with the whole stack: seatd, virtio-gpu, root spawner with the
+          # identity daemon, and the compositor on the tty backend. Host /src/niri is shared in for
           # iterating on host-built binaries. `nix build .#dev-vm && ./result/bin/run-*-vm`.
           dev-vm =
             (lib.nixosSystem {
@@ -280,7 +281,7 @@
         niri = final.callPackage niri-package { };
       };
 
-      # `services.niri-desktop`: the multi-UID desktop from one app list (nix/module.nix).
+      # `services.drv`: the multi-UID desktop from one app list (nix/module.nix).
       nixosModules.default =
         { pkgs, ... }:
         {

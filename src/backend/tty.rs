@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use drm_ffi::drm_mode_modeinfo;
+use drv_policy::Global as PolicyGlobal;
 use libc::dev_t;
 use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
 use niri_ipc::{HSyncPolarity, VSyncPolarity};
-use niri_policy::Global as PolicyGlobal;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};

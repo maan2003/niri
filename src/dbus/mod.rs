@@ -8,6 +8,7 @@ use zbus::zvariant::NoneValue as _;
 
 use crate::niri::State;
 
+pub mod caller;
 pub mod freedesktop_a11y;
 pub mod freedesktop_locale1;
 pub mod freedesktop_login1;
@@ -55,10 +56,19 @@ impl DBusServers {
 
         let mut dbus = Self::default();
 
+        // The D-Bus thread asks the identity daemon who its callers are, on its own connection.
+        let caller = match niri.policy.reconnect() {
+            Ok(policy) => caller::Caller::new(policy),
+            Err(err) => {
+                error!("error connecting to the identity daemon for D-Bus: {err}");
+                std::process::exit(1);
+            }
+        };
+
         // The GNOME portal backend needs the service channel too, not only the screencast API.
         if is_session_instance || config.debug.dbus_interfaces_in_non_session_instances {
             let (to_niri, from_service_channel) = calloop::channel::channel();
-            let service_channel = ServiceChannel::new(to_niri);
+            let service_channel = ServiceChannel::new(to_niri, caller.clone());
             niri.event_loop
                 .insert_source(from_service_channel, move |event, _, state| match event {
                     calloop::channel::Event::Msg(new_client) => {
@@ -105,7 +115,8 @@ impl DBusServers {
                     calloop::channel::Event::Closed => (),
                 })
                 .unwrap();
-            let screenshot = gnome_shell_screenshot::Screenshot::new(to_niri, from_niri);
+            let screenshot =
+                gnome_shell_screenshot::Screenshot::new(to_niri, from_niri, caller.clone());
             dbus.conn_screen_shot = try_start(screenshot, is_session_instance);
 
             let (to_niri, from_introspect) = calloop::channel::channel();
@@ -132,7 +143,7 @@ impl DBusServers {
                         }
                     })
                     .unwrap();
-                let screen_cast = ScreenCast::new(backend.ipc_outputs(), to_niri);
+                let screen_cast = ScreenCast::new(backend.ipc_outputs(), to_niri, caller.clone());
                 dbus.conn_screen_cast = try_start(screen_cast, is_session_instance);
             }
 

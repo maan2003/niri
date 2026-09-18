@@ -1,18 +1,24 @@
 use std::os::unix::net::UnixStream;
 
-use zbus::{fdo, interface, zvariant};
+use drv_policy::Grant;
+use zbus::message::Header;
+use zbus::{fdo, interface, zvariant, Connection};
 
+use super::caller::Caller;
 use super::Start;
 use crate::niri::NewClient;
 
 pub struct ServiceChannel {
     to_niri: calloop::channel::Sender<NewClient>,
+    caller: Caller,
 }
 
 #[interface(name = "org.gnome.Mutter.ServiceChannel")]
 impl ServiceChannel {
     async fn open_wayland_service_connection(
         &mut self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
         service_client_type: u32,
     ) -> fdo::Result<zvariant::OwnedFd> {
         if service_client_type != 1 {
@@ -20,13 +26,15 @@ impl ServiceChannel {
                 "Invalid service client type".to_owned(),
             ));
         }
+        // The socket we hand back has no peer credentials of its own (both ends are ours), so
+        // the client is identified by who asked on the bus.
+        let uid = self.caller.require(conn, &hdr, Grant::Screencast).await?;
 
         let (sock1, sock2) = UnixStream::pair().unwrap();
         let client = NewClient {
             client: sock2,
             restricted: false,
-            // FIXME: maybe you can get the PID from D-Bus somehow?
-            credentials_unknown: true,
+            identity: Some(uid),
         };
         if let Err(err) = self.to_niri.send(client) {
             warn!("error sending message to niri: {err:?}");
@@ -38,8 +46,8 @@ impl ServiceChannel {
 }
 
 impl ServiceChannel {
-    pub fn new(to_niri: calloop::channel::Sender<NewClient>) -> Self {
-        Self { to_niri }
+    pub fn new(to_niri: calloop::channel::Sender<NewClient>, caller: Caller) -> Self {
+        Self { to_niri, caller }
     }
 }
 

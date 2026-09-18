@@ -936,6 +936,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-bridge"
+version = "26.4.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "drv-policy",
+ "rustix 1.1.4",
+ "serde",
+ "zbus",
+]
+
+[[package]]
+name = "drv-identity"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-policy",
+ "rustix 1.1.4",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "drv-policy"
+version = "26.4.0"
+dependencies = [
+ "postcard",
+ "rustix 1.1.4",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "drv-spawn"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-identity",
+ "drv-policy",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2296,6 +2340,7 @@ dependencies = [
  "clap_complete_nushell",
  "directories",
  "drm-ffi",
+ "drv-policy",
  "fastrand",
  "futures-util",
  "git-version",
@@ -2309,7 +2354,6 @@ dependencies = [
  "memmap2",
  "niri-config",
  "niri-ipc",
- "niri-policy",
  "ordered-float",
  "pango",
  "pangocairo",
@@ -2343,18 +2387,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "niri-bridge"
-version = "26.4.0"
-dependencies = [
- "anyhow",
- "clap",
- "niri-policy",
- "rustix 1.1.4",
- "serde",
- "zbus",
-]
-
-[[package]]
 name = "niri-config"
 version = "26.4.0"
 dependencies = [
@@ -2373,29 +2405,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "niri-forker"
-version = "26.4.0"
-dependencies = [
- "clap",
- "libc",
- "niri-policy",
- "rustix 1.1.4",
- "serde",
-]
-
-[[package]]
-name = "niri-identity"
-version = "26.4.0"
-dependencies = [
- "clap",
- "niri-forker",
- "niri-policy",
- "rustix 1.1.4",
- "serde",
- "toml",
-]
-
-[[package]]
 name = "niri-ipc"
 version = "26.4.0"
 dependencies = [
@@ -2403,16 +2412,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "niri-policy"
-version = "26.4.0"
-dependencies = [
- "postcard",
- "rustix 1.1.4",
- "serde",
- "toml",
 ]
 
 [[package]]

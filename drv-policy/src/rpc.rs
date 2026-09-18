@@ -1,6 +1,5 @@
-//! Wire protocol between the compositor and the identity daemon: one Unix socket, requests and
-//! responses in lock step, each message a little-endian `u32` length followed by a postcard
-//! payload.
+//! Wire protocol of the identity daemon: one Unix socket, requests and responses in lock step,
+//! each message a little-endian `u32` length followed by a postcard payload.
 
 use std::io::{self, Read, Write};
 
@@ -10,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -20,17 +19,15 @@ pub enum Request {
     Hello {
         version: u32,
     },
-    /// Policy for a UID. The daemon answers `Response::Policy` for every UID, using its default
-    /// record for ones it does not know.
+    /// Policy for a UID. Anyone may ask about their own UID; other UIDs need
+    /// [`Grant::Lookup`](crate::Grant::Lookup).
     Lookup {
         uid: u32,
     },
-    /// Start an app by manifest name. Arguments come from the manifest, never from here. `env`
-    /// is what the compositor wants children to see (`WAYLAND_DISPLAY`, the config's
-    /// `environment {}` block); the daemon adds the identity-specific parts.
+    /// Start an app by manifest name. Not a privilege: anyone may ask. Arguments and
+    /// environment come from the manifest and the daemon, never from here.
     Launch {
         app: String,
-        env: Vec<(String, String)>,
     },
 }
 
@@ -44,7 +41,7 @@ pub enum Response {
     Launched {
         uid: u32,
     },
-    /// The request was understood and refused (unknown app, forker unavailable, ...).
+    /// The request was understood and refused (unknown app, not allowed, spawner down, ...).
     Error(String),
 }
 

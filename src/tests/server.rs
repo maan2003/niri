@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use calloop::EventLoop;
+use drv_policy::PolicyClient;
 use niri_config::Config;
-use niri_policy::PolicyClient;
 use smithay::reexports::wayland_server::Display;
 
 use crate::niri::State;

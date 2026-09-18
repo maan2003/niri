@@ -1,0 +1,19 @@
+[package]
+name = "drv-identity"
+version.workspace = true
+description = "Identity daemon: one UID per app, its policy, and launching through the spawner"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+rustix = { version = "1.1.4", features = ["process"] }
+serde.workspace = true
+toml = "1"
+
+[[bin]]
+name = "drv"
+path = "src/bin/drv.rs"

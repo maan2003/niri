@@ -1,8 +1,8 @@
 //! What crosses from an app's private session bus to the human's session.
 //!
-//! `niri-bridge serve` runs as the human. Every connection is keyed on the peer UID
+//! `drv-bridge serve` runs as the human. Every connection is keyed on the peer UID
 //! (`SO_PEERCRED`) and the identity daemon's answer for it; the app never names itself.
-//! `niri-bridge app` runs in the app's UID on its private bus and claims the desktop names
+//! `drv-bridge app` runs in the app's UID on its private bus and claims the desktop names
 //! apps expect (`org.freedesktop.Notifications`, `org.freedesktop.portal.Desktop`); it is a
 //! convenience, never a boundary.
 //!
@@ -14,10 +14,10 @@
 use zbus::zvariant::{Array, ObjectPath, Str, Structure, StructureBuilder, Value};
 
 /// Where apps find the server's socket.
-pub const SOCKET_ENV: &str = "NIRI_BRIDGE_SOCKET";
-/// Portal app ids for manifest names: `niri.app.<name>`, so the human's launcher entries and
+pub const SOCKET_ENV: &str = "DRV_BRIDGE_SOCKET";
+/// Portal app ids for manifest names: `drv.app.<name>`, so the human's launcher entries and
 /// the portal dialogs agree on who is asking.
-pub const APP_ID_PREFIX: &str = "niri.app.";
+pub const APP_ID_PREFIX: &str = "drv.app.";
 
 pub const PORTAL_NAME: &str = "org.freedesktop.portal.Desktop";
 pub const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";

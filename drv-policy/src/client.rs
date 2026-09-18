@@ -1,5 +1,5 @@
-//! The compositor's side: ask the daemon, cache per UID, fail closed. There is no mode without
-//! a daemon: nobody is trusted unless a daemon says so.
+//! The asking side: ask the daemon, cache per UID, fail closed. There is no mode without a
+//! daemon: nobody may do anything unless a daemon says so.
 
 use std::collections::HashMap;
 use std::io;
@@ -12,8 +12,8 @@ use crate::rpc::{self, Request, Response};
 use crate::AppPolicy;
 
 /// How long one request may take. Lookups are answered from memory; a launch is one fork
-/// request to the forker. Anything slower is a stuck daemon, and stalling the compositor on it is
-/// worse than failing.
+/// request to the spawner. Anything slower is a stuck daemon, and stalling the compositor on it
+/// is worse than failing.
 const TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Source {
@@ -44,6 +44,14 @@ impl PolicyClient {
         })
     }
 
+    /// A fresh connection to the same daemon, for another thread. Its own cache.
+    pub fn reconnect(&self) -> io::Result<Self> {
+        match &self.source {
+            Source::Socket { path, .. } => Self::connect(path.clone()),
+            Source::Stream(_) => Err(io::Error::other("cannot reconnect a test stream")),
+        }
+    }
+
     pub fn from_stream(stream: UnixStream) -> io::Result<Self> {
         hello(&stream)?;
         Ok(Self {
@@ -52,14 +60,16 @@ impl PolicyClient {
         })
     }
 
-    /// The daemon's answer for `uid`, cached. An error means the daemon could not be reached or
-    /// misbehaved; the caller decides what to do (the compositor uses [`AppPolicy::unknown`]).
+    /// The daemon's answer for `uid`, cached. An error means the daemon could not be reached,
+    /// refused us, or misbehaved; the caller decides what to do (the compositor uses
+    /// [`AppPolicy::unknown`]).
     pub fn lookup(&mut self, uid: u32) -> io::Result<Arc<AppPolicy>> {
         if let Some(policy) = self.cache.get(&uid) {
             return Ok(policy.clone());
         }
         let policy = match self.request(&Request::Lookup { uid })? {
             Response::Policy(policy) => Arc::new(policy),
+            Response::Error(err) => return Err(io::Error::other(err)),
             other => return Err(unexpected("lookup", other)),
         };
         self.cache.insert(uid, policy.clone());
@@ -67,9 +77,9 @@ impl PolicyClient {
     }
 
     /// Asks the daemon to start the named app; returns the UID it runs as. A daemon-side
-    /// refusal (unknown app, no forker) comes back as an error too.
-    pub fn launch(&mut self, app: String, env: Vec<(String, String)>) -> io::Result<u32> {
-        match self.request(&Request::Launch { app, env })? {
+    /// refusal (unknown app, no spawner) comes back as an error too.
+    pub fn launch(&mut self, app: String) -> io::Result<u32> {
+        match self.request(&Request::Launch { app })? {
             Response::Launched { uid } => Ok(uid),
             Response::Error(err) => Err(io::Error::other(err)),
             other => Err(unexpected("launch", other)),

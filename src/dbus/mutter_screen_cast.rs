@@ -3,11 +3,14 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use drv_policy::Grant;
 use serde::Deserialize;
+use zbus::message::Header;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 use zbus::zvariant::{DeserializeDict, OwnedObjectPath, SerializeDict, Type, Value};
-use zbus::{fdo, interface, ObjectServer};
+use zbus::{fdo, interface, Connection, ObjectServer};
 
+use super::caller::Caller;
 use super::{request_name, Start};
 use crate::backend::IpcOutputMap;
 use crate::utils::{CastSessionId, CastStreamId};
@@ -18,6 +21,7 @@ pub struct ScreenCast {
     to_niri: calloop::channel::Sender<ScreenCastToNiri>,
     #[allow(clippy::type_complexity)]
     sessions: Arc<Mutex<Vec<(Session, InterfaceRef<Session>)>>>,
+    caller: Caller,
 }
 
 #[derive(Clone)]
@@ -108,8 +112,12 @@ impl ScreenCast {
     async fn create_session(
         &self,
         #[zbus(object_server)] server: &ObjectServer,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
         properties: HashMap<&str, Value<'_>>,
     ) -> fdo::Result<OwnedObjectPath> {
+        // Only the portal backend; apps get a session through it, with the human's consent.
+        self.caller.require(conn, &hdr, Grant::Screencast).await?;
         if properties.contains_key("remote-desktop-session-id") {
             return Err(fdo::Error::Failed(
                 "there are no remote desktop sessions".to_owned(),
@@ -308,11 +316,13 @@ impl ScreenCast {
     pub fn new(
         ipc_outputs: Arc<Mutex<IpcOutputMap>>,
         to_niri: calloop::channel::Sender<ScreenCastToNiri>,
+        caller: Caller,
     ) -> Self {
         Self {
             ipc_outputs,
             to_niri,
             sessions: Arc::new(Mutex::new(vec![])),
+            caller,
         }
     }
 }

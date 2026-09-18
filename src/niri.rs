@@ -13,13 +13,13 @@ use std::{env, fs, io, mem, thread};
 use _server_decoration::server::org_kde_kwin_server_decoration_manager::Mode as KdeDecorationsMode;
 use anyhow::{bail, ensure, Context};
 use calloop::futures::Scheduler;
+use drv_policy::{AppPolicy, Global as PolicyGlobal, PolicyClient};
 use niri_config::debug::PreviewRender;
 use niri_config::output::{HdrMode, MaxBpc};
 use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
-use niri_policy::{env as niri_identity_env, AppPolicy, Global as PolicyGlobal, PolicyClient};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{InputTime, Keycode};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -2896,7 +2896,7 @@ impl Niri {
                     state.niri.insert_client(NewClient {
                         client,
                         restricted: false,
-                        credentials_unknown: false,
+                        identity: None,
                     });
                 })
                 .unwrap();
@@ -2906,7 +2906,7 @@ impl Niri {
         // A second, world-connectable socket for apps running as other UIDs, which cannot enter
         // our XDG_RUNTIME_DIR. Anyone may connect; the policy decides what they get.
         let apps_socket = create_wayland_socket
-            .then(|| env::var_os("NIRI_APPS_SOCKET").map(PathBuf::from))
+            .then(|| env::var_os(drv_policy::env::APPS_SOCKET).map(PathBuf::from))
             .flatten()
             .and_then(|path| match bind_apps_socket(&event_loop, &path) {
                 Ok(()) => {
@@ -2919,13 +2919,9 @@ impl Niri {
                 }
             });
 
-        let ipc_server = match IpcServer::start(&event_loop, socket_name.as_deref()) {
-            Ok(server) => Some(server),
-            Err(err) => {
-                warn!("error starting IPC server: {err:?}");
-                None
-            }
-        };
+        // No IPC socket: a client that can act as the compositor would bypass every policy.
+        // Launching goes to the identity daemon directly; everything else is Wayland.
+        let ipc_server: Option<IpcServer> = None;
 
         #[cfg(feature = "xdp-gnome-screencast")]
         let screencasting = Screencasting::new();
@@ -3114,46 +3110,15 @@ impl Niri {
         niri
     }
 
-    /// Asks the identity daemon to start the named app as its own UID, with the environment a
-    /// child of ours would have had. Only a name: arguments come from the app's manifest.
+    /// Asks the identity daemon to start the named app as its own UID. Only a name: arguments
+    /// and environment come from the app's manifest, so a key binding is just a launcher.
     pub fn launch(&mut self, command: Vec<String>) {
         let [app] = command.as_slice() else {
             warn!("spawn takes exactly one app name, got {command:?}");
             return;
         };
         let app = app.clone();
-        let mut env = Vec::new();
-        // Our own session: the human's tools (launcher, bar) run as us and use these. The
-        // identity daemon swaps in the apps socket for everyone else.
-        if let Ok(runtime_dir) = env::var("XDG_RUNTIME_DIR") {
-            env.push(("XDG_RUNTIME_DIR".to_owned(), runtime_dir));
-        }
-        if let Some(name) = &self.socket_name {
-            env.push((
-                "WAYLAND_DISPLAY".to_owned(),
-                name.to_string_lossy().into_owned(),
-            ));
-        }
-        if let Some(path) = &self.apps_socket {
-            env.push((
-                niri_identity_env::APPS_WAYLAND_DISPLAY.to_owned(),
-                path.to_string_lossy().into_owned(),
-            ));
-        }
-        if let Some(ipc) = &self.ipc_server {
-            if let Some(path) = &ipc.socket_path {
-                env.push((
-                    niri_ipc::socket::SOCKET_PATH_ENV.to_owned(),
-                    path.to_string_lossy().into_owned(),
-                ));
-            }
-        }
-        for var in &CHILD_ENV.read().unwrap().0 {
-            if let Some(value) = &var.value {
-                env.push((var.name.clone(), value.clone()));
-            }
-        }
-        match self.policy.launch(app.clone(), env) {
+        match self.policy.launch(app.clone()) {
             Ok(uid) => info!("launched {app:?} as uid {uid}"),
             Err(err) => warn!("error launching {app:?}: {err}"),
         }
@@ -3163,38 +3128,29 @@ impl Niri {
         let NewClient {
             client,
             restricted,
-            credentials_unknown,
+            identity,
         } = client;
 
-        // Identity is the peer UID; PIDs are reused and never used for this. Any failure along
-        // the way fails closed: the client gets the nothing-optional policy. Clients without
-        // credentials arrived as an fd over the human's session bus (the Mutter service
-        // channel), so they are the human's own tools.
-        let policy = if credentials_unknown {
-            let me = rustix::process::getuid().as_raw();
-            self.policy.lookup(me).unwrap_or_else(|err| {
-                warn!("policy lookup for own uid {me} failed, treating as unknown: {err}");
+        // Identity is the peer UID; PIDs are reused and never used for this. A socket that
+        // arrived over D-Bus (the Mutter service channel) has no peer of its own, so the
+        // D-Bus side tells us the caller's UID. Any failure along the way fails closed: the
+        // client gets the nothing-optional policy.
+        let credentials_unknown = identity.is_some();
+        let uid = match identity {
+            Some(uid) => Ok(uid),
+            None => rustix::net::sockopt::socket_peercred(&client).map(|cred| cred.uid.as_raw()),
+        };
+        let policy = match uid {
+            Ok(uid) => self.policy.lookup(uid).unwrap_or_else(|err| {
+                warn!("policy lookup for uid {uid} failed, treating as unknown: {err}");
                 Arc::new(AppPolicy::unknown())
-            })
-        } else {
-            match rustix::net::sockopt::socket_peercred(&client) {
-                Ok(cred) => {
-                    let uid = cred.uid.as_raw();
-                    self.policy.lookup(uid).unwrap_or_else(|err| {
-                        warn!("policy lookup for uid {uid} failed, treating as unknown: {err}");
-                        Arc::new(AppPolicy::unknown())
-                    })
-                }
-                Err(err) => {
-                    warn!("error getting client credentials, treating as unknown: {err}");
-                    Arc::new(AppPolicy::unknown())
-                }
+            }),
+            Err(err) => {
+                warn!("error getting client credentials, treating as unknown: {err}");
+                Arc::new(AppPolicy::unknown())
             }
         };
-        debug!(
-            "new client: policy {:?} (trusted: {}, gpu: {})",
-            policy.name, policy.trusted, policy.gpu
-        );
+        debug!("new client: policy {:?} (gpu: {})", policy.name, policy.gpu);
 
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
@@ -7358,7 +7314,7 @@ fn bind_apps_socket(event_loop: &LoopHandle<'static, State>, path: &Path) -> any
                 Ok((client, _)) => state.niri.insert_client(NewClient {
                     client,
                     restricted: false,
-                    credentials_unknown: false,
+                    identity: None,
                 }),
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
@@ -7384,7 +7340,9 @@ pub fn client_allows(global: PolicyGlobal) -> impl Fn(&Client) -> bool + Clone +
 pub struct NewClient {
     pub client: UnixStream,
     pub restricted: bool,
-    pub credentials_unknown: bool,
+    /// The peer's UID when the socket cannot tell us (it came over D-Bus); `None` means read
+    /// it from the socket.
+    pub identity: Option<u32>,
 }
 
 pub struct ClientState {

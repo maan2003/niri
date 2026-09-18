@@ -2,10 +2,10 @@
 members = [
     "niri-config",
     "niri-ipc",
-    "niri-policy",
-    "niri-forker",
-    "niri-identity",
-    "niri-bridge",
+    "drv-policy",
+    "drv-spawn",
+    "drv-identity",
+    "drv-bridge",
     "niri-visual-tests",
 ]
 
@@ -86,7 +86,7 @@ libdisplay-info = { version = "0.3.0", features = ["v0_2"] }
 log = { version = "0.4", features = ["max_level_trace", "release_max_level_debug"] }
 niri-config = { version = "26.4.0", path = "niri-config" }
 niri-ipc = { version = "26.4.0", path = "niri-ipc", features = ["clap"] }
-niri-policy = { version = "26.4.0", path = "niri-policy" }
+drv-policy = { version = "26.4.0", path = "drv-policy" }
 ordered-float = "5"
 pango = { version = "0.21.5", features = ["v1_44"] }
 pangocairo = "0.21.5"

@@ -15,6 +15,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use directories::ProjectDirs;
+use drv_policy::PolicyClient;
 use niri::cli::{Cli, CompletionShell, Sub};
 #[cfg(feature = "dbus")]
 use niri::dbus;
@@ -26,8 +27,6 @@ use niri::utils::spawning::{
 };
 use niri::utils::{cause_panic, version, watcher, IS_SYSTEMD_SERVICE};
 use niri_config::{Config, ConfigPath};
-use niri_ipc::socket::SOCKET_PATH_ENV;
-use niri_policy::PolicyClient;
 use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
@@ -246,13 +245,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         socket_name.to_string_lossy()
     );
 
-    // Set NIRI_SOCKET for children.
-    if let Some(ipc) = &state.niri.ipc_server {
-        let socket_path = ipc.socket_path.as_deref().unwrap();
-        env::set_var(SOCKET_PATH_ENV, socket_path);
-        info!("IPC listening on: {}", socket_path.to_string_lossy());
-    }
-
     // X11 is not supported; keep the host DISPLAY out of the session environment.
     env::remove_var("DISPLAY");
 
@@ -300,8 +292,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
         );
     }
+    // Autostart is the identity daemon's job (`autostart` in the manifest): the compositor
+    // does not decide what runs.
     for elem in spawn_at_startup {
-        state.niri.launch(elem.command);
+        spawn_disabled(&format!("spawn-at-startup {:?}", elem.command));
     }
     for elem in spawn_sh_at_startup {
         spawn_disabled(&format!("spawn-sh-at-startup {:?}", elem.command));
@@ -329,7 +323,6 @@ fn import_environment() {
         "DISPLAY",
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_TYPE",
-        SOCKET_PATH_ENV,
     ]
     .join(" ");
 
@@ -413,19 +406,20 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-/// Socket from `NIRI_IDENTITY_SOCKET`, else `$XDG_RUNTIME_DIR/niri-identity.sock`. Nobody is
-/// trusted unless the daemon says so, so no daemon means no compositor.
+/// Socket from `DRV_IDENTITY_SOCKET`, else `/run/drv/identity.sock`. Nobody may do anything
+/// unless the daemon says so, so no daemon means no compositor.
 fn connect_policy() -> PolicyClient {
-    let path = env::var_os("NIRI_IDENTITY_SOCKET")
+    let path = env::var_os(drv_policy::env::IDENTITY_SOCKET)
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("niri-identity.sock"))
-        });
-    let Some(path) = path else {
-        error!("no identity daemon: set NIRI_IDENTITY_SOCKET or XDG_RUNTIME_DIR");
-        std::process::exit(1);
-    };
-    match PolicyClient::connect(path.clone()) {
+        .unwrap_or_else(|| PathBuf::from("/run/drv/identity.sock"));
+    // At boot the daemon may still be coming up; give it a moment before failing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut result = PolicyClient::connect(path.clone());
+    while result.is_err() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        result = PolicyClient::connect(path.clone());
+    }
+    match result {
         Ok(policy) => {
             info!("connected to identity daemon at {}", path.display());
             policy
@@ -433,7 +427,7 @@ fn connect_policy() -> PolicyClient {
         Err(err) => {
             error!(
                 "error connecting to identity daemon at {}: {err}; \
-                 run niri-identityd or set NIRI_IDENTITY_SOCKET",
+                 run drv-spawnd or set DRV_IDENTITY_SOCKET",
                 path.display()
             );
             std::process::exit(1);

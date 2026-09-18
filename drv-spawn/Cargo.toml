@@ -1,0 +1,19 @@
+[package]
+name = "drv-spawn"
+version.workspace = true
+description = "Root spawner: forks the identity daemon over a socketpair and starts apps under the UIDs it asks for"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+drv-identity = { version = "26.4.0", path = "../drv-identity" }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "net", "process", "std"] }
+
+[[bin]]
+name = "drv-spawnd"
+path = "src/bin/drv-spawnd.rs"

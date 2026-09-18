@@ -80,59 +80,66 @@ in
   networking.firewall.enable = false;
   fonts.enableDefaultPackages = true;
 
+  # Only an ssh admin; nothing on the desktop runs as a human.
   users.users.alice = {
     isNormalUser = true;
     uid = 1000;
   };
 
-  services.niri-desktop = {
+  services.drv = {
     enable = true;
-    user = "alice";
-    # niri's stock binds (its spawn lines name apps that do not exist here and are refused).
+    # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
     config = builtins.replaceStrings [ "// skip-at-startup" ] [ "skip-at-startup" ] (builtins.readFile ../resources/default-config.kdl) + ''
-      spawn-at-startup "hello"
-      spawn-at-startup "gpu-probe"
-      spawn-at-startup "flower"
-      spawn-at-startup "sneaky"
-      spawn-at-startup "hello" "extra-argument"
-      spawn-at-startup "mako"
-      spawn-at-startup "notify-test"
-      spawn-at-startup "portal"
-      spawn-at-startup "portal-gnome"
       // The screencast and introspection D-Bus services the GNOME portal backend needs.
       debug { dbus-interfaces-in-non-session-instances; }
     '';
     apps = {
-      # The launcher: the human's own tool, trusted, runs as the human (Mod+D in the stock
-      # binds). It starts apps through `niri msg`, so the compositor does the launching.
-      fuzzel = { uid = 1000; trusted = true; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; };
-      # Notification daemon: the human's tool on the human's bus; apps reach it only through
-      # the bridge, which names them.
-      mako = { uid = 1000; trusted = true; exec = [ "${pkgs.mako}/bin/mako" ]; };
-      # Portals on the human's bus: the frontend and the GNOME backend (niri speaks its
-      # Mutter screencast API). The human's tools reach them directly; sandboxed apps will
-      # only ever reach them through the bridge.
-      # The frontend hands screencast consumers a PipeWire fd (OpenPipeWireRemote), so it
-      # needs the socket itself.
-      portal = { uid = 1000; trusted = true; exec = [ "${portalWrapper}" ]; groups = [ "pipewire" ]; };
-      portal-gnome = { uid = 1000; trusted = true; exec = [ "${pkgs.xdg-desktop-portal-gnome}/libexec/xdg-desktop-portal-gnome" ]; };
-      # The same browser as the human's own tool: exercises the portal stack without the bridge.
-      chromium-me = {
-        uid = 1000;
-        trusted = true;
-        exec = [ "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland" "file://${sharePage}" ];
+      # The launcher (Mod+D in the stock binds): an app like any other. Its entries run
+      # `drv launch`, straight to the identity daemon.
+      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; };
+      # Notification daemon on the services' bus; apps reach it only through the bridge, which
+      # names them.
+      mako = {
+        uid = 100011;
+        exec = [ "${pkgs.mako}/bin/mako" ];
+        globals = [ "layer-shell" ];
+        servicesBus = true;
+        sessionBusNames = [ "org.freedesktop.Notifications" ];
+        autostart = true;
+      };
+      # Portals on the services' bus: the frontend and the GNOME backend (niri speaks its
+      # Mutter screencast API). The frontend hands screencast consumers a PipeWire fd
+      # (OpenPipeWireRemote), so it needs the socket itself.
+      portal = {
+        uid = 100012;
+        exec = [ "${portalWrapper}" ];
+        groups = [ "pipewire" ];
+        servicesBus = true;
+        sessionBusNames = [ "org.freedesktop.portal.Desktop" ];
+        autostart = true;
+      };
+      # The only holder of the screencast grant: it shows the consent dialog and opens one
+      # session per consent.
+      portal-gnome = {
+        uid = 100013;
+        exec = [ "${pkgs.xdg-desktop-portal-gnome}/libexec/xdg-desktop-portal-gnome" ];
+        servicesBus = true;
+        sessionBusNames = [ "org.freedesktop.impl.portal.desktop.gnome" ];
+        grants = [ "screencast" ];
+        autostart = true;
       };
       # Sends one notification from inside the sandbox over its private bus.
       notify-test = {
         uid = 100007;
         bus = true;
         exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
+        autostart = true;
       };
-      hello = { uid = 100001; exec = [ "${probe}" ]; };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; };
-      flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; };
-      # Asks for a group the forker was not told to hand out: must be refused.
-      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; };
+      hello = { uid = 100001; exec = [ "${probe}" ]; autostart = true; };
+      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; };
+      flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
+      # Asks for a group the spawner was not told to hand out: must be refused.
+      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {

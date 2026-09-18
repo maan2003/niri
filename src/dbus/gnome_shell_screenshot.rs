@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use drv_policy::Grant;
 use niri_ipc::PickedColor;
+use zbus::message::Header;
 use zbus::zvariant::OwnedValue;
-use zbus::{fdo, interface, zvariant};
+use zbus::{fdo, interface, zvariant, Connection};
 
+use super::caller::Caller;
 use super::{request_name, Start};
 
 pub struct Screenshot {
     to_niri: calloop::channel::Sender<ScreenshotToNiri>,
     from_niri: async_channel::Receiver<NiriToScreenshot>,
+    caller: Caller,
 }
 
 pub enum ScreenshotToNiri {
@@ -25,10 +29,13 @@ pub enum NiriToScreenshot {
 impl Screenshot {
     async fn screenshot(
         &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
         include_cursor: bool,
         _flash: bool,
         _filename: PathBuf,
     ) -> fdo::Result<(bool, PathBuf)> {
+        self.caller.require(conn, &hdr, Grant::Screencast).await?;
         if let Err(err) = self
             .to_niri
             .send(ScreenshotToNiri::TakeScreenshot { include_cursor })
@@ -51,7 +58,12 @@ impl Screenshot {
         Ok((true, filename))
     }
 
-    async fn pick_color(&self) -> fdo::Result<HashMap<String, OwnedValue>> {
+    async fn pick_color(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] hdr: Header<'_>,
+    ) -> fdo::Result<HashMap<String, OwnedValue>> {
+        self.caller.require(conn, &hdr, Grant::Screencast).await?;
         let (tx, rx) = async_channel::bounded(1);
         if let Err(err) = self.to_niri.send(ScreenshotToNiri::PickColor(tx)) {
             warn!("error sending pick color message to niri: {err:?}");
@@ -84,8 +96,13 @@ impl Screenshot {
     pub fn new(
         to_niri: calloop::channel::Sender<ScreenshotToNiri>,
         from_niri: async_channel::Receiver<NiriToScreenshot>,
+        caller: Caller,
     ) -> Self {
-        Self { to_niri, from_niri }
+        Self {
+            to_niri,
+            from_niri,
+            caller,
+        }
     }
 }
 

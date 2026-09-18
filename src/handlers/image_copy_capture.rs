@@ -65,7 +65,7 @@ pub struct ImageCopyCursorSession {
 ///
 /// Returns `None` if the session doesn't have its client (it has already been
 /// dropped) or if the credentials cannot be determined (e.g., if peer is
-/// credentials_unknown like mutter_service_channel).
+/// it arrived over the Mutter service channel, whose socket has no peer of its own).
 fn session_credentials(dh: &DisplayHandle, client: Option<Client>) -> Option<Credentials> {
     get_credentials_for_client(dh, &client?)
 }

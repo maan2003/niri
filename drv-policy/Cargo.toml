@@ -1,5 +1,5 @@
 [package]
-name = "niri-policy"
+name = "drv-policy"
 version.workspace = true
 description = "Per-UID client policy: types, wire protocol and the compositor-side client"
 authors.workspace = true

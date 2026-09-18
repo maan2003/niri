@@ -5,9 +5,9 @@
 use std::os::unix::net::UnixStream;
 use std::thread;
 
+use drv_policy::rpc::{self, Request, Response};
+use drv_policy::{AppEntry, AppPolicy, Global, PolicyClient, PolicyFile};
 use niri_config::Config;
-use niri_policy::rpc::{self, Request, Response};
-use niri_policy::{AppEntry, AppPolicy, Global, PolicyClient, PolicyFile};
 
 use super::fixture::{serve_policy as serve, Fixture};
 
@@ -68,8 +68,8 @@ fn untrusted_client_sees_only_the_baseline() {
 }
 
 #[test]
-fn trusted_client_sees_everything() {
-    let names = advertised(AppPolicy::trusted("me"));
+fn fully_granted_client_sees_everything() {
+    let names = advertised(AppPolicy::everything("me"));
     for name in PRIVILEGED {
         assert!(names.iter().any(|n| n == name), "{name} missing");
     }

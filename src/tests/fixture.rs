@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use calloop::generic::Generic;
 use calloop::{EventLoop, Interest, LoopHandle, Mode, PostAction};
+use drv_policy::{daemon, AppPolicy, PolicyClient, PolicyFile, PolicyStore};
 use niri_config::Config;
-use niri_policy::{daemon, AppPolicy, PolicyClient, PolicyFile, PolicyStore};
 use smithay::output::Output;
 
 use super::client::{Client, ClientId};
@@ -18,14 +18,15 @@ use crate::niri::{NewClient, Niri};
 pub fn serve_policy(file: PolicyFile) -> PolicyClient {
     let store = PolicyStore::new(file).unwrap();
     let (ours, theirs) = UnixStream::pair().unwrap();
-    thread::spawn(move || daemon::serve_connection(theirs, &store as &dyn daemon::Handler));
+    let me = rustix::process::getuid().as_raw();
+    thread::spawn(move || daemon::serve_connection(theirs, me, &store as &dyn daemon::Handler));
     PolicyClient::from_stream(ours).unwrap()
 }
 
-/// The single-user answer, said out loud by a daemon: every UID trusted.
+/// Every UID gets every global and grant: the compositor as it was without policy.
 pub fn trust_everyone() -> PolicyClient {
     serve_policy(PolicyFile {
-        default: AppPolicy::trusted("test"),
+        default: AppPolicy::everything("test"),
         apps: Vec::new(),
     })
 }
@@ -122,7 +123,7 @@ impl Fixture {
         self.niri().insert_client(NewClient {
             client: sock1,
             restricted: false,
-            credentials_unknown: false,
+            identity: None,
         });
 
         let client = Client::new(sock2);

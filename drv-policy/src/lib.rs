@@ -1,9 +1,11 @@
 //! Per-UID policy for Wayland clients.
 //!
 //! Identity is the UID of the connecting process (`SO_PEERCRED`); the identity daemon
-//! (`niri-identityd`) says what a UID may do and starts apps under their UIDs. The compositor
-//! holds a [`client::PolicyClient`], asks it once per new connection (cached per UID) and sends
-//! it launch requests. [`PolicyStore`] is a file-backed answerer for tests and simple setups.
+//! (`drv-identityd`) says what a UID may do and starts apps under their UIDs. Every process is
+//! its own UID: the compositor, the bridge, each service and each app. Nothing is "trusted";
+//! a record lists what its UID may do and nothing else. The compositor holds a
+//! [`client::PolicyClient`] and asks it once per new connection (cached per UID).
+//! [`PolicyStore`] is a file-backed answerer for tests and simple setups.
 //!
 //! The compositor applies the policy at one choke point: which optional globals a connection
 //! is shown. Everything a plain app needs (`wl_compositor`, `xdg_wm_base`, `wl_shm`, input,
@@ -73,22 +75,33 @@ impl Global {
     ];
 }
 
-/// What one app (one UID or UID range) is allowed. The record the identity daemon will
-/// eventually own.
+/// Things a UID may do beyond its Wayland globals. Each unlocks one service; none implies
+/// another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Grant {
+    /// Ask the identity daemon about UIDs other than its own (the compositor, the bridge).
+    Lookup,
+    /// Use the compositor's screencast, screenshot and service-channel D-Bus services (the
+    /// portal backend). Apps never get this: they get one portal session at a time, with
+    /// consent.
+    Screencast,
+}
+
+/// What one UID is allowed. The identity daemon's record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AppPolicy {
     /// Shown to the user by the compositor (decorations, notifications). Never app-supplied.
     pub name: String,
-    /// Trusted clients (bar, launcher, lock UI, portals, ...) see every global.
-    #[serde(default)]
-    pub trusted: bool,
     /// May use the GPU (`linux-dmabuf`). Software-rendered clients need only `wl_shm`.
     #[serde(default)]
     pub gpu: bool,
-    /// Globals granted on top of the untrusted baseline. Ignored when `trusted`.
+    /// Globals granted on top of the untrusted baseline.
     #[serde(default)]
     pub globals: Vec<Global>,
+    #[serde(default)]
+    pub grants: Vec<Grant>,
     /// Icon name, for the same places as `name`.
     #[serde(default)]
     pub icon: Option<String>,
@@ -99,32 +112,33 @@ impl AppPolicy {
     pub fn unknown() -> Self {
         Self {
             name: "unknown".to_owned(),
-            trusted: false,
             gpu: false,
             globals: Vec::new(),
+            grants: Vec::new(),
             icon: None,
         }
     }
 
-    /// Everything allowed, as if there were no policy.
-    pub fn trusted(name: &str) -> Self {
+    /// Every global and grant, for tests that want the compositor as it was without policy.
+    pub fn everything(name: &str) -> Self {
         Self {
             name: name.to_owned(),
-            trusted: true,
             gpu: true,
-            globals: Vec::new(),
+            globals: Global::ALL.to_vec(),
+            grants: vec![Grant::Lookup, Grant::Screencast],
             icon: None,
         }
     }
 
     pub fn allows(&self, global: Global) -> bool {
-        if self.trusted {
-            return true;
-        }
         if global == Global::Dmabuf && self.gpu {
             return true;
         }
         self.globals.contains(&global)
+    }
+
+    pub fn has(&self, grant: Grant) -> bool {
+        self.grants.contains(&grant)
     }
 }
 
@@ -154,9 +168,9 @@ impl AppEntry {
 /// name = "unknown"
 ///
 /// [[app]]
-/// uid = 1000
-/// name = "me"
-/// trusted = true
+/// uid = 901
+/// name = "compositor"
+/// grants = ["lookup"]
 ///
 /// [[app]]
 /// uid = 100000
@@ -266,13 +280,14 @@ impl PolicyStore {
 pub mod client;
 pub mod daemon;
 pub mod rpc;
+pub mod spawn;
 
-/// Environment names the compositor and the identity daemon agree on.
+/// Environment names the pieces agree on.
 pub mod env {
-    /// The absolute path of the compositor's apps socket, sent beside the session's own
-    /// `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`. The identity daemon makes it the
-    /// `WAYLAND_DISPLAY` of every app that is not the human.
-    pub const APPS_WAYLAND_DISPLAY: &str = "NIRI_APPS_WAYLAND_DISPLAY";
+    /// Path of the identity daemon's socket.
+    pub const IDENTITY_SOCKET: &str = "DRV_IDENTITY_SOCKET";
+    /// Path the compositor listens on for apps (absolute; apps get it as `WAYLAND_DISPLAY`).
+    pub const APPS_SOCKET: &str = "DRV_APPS_SOCKET";
 }
 
 #[cfg(test)]
@@ -289,7 +304,8 @@ mod tests {
             [[app]]
             uid = 1000
             name = "me"
-            trusted = true
+            globals = ["screencopy"]
+            grants = ["lookup"]
 
             [[app]]
             uid = 100000
@@ -303,6 +319,8 @@ mod tests {
         let store = PolicyStore::new(file).unwrap();
 
         assert!(store.lookup(1000).allows(Global::Screencopy));
+        assert!(store.lookup(1000).has(Grant::Lookup));
+        assert!(!store.lookup(1000).has(Grant::Screencast));
         let sandboxed = store.lookup(150000);
         assert_eq!(sandboxed.name, "sandboxed");
         assert!(sandboxed.allows(Global::Dmabuf));
@@ -315,17 +333,21 @@ mod tests {
 
     #[test]
     fn client_and_daemon_roundtrip() {
-        let file: PolicyFile =
-            toml::from_str("[[app]]\nuid = 7\nname = \"seven\"\ngpu = true\n").unwrap();
+        let file: PolicyFile = toml::from_str(
+            "[[app]]\nuid = 7\nname = \"seven\"\ngpu = true\ngrants = [\"lookup\"]\n",
+        )
+        .unwrap();
         let store = PolicyStore::new(file).unwrap();
         let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        let server =
-            std::thread::spawn(move || daemon::serve_connection(b, &store as &dyn daemon::Handler));
+        let server = std::thread::spawn(move || {
+            daemon::serve_connection(b, 7, &store as &dyn daemon::Handler)
+        });
 
         let mut client = PolicyClient::from_stream(a).unwrap();
         assert_eq!(client.lookup(7).unwrap().name, "seven");
         assert!(client.lookup(7).unwrap().allows(Global::Dmabuf));
         assert_eq!(client.lookup(8).unwrap().name, "unknown");
+        assert!(client.launch("seven".to_owned()).is_err());
         drop(client);
         server.join().unwrap().unwrap();
     }

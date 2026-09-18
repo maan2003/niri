@@ -506,7 +506,7 @@ impl SecurityContextHandler for State {
                 state.niri.insert_client(NewClient {
                     client,
                     restricted: true,
-                    credentials_unknown: false,
+                    identity: None,
                 });
             })
             .unwrap();
