@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::process::ExitCode;
 use std::rc::Rc;
 
@@ -20,7 +20,30 @@ use udev::{EventType, MonitorBuilder, MonitorSocket};
 
 #[derive(Parser)]
 #[command(name = "drv-seatd", about = "Hand seat devices to the compositor")]
-struct Args {}
+struct Args {
+    /// Switch to this VT before taking the seat, so the desktop is not on a VT a getty owns
+    /// (agetty resets its VT to mode 0620, which a non-root seat daemon cannot open).
+    #[arg(long)]
+    vt: Option<u32>,
+}
+
+/// `VT_ACTIVATE` and `VT_WAITACTIVE` on `/dev/tty0` (`CAP_SYS_TTY_CONFIG`).
+fn activate_vt(vt: u32) -> Result<(), String> {
+    const VT_ACTIVATE: libc::c_ulong = 0x5606;
+    const VT_WAITACTIVE: libc::c_ulong = 0x5607;
+    let tty0 = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty0")
+        .map_err(|e| format!("open /dev/tty0: {e}"))?;
+    for request in [VT_ACTIVATE, VT_WAITACTIVE] {
+        // SAFETY: an ioctl with an integer argument on our own fd.
+        if unsafe { libc::ioctl(tty0.as_raw_fd(), request as _, vt as libc::c_int) } < 0 {
+            return Err(format!("switching to VT {vt}: {}", io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
 
 /// The seat's devices as udev sees them: what the client is told about and allowed to open.
 struct Devices {
@@ -355,8 +378,12 @@ fn next_client(wire: &OwnedFd) -> io::Result<Option<OwnedFd>> {
     }
 }
 
-fn run(_args: Args) -> Result<(), String> {
+fn run(args: Args) -> Result<(), String> {
     let wire = wire::take().ok_or("no wire on fd 3: drv-seatd runs under drv-supervisor")?;
+    if let Some(vt) = args.vt {
+        activate_vt(vt)?;
+        eprintln!("drv-seatd: on VT {vt}");
+    }
     let mut daemon = Daemon::open()?;
     eprintln!(
         "drv-seatd: seat {} ready with {} devices",

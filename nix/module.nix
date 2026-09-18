@@ -117,7 +117,13 @@ in
       bus = lib.mkOption { type = lib.types.int; default = 904; };
       gpu = lib.mkOption { type = lib.types.int; default = 905; };
       auth = lib.mkOption { type = lib.types.int; default = 906; };
+      seat = lib.mkOption { type = lib.types.int; default = 907; };
       lock = lib.mkOption { type = lib.types.int; default = 100999; description = "UID of the lock app."; };
+    };
+    vt = lib.mkOption {
+      type = lib.types.int;
+      default = 7;
+      description = "The VT the desktop runs on; keep it above logind's autovt range (6).";
     };
     idleTimeout = lib.mkOption {
       type = lib.types.int;
@@ -238,10 +244,19 @@ in
       };
       drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; };
       drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
-      # The GPU process, forked by drv-seatd. Mesa opens render nodes itself.
+      # The GPU process. Mesa opens render nodes itself.
       drv-gpu = { uid = cfg.ids.gpu; group = "drv-gpu"; isSystemUser = true; extraGroups = [ "render" ]; };
       drv-auth = { uid = cfg.ids.auth; group = "drv-auth"; isSystemUser = true; };
+      # The seat daemon: cards, evdev nodes and the VT are group-owned devices; the VT ioctls
+      # come from CAP_SYS_TTY_CONFIG, which the supervisor leaves it.
+      drv-seat = { uid = cfg.ids.seat; group = "drv-seat"; isSystemUser = true; extraGroups = [ "video" "input" "tty" ]; };
     };
+    # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
+    # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
+    services.udev.extraRules = ''
+      SUBSYSTEM=="tty", KERNEL=="tty0", GROUP="tty", MODE="0660"
+      SUBSYSTEM=="tty", KERNEL=="tty${toString cfg.vt}", GROUP="tty", MODE="0660"
+    '';
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
       drv-appd.gid = cfg.ids.appd;
       drv-compositor.gid = cfg.ids.compositor;
@@ -249,6 +264,7 @@ in
       drv-bus.gid = cfg.ids.bus;
       drv-gpu.gid = cfg.ids.gpu;
       drv-auth.gid = cfg.ids.auth;
+      drv-seat.gid = cfg.ids.seat;
       render = { };
     };
 
@@ -295,8 +311,8 @@ in
       };
     };
 
-    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor, drv-appd with its
-    # forker) as their own users, wires them with socketpairs and restarts what dies; their
+    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor and its GPU process,
+    # drv-appd with its forker) as their own users, wires them with socketpairs and restarts what dies; their
     # logs land here. The compositor's environment is exactly what is listed.
     systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
@@ -314,9 +330,12 @@ in
           "--forker-exec '${forkerExec}'"
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
-          # The only process on the seat: opens DRM and evdev nodes as root through libseat's
-          # builtin backend and hands the fds to the compositor.
-          "--seatd-exec '${cfg.package}/bin/drv-seatd'"
+          # The only process on the seat: opens DRM and evdev nodes through libseat's builtin
+          # backend and hands the fds to the compositor. Its own user with the device groups
+          # and CAP_SYS_TTY_CONFIG for the VT.
+          "--seatd-user drv-seat"
+          "--seatd-cap sys_tty_config"
+          "--seatd-exec '${cfg.package}/bin/drv-seatd --vt ${toString cfg.vt}'"
           "--seatd-env LIBSEAT_BACKEND=builtin"
           "--seatd-env RUST_BACKTRACE=1"
           "--seatd-env RUST_LOG=niri=debug"

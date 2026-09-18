@@ -12,7 +12,7 @@ clap.workspace = true
 drv-os = { version = "26.4.0", path = "../drv-os" }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
 libc = "0.2"
-rustix = { version = "1.1.4", features = ["fs", "net", "process", "std"] }
+rustix = { version = "1.1.4", features = ["fs", "net", "process", "std", "thread"] }
 
 [[bin]]
 name = "drv-supervisor"

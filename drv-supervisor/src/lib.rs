@@ -16,6 +16,7 @@ use drv_os::{dup_high, ensure_owned_dir};
 use drv_policy::forker::Notice;
 use drv_policy::wire::{self, Attach};
 use drv_policy::seq;
+use rustix::thread::{CapabilitySet, CapabilitySets};
 
 /// The pieces the supervisor wires. Each pair below gets a fresh socketpair whenever either
 /// side (re)starts while the other is up.
@@ -111,6 +112,68 @@ pub struct Service {
     pub env: Vec<(String, String)>,
     /// `(path, mode)`: directories to own before the first start.
     pub dirs: Vec<(PathBuf, u32)>,
+    /// Capabilities a non-root service keeps (ambient, so they survive the exec): its whole
+    /// bounding set, so nothing it runs can have more.
+    pub caps: CapabilitySet,
+}
+
+/// A capability by its kernel name without the `CAP_` prefix (`sys_tty_config`).
+pub fn capability(name: &str) -> Result<CapabilitySet, String> {
+    Ok(match name {
+        "chown" => CapabilitySet::CHOWN,
+        "dac_override" => CapabilitySet::DAC_OVERRIDE,
+        "dac_read_search" => CapabilitySet::DAC_READ_SEARCH,
+        "fowner" => CapabilitySet::FOWNER,
+        "kill" => CapabilitySet::KILL,
+        "setgid" => CapabilitySet::SETGID,
+        "setuid" => CapabilitySet::SETUID,
+        "net_admin" => CapabilitySet::NET_ADMIN,
+        "sys_chroot" => CapabilitySet::SYS_CHROOT,
+        "sys_ptrace" => CapabilitySet::SYS_PTRACE,
+        "sys_admin" => CapabilitySet::SYS_ADMIN,
+        "sys_tty_config" => CapabilitySet::SYS_TTY_CONFIG,
+        "mknod" => CapabilitySet::MKNOD,
+        other => return Err(format!("unknown capability {other:?}")),
+    })
+}
+
+/// Between fork and exec, as root: become `uid`/`gid`/`groups` keeping exactly `caps`, and
+/// make `caps` the bounding set. Everything here is async-signal-safe (raw syscalls).
+fn become_user(uid: u32, gid: u32, groups: &[u32], caps: CapabilitySet) -> io::Result<()> {
+    // The bounding set first, while CAP_SETPCAP is still effective.
+    for cap in CapabilitySet::all().iter() {
+        if cap.bits().count_ones() == 1
+            && !caps.contains(cap)
+            && rustix::thread::capability_is_in_bounding_set(cap).unwrap_or(false)
+        {
+            rustix::thread::remove_capability_from_bounding_set(cap)?;
+        }
+    }
+    // Keep the permitted set across the uid change; it is narrowed to `caps` right after.
+    rustix::thread::set_keep_capabilities(true)?;
+    // SAFETY: plain syscalls on our own credentials.
+    if unsafe { libc::setgroups(groups.len(), groups.as_ptr()) } != 0
+        || unsafe { libc::setresgid(gid, gid, gid) } != 0
+        || unsafe { libc::setresuid(uid, uid, uid) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    rustix::thread::set_capabilities(
+        None,
+        CapabilitySets {
+            effective: caps,
+            permitted: caps,
+            inheritable: caps,
+        },
+    )?;
+    // Ambient, so they survive the exec.
+    for cap in caps.iter() {
+        if cap.bits().count_ones() == 1 {
+            rustix::thread::configure_capability_in_ambient_set(cap, true)?;
+        }
+    }
+    rustix::thread::set_keep_capabilities(false)?;
+    Ok(())
 }
 
 /// Forks a service with `fds` on the given numbers in the child (3 is the wire by
@@ -138,10 +201,10 @@ pub fn start_service(service: &Service, fds: &[(i32, BorrowedFd<'_>)]) -> Result
     if fds.iter().any(|(target, _)| *target == wire::WIRE_FD) {
         command.env(wire::WIRE_ENV, wire::WIRE_FD.to_string());
     }
-    let (uid, gid) = (service.uid, service.gid);
+    let (uid, gid, caps) = (service.uid, service.gid, service.caps);
     let groups = service.groups.clone();
     let child_dups = dups.clone();
-    // SAFETY: only dup2/setgroups/setresgid/setresuid/prctl between fork and exec.
+    // SAFETY: only dup2, credential and capability syscalls between fork and exec.
     unsafe {
         command.pre_exec(move || {
             for (high, target) in &child_dups {
@@ -149,12 +212,8 @@ pub fn start_service(service: &Service, fds: &[(i32, BorrowedFd<'_>)]) -> Result
                     return Err(io::Error::last_os_error());
                 }
             }
-            if uid != 0
-                && (libc::setgroups(groups.len(), groups.as_ptr()) != 0
-                    || libc::setresgid(gid, gid, gid) != 0
-                    || libc::setresuid(uid, uid, uid) != 0)
-            {
-                return Err(io::Error::last_os_error());
+            if uid != 0 {
+                become_user(uid, gid, &groups, caps)?;
             }
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(io::Error::last_os_error());

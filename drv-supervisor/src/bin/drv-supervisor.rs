@@ -15,7 +15,8 @@ use std::{fs, thread};
 use clap::Parser;
 use drv_os::{user_groups, user_ids};
 use drv_policy::{seq, wire};
-use drv_supervisor::{start_service, start_wired, Peer, Service, Supervisor};
+use drv_supervisor::{capability, start_service, start_wired, Peer, Service, Supervisor};
+use rustix::thread::CapabilitySet;
 
 /// Where drv-appd finds what the supervisor put in place (its wire is fd 3).
 const APPD_LISTENER_FD: i32 = 4;
@@ -46,9 +47,17 @@ struct Args {
     /// `PATH:MODE` (octal): a directory the auth daemon owns, created before it starts.
     #[arg(long = "authd-dir")]
     authd_dirs: Vec<String>,
-    /// The seat daemon's command line, whitespace-separated. It runs as root.
+    /// System user the seat daemon runs as (groups video, input, tty for the devices it opens);
+    /// root without it.
+    #[arg(long)]
+    seatd_user: Option<String>,
+    /// The seat daemon's command line, whitespace-separated.
     #[arg(long)]
     seatd_exec: Option<String>,
+    /// A capability the seat daemon keeps, by name (`sys_tty_config` for the VT ioctls).
+    /// Repeatable.
+    #[arg(long = "seatd-cap")]
+    seatd_caps: Vec<String>,
     /// `NAME=VALUE` in the seat daemon's environment. Repeatable.
     #[arg(long = "seatd-env")]
     seatd_env: Vec<String>,
@@ -103,13 +112,15 @@ fn supervise(args: Args) -> Result<(), String> {
         args.authd_exec.as_deref(),
         &[],
         &args.authd_dirs,
+        &[],
     )?;
     let seatd = service(
         "drv-seatd",
-        args.seatd_exec.as_deref().map(|_| "root"),
+        args.seatd_exec.as_deref().map(|_| args.seatd_user.as_deref().unwrap_or("root")),
         args.seatd_exec.as_deref(),
         &args.seatd_env,
         &[],
+        &args.seatd_caps,
     )?;
     let compositor = service(
         "compositor",
@@ -117,6 +128,7 @@ fn supervise(args: Args) -> Result<(), String> {
         args.compositor_exec.as_deref(),
         &args.compositor_env,
         &args.compositor_dirs,
+        &[],
     )?;
     let gpu = service(
         "compositor-gpu",
@@ -124,13 +136,15 @@ fn supervise(args: Args) -> Result<(), String> {
         args.gpu_exec.as_deref(),
         &args.gpu_env,
         &[],
+        &[],
     )?;
-    let forker = service("drv-forker", Some("root"), Some(&args.forker_exec), &[], &[])?
+    let forker = service("drv-forker", Some("root"), Some(&args.forker_exec), &[], &[], &[])?
         .ok_or("--forker-exec is required")?;
     let appd = service(
         "drv-appd",
         Some(&args.appd_user),
         Some(&args.appd_exec),
+        &[],
         &[],
         &[],
     )?
@@ -175,6 +189,7 @@ fn service(
     exec: Option<&str>,
     env: &[String],
     dirs: &[String],
+    caps: &[String],
 ) -> Result<Option<Service>, String> {
     let (Some(user), Some(exec)) = (user, exec) else {
         if user.is_some() || exec.is_some() {
@@ -207,6 +222,13 @@ fn service(
             Ok((PathBuf::from(path), mode))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let mut capset = CapabilitySet::empty();
+    for cap in caps {
+        capset |= capability(cap).map_err(|e| format!("{name}: {e}"))?;
+    }
+    if uid == 0 && !capset.is_empty() {
+        return Err(format!("{name}: capabilities are for a non-root user"));
+    }
     Ok(Some(Service {
         name: name.to_owned(),
         uid,
@@ -215,6 +237,7 @@ fn service(
         argv: exec.split_whitespace().map(String::from).collect(),
         env,
         dirs,
+        caps: capset,
     }))
 }
 
