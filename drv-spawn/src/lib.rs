@@ -13,6 +13,7 @@
 //! Zygote on Android has the same shape: root, forks on command, only `system_server` talks
 //! to it.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -20,11 +21,12 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use drv_policy::rpc::{read_msg, write_msg};
-use drv_policy::spawn::{Request, Response};
+use drv_policy::spawn::{Notice, Request, Response};
 use drv_policy::wire::{self, Attach};
 use rustix::fs::{Mode, OFlags};
 
@@ -120,6 +122,12 @@ pub struct Server {
     pub optional_expose: Vec<PathBuf>,
     /// The wires to the auth daemon and the compositor, for apps that get a peer.
     pub wiring: Wiring,
+    /// Live app children, pid to uid, for telling the identity daemon what survived.
+    pub running: Arc<Mutex<HashMap<u32, u32>>>,
+    /// The current identity daemon's notice socket, if any.
+    pub notices: Mutex<Option<UnixStream>>,
+    /// Whether a compositor is running right now, for a freshly forked identity daemon.
+    pub compositor_up: AtomicBool,
 }
 
 /// The spawner's ends of the services' wires, and the links it makes between them.
@@ -324,6 +332,38 @@ pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()
 }
 
 impl Server {
+    /// A new identity daemon: it gets `CompositorStarted` right away if one is up, so it
+    /// autostarts what is missing.
+    pub fn identityd_started(&self, notices: UnixStream) {
+        *self.notices.lock().unwrap() = Some(notices);
+        if self.compositor_up.load(Ordering::SeqCst) {
+            self.compositor_started();
+        }
+    }
+
+    pub fn compositor_started(&self) {
+        self.compositor_up.store(true, Ordering::SeqCst);
+        let mut running: Vec<u32> = self.running.lock().unwrap().values().copied().collect();
+        running.sort_unstable();
+        running.dedup();
+        self.notify(&Notice::CompositorStarted { running });
+    }
+
+    pub fn compositor_stopped(&self) {
+        self.compositor_up.store(false, Ordering::SeqCst);
+    }
+
+    /// One-way; a dead identity daemon is forgotten (its successor announces itself).
+    fn notify(&self, notice: &Notice) {
+        let mut guard = self.notices.lock().unwrap();
+        if let Some(stream) = guard.as_ref() {
+            if let Err(err) = write_msg(stream, notice) {
+                eprintln!("drv-spawnd: notifying the identity daemon: {err}");
+                *guard = None;
+            }
+        }
+    }
+
     fn covers(&self, uid: u32) -> bool {
         self.start <= uid && (uid as u64) < self.start as u64 + self.count as u64
     }
@@ -482,10 +522,15 @@ impl Server {
         let mut child = spawned?;
         let pid = child.id();
         let name = request.argv[0].clone();
+        self.running.lock().unwrap().insert(pid, uid);
+        let running = Arc::clone(&self.running);
         // Reap it, or every launched app leaves a zombie under us.
-        thread::spawn(move || match child.wait() {
-            Ok(status) => eprintln!("drv-spawnd: {name} (pid {pid}, uid {uid}) exited: {status}"),
-            Err(err) => eprintln!("drv-spawnd: waiting for {name} (pid {pid}): {err}"),
+        thread::spawn(move || {
+            match child.wait() {
+                Ok(status) => eprintln!("drv-spawnd: {name} (pid {pid}, uid {uid}) exited: {status}"),
+                Err(err) => eprintln!("drv-spawnd: waiting for {name} (pid {pid}): {err}"),
+            }
+            running.lock().unwrap().remove(&pid);
         });
         Ok(pid)
     }
@@ -740,6 +785,9 @@ mod tests {
             expose: Vec::new(),
             optional_expose: vec![PathBuf::from("/run/allowed")],
             wiring: Wiring::default(),
+            running: Default::default(),
+            notices: Default::default(),
+            compositor_up: Default::default(),
         };
         let (ours, theirs) = UnixStream::pair().unwrap();
         let _server = thread::spawn(move || server.serve(theirs));

@@ -13,6 +13,16 @@ use crate::rpc::{read_msg, write_msg};
 
 /// Fd number the spawner hands its child for this channel.
 pub const CHANNEL_FD: i32 = 4;
+/// Fd number the spawner hands its child for [`Notice`]s: spawner to daemon only, no replies.
+pub const NOTICE_FD: i32 = 5;
+
+/// What the spawner tells the identity daemon unprompted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Notice {
+    /// A compositor was just started, at boot or after one died. `running` is the UIDs of the
+    /// apps still alive; autostart apps outside it died with the old compositor.
+    CompositorStarted { running: Vec<u32> },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {

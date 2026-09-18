@@ -215,27 +215,49 @@ impl Identity {
         Ok(app.uid)
     }
 
-    /// Starts every `autostart` app once the compositor's socket exists, in manifest order.
-    /// Waits up to `timeout` for the socket; the seat daemon will own this ordering later.
-    pub fn autostart(&self, timeout: Duration) {
+    /// Starts every `autostart` app whose UID is not in `running`, in manifest order, once
+    /// the compositor's socket is listening (the file alone may be a dead compositor's).
+    /// Waits up to `timeout` for that.
+    pub fn autostart(&self, running: &[u32], timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        while !self.config.wayland_socket.exists() {
+        while !socket_listening(&self.config.wayland_socket) {
             if Instant::now() > deadline {
                 eprintln!(
-                    "drv-identityd: no compositor socket at {} after {timeout:?}; not autostarting",
+                    "drv-identityd: nothing listening at {} after {timeout:?}; not autostarting",
                     self.config.wayland_socket.display()
                 );
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        for app in self.config.apps.iter().filter(|a| a.autostart) {
+        let apps = self
+            .config
+            .apps
+            .iter()
+            .filter(|a| a.autostart && !running.contains(&a.uid));
+        for app in apps {
             match self.start(app) {
                 Ok(uid) => eprintln!("drv-identityd: autostarted {:?} as uid {uid}", app.name),
                 Err(err) => eprintln!("drv-identityd: autostart {:?}: {err}", app.name),
             }
         }
     }
+}
+
+/// Whether some process is listening on the unix socket at `path`, per `/proc/net/unix`
+/// (no connection is made, so the compositor never sees us).
+fn socket_listening(path: &Path) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
+        return false;
+    };
+    let path = path.to_string_lossy();
+    table.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        // Num RefCount Protocol Flags Type St Inode Path
+        let flags = fields.nth(3);
+        let sock_path = fields.nth(3);
+        flags == Some("00010000") && sock_path == Some(path.as_ref())
+    })
 }
 
 impl Handler for Identity {

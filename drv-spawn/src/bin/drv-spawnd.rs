@@ -20,7 +20,8 @@ use std::{fs, io};
 
 use clap::{Parser, Subcommand};
 use drv_identity::{load_config, Identity};
-use drv_policy::spawn::{Channel, CHANNEL_FD};
+use drv_policy::rpc::read_msg;
+use drv_policy::spawn::{Channel, Notice, CHANNEL_FD, NOTICE_FD};
 use drv_spawn::{dup_high, group_id, start_service, user_groups, user_ids, Peer, Server, Service, Wiring};
 
 const LISTENER_FD: i32 = 3;
@@ -151,6 +152,9 @@ fn supervise(args: Args) -> Result<(), String> {
         expose: args.expose,
         optional_expose: args.optional_expose,
         wiring: Wiring::default(),
+        running: Default::default(),
+        notices: Default::default(),
+        compositor_up: Default::default(),
     });
     let authd = service(
         "drv-authd",
@@ -198,16 +202,18 @@ fn supervise(args: Args) -> Result<(), String> {
     ] {
         let Some(service) = service else { continue };
         let server = server.clone();
-        std::thread::spawn(move || supervise_service(peer, service, &server.wiring));
+        std::thread::spawn(move || supervise_service(peer, service, &server));
     }
 
     loop {
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
+        let (notices, their_notices) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
         let mut child = {
             // Copies above the target numbers, so the dup2s below cannot clobber each other
             // and are never a same-fd no-op (which would keep close-on-exec set).
             let listener_fd = dup_high(listener.as_raw_fd())?;
             let channel_fd = dup_high(theirs.as_raw_fd())?;
+            let notice_fd = dup_high(their_notices.as_raw_fd())?;
             let mut command = Command::new(&exe);
             command
                 .arg("identityd")
@@ -220,6 +226,7 @@ fn supervise(args: Args) -> Result<(), String> {
                     // stays close-on-exec and never reaches the daemon.
                     if libc::dup2(listener_fd, LISTENER_FD) < 0
                         || libc::dup2(channel_fd, CHANNEL_FD) < 0
+                        || libc::dup2(notice_fd, NOTICE_FD) < 0
                     {
                         return Err(io::Error::last_os_error());
                     }
@@ -242,10 +249,13 @@ fn supervise(args: Args) -> Result<(), String> {
             unsafe {
                 libc::close(listener_fd);
                 libc::close(channel_fd);
+                libc::close(notice_fd);
             }
             child
         };
         drop(theirs);
+        drop(their_notices);
+        server.identityd_started(notices);
         eprintln!(
             "drv-spawnd: identity daemon running as uid {identity_uid}, pid {}",
             child.id()
@@ -314,8 +324,9 @@ fn service(
     }))
 }
 
-/// Keeps one service running; its wire goes to the wiring on every start.
-fn supervise_service(peer: Peer, service: Service, wiring: &Wiring) {
+/// Keeps one service running; its wire goes to the wiring on every start, and a compositor
+/// start is announced to the identity daemon (autostart).
+fn supervise_service(peer: Peer, service: Service, server: &Server) {
     loop {
         match start_service(&service) {
             Ok((mut child, wire)) => {
@@ -325,12 +336,18 @@ fn supervise_service(peer: Peer, service: Service, wiring: &Wiring) {
                     service.uid,
                     child.id()
                 );
-                wiring.attach_service(peer, wire);
+                server.wiring.attach_service(peer, wire);
+                if peer == Peer::Compositor {
+                    server.compositor_started();
+                }
                 match child.wait() {
                     Ok(status) => eprintln!("drv-spawnd: {} exited: {status}", service.name),
                     Err(err) => eprintln!("drv-spawnd: waiting for {}: {err}", service.name),
                 }
-                wiring.detach_service(peer);
+                if peer == Peer::Compositor {
+                    server.compositor_stopped();
+                }
+                server.wiring.detach_service(peer);
             }
             Err(err) => eprintln!("drv-spawnd: {err}"),
         }
@@ -345,6 +362,7 @@ fn identityd(config: PathBuf) -> Result<(), String> {
     // else owns them.
     let listener = UnixListener::from(unsafe { OwnedFd::from_raw_fd(LISTENER_FD) });
     let channel = UnixStream::from(unsafe { OwnedFd::from_raw_fd(CHANNEL_FD) });
+    let notices = UnixStream::from(unsafe { OwnedFd::from_raw_fd(NOTICE_FD) });
     let base_env: Vec<(String, String)> = std::env::var("PATH")
         .map(|path| vec![("PATH".to_owned(), path)])
         .unwrap_or_default();
@@ -353,7 +371,19 @@ fn identityd(config: PathBuf) -> Result<(), String> {
         Arc::new(Channel::new(channel)),
         base_env,
     ));
+    // Autostart follows the compositor: on every start of one, what is not running is
+    // launched once its socket listens.
     let autostart = identity.clone();
-    std::thread::spawn(move || autostart.autostart(Duration::from_secs(60)));
+    std::thread::spawn(move || loop {
+        match read_msg::<Notice>(&notices) {
+            Ok(Notice::CompositorStarted { running }) => {
+                autostart.autostart(&running, Duration::from_secs(60))
+            }
+            Err(err) => {
+                eprintln!("drv-identityd: notices from the spawner ended: {err}");
+                return;
+            }
+        }
+    });
     drv_policy::daemon::serve(listener, identity).map_err(|e| format!("serving: {e}"))
 }
