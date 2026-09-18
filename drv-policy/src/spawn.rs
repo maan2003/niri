@@ -1,6 +1,7 @@
 //! The channel between the identity daemon and the root spawner: a socketpair the spawner
 //! created before forking the daemon, so nothing else can ever reach it. Requests and responses
-//! in lock step, framed like [`rpc`](crate::rpc).
+//! in lock step, framed like [`rpc`](crate::rpc). What a child is handed on top of its exec
+//! (see [`wire`](crate::wire)) is asked for here too.
 
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -28,6 +29,10 @@ pub struct Request {
     /// must be on the spawner's optional list.
     #[serde(default)]
     pub expose: Vec<String>,
+    /// Hand the child a connection to `drv-authd` on its wire (the lock app). The daemon gets
+    /// the other end as a verifier.
+    #[serde(default)]
+    pub auth: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

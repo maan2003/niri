@@ -1,29 +1,24 @@
 //! Screen-lock auth daemon protocol and logic.
 //!
-//! Two peers talk to `drv-authd`, told apart by peer UID: the lock app sends `Verify` with the
-//! PIN, and the compositor sits on a connection waiting for `Event::Unlock`. The lock app never
-//! unlocks anything itself; a correct PIN makes the daemon push the unlock to the compositor.
+//! Two kinds of peer talk to `drv-authd`, and the spawner hands it both, already connected
+//! (see `drv_policy::wire`): the lock app sends `Verify` with the PIN, and the compositor sits on
+//! its connection waiting for `Event::Unlock`. The lock app never unlocks anything itself; a
+//! correct PIN makes the daemon push the unlock to the compositor.
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand_core::OsRng;
-use rustix::net::{
-    AddressFamily, RecvFlags, SendFlags, SocketAddrUnix, SocketFlags, SocketType, bind,
-    connect as sock_connect, listen as sock_listen, recv, send, socket_with,
-};
+use rustix::net::{RecvFlags, SendFlags, recv, send};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-pub const VERSION: u32 = 1;
-pub const SOCKET_ENV: &str = "DRV_AUTH_SOCKET";
-pub const DEFAULT_SOCKET: &str = "/run/drv-auth/auth.sock";
 pub const MAX_MSG: usize = 4096;
 
 /// Free attempts before the delay kicks in.
@@ -31,23 +26,13 @@ pub const FREE_ATTEMPTS: u32 = 5;
 const BASE_DELAY: Duration = Duration::from_secs(30);
 const MAX_DELAY: Duration = Duration::from_secs(3600);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    /// The lock app: may `Verify`.
-    Verifier,
-    /// The compositor: receives `Event`s.
-    Compositor,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    Hello { version: u32, role: Role },
     Verify { secret: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Hello { version: u32 },
     Granted,
     Denied { retry_after_ms: u64 },
     Error(String),
@@ -57,12 +42,6 @@ pub enum Response {
 pub enum Event {
     /// The PIN was right: unlock for this long of inactivity.
     Unlock { idle_timeout_ms: u64 },
-}
-
-pub fn socket_path() -> PathBuf {
-    std::env::var_os(SOCKET_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SOCKET))
 }
 
 pub fn send_msg<T: Serialize>(sock: &OwnedFd, msg: &T) -> io::Result<()> {
@@ -88,60 +67,20 @@ pub fn recv_msg<T: for<'de> Deserialize<'de>>(sock: &OwnedFd) -> io::Result<T> {
     msg
 }
 
-pub fn listen(path: &Path) -> io::Result<OwnedFd> {
-    let _ = fs::remove_file(path);
-    let sock = socket_with(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    bind(&sock, &SocketAddrUnix::new(path)?)?;
-    sock_listen(&sock, 8)?;
-    Ok(sock)
-}
-
-pub fn connect(path: &Path) -> io::Result<OwnedFd> {
-    let sock = socket_with(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?;
-    sock_connect(&sock, &SocketAddrUnix::new(path)?)?;
-    Ok(sock)
-}
-
-/// Connect and shake hands as `role`.
-pub fn connect_as(path: &Path, role: Role) -> io::Result<OwnedFd> {
-    let sock = connect(path)?;
+/// One `Verify` on the lock app's connection.
+pub fn verify(sock: &OwnedFd, secret: &[u8]) -> io::Result<Response> {
     send_msg(
-        &sock,
-        &Request::Hello {
-            version: VERSION,
-            role,
-        },
-    )?;
-    match recv_msg::<Response>(&sock)? {
-        Response::Hello { version } if version == VERSION => Ok(sock),
-        Response::Hello { version } => {
-            Err(io::Error::other(format!("version mismatch: {version}")))
-        }
-        Response::Error(err) => Err(io::Error::other(err)),
-        other => Err(io::Error::other(format!("unexpected reply {other:?}"))),
-    }
-}
-
-/// One `Verify` on a fresh connection.
-pub fn verify(path: &Path, secret: &[u8]) -> io::Result<Response> {
-    let sock = connect_as(path, Role::Verifier)?;
-    send_msg(
-        &sock,
+        sock,
         &Request::Verify {
             secret: secret.to_vec(),
         },
     )?;
-    recv_msg(&sock)
+    recv_msg(sock)
+}
+
+/// Wait for a daemon message (for the compositor's connection).
+pub fn recv_event(sock: &OwnedFd) -> io::Result<Event> {
+    recv_msg(sock)
 }
 
 /// On-disk PIN verifier and failure count.
@@ -260,16 +199,6 @@ impl Auth {
         self.retry_at = (!delay.is_zero()).then(|| now + delay);
         Ok(Outcome::Denied { retry_after: delay })
     }
-}
-
-/// Wait for a daemon message (for the compositor's event connection).
-pub fn recv_event(sock: &OwnedFd) -> io::Result<Event> {
-    recv_msg(sock)
-}
-
-pub fn peer_uid(sock: &OwnedFd) -> io::Result<u32> {
-    let cred = rustix::net::sockopt::socket_peercred(sock.as_fd())?;
-    Ok(cred.uid.as_raw())
 }
 
 #[cfg(test)]

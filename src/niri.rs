@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -449,7 +450,6 @@ pub struct Niri {
     pub idle_inhibited: bool,
     pub lock_app_launched_at: Option<Duration>,
     pub auth_link: Option<RegistrationToken>,
-    pub auth_connect_attempted_at: Option<Duration>,
 
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
@@ -2643,6 +2643,37 @@ impl Niri {
         let _span = tracy_client::span!("Niri::new");
 
         let (executor, scheduler) = calloop::futures::executor().unwrap();
+
+        // The spawner's wire: our peers arrive on it already connected (drv-authd now, and
+        // again whenever it restarts). Without a wire nothing ever unlocks.
+        match drv_policy::wire::take() {
+            Some(wire) => {
+                rustix::io::ioctl_fionbio(&wire, true).unwrap();
+                event_loop
+                    .insert_source(
+                        Generic::new(wire, Interest::READ, Mode::Level),
+                        |_, wire, state| match drv_policy::wire::recv_attach(&wire) {
+                            Ok((drv_policy::wire::Attach::Auth, sock)) => {
+                                state.niri.install_auth(sock);
+                                Ok(PostAction::Continue)
+                            }
+                            Ok((other, _)) => {
+                                warn!("ignoring {other:?} on the spawner's wire");
+                                Ok(PostAction::Continue)
+                            }
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                Ok(PostAction::Continue)
+                            }
+                            Err(err) => {
+                                error!("the spawner's wire closed: {err}");
+                                Ok(PostAction::Remove)
+                            }
+                        },
+                    )
+                    .unwrap();
+            }
+            None => error!("no spawner wire (DRV_WIRE_FD): drv-authd can never unlock us"),
+        }
         event_loop.insert_source(executor, |_, _, _| ()).unwrap();
 
         let display_handle = display.handle();
@@ -3101,7 +3132,6 @@ impl Niri {
             idle_inhibited: false,
             lock_app_launched_at: None,
             auth_link: None,
-            auth_connect_attempted_at: None,
             locked_hint: None,
 
             screenshot_ui,
@@ -6804,13 +6834,7 @@ impl Niri {
 
     pub fn lock_tick(&mut self) {
         self.check_lease();
-        let now = get_boot_time();
-
-        if self.auth_link.is_none() {
-            self.connect_auth(now);
-        }
-
-        self.launch_lock_app(now);
+        self.launch_lock_app(get_boot_time());
     }
 
     fn launch_lock_app(&mut self, now: Duration) {
@@ -6834,23 +6858,11 @@ impl Niri {
     }
 
     /// Sit on a connection to drv-authd for `Unlock` events; retried from `lock_tick`.
-    fn connect_auth(&mut self, now: Duration) {
-        if self
-            .auth_connect_attempted_at
-            .is_some_and(|t| now - t < Duration::from_secs(3))
-        {
-            return;
+    /// The spawner handed us a (new) connection to drv-authd: unlocks arrive on it.
+    fn install_auth(&mut self, sock: OwnedFd) {
+        if let Some(token) = self.auth_link.take() {
+            self.event_loop.remove(token);
         }
-        self.auth_connect_attempted_at = Some(now);
-
-        let path = drv_auth::socket_path();
-        let sock = match drv_auth::connect_as(&path, drv_auth::Role::Compositor) {
-            Ok(sock) => sock,
-            Err(err) => {
-                warn!("connecting to drv-authd at {}: {err}", path.display());
-                return;
-            }
-        };
         if let Err(err) = rustix::io::ioctl_fionbio(&sock, true) {
             warn!("drv-authd socket nonblocking: {err}");
             return;
@@ -6876,7 +6888,7 @@ impl Niri {
             })
             .unwrap();
         self.auth_link = Some(token);
-        info!("connected to drv-authd");
+        info!("attached to drv-authd");
     }
 
     /// The lock client released its lock. Without a lease from drv-authd we stay locked and

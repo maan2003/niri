@@ -82,6 +82,9 @@ pub struct AppConfig {
     /// Started by the daemon once the compositor's socket exists, in manifest order.
     #[serde(default)]
     pub autostart: bool,
+    /// Gets a connection to `drv-authd` from the spawner: the lock app.
+    #[serde(default)]
+    pub auth: bool,
 }
 
 impl AppConfig {
@@ -206,6 +209,7 @@ impl Identity {
             env: self.env_for(app),
             network: app.network,
             expose: app.expose.clone(),
+            auth: app.auth,
         };
         self.spawner.fork(&request)?;
         Ok(app.uid)

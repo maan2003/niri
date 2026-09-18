@@ -3,6 +3,9 @@
 //! on fd 3 and the channel on fd 4, then answers spawn requests on its end of the channel
 //! until the daemon dies, and forks a new one. Nothing else can reach the channel: it never
 //! touches the filesystem.
+//!
+//! Also forks and restarts `drv-authd` and the compositor, each with a wire on fd 3, and
+//! links them: whenever either comes up, both get the ends of a fresh socketpair.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -17,7 +20,7 @@ use std::{fs, io};
 use clap::{Parser, Subcommand};
 use drv_identity::{load_config, Identity};
 use drv_policy::spawn::{Channel, CHANNEL_FD};
-use drv_spawn::{group_id, user_ids, Server};
+use drv_spawn::{dup_high, group_id, start_service, user_groups, user_ids, Peer, Server, Service, Wiring};
 
 const LISTENER_FD: i32 = 3;
 
@@ -56,6 +59,27 @@ struct Args {
     /// An entry of `/run` an app may ask for in its manifest. Repeatable.
     #[arg(long = "expose-optional")]
     optional_expose: Vec<PathBuf>,
+    /// System user the auth daemon runs as.
+    #[arg(long)]
+    authd_user: Option<String>,
+    /// The auth daemon's command line, whitespace-separated. Without it no app gets auth.
+    #[arg(long)]
+    authd_exec: Option<String>,
+    /// `PATH:MODE` (octal): a directory the auth daemon owns, created before it starts.
+    #[arg(long = "authd-dir")]
+    authd_dirs: Vec<String>,
+    /// System user the compositor runs as.
+    #[arg(long)]
+    compositor_user: Option<String>,
+    /// The compositor's command line, whitespace-separated.
+    #[arg(long)]
+    compositor_exec: Option<String>,
+    /// `NAME=VALUE` in the compositor's environment. Repeatable; it gets nothing else.
+    #[arg(long = "compositor-env")]
+    compositor_env: Vec<String>,
+    /// `PATH:MODE` (octal): a directory the compositor owns, created before it starts.
+    #[arg(long = "compositor-dir")]
+    compositor_dirs: Vec<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -111,7 +135,7 @@ fn supervise(args: Args) -> Result<(), String> {
         .iter()
         .map(|name| Ok((name.clone(), group_id(name)?)))
         .collect::<Result<Vec<_>, String>>()?;
-    let server = Server {
+    let server = Arc::new(Server {
         start,
         count,
         groups,
@@ -119,7 +143,26 @@ fn supervise(args: Args) -> Result<(), String> {
         home_base: args.home_base,
         expose: args.expose,
         optional_expose: args.optional_expose,
-    };
+        wiring: Wiring::default(),
+    });
+    let authd = service(
+        "drv-authd",
+        args.authd_user.as_deref(),
+        args.authd_exec.as_deref(),
+        &[],
+        &args.authd_dirs,
+        start,
+        count,
+    )?;
+    let compositor = service(
+        "compositor",
+        args.compositor_user.as_deref(),
+        args.compositor_exec.as_deref(),
+        &args.compositor_env,
+        &args.compositor_dirs,
+        start,
+        count,
+    )?;
 
     if let Some(parent) = args.socket.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -130,6 +173,13 @@ fn supervise(args: Args) -> Result<(), String> {
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o666))
         .map_err(|e| format!("chmod {}: {e}", args.socket.display()))?;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+    // The services first: the compositor waits for the identity socket, which is bound.
+    for (peer, service) in [(Peer::Authd, authd), (Peer::Compositor, compositor)] {
+        let Some(service) = service else { continue };
+        let server = server.clone();
+        std::thread::spawn(move || supervise_service(peer, service, &server.wiring));
+    }
 
     loop {
         let (ours, theirs) = UnixStream::pair().map_err(|e| format!("socketpair: {e}"))?;
@@ -191,14 +241,81 @@ fn supervise(args: Args) -> Result<(), String> {
     }
 }
 
-/// `fcntl(F_DUPFD_CLOEXEC)` at 10 or above.
-fn dup_high(fd: i32) -> Result<i32, String> {
-    // SAFETY: plain fcntl on an fd we own.
-    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
-    if new < 0 {
-        return Err(format!("dup fd {fd}: {}", io::Error::last_os_error()));
+/// A service from the command line: its user must exist, be non-root and be outside the app
+/// range. `None` when it is not configured at all.
+fn service(
+    name: &str,
+    user: Option<&str>,
+    exec: Option<&str>,
+    env: &[String],
+    dirs: &[String],
+    start: u32,
+    count: u32,
+) -> Result<Option<Service>, String> {
+    let (Some(user), Some(exec)) = (user, exec) else {
+        if user.is_some() || exec.is_some() {
+            return Err(format!("{name}: both --*-user and --*-exec are needed"));
+        }
+        return Ok(None);
+    };
+    let (uid, gid) = user_ids(user)?;
+    if uid == 0 {
+        return Err(format!("{name} must not be root"));
     }
-    Ok(new)
+    if start <= uid && (uid as u64) < start as u64 + count as u64 {
+        return Err(format!("{name}'s user {user} is inside the app range"));
+    }
+    let env = env
+        .iter()
+        .map(|kv| {
+            kv.split_once('=')
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .ok_or_else(|| format!("{name}: env {kv:?} is not NAME=VALUE"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dirs = dirs
+        .iter()
+        .map(|d| {
+            let (path, mode) = d
+                .split_once(':')
+                .ok_or_else(|| format!("{name}: dir {d:?} is not PATH:MODE"))?;
+            let mode = u32::from_str_radix(mode, 8).map_err(|e| format!("{name}: mode {mode:?}: {e}"))?;
+            Ok((PathBuf::from(path), mode))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(Service {
+        name: name.to_owned(),
+        uid,
+        gid,
+        groups: user_groups(user, gid)?,
+        argv: exec.split_whitespace().map(String::from).collect(),
+        env,
+        dirs,
+    }))
+}
+
+/// Keeps one service running; its wire goes to the wiring on every start.
+fn supervise_service(peer: Peer, service: Service, wiring: &Wiring) {
+    loop {
+        match start_service(&service) {
+            Ok((mut child, wire)) => {
+                eprintln!(
+                    "drv-spawnd: {} running as uid {}, pid {}",
+                    service.name,
+                    service.uid,
+                    child.id()
+                );
+                wiring.attach_service(peer, wire);
+                match child.wait() {
+                    Ok(status) => eprintln!("drv-spawnd: {} exited: {status}", service.name),
+                    Err(err) => eprintln!("drv-spawnd: waiting for {}: {err}", service.name),
+                }
+                wiring.detach_service(peer);
+            }
+            Err(err) => eprintln!("drv-spawnd: {err}"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 /// The unprivileged half. Apps start from our `PATH` and the manifest, nothing else.

@@ -1,16 +1,17 @@
-//! `drv-authd`: verifies the lock PIN and pushes the unlock to the compositor.
+//! `drv-authd`: verifies the lock PIN and pushes the unlock to the compositor. Its peers come
+//! down the spawner's wire, already connected: the compositor's connection, and one verifier
+//! connection per lock app launch. Nothing on the filesystem, nobody to check.
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use drv_auth::{Auth, Event, Outcome, Request, Response, Role, Store, VERSION};
-use rustix::net::{SocketFlags, accept_with};
+use drv_auth::{Auth, Event, Outcome, Request, Response, Store};
+use drv_policy::wire::{self, Attach};
 use zeroize::Zeroize;
 
 #[derive(Parser)]
@@ -21,18 +22,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the daemon.
+    /// Run the daemon, under drv-spawnd.
     Serve {
-        #[arg(long, default_value = drv_auth::DEFAULT_SOCKET)]
-        socket: PathBuf,
         #[arg(long, default_value = "/var/lib/drv-auth")]
         state_dir: PathBuf,
-        /// The lock app's user: the only one that may verify.
-        #[arg(long)]
-        verifier_user: String,
-        /// The compositor's user: the only one that receives unlocks.
-        #[arg(long)]
-        compositor_user: String,
         /// Seconds of inactivity before the compositor locks again.
         #[arg(long, default_value_t = 300)]
         idle_timeout: u64,
@@ -47,65 +40,13 @@ enum Cmd {
 struct Shared {
     auth: Mutex<Auth>,
     compositor: Mutex<Option<OwnedFd>>,
-    verifier_uid: u32,
-    compositor_uid: u32,
     idle_timeout: Duration,
 }
 
-fn user_id(name: &str) -> io::Result<u32> {
-    let c = std::ffi::CString::new(name).map_err(io::Error::other)?;
-    // SAFETY: getpwnam returns a pointer to static storage or null; only read once here.
-    let pw = unsafe { libc::getpwnam(c.as_ptr()) };
-    if pw.is_null() {
-        return Err(io::Error::other(format!("no such user: {name}")));
-    }
-    Ok(unsafe { (*pw).pw_uid })
-}
-
-fn serve_conn(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
-    let uid = drv_auth::peer_uid(&sock)?;
-    let role = match drv_auth::recv_msg::<Request>(&sock)? {
-        Request::Hello { version, role } if version == VERSION => role,
-        Request::Hello { version, .. } => {
-            drv_auth::send_msg(
-                &sock,
-                &Response::Error(format!("version {version} unsupported")),
-            )?;
-            return Ok(());
-        }
-        _ => {
-            drv_auth::send_msg(&sock, &Response::Error("hello first".into()))?;
-            return Ok(());
-        }
-    };
-    let allowed = match role {
-        Role::Verifier => uid == shared.verifier_uid,
-        Role::Compositor => uid == shared.compositor_uid,
-    };
-    if !allowed {
-        eprintln!("refusing uid {uid} as {role:?}");
-        drv_auth::send_msg(
-            &sock,
-            &Response::Error(format!("uid {uid} may not be {role:?}")),
-        )?;
-        return Ok(());
-    }
-    drv_auth::send_msg(&sock, &Response::Hello { version: VERSION })?;
-
-    if role == Role::Compositor {
-        // The compositor only listens; keep the newest connection, drop the old.
-        eprintln!("compositor connected");
-        *shared.compositor.lock().unwrap() = Some(sock);
-        return Ok(());
-    }
-
+fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
     loop {
         let mut secret = match drv_auth::recv_msg::<Request>(&sock) {
             Ok(Request::Verify { secret }) => secret,
-            Ok(_) => {
-                drv_auth::send_msg(&sock, &Response::Error("unexpected request".into()))?;
-                continue;
-            }
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(err) => return Err(err),
         };
@@ -143,20 +84,9 @@ fn serve_conn(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
     }
 }
 
-fn serve(
-    socket: PathBuf,
-    state_dir: PathBuf,
-    verifier_user: String,
-    compositor_user: String,
-    idle_timeout: u64,
-) -> io::Result<()> {
-    let verifier_uid = user_id(&verifier_user)?;
-    let compositor_uid = user_id(&compositor_user)?;
-    if verifier_uid == compositor_uid || verifier_uid == 0 || compositor_uid == 0 {
-        return Err(io::Error::other(
-            "verifier and compositor must be distinct non-root users",
-        ));
-    }
+fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
+    let wire = wire::take()
+        .ok_or_else(|| io::Error::other("no wire on fd 3: drv-authd runs under drv-spawnd"))?;
     let store = Store::new(state_dir);
     if !store.has_pin() {
         eprintln!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
@@ -164,28 +94,29 @@ fn serve(
     let shared = Arc::new(Shared {
         auth: Mutex::new(Auth::new(store)),
         compositor: Mutex::new(None),
-        verifier_uid,
-        compositor_uid,
         idle_timeout: Duration::from_secs(idle_timeout),
     });
-    let listener = drv_auth::listen(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666))?;
-    eprintln!("listening on {}", socket.display());
     loop {
-        let conn = match accept_with(&listener, SocketFlags::CLOEXEC) {
-            Ok(conn) => conn,
-            Err(err) => {
-                eprintln!("accept: {err}");
-                thread::sleep(Duration::from_millis(100));
-                continue;
+        match wire::recv_attach(&wire) {
+            Ok((Attach::Compositor, sock)) => {
+                // The compositor only listens; the newest connection replaces the old.
+                eprintln!("compositor attached");
+                *shared.compositor.lock().unwrap() = Some(sock);
             }
-        };
-        let shared = shared.clone();
-        thread::spawn(move || {
-            if let Err(err) = serve_conn(&shared, conn) {
-                eprintln!("connection: {err}");
+            Ok((Attach::Verifier, sock)) => {
+                let shared = shared.clone();
+                thread::spawn(move || {
+                    if let Err(err) = serve_verifier(&shared, sock) {
+                        eprintln!("verifier connection: {err}");
+                    }
+                });
             }
-        });
+            Ok((other, _)) => eprintln!("ignoring {other:?} on the wire"),
+            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::other("the spawner closed the wire"));
+            }
+            Err(err) => eprintln!("wire: {err}"),
+        }
     }
 }
 
@@ -193,18 +124,9 @@ fn main() {
     let args = Args::parse();
     let res = match args.cmd {
         Cmd::Serve {
-            socket,
             state_dir,
-            verifier_user,
-            compositor_user,
             idle_timeout,
-        } => serve(
-            socket,
-            state_dir,
-            verifier_user,
-            compositor_user,
-            idle_timeout,
-        ),
+        } => serve(state_dir, idle_timeout),
         Cmd::SetPin { state_dir } => {
             let mut pin = Vec::new();
             io::stdin().read_to_end(&mut pin).and_then(|_| {

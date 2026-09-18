@@ -5,19 +5,27 @@
 //! files, no policy, no idea what an "app" is. The identity daemon is the brain; a bug here is
 //! reachable only through it.
 //!
+//! It also forks the two fixed services with peers, `drv-authd` and the compositor, and does
+//! their wiring: every child with peers gets a wire on fd 3 (see `drv_policy::wire`) down which
+//! the spawner pushes connections it made with `socketpair`. Nobody connects to anybody; the
+//! spawner, which forked both ends, hands them over.
+//!
 //! Zygote on Android has the same shape: root, forks on command, only `system_server` talks
 //! to it.
 
 use std::ffi::{CStr, CString};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::{io, thread};
 
 use drv_policy::rpc::{read_msg, write_msg};
 use drv_policy::spawn::{Request, Response};
+use drv_policy::wire::{self, Attach};
 use rustix::fs::{Mode, OFlags};
 
 /// `getgrnam_r`, so the command line and requests can use group names.
@@ -76,6 +84,24 @@ pub fn user_ids(name: &str) -> Result<(u32, u32), String> {
     Ok((pwd.pw_uid, pwd.pw_gid))
 }
 
+/// Every group of a user (`getgrouplist`), for services that keep their supplementary groups.
+pub fn user_groups(name: &str, gid: u32) -> Result<Vec<u32>, String> {
+    let cname = CString::new(name).map_err(|_| format!("bad user name {name:?}"))?;
+    let mut n: libc::c_int = 64;
+    loop {
+        let mut groups = vec![0 as libc::gid_t; n as usize];
+        // SAFETY: the buffer holds `n` gids; the call writes at most that many.
+        let rc = unsafe { libc::getgrouplist(cname.as_ptr(), gid, groups.as_mut_ptr(), &mut n) };
+        if rc >= 0 {
+            groups.truncate(n as usize);
+            return Ok(groups);
+        }
+        if n as usize <= groups.len() {
+            return Err(format!("getgrouplist {name:?} failed"));
+        }
+    }
+}
+
 pub struct Server {
     /// UIDs a request may name: `[start, start + count)`. Never root, never a service.
     pub start: u32,
@@ -92,6 +118,182 @@ pub struct Server {
     /// Entries a request may ask for on top (the services' bus directory for the desktop
     /// services). Anything else asked for is refused.
     pub optional_expose: Vec<PathBuf>,
+    /// The wires to the auth daemon and the compositor, for apps that get a peer.
+    pub wiring: Wiring,
+}
+
+/// The spawner's ends of the services' wires, and the links it makes between them.
+#[derive(Default)]
+pub struct Wiring(Mutex<WiringInner>);
+
+#[derive(Default)]
+struct WiringInner {
+    authd: Option<OwnedFd>,
+    compositor: Option<OwnedFd>,
+}
+
+impl Wiring {
+    /// A service came up (again): keep its wire and link it to the other one if that is up.
+    pub fn attach_service(&self, service: Peer, wire: OwnedFd) {
+        let mut inner = self.0.lock().unwrap();
+        match service {
+            Peer::Authd => inner.authd = Some(wire),
+            Peer::Compositor => inner.compositor = Some(wire),
+        }
+        inner.link();
+    }
+
+    pub fn detach_service(&self, service: Peer) {
+        let mut inner = self.0.lock().unwrap();
+        match service {
+            Peer::Authd => inner.authd = None,
+            Peer::Compositor => inner.compositor = None,
+        }
+    }
+
+    /// A fresh verifier connection: the daemon gets one end, the app's end comes back. `None`
+    /// when the daemon is not up, so the app finds an empty wire.
+    fn verifier(&self) -> Option<OwnedFd> {
+        let mut inner = self.0.lock().unwrap();
+        let authd = inner.authd.as_ref()?;
+        let (app_end, daemon_end) = match wire::pair() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("drv-spawnd: socketpair: {err}");
+                return None;
+            }
+        };
+        if let Err(err) = wire::send_attach(authd, Attach::Verifier, daemon_end.as_fd()) {
+            eprintln!("drv-spawnd: drv-authd's wire: {err}");
+            inner.authd = None;
+            return None;
+        }
+        Some(app_end)
+    }
+}
+
+impl WiringInner {
+    fn link(&mut self) {
+        let (Some(authd), Some(compositor)) = (&self.authd, &self.compositor) else {
+            return;
+        };
+        let (compositor_end, daemon_end) = match wire::pair() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("drv-spawnd: socketpair: {err}");
+                return;
+            }
+        };
+        if let Err(err) = wire::send_attach(authd, Attach::Compositor, daemon_end.as_fd()) {
+            eprintln!("drv-spawnd: drv-authd's wire: {err}");
+            self.authd = None;
+            return;
+        }
+        if let Err(err) = wire::send_attach(compositor, Attach::Auth, compositor_end.as_fd()) {
+            eprintln!("drv-spawnd: the compositor's wire: {err}");
+            self.compositor = None;
+        }
+    }
+}
+
+/// The two services the spawner forks itself and wires together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    Authd,
+    Compositor,
+}
+
+/// A service the spawner forks and keeps running: its own user, no sandbox (it is trusted and
+/// needs the real `/run`), a wire on fd 3.
+pub struct Service {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    /// All supplementary groups of the user, resolved at startup.
+    pub groups: Vec<u32>,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    /// `(path, mode)`: directories to own before the first start.
+    pub dirs: Vec<(PathBuf, u32)>,
+}
+
+/// `fcntl(F_DUPFD_CLOEXEC)` at 10 or above, so a `dup2` onto a low target is never a same-fd
+/// no-op (which would keep close-on-exec set).
+pub fn dup_high(fd: i32) -> Result<i32, String> {
+    // SAFETY: plain fcntl on an fd we own.
+    let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
+    if new < 0 {
+        return Err(format!("dup fd {fd}: {}", io::Error::last_os_error()));
+    }
+    Ok(new)
+}
+
+/// Forks a service with a fresh wire on fd 3; returns the child and our end of the wire.
+pub fn start_service(service: &Service) -> Result<(Child, OwnedFd), String> {
+    for (dir, mode) in &service.dirs {
+        ensure_owned_dir(dir, service.uid, service.gid, *mode)?;
+    }
+    if service.argv.is_empty() {
+        return Err(format!("service {}: empty command", service.name));
+    }
+    let (child_end, ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
+    let wire_fd = dup_high(child_end.as_raw_fd())?;
+    let mut command = Command::new(&service.argv[0]);
+    command
+        .args(&service.argv[1..])
+        .env_clear()
+        .envs(service.env.iter().cloned())
+        .env(wire::WIRE_ENV, wire::WIRE_FD.to_string())
+        .stdin(Stdio::null());
+    let (uid, gid) = (service.uid, service.gid);
+    let groups = service.groups.clone();
+    // SAFETY: only dup2/setgroups/setresgid/setresuid/prctl between fork and exec.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(wire_fd, wire::WIRE_FD) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                || libc::setresgid(gid, gid, gid) != 0
+                || libc::setresuid(uid, uid, uid) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", service.name))?;
+    // SAFETY: our duplicate for the child; the child has its own now.
+    unsafe {
+        libc::close(wire_fd);
+    }
+    Ok((child, ours))
+}
+
+/// Creates `path` (parents too) owned by `uid:gid` with `mode`, or fixes an existing one.
+pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    match rustix::fs::mkdir(path, Mode::from_raw_mode(mode)) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(err) => return Err(format!("mkdir {}: {err}", path.display())),
+    }
+    let fd = rustix::fs::open(path, OFlags::DIRECTORY | OFlags::NOFOLLOW, Mode::empty())
+        .map_err(|err| format!("open {}: {err}", path.display()))?;
+    rustix::fs::fchown(
+        &fd,
+        Some(rustix::process::Uid::from_raw(uid)),
+        Some(rustix::process::Gid::from_raw(gid)),
+    )
+    .map_err(|err| format!("chown {}: {err}", path.display()))?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
+        .map_err(|err| format!("chmod {}: {err}", path.display()))
 }
 
 impl Server {
@@ -167,6 +369,21 @@ impl Server {
             .env_clear()
             .envs(request.env.iter().cloned());
         command.stdin(Stdio::null());
+        // The app's wire, with its auth connection already on it (or nothing, if the daemon
+        // is down: the app sees the wire close).
+        let mut wire_fd = None;
+        let _child_wire;
+        if request.auth {
+            let (child_end, ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
+            match self.wiring.verifier() {
+                Some(auth) => wire::send_attach(&ours, Attach::Auth, auth.as_fd())
+                    .map_err(|e| format!("attaching auth: {e}"))?,
+                None => eprintln!("drv-spawnd: uid {uid} asked for auth but drv-authd is down"),
+            }
+            wire_fd = Some(dup_high(child_end.as_raw_fd())?);
+            _child_wire = child_end;
+            command.env(wire::WIRE_ENV, wire::WIRE_FD.to_string());
+        }
 
         let gid = if as_self {
             rustix::process::getgid().as_raw()
@@ -191,6 +408,11 @@ impl Server {
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
+                if let Some(wire_fd) = wire_fd {
+                    if libc::dup2(wire_fd, wire::WIRE_FD) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
                 if let Some(sandbox) = &sandbox {
                     sandbox.apply()?;
                 }
@@ -221,9 +443,16 @@ impl Server {
             });
         }
 
-        let mut child = command
+        let spawned = command
             .spawn()
-            .map_err(|err| format!("spawn {:?}: {err}", request.argv[0]))?;
+            .map_err(|err| format!("spawn {:?}: {err}", request.argv[0]));
+        if let Some(wire_fd) = wire_fd {
+            // SAFETY: our duplicate for the child.
+            unsafe {
+                libc::close(wire_fd);
+            }
+        }
+        let mut child = spawned?;
         let pid = child.id();
         let name = request.argv[0].clone();
         // Reap it, or every launched app leaves a zombie under us.
@@ -454,23 +683,11 @@ impl Server {
     /// `<base>/<uid>`, mode 0700, owned by the UID. Created on first launch.
     fn owned_dir(&self, base: &Path, uid: u32, gid: u32) -> Result<PathBuf, String> {
         let dir = base.join(uid.to_string());
-        let mkdir = |path: &Path, mode: Mode| match rustix::fs::mkdir(path, mode) {
-            Ok(()) => Ok(()),
-            Err(rustix::io::Errno::EXIST) => Ok(()),
-            Err(err) => Err(format!("mkdir {}: {err}", path.display())),
-        };
-        mkdir(base, Mode::from_raw_mode(0o711))?;
-        mkdir(&dir, Mode::from_raw_mode(0o700))?;
-        let fd = rustix::fs::open(&dir, OFlags::DIRECTORY | OFlags::NOFOLLOW, Mode::empty())
-            .map_err(|err| format!("open {}: {err}", dir.display()))?;
-        rustix::fs::fchown(
-            &fd,
-            Some(rustix::process::Uid::from_raw(uid)),
-            Some(rustix::process::Gid::from_raw(gid)),
-        )
-        .map_err(|err| format!("chown {}: {err}", dir.display()))?;
-        rustix::fs::fchmod(&fd, Mode::from_raw_mode(0o700))
-            .map_err(|err| format!("chmod {}: {err}", dir.display()))?;
+        match rustix::fs::mkdir(base, Mode::from_raw_mode(0o711)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(err) => return Err(format!("mkdir {}: {err}", base.display())),
+        }
+        ensure_owned_dir(&dir, uid, gid, 0o700)?;
         Ok(dir)
     }
 }
@@ -495,6 +712,7 @@ mod tests {
             home_base: dir.join("home"),
             expose: Vec::new(),
             optional_expose: vec![PathBuf::from("/run/allowed")],
+            wiring: Wiring::default(),
         };
         let (ours, theirs) = UnixStream::pair().unwrap();
         let _server = thread::spawn(move || server.serve(theirs));
@@ -507,6 +725,7 @@ mod tests {
             env: vec![("PATH".into(), path.clone())],
             network: false,
             expose: Vec::new(),
+            auth: false,
         };
 
         let pid = channel

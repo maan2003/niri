@@ -12,12 +12,11 @@ let
   sessionBus = "unix:path=/run/drv-session/bus";
   identitySocket = "/run/drv/identity.sock";
   seatSocket = "/run/drv-seat/seat.sock";
-  authSocket = "/run/drv-auth/auth.sock";
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart;
+    inherit (app) uid groups gpu network globals grants autostart auth;
     env = lib.optionalAttrs app.servicesBus { DBUS_SESSION_BUS_ADDRESS = sessionBus; } // app.env;
     expose = lib.optional app.servicesBus "/run/drv-session" ++ app.expose;
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
@@ -197,6 +196,11 @@ in
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
+          auth = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Gets a connection to drv-authd from the spawner at launch: the lock screen.";
+          };
         };
       }));
     };
@@ -263,13 +267,12 @@ in
     '';
 
     # The lock screen: draws and takes the PIN, nothing more. The only app with the
-    # session-lock global and the only UID drv-authd verifies for.
+    # session-lock global and the only one the spawner wires to drv-authd.
     services.drv.apps.lock = {
       uid = cfg.ids.lock;
       exec = [ "${cfg.package}/bin/drv-lock" ];
       globals = [ "session-lock" ];
-      env.DRV_AUTH_SOCKET = authSocket;
-      expose = [ "/run/drv-auth" ];
+      auth = true;
     };
     environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
     environment.systemPackages = [ cfg.package desktopEntries ];
@@ -286,11 +289,13 @@ in
       };
     };
 
-    # Root. Forks the identity daemon over a socketpair and starts apps for it.
+    # Root. Forks the identity daemon over a socketpair and starts apps for it; also forks
+    # drv-authd and the compositor as their own users and wires the three together (their
+    # logs land here). The compositor's environment is exactly what is listed.
     systemd.services.drv-spawnd = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-session-bus.service" ];
-      requires = [ "drv-session-bus.service" ];
+      after = [ "drv-session-bus.service" "drv-seatd.service" ];
+      requires = [ "drv-session-bus.service" "drv-seatd.service" ];
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/drv-spawnd"
@@ -300,6 +305,26 @@ in
           "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
           "--runtime-base /run/drv-apps"
           "--home-base /var/lib/drv-apps"
+          # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
+          # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
+          "--authd-user drv-auth"
+          "--authd-exec '${cfg.package}/bin/drv-authd serve --state-dir /var/lib/drv-auth --idle-timeout ${toString cfg.idleTimeout}'"
+          "--authd-dir /var/lib/drv-auth:0700"
+          "--compositor-user drv-compositor"
+          "--compositor-exec '${cfg.package}/bin/niri -c /etc/drv/config.kdl'"
+          # Apps as other UIDs must traverse the socket directory.
+          "--compositor-dir /run/drv-compositor:0711"
+          "--compositor-dir /run/drv-wayland:0711"
+        ] ++ map (e: "--compositor-env ${e}") [
+          "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
+          # Screencasts go to the system PipeWire, like everyone's audio.
+          "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
+          "DRV_SEAT_SOCKET=${seatSocket}"
+          "DRV_IDENTITY_SOCKET=${identitySocket}"
+          "DRV_APPS_SOCKET=/run/drv-wayland/wayland"
+          "XDG_RUNTIME_DIR=/run/drv-compositor"
+          "RUST_BACKTRACE=1"
+          "RUST_LOG=niri=debug"
         ] ++ map (g: "--group ${g}") cfg.groups ++ map (p: "--expose ${p}") cfg.expose
           ++ map (p: "--expose-optional ${p}") optionalExpose);
         RuntimeDirectory = "drv";
@@ -346,48 +371,5 @@ in
       };
     };
 
-    # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd set-pin`) and
-    # pushes the unlock straight to the compositor; the lock app only asks.
-    systemd.services.drv-authd = {
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        User = "drv-auth";
-        ExecStart = "${cfg.package}/bin/drv-authd serve --socket ${authSocket} --state-dir /var/lib/drv-auth --verifier-user app-lock --compositor-user drv-compositor --idle-timeout ${toString cfg.idleTimeout}";
-        StateDirectory = "drv-auth";
-        StateDirectoryMode = "0700";
-        RuntimeDirectory = "drv-auth";
-        RuntimeDirectoryMode = "0711";
-        Restart = "on-failure";
-        RestartSec = 1;
-      };
-    };
-
-    systemd.services.drv-compositor = {
-      wantedBy = [ "multi-user.target" ];
-      after = [ "drv-spawnd.service" "drv-session-bus.service" "drv-bridge.service" "drv-seatd.service" "drv-authd.service" ];
-      # Apps autostart once the compositor's socket exists; the desktop services among them
-      # (`servicesBus`) need the bus, which is up before us.
-      requires = [ "drv-spawnd.service" "drv-session-bus.service" "drv-seatd.service" ];
-      environment = {
-        DBUS_SESSION_BUS_ADDRESS = sessionBus;
-        # Screencasts go to the system PipeWire, like everyone's audio.
-        PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
-        DRV_SEAT_SOCKET = seatSocket;
-        DRV_AUTH_SOCKET = authSocket;
-        DRV_IDENTITY_SOCKET = identitySocket;
-        DRV_APPS_SOCKET = "/run/drv-wayland/wayland";
-        XDG_RUNTIME_DIR = "/run/drv-compositor";
-        RUST_BACKTRACE = "1";
-        RUST_LOG = "niri=debug";
-      };
-      serviceConfig = {
-        User = "drv-compositor";
-        ExecStart = "${cfg.package}/bin/niri -c /etc/drv/config.kdl";
-        RuntimeDirectory = "drv-compositor drv-wayland";
-        # Apps as other UIDs must traverse the socket directory.
-        RuntimeDirectoryMode = "0711";
-        Restart = "no";
-      };
-    };
   };
 }

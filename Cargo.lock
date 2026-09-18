@@ -1007,6 +1007,7 @@ version = "26.4.0"
 dependencies = [
  "argon2",
  "clap",
+ "drv-policy",
  "libc",
  "postcard",
  "rand_core 0.6.4",
@@ -1043,6 +1044,7 @@ name = "drv-lock"
 version = "26.4.0"
 dependencies = [
  "drv-auth",
+ "drv-policy",
  "pangocairo",
  "smithay-client-toolkit",
  "wayland-client",

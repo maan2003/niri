@@ -7,6 +7,7 @@ description = "The lock screen: draws itself and takes the PIN; drv-authd does t
 
 [dependencies]
 drv-auth = { version = "26.4.0", path = "../drv-auth" }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
 pangocairo = "0.21.5"
 smithay-client-toolkit = "0.21.1"
 wayland-client = "0.31.15"

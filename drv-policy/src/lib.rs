@@ -281,6 +281,7 @@ pub mod client;
 pub mod daemon;
 pub mod rpc;
 pub mod spawn;
+pub mod wire;
 
 /// Environment names the pieces agree on.
 pub mod env {

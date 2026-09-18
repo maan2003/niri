@@ -3,6 +3,7 @@
 //! when the compositor sends `finished`.
 
 use std::collections::HashMap;
+use std::os::fd::OwnedFd;
 use std::process;
 use std::time::Duration;
 
@@ -48,6 +49,8 @@ struct App {
     /// Waiting for the compositor to finish us after a correct PIN.
     granted: bool,
     granted_ticks: u32,
+    /// Our connection to drv-authd, handed over by the spawner at launch.
+    auth: OwnedFd,
 }
 
 struct Surface {
@@ -131,8 +134,7 @@ impl App {
         if self.pin.is_empty() || self.granted {
             return;
         }
-        let path = drv_auth::socket_path();
-        let reply = drv_auth::verify(&path, &self.pin);
+        let reply = drv_auth::verify(&self.auth, &self.pin);
         self.pin.zeroize();
         self.pin.clear();
         match reply {
@@ -151,7 +153,12 @@ impl App {
                 };
             }
             Ok(other) => self.message = format!("Auth failed: {other:?}"),
-            Err(err) => self.message = format!("Auth daemon unreachable: {err}"),
+            Err(err) => {
+                // A restarted daemon reaches us through a fresh launch, not a reconnect: the
+                // compositor starts us again while it is locked, with a new connection.
+                eprintln!("drv-lock: auth daemon unreachable: {err}");
+                process::exit(1);
+            }
         }
         self.draw_all();
     }
@@ -440,6 +447,26 @@ smithay_client_toolkit::delegate_registry!(App);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
 smithay_client_toolkit::delegate_dispatch2!(App);
 
+/// The spawner's wire carries exactly one thing for us: the auth connection. Without it we
+/// could only draw, so we quit and let the compositor try again.
+fn take_auth() -> OwnedFd {
+    let Some(wire) = drv_policy::wire::take() else {
+        eprintln!("drv-lock: no wire (DRV_WIRE_FD): not launched by drv-spawnd");
+        process::exit(1);
+    };
+    match drv_policy::wire::recv_attach(&wire) {
+        Ok((drv_policy::wire::Attach::Auth, fd)) => fd,
+        Ok((other, _)) => {
+            eprintln!("drv-lock: unexpected {other:?} on the wire");
+            process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("drv-lock: no auth connection on the wire: {err}");
+            process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let conn = Connection::connect_to_env().expect("wayland connection");
     let (globals, event_queue) = registry_queue_init(&conn).expect("registry");
@@ -466,6 +493,7 @@ fn main() {
         message: String::new(),
         granted: false,
         granted_ticks: 0,
+        auth: take_auth(),
     };
     app.session_lock = Some(
         app.session_lock_state

@@ -210,6 +210,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
     let policy = connect_policy();
+    if std::env::var_os(drv_policy::wire::WIRE_ENV).is_none() {
+        error!("no spawner wire (DRV_WIRE_FD): the compositor runs under drv-spawnd");
+        std::process::exit(1);
+    }
 
     store_and_increase_nofile_rlimit();
 
