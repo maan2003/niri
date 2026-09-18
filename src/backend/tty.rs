@@ -171,11 +171,9 @@ impl Tty {
     ) -> anyhow::Result<Self> {
         let _span = tracy_client::span!("Tty::new");
 
-        let seat_socket = std::env::var_os(drv_seat::SOCKET_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(drv_seat::DEFAULT_SOCKET));
-        let (session, notifier) = DrvSeatSession::connect(&seat_socket)
-            .with_context(|| format!("error connecting to the seat daemon at {seat_socket:?}"))?;
+        let control = crate::wire::take_seat().context("no seat connection from the spawner")?;
+        let (session, notifier) =
+            DrvSeatSession::attach(control).context("error attaching to the seat daemon")?;
         let seat_name = session.seat();
 
         let udev_backend =

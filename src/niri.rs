@@ -450,6 +450,8 @@ pub struct Niri {
     pub idle_inhibited: bool,
     pub lock_app_launched_at: Option<Duration>,
     pub auth_link: Option<RegistrationToken>,
+    /// What the wire delivered before the event loop ran; `State::new` hands them over.
+    pub pending_attachments: Vec<(drv_policy::wire::Attach, OwnedFd)>,
 
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
@@ -816,6 +818,9 @@ impl State {
             create_wayland_socket,
             is_session_instance,
         );
+        for (attach, sock) in mem::take(&mut niri.pending_attachments) {
+            niri.on_attach(attach, sock);
+        }
         backend.init(&mut niri);
 
         let mut state = Self { backend, niri };
@@ -2646,19 +2651,17 @@ impl Niri {
 
         // The spawner's wire: our peers arrive on it already connected (drv-authd now, and
         // again whenever it restarts). Without a wire nothing ever unlocks.
-        match drv_policy::wire::take() {
-            Some(wire) => {
+        let mut pending_attachments = Vec::new();
+        match crate::wire::take() {
+            Some((wire, pending)) => {
+                pending_attachments = pending;
                 rustix::io::ioctl_fionbio(&wire, true).unwrap();
                 event_loop
                     .insert_source(
                         Generic::new(wire, Interest::READ, Mode::Level),
                         |_, wire, state| match drv_policy::wire::recv_attach(&wire) {
-                            Ok((drv_policy::wire::Attach::Auth, sock)) => {
-                                state.niri.install_auth(sock);
-                                Ok(PostAction::Continue)
-                            }
-                            Ok((other, _)) => {
-                                warn!("ignoring {other:?} on the spawner's wire");
+                            Ok((attach, sock)) => {
+                                state.niri.on_attach(attach, sock);
                                 Ok(PostAction::Continue)
                             }
                             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -3132,6 +3135,7 @@ impl Niri {
             idle_inhibited: false,
             lock_app_launched_at: None,
             auth_link: None,
+            pending_attachments,
             locked_hint: None,
 
             screenshot_ui,
@@ -6858,6 +6862,21 @@ impl Niri {
     }
 
     /// Sit on a connection to drv-authd for `Unlock` events; retried from `lock_tick`.
+    /// Something arrived on the spawner's wire.
+    pub fn on_attach(&mut self, attach: drv_policy::wire::Attach, sock: OwnedFd) {
+        use drv_policy::wire::Attach;
+        match attach {
+            Attach::Auth => self.install_auth(sock),
+            // The seat daemon restarted. Our backend was built on the old one, so start over:
+            // the spawner brings us back, wired to the new one, locked as always.
+            Attach::Seat => {
+                warn!("the seat daemon restarted; exiting so the spawner starts us afresh");
+                self.stop_signal.stop();
+            }
+            other => warn!("ignoring {other:?} on the spawner's wire"),
+        }
+    }
+
     /// The spawner handed us a (new) connection to drv-authd: unlocks arrive on it.
     fn install_auth(&mut self, sock: OwnedFd) {
         if let Some(token) = self.auth_link.take() {

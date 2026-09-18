@@ -1,24 +1,21 @@
 //! Seat protocol: the compositor gets its DRM and evdev fds from a root daemon instead of
-//! holding device groups itself. One `SOCK_SEQPACKET` socket, requests in lock step, a reply
-//! may carry one fd. Session enable/disable arrive on a second socket handed over with
-//! `Hello`, so they never interleave with replies.
+//! holding device groups itself. One `SOCK_SEQPACKET` connection, handed to both sides by the
+//! spawner, requests in lock step, a reply may carry one fd. Session enable/disable arrive on
+//! a second socket handed over with `Hello`, so they never interleave with replies.
 
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::Path;
 
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+    SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
 pub const VERSION: u32 = 1;
-pub const SOCKET_ENV: &str = "DRV_SEAT_SOCKET";
-pub const DEFAULT_SOCKET: &str = "/run/drv-seat/seat.sock";
 /// Datagrams larger than this are refused.
 pub const MAX_MSG: usize = 4096;
 /// Fds per message: a `StartGpu` carries one per device.
@@ -125,15 +122,6 @@ pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>
     Ok((value, fds))
 }
 
-fn seqpacket() -> io::Result<OwnedFd> {
-    Ok(rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?)
-}
-
 /// A pair of connected event sockets.
 pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(rustix::net::socketpair(
@@ -142,20 +130,6 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
         SocketFlags::CLOEXEC,
         None,
     )?)
-}
-
-pub fn listen(path: &Path) -> io::Result<OwnedFd> {
-    let _ = std::fs::remove_file(path);
-    let sock = seqpacket()?;
-    rustix::net::bind(&sock, &SocketAddrUnix::new(path)?)?;
-    rustix::net::listen(&sock, 4)?;
-    Ok(sock)
-}
-
-pub fn connect(path: &Path) -> io::Result<OwnedFd> {
-    let sock = seqpacket()?;
-    rustix::net::connect(&sock, &SocketAddrUnix::new(path)?)?;
-    Ok(sock)
 }
 
 #[cfg(test)]

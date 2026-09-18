@@ -1,6 +1,7 @@
 //! Root seat daemon: the only process on the seat. Holds the libseat session, opens DRM and
-//! evdev nodes for one client at a time (the compositor, checked by UID), passes the fds, and
-//! forwards enable/disable. The compositor holds no device groups and never sees a VT.
+//! evdev nodes for one client at a time (the compositor, whose connection the spawner hands
+//! down the wire), passes the fds, and forwards enable/disable. The compositor holds no
+//! device groups and never sees a VT.
 //!
 //! It also forks the GPU process on the compositor's request, as its own user, so the
 //! compositor never execs anything and a Mesa exploit lands in a UID that holds no client
@@ -11,13 +12,13 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::rc::Rc;
 
 use clap::Parser;
+use drv_policy::wire::{self, Attach};
 use drv_seat::{Event, Request, Response, VERSION};
 use libseat::{Seat, SeatEvent};
 use rustix::event::{PollFd, PollFlags};
@@ -25,11 +26,6 @@ use rustix::event::{PollFd, PollFlags};
 #[derive(Parser)]
 #[command(name = "drv-seatd", about = "Hand seat devices to the compositor")]
 struct Args {
-    #[arg(long, default_value = drv_seat::DEFAULT_SOCKET)]
-    socket: PathBuf,
-    /// The one user allowed to connect.
-    #[arg(long)]
-    client: String,
     /// The compositor binary, run as `<exec> gpu-process` for `StartGpu`. Without it the
     /// request is refused.
     #[arg(long)]
@@ -182,15 +178,16 @@ impl Daemon {
         self.drain(client);
     }
 
-    /// Serves one client until it hangs up.
-    fn serve(&mut self, control: OwnedFd) -> io::Result<()> {
+    /// Serves one client until it hangs up, or until the spawner attaches its successor
+    /// (which is then returned).
+    fn serve(&mut self, control: OwnedFd, wire: &OwnedFd) -> io::Result<Option<OwnedFd>> {
         let (hello, _): (Request, _) = drv_seat::recv(&control)?;
         match hello {
             Request::Hello { version } if version == VERSION => (),
             Request::Hello { version } => {
                 let msg = format!("version {version} unsupported, want {VERSION}");
                 drv_seat::send(&control, &Response::Error(msg), &[])?;
-                return Ok(());
+                return Ok(None);
             }
             _ => return Err(io::Error::other("expected Hello")),
         }
@@ -213,22 +210,31 @@ impl Daemon {
             let mut fds = [
                 PollFd::new(&control, PollFlags::IN),
                 PollFd::new(&seat_fd, PollFlags::IN),
+                PollFd::new(wire, PollFlags::IN),
             ];
             rustix::event::poll(&mut fds, None)?;
-            let (control_ready, seat_ready) = (
+            let (control_ready, seat_ready, wire_ready) = (
                 !fds[0].revents().is_empty(),
                 !fds[1].revents().is_empty(),
+                !fds[2].revents().is_empty(),
             );
             drop(fds);
             if seat_ready {
                 self.dispatch(Some(&events));
+            }
+            if wire_ready {
+                match next_client(wire) {
+                    Ok(Some(next)) => break Ok(Some(next)),
+                    Ok(None) => {}
+                    Err(err) => break Err(err),
+                }
             }
             if !control_ready {
                 continue;
             }
             let (request, received): (Request, Vec<OwnedFd>) = match drv_seat::recv(&control) {
                 Ok(r) => r,
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break Ok(None),
                 Err(err) => break Err(err),
             };
             let (reply, fd) = match request {
@@ -298,8 +304,8 @@ impl Daemon {
         result
     }
 
-    /// Waits for a connection, keeping the seat serviced meanwhile.
-    fn accept(&mut self, listener: &OwnedFd) -> io::Result<OwnedFd> {
+    /// Waits for the spawner to attach a compositor, keeping the seat serviced meanwhile.
+    fn accept(&mut self, wire: &OwnedFd) -> io::Result<OwnedFd> {
         loop {
             let seat_fd = self
                 .seat
@@ -307,11 +313,11 @@ impl Daemon {
                 .map_err(|err| io::Error::other(format!("seat fd: {err:?}")))?
                 .try_clone_to_owned()?;
             let mut fds = [
-                PollFd::new(listener, PollFlags::IN),
+                PollFd::new(wire, PollFlags::IN),
                 PollFd::new(&seat_fd, PollFlags::IN),
             ];
             rustix::event::poll(&mut fds, None)?;
-            let (listener_ready, seat_ready) = (
+            let (wire_ready, seat_ready) = (
                 !fds[0].revents().is_empty(),
                 !fds[1].revents().is_empty(),
             );
@@ -319,10 +325,28 @@ impl Daemon {
             if seat_ready {
                 self.dispatch(None);
             }
-            if listener_ready {
-                return Ok(rustix::net::accept(listener)?);
+            if wire_ready {
+                if let Some(control) = next_client(wire)? {
+                    return Ok(control);
+                }
             }
         }
+    }
+}
+
+/// One message off the wire: a compositor connection, or nothing worth having. A closed wire
+/// means the spawner is gone, and so are we.
+fn next_client(wire: &OwnedFd) -> io::Result<Option<OwnedFd>> {
+    match wire::recv_attach(wire) {
+        Ok((Attach::Compositor, control)) => Ok(Some(control)),
+        Ok((other, _)) => {
+            eprintln!("drv-seatd: ignoring {other:?} on the wire");
+            Ok(None)
+        }
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(io::Error::other("the spawner closed the wire"))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -375,12 +399,12 @@ fn user_id(name: &str) -> Result<(u32, u32), String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let (client_uid, _) = user_id(&args.client)?;
+    let wire = wire::take().ok_or("no wire on fd 3: drv-seatd runs under drv-spawnd")?;
     let gpu = match args.gpu_exec {
         Some(exec) => {
             let (uid, gid) = user_id(&args.gpu_user)?;
-            if uid == client_uid || uid == 0 {
-                return Err("the GPU user must be neither root nor the client".into());
+            if uid == 0 {
+                return Err("the GPU user must not be root".into());
             }
             let groups = args
                 .gpu_groups
@@ -399,34 +423,23 @@ fn run(args: Args) -> Result<(), String> {
     // GPU processes are not waited for.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     let mut daemon = Daemon::open(gpu)?;
-    let listener = drv_seat::listen(&args.socket)
-        .map_err(|err| format!("listening on {:?}: {err}", args.socket))?;
-    // The directory is what keeps others away from the socket; the UID check is the guard.
-    std::fs::set_permissions(&args.socket, std::fs::Permissions::from_mode(0o666))
-        .map_err(|err| format!("chmod {:?}: {err}", args.socket))?;
-    eprintln!(
-        "drv-seatd: seat {} ready, serving uid {client_uid}",
-        daemon.seat.name()
-    );
+    eprintln!("drv-seatd: seat {} ready", daemon.seat.name());
+    let mut next = None;
     loop {
-        let control = daemon
-            .accept(&listener)
-            .map_err(|err| format!("accepting: {err}"))?;
-        let peer = match rustix::net::sockopt::socket_peercred(&control) {
-            Ok(cred) => cred.uid.as_raw(),
-            Err(err) => {
-                eprintln!("drv-seatd: no peer credentials: {err}");
-                continue;
-            }
+        let control = match next.take() {
+            Some(control) => control,
+            None => daemon
+                .accept(&wire)
+                .map_err(|err| format!("waiting for a compositor: {err}"))?,
         };
-        if peer != client_uid {
-            eprintln!("drv-seatd: refusing uid {peer}");
-            continue;
-        }
-        eprintln!("drv-seatd: client connected");
-        match daemon.serve(control) {
-            Ok(()) => eprintln!("drv-seatd: client hung up"),
-            Err(err) => eprintln!("drv-seatd: client failed: {err}"),
+        eprintln!("drv-seatd: compositor attached");
+        match daemon.serve(control, &wire) {
+            Ok(None) => eprintln!("drv-seatd: compositor hung up"),
+            Ok(Some(successor)) => {
+                eprintln!("drv-seatd: a new compositor was attached");
+                next = Some(successor);
+            }
+            Err(err) => eprintln!("drv-seatd: compositor failed: {err}"),
         }
     }
 }

@@ -1066,6 +1066,7 @@ name = "drv-seat"
 version = "26.4.0"
 dependencies = [
  "clap",
+ "drv-policy",
  "libc",
  "libseat",
  "postcard",

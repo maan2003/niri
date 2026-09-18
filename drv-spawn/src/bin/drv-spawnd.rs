@@ -4,8 +4,9 @@
 //! until the daemon dies, and forks a new one. Nothing else can reach the channel: it never
 //! touches the filesystem.
 //!
-//! Also forks and restarts `drv-authd` and the compositor, each with a wire on fd 3, and
-//! links them: whenever either comes up, both get the ends of a fresh socketpair.
+//! Also forks and restarts `drv-seatd`, `drv-authd` and the compositor, each with a wire on
+//! fd 3, and links the compositor to each daemon: whenever one of a pair comes up, both get
+//! the ends of a fresh socketpair.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -68,6 +69,12 @@ struct Args {
     /// `PATH:MODE` (octal): a directory the auth daemon owns, created before it starts.
     #[arg(long = "authd-dir")]
     authd_dirs: Vec<String>,
+    /// The seat daemon's command line, whitespace-separated. It runs as root.
+    #[arg(long)]
+    seatd_exec: Option<String>,
+    /// `NAME=VALUE` in the seat daemon's environment. Repeatable.
+    #[arg(long = "seatd-env")]
+    seatd_env: Vec<String>,
     /// System user the compositor runs as.
     #[arg(long)]
     compositor_user: Option<String>,
@@ -154,6 +161,15 @@ fn supervise(args: Args) -> Result<(), String> {
         start,
         count,
     )?;
+    let seatd = service(
+        "drv-seatd",
+        args.seatd_exec.as_deref().map(|_| "root"),
+        args.seatd_exec.as_deref(),
+        &args.seatd_env,
+        &[],
+        start,
+        count,
+    )?;
     let compositor = service(
         "compositor",
         args.compositor_user.as_deref(),
@@ -175,7 +191,11 @@ fn supervise(args: Args) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
 
     // The services first: the compositor waits for the identity socket, which is bound.
-    for (peer, service) in [(Peer::Authd, authd), (Peer::Compositor, compositor)] {
+    for (peer, service) in [
+        (Peer::Seatd, seatd),
+        (Peer::Authd, authd),
+        (Peer::Compositor, compositor),
+    ] {
         let Some(service) = service else { continue };
         let server = server.clone();
         std::thread::spawn(move || supervise_service(peer, service, &server.wiring));
@@ -259,7 +279,7 @@ fn service(
         return Ok(None);
     };
     let (uid, gid) = user_ids(user)?;
-    if uid == 0 {
+    if uid == 0 && name != "drv-seatd" {
         return Err(format!("{name} must not be root"));
     }
     if start <= uid && (uid as u64) < start as u64 + count as u64 {

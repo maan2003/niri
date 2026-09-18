@@ -11,7 +11,6 @@ let
   bridgeSocket = "/run/drv-bridge/bridge.sock";
   sessionBus = "unix:path=/run/drv-session/bus";
   identitySocket = "/run/drv/identity.sock";
-  seatSocket = "/run/drv-seat/seat.sock";
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
@@ -294,8 +293,8 @@ in
     # logs land here). The compositor's environment is exactly what is listed.
     systemd.services.drv-spawnd = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-session-bus.service" "drv-seatd.service" ];
-      requires = [ "drv-session-bus.service" "drv-seatd.service" ];
+      after = [ "drv-session-bus.service" ];
+      requires = [ "drv-session-bus.service" ];
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/drv-spawnd"
@@ -307,6 +306,13 @@ in
           "--home-base /var/lib/drv-apps"
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
+          # The only process on the seat: opens DRM and evdev nodes as root through libseat's
+          # builtin backend and hands the fds to the compositor. Also forks the GPU process as
+          # drv-gpu on the compositor's request.
+          "--seatd-exec '${cfg.package}/bin/drv-seatd --gpu-exec ${cfg.package}/bin/niri --gpu-user drv-gpu --gpu-group render'"
+          "--seatd-env LIBSEAT_BACKEND=builtin"
+          "--seatd-env RUST_BACKTRACE=1"
+          "--seatd-env RUST_LOG=niri=debug"
           "--authd-user drv-auth"
           "--authd-exec '${cfg.package}/bin/drv-authd serve --state-dir /var/lib/drv-auth --idle-timeout ${toString cfg.idleTimeout}'"
           "--authd-dir /var/lib/drv-auth:0700"
@@ -319,7 +325,6 @@ in
           "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
-          "DRV_SEAT_SOCKET=${seatSocket}"
           "DRV_IDENTITY_SOCKET=${identitySocket}"
           "DRV_APPS_SOCKET=/run/drv-wayland/wayland"
           "XDG_RUNTIME_DIR=/run/drv-compositor"
@@ -347,25 +352,6 @@ in
         ExecStart = "${cfg.package}/bin/drv-bridge serve --socket ${bridgeSocket}";
         RuntimeDirectory = "drv-bridge";
         RuntimeDirectoryMode = "0755";
-        Restart = "on-failure";
-        RestartSec = 1;
-      };
-    };
-
-    # The only process on the seat: opens DRM and evdev nodes as root through libseat's builtin
-    # backend and hands the fds to the compositor, which it checks by UID. Also forks the GPU
-    # process as drv-gpu on the compositor's request; its logs land here.
-    systemd.services.drv-seatd = {
-      wantedBy = [ "multi-user.target" ];
-      environment = {
-        LIBSEAT_BACKEND = "builtin";
-        RUST_BACKTRACE = "1";
-        RUST_LOG = "niri=debug";
-      };
-      serviceConfig = {
-        ExecStart = "${cfg.package}/bin/drv-seatd --socket ${seatSocket} --client drv-compositor --gpu-exec ${cfg.package}/bin/niri --gpu-user drv-gpu --gpu-group render";
-        RuntimeDirectory = "drv-seat";
-        RuntimeDirectoryMode = "0711";
         Restart = "on-failure";
         RestartSec = 1;
       };

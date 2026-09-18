@@ -1,5 +1,5 @@
-//! The compositor's seat: devices come from `drv-seatd` over a socket, so this process holds
-//! no device groups and no VT. Implements smithay's `Session` for libinput and the DRM code.
+//! The compositor's seat: devices come from `drv-seatd` over the connection the spawner
+//! handed us, so this process holds no device groups and no VT. Implements smithay's `Session` for libinput and the DRM code.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -57,8 +57,8 @@ impl From<io::Error> for Error {
 }
 
 impl DrvSeatSession {
-    pub fn connect(path: &Path) -> anyhow::Result<(Self, DrvSeatNotifier)> {
-        let control = drv_seat::connect(path)?;
+    /// `control` is the connection the spawner handed us.
+    pub fn attach(control: OwnedFd) -> anyhow::Result<(Self, DrvSeatNotifier)> {
         drv_seat::send(&control, &Request::Hello { version: VERSION }, &[])?;
         let (reply, mut fds): (Response, _) = drv_seat::recv(&control)?;
         let (seat, active) = match reply {

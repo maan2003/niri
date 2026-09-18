@@ -129,24 +129,37 @@ pub struct Wiring(Mutex<WiringInner>);
 #[derive(Default)]
 struct WiringInner {
     authd: Option<OwnedFd>,
+    seatd: Option<OwnedFd>,
     compositor: Option<OwnedFd>,
 }
 
 impl Wiring {
-    /// A service came up (again): keep its wire and link it to the other one if that is up.
+    /// A service came up (again): keep its wire and link it to its counterparts that are up.
+    /// Exactly the pairs the newcomer is part of, so nobody is linked twice for one start.
     pub fn attach_service(&self, service: Peer, wire: OwnedFd) {
         let mut inner = self.0.lock().unwrap();
         match service {
-            Peer::Authd => inner.authd = Some(wire),
-            Peer::Compositor => inner.compositor = Some(wire),
+            Peer::Authd => {
+                inner.authd = Some(wire);
+                inner.link(Peer::Authd);
+            }
+            Peer::Seatd => {
+                inner.seatd = Some(wire);
+                inner.link(Peer::Seatd);
+            }
+            Peer::Compositor => {
+                inner.compositor = Some(wire);
+                inner.link(Peer::Seatd);
+                inner.link(Peer::Authd);
+            }
         }
-        inner.link();
     }
 
     pub fn detach_service(&self, service: Peer) {
         let mut inner = self.0.lock().unwrap();
         match service {
             Peer::Authd => inner.authd = None,
+            Peer::Seatd => inner.seatd = None,
             Peer::Compositor => inner.compositor = None,
         }
     }
@@ -173,8 +186,16 @@ impl Wiring {
 }
 
 impl WiringInner {
-    fn link(&mut self) {
-        let (Some(authd), Some(compositor)) = (&self.authd, &self.compositor) else {
+    /// Links the compositor to one daemon, if both are up: a fresh pair, the daemon's end as
+    /// `Compositor`, the compositor's end as the daemon's kind.
+    fn link(&mut self, daemon: Peer) {
+        let (daemon_wire, name, kind) = match daemon {
+            Peer::Seatd => (&mut self.seatd, "drv-seatd", Attach::Seat),
+            Peer::Authd => (&mut self.authd, "drv-authd", Attach::Auth),
+            Peer::Compositor => return,
+        };
+        let (Some(daemon_wire), Some(compositor)) = (daemon_wire.as_ref(), &self.compositor)
+        else {
             return;
         };
         let (compositor_end, daemon_end) = match wire::pair() {
@@ -184,12 +205,15 @@ impl WiringInner {
                 return;
             }
         };
-        if let Err(err) = wire::send_attach(authd, Attach::Compositor, daemon_end.as_fd()) {
-            eprintln!("drv-spawnd: drv-authd's wire: {err}");
-            self.authd = None;
+        if let Err(err) = wire::send_attach(daemon_wire, Attach::Compositor, daemon_end.as_fd()) {
+            eprintln!("drv-spawnd: {name}'s wire: {err}");
+            match daemon {
+                Peer::Seatd => self.seatd = None,
+                _ => self.authd = None,
+            }
             return;
         }
-        if let Err(err) = wire::send_attach(compositor, Attach::Auth, compositor_end.as_fd()) {
+        if let Err(err) = wire::send_attach(compositor, kind, compositor_end.as_fd()) {
             eprintln!("drv-spawnd: the compositor's wire: {err}");
             self.compositor = None;
         }
@@ -200,11 +224,13 @@ impl WiringInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Peer {
     Authd,
+    /// Stays root: it holds the seat and opens the device nodes.
+    Seatd,
     Compositor,
 }
 
-/// A service the spawner forks and keeps running: its own user, no sandbox (it is trusted and
-/// needs the real `/run`), a wire on fd 3.
+/// A service the spawner forks and keeps running: its own user (or root for the seat daemon),
+/// no sandbox (it is trusted and needs the real `/run`), a wire on fd 3.
 pub struct Service {
     pub name: String,
     pub uid: u32,
@@ -253,9 +279,10 @@ pub fn start_service(service: &Service) -> Result<(Child, OwnedFd), String> {
             if libc::dup2(wire_fd, wire::WIRE_FD) < 0 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
-                || libc::setresgid(gid, gid, gid) != 0
-                || libc::setresuid(uid, uid, uid) != 0
+            if uid != 0
+                && (libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                    || libc::setresgid(gid, gid, gid) != 0
+                    || libc::setresuid(uid, uid, uid) != 0)
             {
                 return Err(io::Error::last_os_error());
             }

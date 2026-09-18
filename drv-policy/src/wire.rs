@@ -22,10 +22,12 @@ pub const WIRE_ENV: &str = "DRV_WIRE_FD";
 pub enum Attach {
     /// To the compositor or the lock app: a connection to `drv-authd`.
     Auth,
-    /// To `drv-authd`: the compositor's connection (replaces the previous one).
+    /// To `drv-authd` or `drv-seatd`: the compositor's connection (replaces the previous one).
     Compositor,
     /// To `drv-authd`: a lock app's connection.
     Verifier,
+    /// To the compositor: its connection to `drv-seatd`.
+    Seat,
 }
 
 /// The child's end, if the spawner gave us one.
