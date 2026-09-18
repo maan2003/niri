@@ -4,7 +4,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -92,6 +92,30 @@ impl DrvSeatSession {
     fn call(&self, request: &Request) -> Result<(Response, Vec<OwnedFd>), Error> {
         drv_seat::send(&self.inner.control, request, &[])?;
         Ok(drv_seat::recv(&self.inner.control)?)
+    }
+
+    /// Has the seat daemon fork the GPU process with these DRM devices; returns the socket to
+    /// it and its pid.
+    pub fn start_gpu(
+        &self,
+        devices: &[(u64, BorrowedFd<'_>)],
+        render_node_hint: Option<u64>,
+    ) -> anyhow::Result<(OwnedFd, u32)> {
+        let request = Request::StartGpu {
+            devices: devices.iter().map(|(dev, _)| *dev).collect(),
+            render_node_hint,
+        };
+        let fds: Vec<_> = devices.iter().map(|(_, fd)| *fd).collect();
+        drv_seat::send(&self.inner.control, &request, &fds)?;
+        let (reply, mut received): (Response, Vec<OwnedFd>) = drv_seat::recv(&self.inner.control)?;
+        match reply {
+            Response::GpuStarted { pid } => {
+                let socket = received.pop().context("no socket with GpuStarted")?;
+                Ok((socket, pid))
+            }
+            Response::Error(msg) => bail!("seat daemon refused to start the GPU process: {msg}"),
+            other => bail!("unexpected reply to StartGpu: {other:?}"),
+        }
     }
 
     fn expect_done(&self, request: &Request) -> Result<(), Error> {

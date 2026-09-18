@@ -21,6 +21,8 @@ pub const SOCKET_ENV: &str = "DRV_SEAT_SOCKET";
 pub const DEFAULT_SOCKET: &str = "/run/drv-seat/seat.sock";
 /// Datagrams larger than this are refused.
 pub const MAX_MSG: usize = 4096;
+/// Fds per message: a `StartGpu` carries one per device.
+pub const MAX_FDS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -30,6 +32,13 @@ pub enum Request {
     /// Close a device opened here. The client drops its own fd itself.
     Close { id: u32 },
     SwitchVt { vt: i32 },
+    /// Fork the GPU process as its own user with these DRM devices (one fd attached per
+    /// entry, in order) and hand back the core's end of their socket. What runs is the
+    /// daemon's configured executable, never the caller's choice.
+    StartGpu {
+        devices: Vec<u64>,
+        render_node_hint: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +51,8 @@ pub enum Response {
     },
     /// Carries the device fd.
     Opened { id: u32 },
+    /// Carries the core's socket to the GPU process.
+    GpuStarted { pid: u32 },
     Done,
     Error(String),
 }
@@ -69,7 +80,7 @@ pub fn send<T: Serialize>(sock: impl AsFd, msg: &T, fds: &[BorrowedFd<'_>]) -> i
     if payload.len() > MAX_MSG {
         return Err(io::Error::other("message too large"));
     }
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
         return Err(io::Error::other("too many fds"));
@@ -89,7 +100,7 @@ pub fn send<T: Serialize>(sock: impl AsFd, msg: &T, fds: &[BorrowedFd<'_>]) -> i
 /// One datagram and the fds that came with it. A closed peer is `UnexpectedEof`.
 pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>)> {
     let mut buf = [0u8; MAX_MSG];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
     let msg = rustix::net::recvmsg(
         sock,

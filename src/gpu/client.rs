@@ -120,6 +120,22 @@ impl GpuClient {
         Ok(client)
     }
 
+    /// Talks to a GPU process someone else started (the seat daemon) over `socket`. The
+    /// process is nobody's child here: it exits when the socket closes.
+    pub fn from_socket(socket: OwnedFd) -> anyhow::Result<Self> {
+        let mut client = Self {
+            chan: Channel::new(socket),
+            child: None,
+            thread: None,
+            caps: None,
+            device_results: Vec::new(),
+            events: VecDeque::new(),
+            waker: None,
+        };
+        client.handshake()?;
+        Ok(client)
+    }
+
     /// Runs the GPU server on a thread in this process. For tests and debugging only.
     pub fn spawn_thread(mode: Mode) -> anyhow::Result<Self> {
         let (ours, theirs) = Channel::pair()?;

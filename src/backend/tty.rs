@@ -54,7 +54,7 @@ use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use super::{IpcOutputMap, OutputHdrCaps, RenderResult};
 use crate::backend::OutputId;
 use crate::frame_clock::FrameClock;
-use crate::gpu::client::{GpuClient, Mode as GpuMode};
+use crate::gpu::client::GpuClient;
 use crate::gpu::convert;
 use crate::gpu::protocol::{
     Caps, CastEvent, ColorState, ConnectorInfo, DevId, DeviceResult, ElementState, Event, GpuEvent,
@@ -78,8 +78,6 @@ pub struct Tty {
     renderer: RemoteRenderer,
     /// Set once the GPU process has a renderer (after the primary device was added).
     renderer_ready: bool,
-    /// Our executable, for (re)spawning the GPU process.
-    gpu_exe: PathBuf,
     /// The GPU process socket in the event loop.
     gpu_source: RegistrationToken,
     /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
@@ -252,10 +250,8 @@ impl Tty {
 
         // The GPU process gets every device we can open right now and seals itself once
         // they're in.
-        let gpu_exe = std::env::current_exe().context("error getting our executable path")?;
         let mut session = session;
         let (mut client, pending_devices, unusable_devices) = spawn_gpu(
-            &gpu_exe,
             &mut session,
             &udev_dispatcher,
             &ignored_nodes,
@@ -289,7 +285,6 @@ impl Tty {
             event_loop,
             renderer,
             renderer_ready: false,
-            gpu_exe,
             gpu_source,
             gpu_ping: ping,
             gpu_devices,
@@ -399,7 +394,6 @@ impl Tty {
         self.unusable_devices.clear();
 
         let res = spawn_gpu(
-            &self.gpu_exe,
             &mut self.session,
             &self.udev_dispatcher,
             &self.ignored_nodes,
@@ -2272,7 +2266,6 @@ fn open_device(
 /// them. Returns the client, the devices it accepted, and the ones it rejected (closed here,
 /// not to be retried).
 fn spawn_gpu(
-    exe: &Path,
     session: &mut DrvSeatSession,
     udev: &Dispatcher<'static, UdevBackend, State>,
     ignored_nodes: &HashSet<DrmNode>,
@@ -2302,13 +2295,11 @@ fn spawn_gpu(
         .iter()
         .map(|(node, fd)| (node.dev_id(), fd.as_fd()))
         .collect();
-    let mut client = GpuClient::spawn_process(
-        exe,
-        GpuMode::Drm,
-        &fds,
-        render_node_hint.map(|n| n.dev_id()),
-    )
-    .context("error spawning the GPU process")?;
+    let (socket, pid) = session
+        .start_gpu(&fds, render_node_hint.map(|n| n.dev_id()))
+        .context("error starting the GPU process")?;
+    debug!("GPU process started by the seat daemon, pid {pid}");
+    let mut client = GpuClient::from_socket(socket).context("error connecting to the GPU process")?;
 
     let results: HashMap<DevId, DeviceResult> = client
         .take_device_results()

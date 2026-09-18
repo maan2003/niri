@@ -109,6 +109,7 @@ in
       compositor = lib.mkOption { type = lib.types.int; default = 902; };
       bridge = lib.mkOption { type = lib.types.int; default = 903; };
       bus = lib.mkOption { type = lib.types.int; default = 904; };
+      gpu = lib.mkOption { type = lib.types.int; default = 905; };
     };
     uidRange = {
       start = lib.mkOption { type = lib.types.int; default = 100000; };
@@ -219,12 +220,15 @@ in
       };
       drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; };
       drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
+      # The GPU process, forked by drv-seatd. Mesa opens render nodes itself.
+      drv-gpu = { uid = cfg.ids.gpu; group = "drv-gpu"; isSystemUser = true; extraGroups = [ "render" ]; };
     };
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
       drv-identity.gid = cfg.ids.identity;
       drv-compositor.gid = cfg.ids.compositor;
       drv-bridge.gid = cfg.ids.bridge;
       drv-bus.gid = cfg.ids.bus;
+      drv-gpu.gid = cfg.ids.gpu;
       render = { };
     };
 
@@ -295,12 +299,17 @@ in
     };
 
     # The only process on the seat: opens DRM and evdev nodes as root through libseat's builtin
-    # backend and hands the fds to the compositor, which it checks by UID.
+    # backend and hands the fds to the compositor, which it checks by UID. Also forks the GPU
+    # process as drv-gpu on the compositor's request; its logs land here.
     systemd.services.drv-seatd = {
       wantedBy = [ "multi-user.target" ];
-      environment.LIBSEAT_BACKEND = "builtin";
+      environment = {
+        LIBSEAT_BACKEND = "builtin";
+        RUST_BACKTRACE = "1";
+        RUST_LOG = "niri=debug";
+      };
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/drv-seatd --socket ${seatSocket} --client drv-compositor";
+        ExecStart = "${cfg.package}/bin/drv-seatd --socket ${seatSocket} --client drv-compositor --gpu-exec ${cfg.package}/bin/niri --gpu-user drv-gpu --gpu-group render";
         RuntimeDirectory = "drv-seat";
         RuntimeDirectoryMode = "0711";
         Restart = "on-failure";
