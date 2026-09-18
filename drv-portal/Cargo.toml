@@ -3,13 +3,22 @@ name = "drv-portal"
 version = "26.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "The file chooser and the documents mount: the person picks a file for an app, and that one file is what the app gets."
+description = "The person's side of the portals: the file chooser with its documents mount, and screen sharing consent."
+
+[features]
+default = ["service"]
+# The binary and its UI; off for crates that want only the protocols.
+service = ["dep:clap", "dep:drv-os", "dep:drv-ui", "dep:fuser", "dep:libc"]
 
 [dependencies]
-clap = { workspace = true }
-drv-os = { version = "26.4.0", path = "../drv-os" }
+clap = { workspace = true, optional = true }
+drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
-drv-ui = { version = "26.4.0", path = "../drv-ui" }
-fuser = { version = "0.18", default-features = false }
-libc = "0.2"
+drv-ui = { version = "26.4.0", path = "../drv-ui", optional = true }
+fuser = { version = "0.18", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
 serde.workspace = true
+
+[[bin]]
+name = "drv-portal"
+required-features = ["service"]

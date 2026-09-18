@@ -170,6 +170,10 @@ in
       # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
       # Then it saves a copy the same way. Results in its home, result.txt.
       chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; };
+      # A client of screen sharing, as a browser would use it: session, Start (the person
+      # picks a screen at drv-portal), the PipeWire remote, and what that remote can see.
+      # Holds the cast 20 s, then closes. Results in its home, cast.txt.
+      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; groups = [ "pipewire" ]; };
       # Plays a sound: audio is just the `pipewire` group plus the exposed socket directory.
       beep = {
         uid = 100006;

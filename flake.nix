@@ -135,7 +135,11 @@
             lib.optional withDbus "dbus"
             ++ lib.optional withDinit "dinit"
             ++ lib.optional withScreencastSupport "xdp-gnome-screencast"
-            ++ lib.optional withSystemd "systemd";
+            ++ lib.optional withSystemd "systemd"
+            # No default features below applies to every package: drv-portal's binary is
+            # behind its `service` feature (the compositor and the bridge want only its
+            # protocols).
+            ++ [ "drv-portal/service" ];
           buildNoDefaultFeatures = true;
 
           # ever since this commit:

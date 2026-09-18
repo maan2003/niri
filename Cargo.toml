@@ -98,6 +98,7 @@ drv-policy = { version = "26.4.0", path = "drv-policy" }
 drv-os = { version = "26.4.0", path = "drv-os" }
 drv-seat = { version = "26.4.0", path = "drv-seat" }
 drv-auth = { version = "26.4.0", path = "drv-auth" }
+drv-portal = { version = "26.4.0", path = "drv-portal", default-features = false }
 ordered-float = "5"
 pango = { version = "0.21.5", features = ["v1_44"] }
 pangocairo = "0.21.5"

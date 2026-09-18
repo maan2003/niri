@@ -239,7 +239,8 @@ in
         # Devices come from drv-seatd; PipeWire is for screencasts.
         extraGroups = [ "pipewire" ];
       };
-      drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; };
+      # PipeWire is for the screencast remotes it hands to apps.
+      drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; extraGroups = [ "pipewire" ]; };
       drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
       # The GPU process. Mesa opens render nodes itself.
       drv-gpu = { uid = cfg.ids.gpu; group = "drv-gpu"; isSystemUser = true; extraGroups = [ "render" ]; };
@@ -288,6 +289,18 @@ in
       systemWide = true;
       pulse.enable = true;
       alsa.enable = true;
+      # The bridge only connects to PipeWire to hand apps a remote cut down to one
+      # stream. WirePlumber grants every new client everything a moment after it
+      # connects, which would undo that cut, so the bridge's clients get nothing
+      # from it. The uid is set by PipeWire itself, an app holding the fd can't forge it.
+      wireplumber.extraConfig."50-drv-bridge" = {
+        "access.rules" = [
+          {
+            matches = [ { "pipewire.sec.uid" = toString cfg.ids.bridge; } ];
+            actions.update-props.default_permissions = "-";
+          }
+        ];
+      };
     };
 
     environment.etc."drv/appd.toml".source = appdFile;
@@ -395,15 +408,17 @@ in
           "--portal-env RUST_BACKTRACE=1"
           "--docs /run/drv-doc"
           # The bridge: the apps' desktop services, keyed on the peer UID. Notifications and
-          # the rest of the portals still go to the services' bus; the file chooser goes down
-          # its supervisor link to drv-portal.
+          # the rest of the portals still go to the services' bus; the file chooser and the
+          # screencast go down its supervisor link to drv-portal. PipeWire is for the
+          # screencast remotes: a connection per share that sees the one node.
           "--bridge-user drv-bridge"
           "--bridge-exec '${cfg.package}/bin/drv-bridge serve'"
           "--bridge-socket ${bridgeSocket}"
           "--bridge-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           "--bridge-env DRV_APPD_SOCKET=${appdSocket}"
+          "--bridge-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
           "--bridge-env RUST_BACKTRACE=1"
-        ] ++ map (p: "--bridge-expose ${p}") [ "/run/drv" "/run/drv-session" ]
+        ] ++ map (p: "--bridge-expose ${p}") [ "/run/drv" "/run/drv-session" "/run/pipewire" ]
           ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.
           "MESA_SHADER_CACHE_DISABLE=true"

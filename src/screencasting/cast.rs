@@ -12,8 +12,7 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
-use zbus::object_server::SignalEmitter;
-
+use super::CastNotify;
 use crate::dbus::mutter_screen_cast::CursorMode;
 use crate::gpu::protocol::{CastCursorMode, CastInfo, CursorMeta, Request};
 use crate::gpu::record::Recorder;
@@ -33,7 +32,7 @@ pub struct Cast {
     pub dynamic_target: bool,
     /// Effective cursor mode (the GPU may downgrade metadata to embedded).
     pub cursor_mode: CursorMode,
-    pub signal_ctx: SignalEmitter<'static>,
+    pub notify: CastNotify,
     pub node_id: Option<u32>,
     /// Presentation time of the last frame the GPU actually sent.
     pub last_frame_time: Duration,
@@ -130,7 +129,7 @@ impl Cast {
         size: Size<i32, Physical>,
         refresh: u32,
         cursor_mode: CursorMode,
-        signal_ctx: SignalEmitter<'static>,
+        notify: CastNotify,
     ) -> Self {
         Self {
             event_loop,
@@ -139,7 +138,7 @@ impl Cast {
             target,
             dynamic_target: false,
             cursor_mode,
-            signal_ctx,
+            notify,
             node_id: None,
             last_frame_time: Duration::ZERO,
             pending_frame_time: None,

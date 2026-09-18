@@ -12,7 +12,8 @@ anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
 drv-os = { version = "26.4.0", path = "../drv-os" }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
-drv-portal = { version = "26.4.0", path = "../drv-portal" }
+drv-portal = { version = "26.4.0", path = "../drv-portal", default-features = false }
+pipewire = { version = "0.10", features = ["v0_3_33"] }
 rustix = { version = "1.1.4", features = ["net", "process", "std"] }
 serde.workspace = true
 zbus = { version = "5", features = ["bus-impl"] }

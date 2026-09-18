@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{self, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
@@ -22,7 +24,7 @@ use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
 use zbus::zvariant::serialized::Context;
-use zbus::zvariant::{ObjectPath, OwnedValue, Signature, Structure, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, Value};
 use zbus::AuthMechanism;
 
 #[derive(Parser)]
@@ -128,10 +130,77 @@ fn failed(call: &Header<'_>, text: String) -> zbus::Result<Message> {
 }
 
 const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
+const SCREEN_CAST: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+const SESSION_IFACE: &str = "org.freedesktop.portal.Session";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 /// What we claim `org.freedesktop.portal.FileChooser` is (`current_name`, `current_folder`).
 const FILE_CHOOSER_VERSION: u32 = 4;
+/// What we claim `org.freedesktop.portal.ScreenCast` is. Restore tokens are accepted and
+/// ignored: every share is a fresh consent.
+const SCREEN_CAST_VERSION: u32 = 4;
+/// `AvailableSourceTypes`: monitors, for now.
+const SOURCE_TYPES: u32 = 1;
+/// `AvailableCursorModes`: hidden, embedded, metadata.
+const CURSOR_MODES: u32 = 1 | 2 | 4;
+
+/// A PipeWire connection an app may have: it sees the core and the one node, nothing
+/// else. The permissions live in the daemon, so they hold whatever the app does with the fd.
+fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
+    use pipewire::context::ContextRc;
+    use pipewire::core::PW_ID_CORE;
+    use pipewire::loop_::Timeout;
+    use pipewire::main_loop::MainLoopRc;
+    use pipewire::permissions::{Permission, PermissionFlags};
+
+    let main_loop = MainLoopRc::new(None).context("PipeWire main loop")?;
+    let context = ContextRc::new(&main_loop, None).context("PipeWire context")?;
+    let core = context.connect_rc(None).context("connecting to PipeWire")?;
+    // SAFETY: the core is connected; the client proxy it returns lives as long as the core.
+    let client = unsafe { pipewire::sys::pw_core_get_client(core.as_raw_ptr()) };
+    anyhow::ensure!(!client.is_null(), "PipeWire gave no client");
+    let rx = PermissionFlags::R | PermissionFlags::X;
+    let perms = [
+        Permission::new(PW_ID_CORE, rx),
+        Permission::new(node_id, rx),
+        Permission::new(pipewire::sys::PW_ID_ANY, PermissionFlags::empty()),
+    ];
+    // SAFETY: a live client proxy, and the array is `pw_permission` in memory.
+    unsafe {
+        pipewire::spa::spa_interface_call_method!(
+            client,
+            pipewire::sys::pw_client_methods,
+            update_permissions,
+            perms.len() as u32,
+            perms.as_ptr().cast()
+        );
+    }
+    // A round trip, so the permissions are in before the fd changes hands.
+    let done = Rc::new(std::cell::Cell::new(false));
+    let pending = core.sync(0).context("PipeWire sync")?;
+    let _listener = {
+        let done = done.clone();
+        core.add_listener_local()
+            .done(move |id, seq| {
+                if id == PW_ID_CORE && seq == pending {
+                    done.set(true);
+                }
+            })
+            .error(|id, seq, res, message| {
+                eprintln!("bridge: PipeWire error on {id} ({seq}): {res} {message}");
+            })
+            .register()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !done.get() {
+        anyhow::ensure!(Instant::now() < deadline, "PipeWire did not answer");
+        main_loop.loop_().iterate(Timeout::Finite(Duration::from_millis(200)));
+    }
+    // SAFETY: after steal_fd the core no longer owns the fd; nothing else here uses it.
+    let fd = unsafe { pipewire::sys::pw_core_steal_fd(core.as_raw_ptr()) };
+    anyhow::ensure!(fd >= 0, "PipeWire kept its fd");
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
 
 /// `file://` with everything outside the unreserved set escaped.
 fn file_uri(path: &str) -> String {
@@ -143,6 +212,15 @@ fn file_uri(path: &str) -> String {
         }
     }
     out
+}
+
+/// The app-side caller of a call the shim relayed (it puts the unique name in the
+/// destination field), as a path component.
+fn caller_of(hdr: &Header<'_>) -> anyhow::Result<String> {
+    match hdr.destination() {
+        Some(BusName::Unique(name)) => Ok(sender_component(name.as_str())),
+        _ => bail!("no caller"),
+    }
 }
 
 fn is_portal_call(hdr: &Header<'_>) -> bool {
@@ -184,6 +262,8 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
     // Bound by the supervisor, any UID may connect; who they are is decided per connection.
     let listener = fds.listener("listener")?;
     let portal = Portal::start(fds.socket("portal", Kind::SeqPacket)?)?;
+    // For the screencast remotes.
+    pipewire::init();
     // Fail at startup, not on the first app, if there is no session bus.
     drop(Connection::session().context("the services' bus")?);
     let policy = Arc::new(Mutex::new(
@@ -227,7 +307,10 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
 struct Portal {
     sock: OwnedFd,
     next: AtomicU64,
+    /// One answer each: the choosers.
     waiting: Mutex<HashMap<u64, Box<dyn FnOnce(protocol::Response) + Send>>>,
+    /// Casts hear more than once: `Cast` when streaming, `Closed` at the end.
+    casts: Mutex<HashMap<u64, Arc<dyn Fn(protocol::Response) + Send + Sync>>>,
 }
 
 impl Portal {
@@ -243,6 +326,7 @@ impl Portal {
             sock,
             next: AtomicU64::new(1),
             waiting: Mutex::new(HashMap::new()),
+            casts: Mutex::new(HashMap::new()),
         });
         let reader = portal.clone();
         thread::spawn(move || loop {
@@ -260,13 +344,23 @@ impl Portal {
     fn dispatch(&self, resp: protocol::Response) {
         let id = match &resp {
             protocol::Response::Chosen { id, .. }
+            | protocol::Response::Cast { id, .. }
+            | protocol::Response::Closed { id }
             | protocol::Response::Cancelled { id }
             | protocol::Response::Failed { id, .. } => *id,
             protocol::Response::Hello { .. } => return,
         };
         let waiter = self.waiting.lock().unwrap().remove(&id);
-        match waiter {
-            Some(done) => done(resp),
+        if let Some(done) = waiter {
+            return done(resp);
+        }
+        let last = !matches!(resp, protocol::Response::Cast { .. });
+        let cast = {
+            let mut casts = self.casts.lock().unwrap();
+            if last { casts.remove(&id) } else { casts.get(&id).cloned() }
+        };
+        match cast {
+            Some(on) => on(resp),
             None => eprintln!("bridge: drv-portal answered {id}, which nobody asked"),
         }
     }
@@ -295,12 +389,55 @@ impl Portal {
         Ok(id)
     }
 
+    /// Asks for a screen for `app`. `on` hears `Cast` once the node streams, then `Closed`
+    /// when it ends; or `Cancelled`/`Failed` instead.
+    fn cast(
+        &self,
+        app: &str,
+        uid: u32,
+        cursor: protocol::Cursor,
+        on: impl Fn(protocol::Response) + Send + Sync + 'static,
+    ) -> anyhow::Result<u64> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.casts.lock().unwrap().insert(id, Arc::new(on));
+        let req = protocol::Request::Cast {
+            id,
+            app: app.to_owned(),
+            uid,
+            cursor,
+        };
+        if let Err(err) = seq::send(&self.sock, &req, &[]) {
+            self.casts.lock().unwrap().remove(&id);
+            return Err(err).context("asking drv-portal");
+        }
+        Ok(id)
+    }
+
+    /// Withdraws a chooser, or a cast: a live one stops.
     fn cancel(&self, id: u64) {
         self.waiting.lock().unwrap().remove(&id);
+        self.casts.lock().unwrap().remove(&id);
         if let Err(err) = seq::send(&self.sock, &protocol::Request::Cancel { id }, &[]) {
             eprintln!("bridge: cancelling {id} at drv-portal: {err}");
         }
     }
+}
+
+/// A screencast session of one app: from `CreateSession` to `Close`, or the cast's end.
+struct CastSession {
+    cursor: protocol::Cursor,
+    /// Set by `Start`.
+    portal_id: Option<u64>,
+    /// The node, once the person consented and it streams.
+    node: Option<u32>,
+}
+
+/// What `ours` did with a call.
+enum Ours {
+    Reply(Message),
+    /// Answered already (the reply had to go before a signal).
+    Done,
+    No,
 }
 
 /// One connected app: its peer-to-peer link and its own connection on the human's bus.
@@ -321,9 +458,11 @@ struct LinkState {
     pending: HashMap<NonZeroU32, Message>,
     /// Portal handle token → the app-side sender component that owns it.
     owners: HashMap<String, String>,
-    /// Request handles we answer ourselves (the file chooser), by path, with the id at
-    /// drv-portal: `Request.Close` on one cancels there.
+    /// Request handles we answer ourselves (the file chooser, `Start`), by path, with the
+    /// id at drv-portal: `Request.Close` on one cancels there.
     ours: HashMap<String, u64>,
+    /// Screencast sessions by their path.
+    sessions: HashMap<String, CastSession>,
 }
 
 impl AppLink {
@@ -383,6 +522,15 @@ impl AppLink {
             }
         }
         eprintln!("bridge: {} disconnected", link.app.name);
+        // What drv-portal holds for this connection: dialogs down, casts stopped.
+        let ids: Vec<u64> = {
+            let state = link.state.lock().unwrap();
+            let sessions = state.sessions.values().filter_map(|s| s.portal_id);
+            state.ours.values().copied().chain(sessions).collect()
+        };
+        for id in ids {
+            link.portal.cancel(id);
+        }
         // Dropping our bus connection ends the other thread; sessions the portal still holds
         // for this connection go away with it.
         zbus::block_on(link.bus.inner().clone().close())?;
@@ -395,80 +543,264 @@ impl AppLink {
         if hdr.message_type() != MessageType::MethodCall {
             return Ok(());
         }
-        let reply = if let Some(reply) = self.ours(msg, &hdr)? {
-            reply
-        } else if is_portal_call(&hdr) {
-            match self.forward_to_portal(msg, &hdr) {
+        let reply = match self.ours(msg, &hdr) {
+            Ok(Ours::Reply(reply)) => reply,
+            Ok(Ours::Done) => return Ok(()),
+            Err(err) => failed(&hdr, format!("{err:#}"))?,
+            Ok(Ours::No) if is_portal_call(&hdr) => match self.forward_to_portal(msg, &hdr) {
                 Ok(()) => return Ok(()),
                 Err(err) => failed(&hdr, format!("{err:#}"))?,
-            }
-        } else if hdr
-            .interface()
-            .is_some_and(|i| i.as_str() == NOTIFICATIONS_NAME)
-        {
-            self.notification(msg, &hdr)?
-        } else {
-            Message::error(&hdr, "org.freedesktop.DBus.Error.UnknownMethod")?.build(&format!(
-                "the bridge does not carry {}.{}",
-                hdr.interface().map(|i| i.as_str()).unwrap_or("?"),
-                hdr.member().map(|m| m.as_str()).unwrap_or("?")
-            ))?
+            },
+            Ok(Ours::No) => self.other(msg, &hdr)?,
         };
         self.p2p.send(&reply)?;
         Ok(())
     }
 
-    /// What we answer without xdg-desktop-portal: the file chooser (drv-portal's), its
-    /// `version`, and `Close` on a request of ours. `None` is "not ours, forward it".
-    fn ours(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Option<Message>> {
+    /// Not a portal call: notifications, or nothing.
+    fn other(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Message> {
+        Ok(if hdr
+            .interface()
+            .is_some_and(|i| i.as_str() == NOTIFICATIONS_NAME)
+        {
+            self.notification(msg, hdr)?
+        } else {
+            Message::error(hdr, "org.freedesktop.DBus.Error.UnknownMethod")?.build(&format!(
+                "the bridge does not carry {}.{}",
+                hdr.interface().map(|i| i.as_str()).unwrap_or("?"),
+                hdr.member().map(|m| m.as_str()).unwrap_or("?")
+            ))?
+        })
+    }
+
+    /// What we answer without xdg-desktop-portal: the file chooser and the screencast
+    /// (drv-portal's), their properties, their sessions, and `Close` on a request of ours.
+    fn ours(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Ours> {
         let path = hdr.path().context("no path")?.as_str().to_owned();
         let interface = hdr.interface().map(|i| i.as_str().to_owned()).unwrap_or_default();
         let member = hdr.member().map(|m| m.as_str().to_owned()).unwrap_or_default();
         if path == PORTAL_PATH && interface == FILE_CHOOSER {
-            return self.file_chooser(msg, hdr, &member).map(Some);
+            return self.file_chooser(msg, hdr, &member).map(Ours::Reply);
+        }
+        if path == PORTAL_PATH && interface == SCREEN_CAST {
+            return self.screen_cast(msg, hdr, &member);
         }
         if path == PORTAL_PATH && interface == PROPERTIES {
+            let props = |iface: &str| -> Option<Vec<(&'static str, Value<'static>)>> {
+                match iface {
+                    FILE_CHOOSER => Some(vec![("version", Value::U32(FILE_CHOOSER_VERSION))]),
+                    SCREEN_CAST => Some(vec![
+                        ("version", Value::U32(SCREEN_CAST_VERSION)),
+                        ("AvailableSourceTypes", Value::U32(SOURCE_TYPES)),
+                        ("AvailableCursorModes", Value::U32(CURSOR_MODES)),
+                    ]),
+                    _ => None,
+                }
+            };
             match member.as_str() {
                 "Get" => {
                     let (iface, prop): (String, String) = msg.body().deserialize()?;
-                    if iface == FILE_CHOOSER {
-                        return Ok(Some(if prop == "version" {
-                            Message::method_return(hdr)?.build(&Value::U32(FILE_CHOOSER_VERSION))?
-                        } else {
-                            Message::error(hdr, "org.freedesktop.DBus.Error.InvalidArgs")?
-                                .build(&format!("no property {prop} on {FILE_CHOOSER}"))?
+                    if let Some(props) = props(&iface) {
+                        let found = props.into_iter().find(|(name, _)| *name == prop);
+                        return Ok(Ours::Reply(match found {
+                            Some((_, value)) => Message::method_return(hdr)?.build(&value)?,
+                            None => Message::error(hdr, "org.freedesktop.DBus.Error.InvalidArgs")?
+                                .build(&format!("no property {prop} on {iface}"))?,
                         }));
                     }
                 }
                 "GetAll" => {
                     let (iface,): (String,) = msg.body().deserialize()?;
-                    if iface == FILE_CHOOSER {
-                        let mut all: HashMap<&str, Value<'_>> = HashMap::new();
-                        all.insert("version", Value::U32(FILE_CHOOSER_VERSION));
-                        return Ok(Some(Message::method_return(hdr)?.build(&all)?));
+                    if let Some(props) = props(&iface) {
+                        let all: HashMap<&str, Value<'_>> = props.into_iter().collect();
+                        return Ok(Ours::Reply(Message::method_return(hdr)?.build(&all)?));
                     }
                 }
                 _ => {}
             }
-            return Ok(None);
+            return Ok(Ours::No);
+        }
+        if interface == SESSION_IFACE {
+            let session = {
+                let mut state = self.state.lock().unwrap();
+                if !state.sessions.contains_key(&path) {
+                    return Ok(Ours::No);
+                }
+                match member.as_str() {
+                    "Close" => state.sessions.remove(&path),
+                    other => bail!("no {other} on {SESSION_IFACE}"),
+                }
+            };
+            if let Some(id) = session.and_then(|s| s.portal_id) {
+                self.portal.cancel(id);
+            }
+            return Ok(Ours::Reply(Message::method_return(hdr)?.build(&())?));
         }
         if interface == REQUEST_IFACE && member == "Close" {
             let id = self.state.lock().unwrap().ours.remove(&path);
             if let Some(id) = id {
                 self.portal.cancel(id);
-                return Ok(Some(Message::method_return(hdr)?.build(&())?));
+                return Ok(Ours::Reply(Message::method_return(hdr)?.build(&())?));
             }
         }
-        Ok(None)
+        Ok(Ours::No)
+    }
+
+    /// The portal `Response` signal on a request handle, to the app-side caller.
+    fn respond(&self, handle: &str, caller: &str, code: u32, results: HashMap<&str, Value<'_>>) -> anyhow::Result<()> {
+        let signal = Message::signal(handle, REQUEST_IFACE, "Response")?
+            .destination(unique_from_component(caller))?
+            .build(&(code, results))?;
+        self.p2p.send(&signal).context("response signal")
+    }
+
+    /// The app's request handle for a call: its token (one path element) under its own
+    /// caller component, as the portal spec has it.
+    fn handle(&self, msg: &Message, caller: &str, options: &HashMap<String, OwnedValue>, key: &str) -> String {
+        let token: String = options
+            .get(key)
+            .cloned()
+            .and_then(|v| String::try_from(v).ok())
+            .unwrap_or_else(|| format!("drv{}", msg.primary_header().serial_num()))
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let kind = if key == "session_handle_token" { "session" } else { "request" };
+        format!("{PORTAL_PATH}/{kind}/{caller}/{token}")
+    }
+
+    /// `org.freedesktop.portal.ScreenCast`, monitors only: the session is ours, the person
+    /// consents at drv-portal on `Start`, and `OpenPipeWireRemote` hands out a connection
+    /// that sees the one node.
+    fn screen_cast(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
+        let caller = caller_of(hdr)?;
+        let reply_handle = |handle: &str| -> anyhow::Result<Message> {
+            Ok(Message::method_return(hdr)?.build(&ObjectPath::try_from(handle)?)?)
+        };
+        match member {
+            "CreateSession" => {
+                let (options,): (HashMap<String, OwnedValue>,) = msg.body().deserialize()?;
+                let handle = self.handle(msg, &caller, &options, "handle_token");
+                let session = self.handle(msg, &caller, &options, "session_handle_token");
+                self.state.lock().unwrap().sessions.insert(
+                    session.clone(),
+                    CastSession {
+                        cursor: protocol::Cursor::Embedded,
+                        portal_id: None,
+                        node: None,
+                    },
+                );
+                // The reply first, then the signal: the spec's order.
+                self.p2p.send(&reply_handle(&handle)?)?;
+                let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+                results.insert("session_handle", Value::from(session.as_str()));
+                self.respond(&handle, &caller, 0, results)?;
+                Ok(Ours::Done)
+            }
+            "SelectSources" => {
+                let (session, options): (OwnedObjectPath, HashMap<String, OwnedValue>) =
+                    msg.body().deserialize()?;
+                let cursor = match options.get("cursor_mode").cloned().and_then(|v| u32::try_from(v).ok()) {
+                    Some(1) => protocol::Cursor::Hidden,
+                    Some(4) => protocol::Cursor::Metadata,
+                    _ => protocol::Cursor::Embedded,
+                };
+                {
+                    let mut state = self.state.lock().unwrap();
+                    let s = state.sessions.get_mut(session.as_str()).context("no such session")?;
+                    s.cursor = cursor;
+                }
+                let handle = self.handle(msg, &caller, &options, "handle_token");
+                self.p2p.send(&reply_handle(&handle)?)?;
+                self.respond(&handle, &caller, 0, HashMap::new())?;
+                Ok(Ours::Done)
+            }
+            "Start" => {
+                let (session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
+                    msg.body().deserialize()?;
+                let cursor = {
+                    let state = self.state.lock().unwrap();
+                    let s = state.sessions.get(session.as_str()).context("no such session")?;
+                    anyhow::ensure!(s.portal_id.is_none(), "the session was started already");
+                    s.cursor
+                };
+                let handle = self.handle(msg, &caller, &options, "handle_token");
+                let link = self.clone();
+                let session_path = session.as_str().to_owned();
+                let (caller2, handle2) = (caller.clone(), handle.clone());
+                let id = self.portal.cast(&self.app.name, self.uid, cursor, move |resp| {
+                    let res = match resp {
+                        protocol::Response::Cast { node_id, output, width, height, .. } => {
+                            let mut state = link.state.lock().unwrap();
+                            state.ours.remove(&handle2);
+                            match state.sessions.get_mut(&session_path) {
+                                Some(s) => s.node = Some(node_id),
+                                None => return, // closed meanwhile; drv-portal has the Cancel
+                            }
+                            drop(state);
+                            let mut stream: HashMap<&str, Value<'_>> = HashMap::new();
+                            stream.insert("source_type", Value::U32(1));
+                            stream.insert("id", Value::from(output));
+                            stream.insert("position", Value::from((0i32, 0i32)));
+                            stream.insert("size", Value::from((width, height)));
+                            let streams = vec![Value::from(Structure::from((node_id, stream)))];
+                            let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+                            results.insert("streams", Value::from(streams));
+                            link.respond(&handle2, &caller2, 0, results)
+                        }
+                        protocol::Response::Cancelled { .. } => {
+                            link.state.lock().unwrap().ours.remove(&handle2);
+                            link.respond(&handle2, &caller2, 1, HashMap::new())
+                        }
+                        protocol::Response::Failed { reason, .. } => {
+                            eprintln!("bridge: {}: screencast: {reason}", link.app.name);
+                            link.state.lock().unwrap().ours.remove(&handle2);
+                            link.respond(&handle2, &caller2, 2, HashMap::new())
+                        }
+                        protocol::Response::Closed { .. } => {
+                            if link.state.lock().unwrap().sessions.remove(&session_path).is_none() {
+                                return;
+                            }
+                            Message::signal(session_path.as_str(), SESSION_IFACE, "Closed")
+                                .and_then(|b| b.destination(unique_from_component(&caller2)))
+                                .and_then(|b| b.build(&HashMap::<&str, Value<'_>>::new()))
+                                .map_err(anyhow::Error::from)
+                                .and_then(|s| link.p2p.send(&s).map_err(anyhow::Error::from))
+                        }
+                        protocol::Response::Hello { .. } | protocol::Response::Chosen { .. } => return,
+                    };
+                    if let Err(err) = res {
+                        eprintln!("bridge: {}: screencast: {err:#}", link.app.name);
+                    }
+                })?;
+                {
+                    let mut state = self.state.lock().unwrap();
+                    if let Some(s) = state.sessions.get_mut(session.as_str()) {
+                        s.portal_id = Some(id);
+                    }
+                    state.ours.insert(handle.clone(), id);
+                }
+                Ok(Ours::Reply(reply_handle(&handle)?))
+            }
+            "OpenPipeWireRemote" => {
+                let (session, _options): (OwnedObjectPath, HashMap<String, OwnedValue>) =
+                    msg.body().deserialize()?;
+                let node = {
+                    let state = self.state.lock().unwrap();
+                    let s = state.sessions.get(session.as_str()).context("no such session")?;
+                    s.node.context("the session is not streaming")?
+                };
+                let fd = pipewire_remote(node)?;
+                Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
+            }
+            other => bail!("no {other} on {SCREEN_CAST}"),
+        }
     }
 
     /// `OpenFile`/`SaveFile`: the handle goes back now, the `Response` signal when the
     /// person has picked. The app's `title` is shown as a hint under our own line naming it.
     fn file_chooser(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Message> {
-        let caller = match hdr.destination() {
-            Some(BusName::Unique(name)) => sender_component(name.as_str()),
-            _ => bail!("no caller"),
-        };
+        let caller = caller_of(hdr)?;
         let (_parent, title, options): (String, String, HashMap<String, OwnedValue>) =
             msg.body().deserialize().context("FileChooser arguments")?;
         let string = |key: &str| options.get(key).cloned().and_then(|v| String::try_from(v).ok());
@@ -481,13 +813,7 @@ impl AppLink {
             },
             other => bail!("no {other} on {FILE_CHOOSER}"),
         };
-        // The token is the app's; it must be one path element.
-        let token: String = string("handle_token")
-            .unwrap_or_else(|| format!("drv{}", msg.primary_header().serial_num()))
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-            .collect();
-        let handle = format!("{PORTAL_PATH}/request/{caller}/{token}");
+        let handle = self.handle(msg, &caller, &options, "handle_token");
         let link = self.clone();
         let signal_path = handle.clone();
         let id = self.portal.ask(&self.app.name, self.uid, title, kind, move |resp| {
@@ -501,17 +827,13 @@ impl AppLink {
                     eprintln!("bridge: {}: file chooser: {reason}", link.app.name);
                     (2, Vec::new())
                 }
-                protocol::Response::Hello { .. } => return,
+                _ => return,
             };
             let mut results: HashMap<&str, Value<'_>> = HashMap::new();
             if code == 0 {
                 results.insert("uris", Value::from(uris));
             }
-            let signal = Message::signal(signal_path.as_str(), REQUEST_IFACE, "Response")
-                .and_then(|b| b.destination(unique_from_component(&caller)))
-                .and_then(|b| b.build(&(code, results)));
-            let sent = signal.and_then(|s| link.p2p.send(&s));
-            if let Err(err) = sent {
+            if let Err(err) = link.respond(&signal_path, &caller, code, results) {
                 eprintln!("bridge: {}: file chooser response: {err}", link.app.name);
             }
         })?;

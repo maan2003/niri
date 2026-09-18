@@ -100,7 +100,7 @@ pub enum ScreenCastToNiri {
         stream_id: CastStreamId,
         target: StreamTargetId,
         cursor_mode: CursorMode,
-        signal_ctx: SignalEmitter<'static>,
+        notify: crate::screencasting::CastNotify,
     },
     StopCast {
         session_id: CastSessionId,
@@ -390,7 +390,7 @@ impl Stream {
             stream_id: self.id,
             target: self.target.make_id(),
             cursor_mode: self.cursor_mode,
-            signal_ctx: ctxt,
+            notify: crate::screencasting::CastNotify::Mutter(ctxt),
         };
 
         if let Err(err) = self.to_niri.send(msg) {

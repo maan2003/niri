@@ -242,6 +242,9 @@ pub struct Niri {
     pub launcher: Option<PolicyClient>,
     /// The poke line to drv-menu, from the supervisor: `show-launcher` writes a byte to it.
     pub menu: Option<std::os::unix::net::UnixStream>,
+    /// The cast line to drv-portal, from the supervisor (`drv_portal::compositor`).
+    pub portal: Option<OwnedFd>,
+    pub portal_link: Option<RegistrationToken>,
 
     /// Output config from the config file.
     ///
@@ -3155,6 +3158,8 @@ impl Niri {
             policy,
             launcher: None,
             menu: None,
+            portal: None,
+            portal_link: None,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -6861,6 +6866,7 @@ impl Niri {
             },
             Peer::MenuClient => self.insert_layer_client(sock, "menu"),
             Peer::PortalClient => self.insert_layer_client(sock, "portal"),
+            Peer::Portal => self.install_portal(sock),
             Peer::Menu => {
                 let sock = std::os::unix::net::UnixStream::from(sock);
                 if let Err(err) = sock.set_nonblocking(true) {
@@ -6903,6 +6909,55 @@ impl Niri {
             .unwrap();
         self.auth_link = Some(token);
         info!("attached to drv-authd");
+    }
+
+    /// drv-portal's cast line: requests come in here, answers and cast events go out on a
+    /// dup we keep.
+    fn install_portal(&mut self, sock: OwnedFd) {
+        if let Some(token) = self.portal_link.take() {
+            self.event_loop.remove(token);
+        }
+        if let Err(err) = rustix::io::ioctl_fionbio(&sock, true) {
+            warn!("drv-portal socket nonblocking: {err}");
+            return;
+        }
+        let out = match sock.try_clone() {
+            Ok(out) => out,
+            Err(err) => {
+                warn!("drv-portal socket dup: {err}");
+                return;
+            }
+        };
+        let source = Generic::new(sock, Interest::READ, Mode::Level);
+        let token = self
+            .event_loop
+            .insert_source(source, |_, sock, state| {
+                match drv_policy::seq::recv::<drv_portal::compositor::ToCompositor>(&*sock) {
+                    Ok((msg, _)) => {
+                        #[cfg(feature = "xdp-gnome-screencast")]
+                        state.on_portal_msg(msg);
+                        #[cfg(not(feature = "xdp-gnome-screencast"))]
+                        {
+                            let _ = state;
+                            warn!("built without screencasting; ignoring drv-portal's {msg:?}");
+                        }
+                        Ok(PostAction::Continue)
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        Ok(PostAction::Continue)
+                    }
+                    Err(err) => {
+                        warn!("drv-portal connection lost: {err}");
+                        state.niri.portal = None;
+                        state.niri.portal_link = None;
+                        Ok(PostAction::Remove)
+                    }
+                }
+            })
+            .unwrap();
+        self.portal = Some(out);
+        self.portal_link = Some(token);
+        info!("attached to drv-portal");
     }
 
     /// The supervisor handed us the locker's Wayland connection. No lookup: it is the locker

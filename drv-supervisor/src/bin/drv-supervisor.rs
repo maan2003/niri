@@ -305,6 +305,7 @@ struct Links {
     menu_client: (OwnedFd, OwnedFd),
     menu_appd: (OwnedFd, OwnedFd),
     portal_client: (OwnedFd, OwnedFd),
+    compositor_portal: (OwnedFd, OwnedFd),
     bridge_portal: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
@@ -324,6 +325,7 @@ impl Links {
             menu_client: stream()?,
             menu_appd: stream()?,
             portal_client: stream()?,
+            compositor_portal: seq()?,
             bridge_portal: seq()?,
             locker_auth: seq()?,
             appd_forker: seq()?,
@@ -365,6 +367,7 @@ fn start_set(
                 ("menu", l.compositor_menu.0.as_fd()),
                 ("menu-client", l.menu_client.0.as_fd()),
                 ("portal-client", l.portal_client.0.as_fd()),
+                ("portal", l.compositor_portal.0.as_fd()),
             ],
         ),
         (
@@ -389,6 +392,7 @@ fn start_set(
             &set.portal,
             vec![
                 ("wayland", l.portal_client.1.as_fd()),
+                ("compositor", l.compositor_portal.1.as_fd()),
                 ("bridge", l.bridge_portal.1.as_fd()),
                 ("fuse", fuse.as_fd()),
             ],
