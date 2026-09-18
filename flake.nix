@@ -53,6 +53,7 @@
               ./drv-seat
             ./drv-auth
             ./drv-lock
+            ./drv-menu
               ./niri-visual-tests
               ./resources
               ./src
@@ -98,6 +99,8 @@
             "drv-auth"
             "-p"
             "drv-lock"
+            "-p"
+            "drv-menu"
           ];
 
           nativeBuildInputs = [

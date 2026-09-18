@@ -17,6 +17,8 @@ pub trait Handler: Send + Sync {
     fn lookup(&self, peer: u32, uid: u32) -> Result<AppPolicy, String>;
     /// Start the named app (see [`Request::Launch`]); returns the UID it runs as.
     fn launch(&self, peer: u32, app: &str) -> Result<u32, String>;
+    /// The names `launch` accepts (see [`Request::Apps`]).
+    fn apps(&self, peer: u32) -> Result<Vec<String>, String>;
 }
 
 /// A file-backed store answers lookups and cannot launch anything.
@@ -30,6 +32,10 @@ impl Handler for PolicyStore {
     }
 
     fn launch(&self, _peer: u32, _app: &str) -> Result<u32, String> {
+        Err("this policy daemon does not launch apps".to_owned())
+    }
+
+    fn apps(&self, _peer: u32) -> Result<Vec<String>, String> {
         Err("this policy daemon does not launch apps".to_owned())
     }
 }
@@ -70,6 +76,10 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
             },
             Request::Launch { app } => match handler.launch(peer, &app) {
                 Ok(uid) => Response::Launched { uid },
+                Err(err) => Response::Error(err),
+            },
+            Request::Apps => match handler.apps(peer) {
+                Ok(apps) => Response::Apps(apps),
                 Err(err) => Response::Error(err),
             },
         };

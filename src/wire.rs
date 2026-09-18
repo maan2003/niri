@@ -18,6 +18,8 @@ pub enum Peer {
     Locker,
     /// Our launch channel to drv-appd.
     Appd,
+    /// The poke line to drv-menu: a byte per `show-launcher`.
+    Menu,
 }
 
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
@@ -69,6 +71,7 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
         (Peer::Auth, "auth", Kind::SeqPacket),
         (Peer::Locker, "locker", Kind::Stream),
         (Peer::Appd, "appd", Kind::Stream),
+        (Peer::Menu, "menu", Kind::Stream),
     ] {
         match fds.socket(name, kind) {
             Ok(fd) => out.push((peer, fd)),

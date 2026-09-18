@@ -2298,6 +2298,9 @@ impl State {
             Action::LockSession => {
                 self.niri.lock_now();
             }
+            Action::ShowLauncher => {
+                self.niri.show_launcher();
+            }
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();

@@ -98,14 +98,12 @@ in
   services.drv = {
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
-    config = builtins.replaceStrings [ "// skip-at-startup" ] [ "skip-at-startup" ] (builtins.readFile ../resources/default-config.kdl) + ''
+    # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
+    config = builtins.replaceStrings [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" ] [ "skip-at-startup" "{ show-launcher; }" ] (builtins.readFile ../resources/default-config.kdl) + ''
       // The screencast and introspection D-Bus services the GNOME portal backend needs.
       debug { dbus-interfaces-in-non-session-instances; }
     '';
     apps = {
-      # Mod+D in the stock binds. An app, so it holds no launch authority: its entries cannot
-      # launch anything until the menu is a supervisor service (next milestone).
-      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; globals = [ "layer-shell" ]; };
       # Notification daemon on the services' bus; apps reach it only through the bridge, which
       # names them.
       mako = {

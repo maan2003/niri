@@ -240,6 +240,8 @@ pub struct Niri {
     /// Our launch channel to drv-appd, from the supervisor's wire (`Attach::Appd`). The public
     /// socket launches nothing; without this, spawn binds do nothing.
     pub launcher: Option<PolicyClient>,
+    /// The poke line to drv-menu, from the supervisor: `show-launcher` writes a byte to it.
+    pub menu: Option<std::os::unix::net::UnixStream>,
 
     /// Output config from the config file.
     ///
@@ -3152,6 +3154,7 @@ impl Niri {
 
             policy,
             launcher: None,
+            menu: None,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -3175,6 +3178,20 @@ impl Niri {
         match launcher.launch(app.clone()) {
             Ok(uid) => info!("launched {app:?} as uid {uid}"),
             Err(err) => warn!("error launching {app:?}: {err}"),
+        }
+    }
+
+    /// Asks drv-menu, over the line the supervisor linked, to show the app menu.
+    pub fn show_launcher(&mut self) {
+        let Some(menu) = self.menu.as_mut() else {
+            warn!("cannot show the menu: no line to drv-menu from the supervisor");
+            return;
+        };
+        match std::io::Write::write(menu, b"\n") {
+            Ok(_) => (),
+            // A backlog means the menu is busy; one more poke would not help.
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+            Err(err) => warn!("the line to drv-menu: {err}"),
         }
     }
 
@@ -6842,6 +6859,14 @@ impl Niri {
                 }
                 Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
             },
+            Peer::Menu => {
+                let sock = std::os::unix::net::UnixStream::from(sock);
+                if let Err(err) = sock.set_nonblocking(true) {
+                    warn!("the line to drv-menu: {err}");
+                }
+                info!("menu attached");
+                self.menu = Some(sock);
+            }
         }
     }
 

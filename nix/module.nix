@@ -39,6 +39,7 @@ let
       # Services: identified, never launched. They may ask who other UIDs are.
       { name = "compositor"; uid = cfg.ids.compositor; grants = [ "lookup" ]; }
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
+      { name = "menu"; uid = cfg.ids.menu; globals = [ "layer-shell" ]; }
     ] ++ appEntries;
   };
   # Names only the compositor owns, and only screencast-granted users may call.
@@ -107,6 +108,12 @@ in
       lock = lib.mkOption { type = lib.types.int; default = 908; };
       forker = lib.mkOption { type = lib.types.int; default = 909; };
       supervisor = lib.mkOption { type = lib.types.int; default = 910; };
+      menu = lib.mkOption { type = lib.types.int; default = 911; };
+    };
+    menu = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "${pkgs.fuzzel}/bin/fuzzel" "--dmenu" ];
+      description = "The dmenu-style program drv-menu runs on `show-launcher`: names on stdin, the choice on stdout.";
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -240,6 +247,9 @@ in
       drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
       # The supervisor: the capabilities its unit grants it (below), nothing else.
       drv-supervisor = { uid = cfg.ids.supervisor; group = "drv-supervisor"; isSystemUser = true; };
+      # The app menu: a launcher because the supervisor handed it a channel, a Wayland client
+      # like any app (the manifest lists it with layer-shell).
+      drv-menu = { uid = cfg.ids.menu; group = "drv-menu"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -258,6 +268,7 @@ in
       drv-lock.gid = cfg.ids.lock;
       drv-forker.gid = cfg.ids.forker;
       drv-supervisor.gid = cfg.ids.supervisor;
+      drv-menu.gid = cfg.ids.menu;
       render = { };
     };
 
@@ -351,6 +362,13 @@ in
           "--locker-user drv-lock"
           "--locker-exec '${cfg.package}/bin/drv-lock'"
           "--locker-env RUST_BACKTRACE=1"
+          # The app menu: holds a launch channel to drv-appd and runs the program below when
+          # the compositor's `show-launcher` bind pokes it. Its Wayland connection is the apps'
+          # socket, as drv-menu.
+          "--menu-user drv-menu"
+          "--menu-exec '${cfg.package}/bin/drv-menu ${lib.concatStringsSep " " cfg.menu}'"
+          "--menu-env WAYLAND_DISPLAY=/run/drv-wayland/wayland"
+          "--menu-env RUST_BACKTRACE=1"
         ] ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.
           "MESA_SHADER_CACHE_DISABLE=true"

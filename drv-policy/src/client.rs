@@ -86,6 +86,15 @@ impl PolicyClient {
         }
     }
 
+    /// The names `launch` accepts; only a launch channel answers.
+    pub fn apps(&mut self) -> io::Result<Vec<String>> {
+        match self.request(&Request::Apps)? {
+            Response::Apps(apps) => Ok(apps),
+            Response::Error(err) => Err(io::Error::other(err)),
+            other => Err(unexpected("apps", other)),
+        }
+    }
+
     fn request(&mut self, request: &Request) -> io::Result<Response> {
         match &mut self.source {
             Source::Socket { path, conn } => {

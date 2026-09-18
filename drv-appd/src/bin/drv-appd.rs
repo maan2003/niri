@@ -1,6 +1,7 @@
 //! drv-appd's process. Its fds come from the supervisor by name: `listener` (the public
-//! socket, lookups only), `channel` (to drv-forker) and `compositor` (the compositor's launch
-//! channel). Nothing here is found; all of it was put in place before we ran.
+//! socket, lookups only), `channel` (to drv-forker), `compositor` and `menu` (the launch
+//! channels of the two launchers). Nothing here is found; all of it was put in place before
+//! we ran.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,6 +27,7 @@ fn run(args: Args) -> Result<(), String> {
     let listener = fds.listener("listener").map_err(|e| e.to_string())?;
     let channel = fds.socket("channel", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let compositor = fds.socket("compositor", Kind::Stream).map_err(|e| e.to_string())?;
+    let menu = fds.socket("menu", Kind::Stream).map_err(|e| e.to_string())?;
     let config = load_config(&args.config).map_err(|e| e.to_string())?;
     let base_env: Vec<(String, String)> = std::env::var("PATH")
         .map(|path| vec![("PATH".to_owned(), path)])
@@ -33,6 +35,7 @@ fn run(args: Args) -> Result<(), String> {
     let appd = Arc::new(Appd::new(config, Arc::new(Channel::new(channel)), base_env));
 
     appd.serve_launcher("the compositor".to_owned(), compositor);
+    appd.serve_launcher("the menu".to_owned(), menu);
 
     // Autostart once the compositor's socket listens; the apps live as long as the set does.
     let autostart = appd.clone();

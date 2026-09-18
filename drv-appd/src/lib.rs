@@ -187,6 +187,16 @@ impl Appd {
         self.config.apps.iter().find(|a| a.uid == uid)
     }
 
+    /// What a menu may offer: every entry with an `exec`, in manifest order.
+    fn launchable(&self) -> Vec<String> {
+        self.config
+            .apps
+            .iter()
+            .filter(|a| a.exec.is_some())
+            .map(|a| a.name.clone())
+            .collect()
+    }
+
     /// The child's environment: ours (`PATH`..), the config's `[env]`, the app's own, then
     /// the compositor's apps socket as `WAYLAND_DISPLAY`. The forker sets `HOME` and
     /// `XDG_RUNTIME_DIR`.
@@ -293,6 +303,12 @@ impl Handler for Appd {
             "uid {peer} asked to launch {name:?} on the public socket; only a launch channel may"
         ))
     }
+
+    fn apps(&self, peer: u32) -> Result<Vec<String>, String> {
+        Err(format!(
+            "uid {peer} asked for the app list on the public socket; only a launch channel may"
+        ))
+    }
 }
 
 /// One launch channel's handler: launches for `who`, nothing else.
@@ -316,6 +332,10 @@ impl Handler for Launcher {
         let uid = self.appd.start(app)?;
         eprintln!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
         Ok(uid)
+    }
+
+    fn apps(&self, _peer: u32) -> Result<Vec<String>, String> {
+        Ok(self.appd.launchable())
     }
 }
 

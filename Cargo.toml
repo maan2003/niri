@@ -6,6 +6,7 @@ members = [
     "drv-seat",
     "drv-auth",
     "drv-lock",
+    "drv-menu",
     "drv-supervisor",
     "drv-appd",
     "drv-forker",

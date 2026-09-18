@@ -914,6 +914,8 @@ pub enum Action {
     StopAllCasts {},
     /// Lock the session now.
     LockSession {},
+    /// Show the app menu (drv-menu).
+    ShowLauncher {},
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
     /// Open the Overview.

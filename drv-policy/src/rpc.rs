@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -31,6 +31,8 @@ pub enum Request {
     Launch {
         app: String,
     },
+    /// The names `Launch` accepts, for a menu. Only on a launch channel.
+    Apps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +45,8 @@ pub enum Response {
     Launched {
         uid: u32,
     },
+    /// The launchable app names, in manifest order.
+    Apps(Vec<String>),
     /// The request was understood and refused (unknown app, not allowed, spawner down, ...).
     Error(String),
 }

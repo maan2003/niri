@@ -1067,6 +1067,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-menu"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
+ "drv-policy",
+ "libc",
+]
+
+[[package]]
 name = "drv-os"
 version = "26.4.0"
 dependencies = [

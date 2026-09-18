@@ -95,6 +95,15 @@ struct Args {
     /// `NAME=VALUE` in the locker's environment. Repeatable; it gets nothing else.
     #[arg(long = "locker-env")]
     locker_env: Vec<String>,
+    /// System user the menu runs as.
+    #[arg(long)]
+    menu_user: String,
+    /// The menu's command line, whitespace-separated (`drv-menu <program> --dmenu`).
+    #[arg(long)]
+    menu_exec: String,
+    /// `NAME=VALUE` in the menu's environment. Repeatable; it gets nothing else.
+    #[arg(long = "menu-env")]
+    menu_env: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -124,6 +133,7 @@ struct Set {
     gpu: Service,
     compositor: Service,
     locker: Service,
+    menu: Service,
     forker: Service,
     appd: Service,
 }
@@ -142,6 +152,7 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
         )?,
         locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[])?,
+        menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[])?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -185,6 +196,8 @@ struct Links {
     compositor_gpu: (OwnedFd, OwnedFd),
     compositor_locker: (OwnedFd, OwnedFd),
     compositor_appd: (OwnedFd, OwnedFd),
+    compositor_menu: (OwnedFd, OwnedFd),
+    menu_appd: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
 }
@@ -199,6 +212,8 @@ impl Links {
             compositor_gpu: stream()?,
             compositor_locker: stream()?,
             compositor_appd: stream()?,
+            compositor_menu: stream()?,
+            menu_appd: stream()?,
             locker_auth: seq()?,
             appd_forker: seq()?,
         })
@@ -210,7 +225,7 @@ type Group = Vec<(&'static str, Child)>;
 /// Starts the set in order; a member that fails to start takes the ones already up down.
 fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
     let l = Links::make()?;
-    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 7] = [
+    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 8] = [
         ("drv-seatd", &set.seatd, vec![("compositor", l.compositor_seat.1.as_fd())]),
         (
             "drv-authd",
@@ -230,6 +245,7 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("gpu", l.compositor_gpu.0.as_fd()),
                 ("locker", l.compositor_locker.0.as_fd()),
                 ("appd", l.compositor_appd.0.as_fd()),
+                ("menu", l.compositor_menu.0.as_fd()),
             ],
         ),
         (
@@ -240,6 +256,14 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("auth", l.locker_auth.0.as_fd()),
             ],
         ),
+        (
+            "drv-menu",
+            &set.menu,
+            vec![
+                ("compositor", l.compositor_menu.1.as_fd()),
+                ("appd", l.menu_appd.0.as_fd()),
+            ],
+        ),
         ("drv-forker", &set.forker, vec![("channel", l.appd_forker.1.as_fd())]),
         (
             "drv-appd",
@@ -248,6 +272,7 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("listener", listener.as_fd()),
                 ("channel", l.appd_forker.0.as_fd()),
                 ("compositor", l.compositor_appd.1.as_fd()),
+                ("menu", l.menu_appd.1.as_fd()),
             ],
         ),
     ];
