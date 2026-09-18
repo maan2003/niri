@@ -434,6 +434,7 @@ impl State {
         for session_id in to_stop {
             self.niri.stop_cast(session_id);
         }
+        self.niri.refresh_cast_indicator();
     }
 
     pub fn on_screen_cast_msg(&mut self, msg: ScreenCastToNiri) {
@@ -471,6 +472,7 @@ impl State {
                             cursor_mode,
                             signal_ctx,
                         });
+                        self.niri.refresh_cast_indicator();
                         return;
                     }
                     StreamTargetId::Window { id } => {
@@ -502,6 +504,7 @@ impl State {
                         self.niri.stop_cast(session_id);
                     }
                 }
+                self.niri.refresh_cast_indicator();
             }
             ScreenCastToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
         }
@@ -774,18 +777,46 @@ impl Niri {
             self.stop_cast_stream(&cast);
         }
 
-        let dbus = &self.dbus.as_ref().unwrap();
-        let server = dbus.conn_screen_cast.as_ref().unwrap().object_server();
-        let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
-        if let Ok(iface) = server.interface::<_, mutter_screen_cast::Session>(path) {
-            let _span = tracy_client::span!("invoking Session::stop");
+        {
+            let dbus = &self.dbus.as_ref().unwrap();
+            let server = dbus.conn_screen_cast.as_ref().unwrap().object_server();
+            let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
+            if let Ok(iface) = server.interface::<_, mutter_screen_cast::Session>(path) {
+                let _span = tracy_client::span!("invoking Session::stop");
 
-            async_io::block_on(async move {
-                iface
-                    .get()
-                    .stop(server.inner(), iface.signal_emitter().clone())
-                    .await
-            });
+                async_io::block_on(async move {
+                    iface
+                        .get()
+                        .stop(server.inner(), iface.signal_emitter().clone())
+                        .await
+                });
+            }
+        }
+
+        self.refresh_cast_indicator();
+    }
+
+    /// Stops every screencast session: the human's kill switch. Each session gets the Mutter
+    /// `Closed` signal, so the portal and the app see the lease end.
+    pub fn stop_all_casts(&mut self) {
+        let ids = self.cast_session_ids();
+        debug!("stopping {} screencast session(s)", ids.len());
+        for id in ids {
+            self.stop_cast(id);
+        }
+    }
+
+    fn cast_session_ids(&self) -> HashSet<CastSessionId> {
+        let casts = self.casting.casts.iter().map(|cast| cast.session_id);
+        let pending = self.casting.pending_dynamic_casts.iter().map(|p| p.session_id);
+        casts.chain(pending).collect()
+    }
+
+    /// Keeps the on-screen indicator in step with the live sessions.
+    pub fn refresh_cast_indicator(&mut self) {
+        let sessions = self.cast_session_ids().len();
+        if self.cast_indicator.set_sessions(sessions) {
+            self.queue_redraw_all();
         }
     }
 

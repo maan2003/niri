@@ -908,6 +908,10 @@ pub enum Action {
         #[cfg_attr(feature = "clap", arg(long))]
         session_id: u64,
     },
+    /// Stop every PipeWire screencast.
+    ///
+    /// Bind this to a key: the "Screen is being shared" indicator names it.
+    StopAllCasts {},
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
     /// Open the Overview.

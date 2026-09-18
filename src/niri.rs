@@ -178,6 +178,7 @@ use crate::render_helpers::{
 use crate::screencasting::Screencasting;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
+use crate::ui::cast_indicator::CastIndicator;
 use crate::ui::hotkey_overlay::HotkeyOverlay;
 use crate::ui::mru::{MruCloseRequest, WindowMruUi, WindowMruUiRenderElement};
 use crate::ui::screen_transition::{self, ScreenTransition};
@@ -445,6 +446,7 @@ pub struct Niri {
     pub screenshot_ui: ScreenshotUi,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
+    pub cast_indicator: CastIndicator,
     pub exit_confirm_dialog: ExitConfirmDialog,
 
     pub window_mru_ui: WindowMruUi,
@@ -1701,6 +1703,7 @@ impl State {
             self.niri
                 .hotkey_overlay
                 .on_hotkey_config_updated(new_mod_key);
+            self.niri.cast_indicator.on_hotkey_config_updated(new_mod_key);
             self.niri.mods_with_mouse_binds = mods_with_mouse_binds(new_mod_key, &config.binds);
             self.niri.mods_with_wheel_binds = mods_with_wheel_binds(new_mod_key, &config.binds);
             self.niri.mods_with_tablet_stylus_binds =
@@ -2869,6 +2872,7 @@ impl Niri {
             ConfigErrorNotification::new(animation_clock.clone(), config.clone());
 
         let mut hotkey_overlay = HotkeyOverlay::new(config.clone(), mod_key);
+        let cast_indicator = CastIndicator::new(config.clone(), mod_key);
         if !config_.hotkey_overlay.skip_at_startup {
             hotkey_overlay.show();
         }
@@ -3076,6 +3080,7 @@ impl Niri {
             screenshot_ui,
             config_error_notification,
             hotkey_overlay,
+            cast_indicator,
             exit_confirm_dialog,
 
             window_mru_ui,
@@ -4729,6 +4734,14 @@ impl Niri {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
         }
 
+        // The screencast indicator: above everything but the pointer, and only on screen, never
+        // in a cast. It is for the human at the screen.
+        if matches!(ctx.target, RenderTarget::Output) {
+            if let Some(element) = self.cast_indicator.render(ctx.renderer, output) {
+                push(element.into());
+            }
+        }
+
         // Next, the screen transition texture.
         {
             if let Some(transition) = &state.screen_transition {
@@ -6258,6 +6271,9 @@ impl Niri {
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn stop_cast(&mut self, _session_id: crate::utils::CastSessionId) {}
+
+    #[cfg(not(feature = "xdp-gnome-screencast"))]
+    pub fn stop_all_casts(&mut self) {}
 
     pub fn debug_toggle_damage(&mut self) {
         self.debug_draw_damage = !self.debug_draw_damage;

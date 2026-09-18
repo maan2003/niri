@@ -493,7 +493,7 @@ fn action_name(action: &Action) -> String {
     }
 }
 
-fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
+pub(super) fn key_name(screen_reader: bool, mod_key: ModKey, key: &Key) -> String {
     let mut name = String::new();
 
     let has_comp_mod = key.modifiers.contains(Modifiers::COMPOSITOR);
