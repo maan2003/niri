@@ -1,18 +1,24 @@
-//! The lock screen. It only draws and collects the PIN: the compositor decides when the
-//! session is locked, and `drv-authd` tells the compositor to unlock on a correct PIN. We exit
-//! when the compositor sends `finished`.
+//! The lock screen, a supervisor service in the compositor's group. It only draws and
+//! collects the PIN: the compositor decides when the session is locked, and `drv-authd` tells
+//! the compositor to unlock on a correct PIN. Both connections come down the supervisor's
+//! wire. After every `finished` we ask to lock again; the compositor holds that request until
+//! the session locks.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process;
 use std::time::Duration;
+
+use drv_policy::wire::Attach;
 
 use pangocairo::cairo::{Format, ImageSurface};
 use pangocairo::pango::{Alignment, FontDescription};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
@@ -49,9 +55,12 @@ struct App {
     /// Waiting for the compositor to finish us after a correct PIN.
     granted: bool,
     granted_ticks: u32,
-    /// Our connection to drv-authd, handed over by drv-appd at launch.
-    auth: OwnedFd,
+    /// Our connection to drv-authd, from the supervisor's wire; a restarted daemon arrives
+    /// there as a new one.
+    auth: Option<OwnedFd>,
 }
+
+const NO_AUTH: &str = "Auth daemon unavailable";
 
 struct Surface {
     lock_surface: SessionLockSurface,
@@ -130,11 +139,29 @@ impl App {
         }
     }
 
+    /// Asks to lock; the compositor answers `locked` when the session is (or gets) locked.
+    fn relock(&mut self, qh: &QueueHandle<Self>) {
+        match self.session_lock_state.lock(qh) {
+            Ok(lock) => self.session_lock = Some(lock),
+            Err(err) => {
+                eprintln!("drv-lock: no session-lock global: {err}");
+                process::exit(1);
+            }
+        }
+    }
+
     fn submit(&mut self) {
         if self.pin.is_empty() || self.granted {
             return;
         }
-        let reply = drv_auth::verify(&self.auth, &self.pin);
+        let Some(auth) = &self.auth else {
+            self.pin.zeroize();
+            self.pin.clear();
+            self.message = NO_AUTH.to_owned();
+            self.draw_all();
+            return;
+        };
+        let reply = drv_auth::verify(auth, &self.pin);
         self.pin.zeroize();
         self.pin.clear();
         match reply {
@@ -154,10 +181,10 @@ impl App {
             }
             Ok(other) => self.message = format!("Auth failed: {other:?}"),
             Err(err) => {
-                // A restarted daemon reaches us through a fresh launch, not a reconnect: the
-                // compositor starts us again while it is locked, with a new connection.
+                // A restarted daemon comes back down the wire as a new connection.
                 eprintln!("drv-lock: auth daemon unreachable: {err}");
-                process::exit(1);
+                self.auth = None;
+                self.message = NO_AUTH.to_owned();
             }
         }
         self.draw_all();
@@ -214,9 +241,20 @@ impl SessionLockHandler for App {
         }
     }
 
-    fn finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _lock: SessionLock) {
-        // The compositor is done with us: either it unlocked or it refused the lock.
-        process::exit(0);
+    fn finished(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, lock: SessionLock) {
+        // The compositor unlocked (or refused): let this lock go, forget the PIN, and ask
+        // again so the next locking finds our request waiting.
+        self.surfaces.clear();
+        if lock.is_locked() {
+            lock.unlock();
+        }
+        self.session_lock = None;
+        self.pin.zeroize();
+        self.pin.clear();
+        self.message.clear();
+        self.granted = false;
+        self.granted_ticks = 0;
+        self.relock(qh);
     }
 
     fn configure(
@@ -447,28 +485,26 @@ smithay_client_toolkit::delegate_registry!(App);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
 smithay_client_toolkit::delegate_dispatch2!(App);
 
-/// The spawner's wire carries exactly one thing for us: the auth connection. Without it we
-/// could only draw, so we quit and let the compositor try again.
-fn take_auth() -> OwnedFd {
+fn main() {
     let Some(wire) = drv_policy::wire::take() else {
-        eprintln!("drv-lock: no wire (DRV_WIRE_FD): not launched by drv-appd");
+        eprintln!("drv-lock: no wire (DRV_WIRE_FD): the locker runs under drv-supervisor");
         process::exit(1);
     };
-    match drv_policy::wire::recv_attach(&wire) {
-        Ok((drv_policy::wire::Attach::Auth, fd)) => fd,
-        Ok((other, _)) => {
-            eprintln!("drv-lock: unexpected {other:?} on the wire");
-            process::exit(1);
+    // The compositor first: there is nothing to draw on without it. drv-authd's connection
+    // may be on the wire already or come later (it is up when it is up).
+    let mut auth = None;
+    let compositor = loop {
+        match drv_policy::wire::recv_attach(&wire) {
+            Ok((Attach::Compositor, fd)) => break fd,
+            Ok((Attach::Auth, fd)) => auth = Some(fd),
+            Ok((other, _)) => eprintln!("drv-lock: ignoring {other:?} on the wire"),
+            Err(err) => {
+                eprintln!("drv-lock: the supervisor's wire failed: {err}");
+                process::exit(1);
+            }
         }
-        Err(err) => {
-            eprintln!("drv-lock: no auth connection on the wire: {err}");
-            process::exit(1);
-        }
-    }
-}
-
-fn main() {
-    let conn = Connection::connect_to_env().expect("wayland connection");
+    };
+    let conn = Connection::from_socket(UnixStream::from(compositor)).expect("wayland connection");
     let (globals, event_queue) = registry_queue_init(&conn).expect("registry");
     let qh: QueueHandle<App> = event_queue.handle();
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("event loop");
@@ -493,15 +529,36 @@ fn main() {
         message: String::new(),
         granted: false,
         granted_ticks: 0,
-        auth: take_auth(),
+        auth,
     };
-    app.session_lock = Some(
-        app.session_lock_state
-            .lock(&qh)
-            .expect("ext-session-lock global"),
-    );
+    app.relock(&qh);
 
-    // If the compositor never finishes us after a grant, do not sit there forever.
+    // The wire stays: drv-authd comes back down it after a restart.
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(wire, Interest::READ, Mode::Level),
+            |_, wire, app: &mut App| {
+                match drv_policy::wire::recv_attach(wire) {
+                    Ok((Attach::Auth, fd)) => {
+                        app.auth = Some(fd);
+                        if app.message == NO_AUTH {
+                            app.message.clear();
+                            app.draw_all();
+                        }
+                    }
+                    Ok((other, _)) => eprintln!("drv-lock: ignoring {other:?} on the wire"),
+                    Err(err) => {
+                        eprintln!("drv-lock: the supervisor's wire closed: {err}; exiting");
+                        process::exit(1);
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .expect("wire source");
+
+    // If the compositor never finishes us after a grant, take the PIN again.
     event_loop
         .handle()
         .insert_source(
@@ -510,8 +567,11 @@ fn main() {
                 if app.granted {
                     app.granted_ticks += 1;
                     if app.granted_ticks > 10 {
-                        eprintln!("drv-lock: no finish after grant; exiting");
-                        process::exit(0);
+                        eprintln!("drv-lock: no finish after grant");
+                        app.granted = false;
+                        app.granted_ticks = 0;
+                        app.message = "Unlock did not go through, try again".to_owned();
+                        app.draw_all();
                     }
                 }
                 TimeoutAction::ToDuration(Duration::from_secs(1))
@@ -521,7 +581,7 @@ fn main() {
 
     loop {
         if let Err(err) = event_loop.dispatch(None, &mut app) {
-            // The compositor went away (it restarts locked and launches us again).
+            // The compositor went away; the supervisor restarts the whole group, us included.
             eprintln!("drv-lock: connection lost: {err}; exiting");
             process::exit(0);
         }

@@ -20,11 +20,12 @@ pub const WIRE_ENV: &str = "DRV_WIRE_FD";
 /// What the fd riding along is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Attach {
-    /// To the compositor or the lock app: a connection to `drv-authd`.
+    /// To the compositor or the locker: a connection to `drv-authd`.
     Auth,
-    /// To `drv-authd` or `drv-seatd`: the compositor's connection (replaces the previous one).
+    /// To `drv-authd`, `drv-seatd`, compositor-gpu or the locker: the compositor's connection
+    /// (replaces the previous one).
     Compositor,
-    /// To `drv-authd`: a lock app's connection.
+    /// To `drv-authd`: the locker's connection (or an auth app's, via drv-appd).
     Verifier,
     /// To the compositor: its connection to `drv-seatd`.
     Seat,
@@ -33,6 +34,8 @@ pub enum Attach {
     /// To the compositor: its connection to compositor-gpu (a stream socket; see
     /// [`stream_pair`]).
     Gpu,
+    /// To the compositor: the locker's Wayland connection (a stream socket).
+    Locker,
 }
 
 /// The child's end, if the spawner gave us one.

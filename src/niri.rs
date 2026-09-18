@@ -448,7 +448,6 @@ pub struct Niri {
     pub lease_idle_timeout: Duration,
     /// A visible idle-inhibiting surface keeps extending the lease.
     pub idle_inhibited: bool,
-    pub lock_app_launched_at: Option<Duration>,
     pub auth_link: Option<RegistrationToken>,
     /// What the wire delivered before the event loop ran; `State::new` hands them over.
     pub pending_attachments: Vec<(drv_policy::wire::Attach, OwnedFd)>,
@@ -621,6 +620,8 @@ pub struct PointContents {
 pub enum LockState {
     #[default]
     Unlocked,
+    /// The locker asked to lock while the session is unlocked: held for the next locking.
+    Pending(SessionLocker),
     /// A lock client attached; `locked` goes out once every output rendered a locked frame.
     Locking(SessionLocker),
     Locked(ExtSessionLockV1),
@@ -2985,12 +2986,12 @@ impl Niri {
             })
             .unwrap();
 
-        // The lock: expire the lease, relaunch the lock app, reconnect to drv-authd.
+        // The lock: expire the lease even while nothing is rendered or typed.
         event_loop
             .insert_source(
                 Timer::from_duration(Duration::from_secs(1)),
                 |_, _, state| {
-                    state.niri.lock_tick();
+                    state.niri.check_lease();
                     TimeoutAction::ToDuration(Duration::from_secs(1))
                 },
             )
@@ -3133,7 +3134,6 @@ impl Niri {
             lease_until: None,
             lease_idle_timeout: Duration::from_secs(300),
             idle_inhibited: false,
-            lock_app_launched_at: None,
             auth_link: None,
             pending_attachments,
             locked_hint: None,
@@ -6744,10 +6744,13 @@ impl Niri {
         !self.lease_until.is_some_and(|until| get_boot_time() < until)
     }
 
-    /// A client asks to lock: fine only while we are locked ourselves, otherwise `finished`.
+    /// A client asks to lock. While we are locked ourselves it takes over the screens; while
+    /// we are not, the request is held (the locker asks right after every `finished`) and
+    /// answered when the session locks. Only the locker sees the global, so this is it.
     pub fn lock(&mut self, confirmation: SessionLocker) {
         if !self.is_locked() {
-            info!("refusing lock: the session is not locked");
+            debug!("holding the lock request until the session locks");
+            self.lock_state = LockState::Pending(confirmation);
             return;
         }
 
@@ -6763,6 +6766,10 @@ impl Niri {
             _ => (),
         }
 
+        self.accept_lock(confirmation);
+    }
+
+    fn accept_lock(&mut self, confirmation: SessionLocker) {
         info!("lock client attached");
         if self.output_state.is_empty() {
             let lock = confirmation.ext_session_lock().clone();
@@ -6775,7 +6782,7 @@ impl Niri {
         }
     }
 
-    /// Lock now: no lease, black outputs, launch the lock app.
+    /// Lock now: no lease, black outputs, and the locker's standing request becomes the lock.
     pub fn lock_now(&mut self) {
         if self.lease_until.is_none() {
             return;
@@ -6787,7 +6794,12 @@ impl Niri {
             .set_cursor_image(CursorImageStatus::default_named());
         self.cancel_mru();
         self.queue_redraw_all();
-        self.launch_lock_app(get_boot_time());
+        if matches!(self.lock_state, LockState::Pending(_)) {
+            let LockState::Pending(confirmation) = mem::take(&mut self.lock_state) else {
+                unreachable!()
+            };
+            self.accept_lock(confirmation);
+        }
     }
 
     /// drv-authd verified the PIN: unlock and send the lock client away.
@@ -6828,45 +6840,12 @@ impl Niri {
         }
     }
 
-    fn lock_client_alive(&self) -> bool {
-        match &self.lock_state {
-            LockState::Unlocked => false,
-            LockState::Locking(_) => true,
-            LockState::Locked(lock) => lock.is_alive(),
-        }
-    }
-
-    pub fn lock_tick(&mut self) {
-        self.check_lease();
-        self.launch_lock_app(get_boot_time());
-    }
-
-    fn launch_lock_app(&mut self, now: Duration) {
-        if !self.is_locked() || self.lock_client_alive() {
-            return;
-        }
-        let Some(app) = self.config.borrow().lock.app.clone() else {
-            return;
-        };
-        if self
-            .lock_app_launched_at
-            .is_some_and(|t| now - t < Duration::from_secs(3))
-        {
-            return;
-        }
-        self.lock_app_launched_at = Some(now);
-        match self.policy.launch(app.clone()) {
-            Ok(_) => debug!("launched lock app {app}"),
-            Err(err) => warn!("launching lock app {app}: {err}"),
-        }
-    }
-
-    /// Sit on a connection to drv-authd for `Unlock` events; retried from `lock_tick`.
     /// Something arrived on the spawner's wire.
     pub fn on_attach(&mut self, attach: drv_policy::wire::Attach, sock: OwnedFd) {
         use drv_policy::wire::Attach;
         match attach {
             Attach::Auth => self.install_auth(sock),
+            Attach::Locker => self.insert_locker(sock),
             // The seat daemon restarted. Our backend was built on the old one, so start over:
             // the spawner brings us back, wired to the new one, locked as always.
             Attach::Seat => {
@@ -6916,15 +6895,41 @@ impl Niri {
         info!("attached to drv-authd");
     }
 
-    /// The lock client released its lock. Without a lease from drv-authd we stay locked and
-    /// launch it again.
+    /// The supervisor handed us the locker's Wayland connection. No lookup: it is the locker
+    /// because it came down the wire, and it gets exactly the session-lock global.
+    fn insert_locker(&mut self, sock: OwnedFd) {
+        let config = self.config.borrow();
+        let data = Arc::new(ClientState {
+            compositor_state: Default::default(),
+            can_view_decoration_globals: config.prefer_no_csd,
+            primary_selection_disabled: config.clipboard.disable_primary,
+            restricted: false,
+            credentials_unknown: false,
+            policy: Arc::new(AppPolicy {
+                name: "locker".to_owned(),
+                gpu: false,
+                globals: vec![PolicyGlobal::SessionLock],
+                grants: Vec::new(),
+                icon: None,
+            }),
+        });
+        match self.display_handle.insert_client(UnixStream::from(sock), data) {
+            Ok(_) => info!("locker attached"),
+            Err(err) => warn!("error inserting the locker: {err}"),
+        }
+    }
+
+    /// The lock client released its lock. Without a lease from drv-authd we stay locked.
     pub fn unlock(&mut self) {
         info!("lock client released its lock");
         self.drop_lock_client();
     }
 
+    /// Forgets the current lock; a request held for the next locking stays.
     fn drop_lock_client(&mut self) {
-        let _prev = mem::take(&mut self.lock_state);
+        if !matches!(self.lock_state, LockState::Pending(_)) {
+            let _prev = mem::take(&mut self.lock_state);
+        }
         for output_state in self.output_state.values_mut() {
             output_state.lock_surface = None;
         }
@@ -7012,7 +7017,7 @@ impl Niri {
 
     pub fn new_lock_surface(&mut self, surface: LockSurface, output: &Output) {
         let lock = match &self.lock_state {
-            LockState::Unlocked => {
+            LockState::Unlocked | LockState::Pending(_) => {
                 error!("tried to add a lock surface on an unlocked session");
                 return;
             }

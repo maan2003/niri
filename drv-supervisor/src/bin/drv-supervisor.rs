@@ -83,6 +83,16 @@ struct Args {
     /// `NAME=VALUE` in the GPU process's environment. Repeatable; it gets nothing else.
     #[arg(long = "gpu-env")]
     gpu_env: Vec<String>,
+    /// System user the locker runs as.
+    #[arg(long)]
+    locker_user: Option<String>,
+    /// The locker's command line, whitespace-separated. It joins the compositor's group; its
+    /// Wayland connection and its drv-authd connection come down its wire.
+    #[arg(long)]
+    locker_exec: Option<String>,
+    /// `NAME=VALUE` in the locker's environment. Repeatable; it gets nothing else.
+    #[arg(long = "locker-env")]
+    locker_env: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -138,6 +148,17 @@ fn supervise(args: Args) -> Result<(), String> {
         &[],
         &[],
     )?;
+    let locker = service(
+        "locker",
+        args.locker_user.as_deref(),
+        args.locker_exec.as_deref(),
+        &args.locker_env,
+        &[],
+        &[],
+    )?;
+    if locker.is_some() && gpu.is_none() {
+        return Err("--locker-exec needs a compositor with --gpu-exec (the locker joins that group)".to_owned());
+    }
     let forker = service("drv-forker", Some("root"), Some(&args.forker_exec), &[], &[], &[])?
         .ok_or("--forker-exec is required")?;
     let appd = service(
@@ -169,7 +190,9 @@ fn supervise(args: Args) -> Result<(), String> {
     match (compositor, gpu) {
         (Some(compositor), Some(gpu)) => {
             let supervisor = supervisor.clone();
-            thread::spawn(move || supervise_compositor(&supervisor, &compositor, &gpu));
+            thread::spawn(move || {
+                supervise_compositor(&supervisor, &compositor, &gpu, locker.as_ref())
+            });
         }
         (Some(compositor), None) => {
             let supervisor = supervisor.clone();
@@ -291,21 +314,30 @@ fn supervise_appd(supervisor: &Supervisor, appd: &Service, forker: &Service, lis
     }
 }
 
-/// The compositor and its GPU process as one group. The GPU process is started first and
-/// gets the core's connection down its wire; it waits there for the core's `Start`. When
-/// either dies the other is stopped and both come back: a sealed GPU process cannot bring up
-/// a renderer for a new core, and a core cannot outlive its renderer.
-fn supervise_compositor(supervisor: &Supervisor, compositor: &Service, gpu: &Service) {
+/// The compositor, its GPU process and the locker as one group. The GPU process is started
+/// first and gets the core's connection down its wire; it waits there for the core's `Start`.
+/// The locker's Wayland connection is a link like any other. When any of them dies the rest
+/// are stopped and all come back: a sealed GPU process cannot bring up a renderer for a new
+/// core, a core cannot outlive its renderer, and a locker is only ever wired to one core.
+fn supervise_compositor(
+    supervisor: &Supervisor,
+    compositor: &Service,
+    gpu: &Service,
+    locker: Option<&Service>,
+) {
     loop {
-        match start_compositor_group(compositor, gpu) {
-            Ok((children, wire_compositor, wire_gpu)) => {
-                supervisor.wiring.attach_service(Peer::Gpu, wire_gpu);
-                supervisor.wiring.attach_service(Peer::Compositor, wire_compositor);
+        match start_compositor_group(compositor, gpu, locker) {
+            Ok((children, wires)) => {
+                let peers: Vec<Peer> = wires.iter().map(|(peer, _)| *peer).collect();
+                for (peer, wire) in wires {
+                    supervisor.wiring.attach_service(peer, wire);
+                }
                 supervisor.compositor_started();
                 wait_group(children);
                 supervisor.compositor_stopped();
-                supervisor.wiring.detach_service(Peer::Compositor);
-                supervisor.wiring.detach_service(Peer::Gpu);
+                for peer in peers {
+                    supervisor.wiring.detach_service(peer);
+                }
             }
             Err(err) => eprintln!("drv-supervisor: {err}"),
         }
@@ -313,35 +345,43 @@ fn supervise_compositor(supervisor: &Supervisor, compositor: &Service, gpu: &Ser
     }
 }
 
+/// Starts the group in wiring order (the compositor's links complete when it attaches, the
+/// locker's when it does); a member that fails to start takes the ones already up down.
 fn start_compositor_group(
     compositor: &Service,
     gpu: &Service,
-) -> Result<(Group, std::os::fd::OwnedFd, std::os::fd::OwnedFd), String> {
-    let (gpu_child, wire_gpu) = start_wired(gpu)?;
-    eprintln!(
-        "drv-supervisor: {} running as uid {}, pid {}",
-        gpu.name,
-        gpu.uid,
-        gpu_child.id()
-    );
-    let (compositor_child, wire_compositor) = match start_wired(compositor) {
-        Ok(started) => started,
-        Err(err) => {
-            stop(gpu_child);
-            return Err(err);
+    locker: Option<&Service>,
+) -> Result<(Group, Vec<(Peer, std::os::fd::OwnedFd)>), String> {
+    let mut members = vec![
+        ("compositor-gpu", Peer::Gpu, gpu),
+        ("compositor", Peer::Compositor, compositor),
+    ];
+    if let Some(locker) = locker {
+        members.push(("locker", Peer::Locker, locker));
+    }
+    let mut children: Group = Vec::new();
+    let mut wires = Vec::new();
+    for (name, peer, service) in members {
+        match start_wired(service) {
+            Ok((child, wire)) => {
+                eprintln!(
+                    "drv-supervisor: {} running as uid {}, pid {}",
+                    service.name,
+                    service.uid,
+                    child.id()
+                );
+                children.push((name, child));
+                wires.push((peer, wire));
+            }
+            Err(err) => {
+                for (_, child) in children {
+                    stop(child);
+                }
+                return Err(err);
+            }
         }
-    };
-    eprintln!(
-        "drv-supervisor: {} running as uid {}, pid {}",
-        compositor.name,
-        compositor.uid,
-        compositor_child.id()
-    );
-    Ok((
-        vec![("compositor-gpu", gpu_child), ("compositor", compositor_child)],
-        wire_compositor,
-        wire_gpu,
-    ))
+    }
+    Ok((children, wires))
 }
 
 /// Terminates and reaps a child whose group could not be completed.

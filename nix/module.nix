@@ -118,7 +118,7 @@ in
       gpu = lib.mkOption { type = lib.types.int; default = 905; };
       auth = lib.mkOption { type = lib.types.int; default = 906; };
       seat = lib.mkOption { type = lib.types.int; default = 907; };
-      lock = lib.mkOption { type = lib.types.int; default = 100999; description = "UID of the lock app."; };
+      lock = lib.mkOption { type = lib.types.int; default = 908; };
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -211,7 +211,7 @@ in
           auth = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "Gets a connection to drv-authd from the spawner at launch: the lock screen.";
+            description = "Gets a connection to drv-authd from the spawner at launch.";
           };
         };
       }));
@@ -250,6 +250,8 @@ in
       # The seat daemon: cards, evdev nodes and the VT are group-owned devices; the VT ioctls
       # come from CAP_SYS_TTY_CONFIG, which the supervisor leaves it.
       drv-seat = { uid = cfg.ids.seat; group = "drv-seat"; isSystemUser = true; extraGroups = [ "video" "input" "tty" ]; };
+      # The lock screen: no devices, no sockets; everything it talks to comes down its wire.
+      drv-lock = { uid = cfg.ids.lock; group = "drv-lock"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -265,6 +267,7 @@ in
       drv-gpu.gid = cfg.ids.gpu;
       drv-auth.gid = cfg.ids.auth;
       drv-seat.gid = cfg.ids.seat;
+      drv-lock.gid = cfg.ids.lock;
       render = { };
     };
 
@@ -282,20 +285,7 @@ in
     boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
     boot.kernelParams = [ "drm_kms_helper.blank_on_resume=1" ];
 
-    environment.etc."drv/config.kdl".text = cfg.config + ''
-
-      // The lock screen app, launched by the compositor whenever the session is locked.
-      lock { app "lock"; }
-    '';
-
-    # The lock screen: draws and takes the PIN, nothing more. The only app with the
-    # session-lock global and the only one the spawner wires to drv-authd.
-    services.drv.apps.lock = {
-      uid = cfg.ids.lock;
-      exec = [ "${cfg.package}/bin/drv-lock" ];
-      globals = [ "session-lock" ];
-      auth = true;
-    };
+    environment.etc."drv/config.kdl".text = cfg.config;
     environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
     environment.systemPackages = [ cfg.package desktopEntries ];
 
@@ -311,8 +301,8 @@ in
       };
     };
 
-    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor and its GPU process,
-    # drv-appd with its forker) as their own users, wires them with socketpairs and restarts what dies; their
+    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor with its GPU process
+    # and locker, drv-appd with its forker) as their own users, wires them with socketpairs and restarts what dies; their
     # logs land here. The compositor's environment is exactly what is listed.
     systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
@@ -351,6 +341,12 @@ in
           # has handed it the devices. One group with the compositor: either dying restarts both.
           "--gpu-user drv-gpu"
           "--gpu-exec '${cfg.package}/bin/niri gpu-process --mode drm'"
+          # The lock screen, in the compositor's group: draws and takes the PIN, nothing more.
+          # Its Wayland connection and its drv-authd connection come down its wire from the
+          # supervisor; it has no socket to find and none finds it.
+          "--locker-user drv-lock"
+          "--locker-exec '${cfg.package}/bin/drv-lock'"
+          "--locker-env RUST_BACKTRACE=1"
         ] ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.
           "MESA_SHADER_CACHE_DISABLE=true"
