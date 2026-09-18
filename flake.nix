@@ -44,8 +44,10 @@
             fileset = lib.fileset.unions [
               ./niri-config
               ./drv-bridge
-              ./drv-spawn
-              ./drv-identity
+              ./drv-supervisor
+              ./drv-appd
+              ./drv-forker
+              ./drv-os
               ./niri-ipc
               ./drv-policy
               ./drv-seat
@@ -77,15 +79,17 @@
 
           strictDeps = true;
 
-          # The spawner (with the identity daemon inside), the drv CLI and the bridge ship with the
+          # The supervisor, drv-appd, drv-forker, the drv CLI and the bridge ship with the
           # compositor.
           cargoBuildFlags = [
             "-p"
             "niri"
             "-p"
-            "drv-spawn"
+            "drv-supervisor"
             "-p"
-            "drv-identity"
+            "drv-appd"
+            "-p"
+            "drv-forker"
             "-p"
             "drv-bridge"
             "-p"

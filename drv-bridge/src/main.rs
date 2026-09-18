@@ -36,8 +36,8 @@ enum Cmd {
     Serve {
         #[arg(long)]
         socket: PathBuf,
-        #[arg(long, env = "DRV_IDENTITY_SOCKET")]
-        identity: PathBuf,
+        #[arg(long, env = "DRV_APPD_SOCKET")]
+        appd: PathBuf,
     },
     /// Run in the app's UID on its private bus: claim the desktop names, forward to the server,
     /// then run the app.
@@ -51,7 +51,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
-        Cmd::Serve { socket, identity } => serve(socket, identity),
+        Cmd::Serve { socket, appd } => serve(socket, appd),
         Cmd::App { socket, command } => app(socket, command),
     }
 }

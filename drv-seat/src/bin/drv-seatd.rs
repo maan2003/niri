@@ -532,7 +532,7 @@ fn user_id(name: &str) -> Result<(u32, u32), String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let wire = wire::take().ok_or("no wire on fd 3: drv-seatd runs under drv-spawnd")?;
+    let wire = wire::take().ok_or("no wire on fd 3: drv-seatd runs under drv-supervisor")?;
     let gpu = match args.gpu_exec {
         Some(exec) => {
             let (uid, gid) = user_id(&args.gpu_user)?;

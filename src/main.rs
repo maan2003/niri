@@ -287,7 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     watcher::setup(&mut state, &config_path, config_includes);
 
-    // The compositor does not spawn processes; the identity daemon launches apps for it.
+    // The compositor does not spawn processes; drv-appd launches apps for it.
     if !cli.command.is_empty() {
         state.niri.launch(
             cli.command
@@ -296,7 +296,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect(),
         );
     }
-    // Autostart is the identity daemon's job (`autostart` in the manifest): the compositor
+    // Autostart is drv-appd's job (`autostart` in the manifest): the compositor
     // does not decide what runs.
     for elem in spawn_at_startup {
         spawn_disabled(&format!("spawn-at-startup {:?}", elem.command));
@@ -410,12 +410,12 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-/// Socket from `DRV_IDENTITY_SOCKET`, else `/run/drv/identity.sock`. Nobody may do anything
+/// Socket from `DRV_APPD_SOCKET`, else `/run/drv/appd.sock`. Nobody may do anything
 /// unless the daemon says so, so no daemon means no compositor.
 fn connect_policy() -> PolicyClient {
-    let path = env::var_os(drv_policy::env::IDENTITY_SOCKET)
+    let path = env::var_os(drv_policy::env::APPD_SOCKET)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/drv/identity.sock"));
+        .unwrap_or_else(|| PathBuf::from("/run/drv/appd.sock"));
     // At boot the daemon may still be coming up; give it a moment before failing.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut result = PolicyClient::connect(path.clone());
@@ -425,13 +425,13 @@ fn connect_policy() -> PolicyClient {
     }
     match result {
         Ok(policy) => {
-            info!("connected to identity daemon at {}", path.display());
+            info!("connected to drv-appd at {}", path.display());
             policy
         }
         Err(err) => {
             error!(
-                "error connecting to identity daemon at {}: {err}; \
-                 run drv-spawnd or set DRV_IDENTITY_SOCKET",
+                "error connecting to drv-appd at {}: {err}; \
+                 run drv-supervisor or set DRV_APPD_SOCKET",
                 path.display()
             );
             std::process::exit(1);

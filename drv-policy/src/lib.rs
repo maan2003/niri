@@ -280,13 +280,14 @@ impl PolicyStore {
 pub mod client;
 pub mod daemon;
 pub mod rpc;
-pub mod spawn;
+pub mod forker;
+pub mod seq;
 pub mod wire;
 
 /// Environment names the pieces agree on.
 pub mod env {
-    /// Path of the identity daemon's socket.
-    pub const IDENTITY_SOCKET: &str = "DRV_IDENTITY_SOCKET";
+    /// Path of drv-appd's public socket.
+    pub const APPD_SOCKET: &str = "DRV_APPD_SOCKET";
     /// Path the compositor listens on for apps (absolute; apps get it as `WAYLAND_DISPLAY`).
     pub const APPS_SOCKET: &str = "DRV_APPS_SOCKET";
 }

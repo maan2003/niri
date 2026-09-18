@@ -5,23 +5,10 @@
 //! a second socket handed over with `Hello`, so they never interleave with replies. Only an
 //! announced device can be opened.
 
-use std::io::{self, IoSlice, IoSliceMut};
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-
-use rustix::net::{
-    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
-};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
 pub const VERSION: u32 = 2;
-/// Datagrams larger than this are refused.
-pub const MAX_MSG: usize = 4096;
-/// Fds per message: a `StartGpu` carries one per device.
-pub const MAX_FDS: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -100,68 +87,13 @@ pub fn is_allowed_device(path: &str) -> bool {
     matches!(number, Some(n) if !n.is_empty() && n.len() <= 4 && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-pub fn send<T: Serialize>(sock: impl AsFd, msg: &T, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
-    let payload = postcard::to_stdvec(msg).map_err(|e| io::Error::other(e.to_string()))?;
-    if payload.len() > MAX_MSG {
-        return Err(io::Error::other("message too large"));
-    }
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
-    let mut control = SendAncillaryBuffer::new(&mut space);
-    if !fds.is_empty() && !control.push(SendAncillaryMessage::ScmRights(fds)) {
-        return Err(io::Error::other("too many fds"));
-    }
-    let sent = rustix::net::sendmsg(
-        sock,
-        &[IoSlice::new(&payload)],
-        &mut control,
-        SendFlags::NOSIGNAL,
-    )?;
-    if sent != payload.len() {
-        return Err(io::Error::other("short send"));
-    }
-    Ok(())
-}
-
-/// One datagram and the fds that came with it. A closed peer is `UnexpectedEof`.
-pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>)> {
-    let mut buf = [0u8; MAX_MSG];
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
-    let mut control = RecvAncillaryBuffer::new(&mut space);
-    let msg = rustix::net::recvmsg(
-        sock,
-        &mut [IoSliceMut::new(&mut buf)],
-        &mut control,
-        RecvFlags::CMSG_CLOEXEC,
-    )?;
-    let mut fds = Vec::new();
-    for m in control.drain() {
-        if let RecvAncillaryMessage::ScmRights(received) = m {
-            fds.extend(received);
-        }
-    }
-    if msg.bytes == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
-    }
-    if msg.flags.contains(rustix::net::ReturnFlags::TRUNC) {
-        return Err(io::Error::other("message too large"));
-    }
-    let value = postcard::from_bytes(&buf[..msg.bytes])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok((value, fds))
-}
-
-/// A pair of connected event sockets.
-pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
-    Ok(rustix::net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::SEQPACKET,
-        SocketFlags::CLOEXEC,
-        None,
-    )?)
-}
+pub use drv_policy::seq::{pair, recv, send};
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::os::fd::AsFd;
+
     use super::*;
 
     #[test]

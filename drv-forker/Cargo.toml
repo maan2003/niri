@@ -1,0 +1,19 @@
+[package]
+name = "drv-forker"
+version.workspace = true
+description = "drv-appd's privileged helper: forks one sandboxed app per request, nothing else"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+drv-os = { version = "26.4.0", path = "../drv-os" }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "net", "process", "std"] }
+
+[[bin]]
+name = "drv-forker"
+path = "src/main.rs"

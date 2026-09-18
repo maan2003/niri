@@ -1002,6 +1002,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-appd"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-policy",
+ "rustix 1.1.4",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "drv-auth"
 version = "26.4.0"
 dependencies = [
@@ -1029,14 +1040,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv-identity"
+name = "drv-forker"
 version = "26.4.0"
 dependencies = [
  "clap",
+ "drv-os",
  "drv-policy",
+ "libc",
  "rustix 1.1.4",
- "serde",
- "toml",
 ]
 
 [[package]]
@@ -1049,6 +1060,14 @@ dependencies = [
  "smithay-client-toolkit",
  "wayland-client",
  "zeroize",
+]
+
+[[package]]
+name = "drv-os"
+version = "26.4.0"
+dependencies = [
+ "libc",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1076,11 +1095,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv-spawn"
+name = "drv-supervisor"
 version = "26.4.0"
 dependencies = [
  "clap",
- "drv-identity",
+ "drv-os",
  "drv-policy",
  "libc",
  "rustix 1.1.4",

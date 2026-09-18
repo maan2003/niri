@@ -43,6 +43,15 @@ struct Shared {
     idle_timeout: Duration,
 }
 
+fn spawn_verifier(shared: &Arc<Shared>, sock: OwnedFd) {
+    let shared = shared.clone();
+    thread::spawn(move || {
+        if let Err(err) = serve_verifier(&shared, sock) {
+            eprintln!("verifier connection: {err}");
+        }
+    });
+}
+
 fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
     loop {
         let mut secret = match drv_auth::recv_msg::<Request>(&sock) {
@@ -86,7 +95,7 @@ fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
 
 fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
     let wire = wire::take()
-        .ok_or_else(|| io::Error::other("no wire on fd 3: drv-authd runs under drv-spawnd"))?;
+        .ok_or_else(|| io::Error::other("no wire on fd 3: drv-authd runs under drv-supervisor"))?;
     let store = Store::new(state_dir);
     if !store.has_pin() {
         eprintln!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
@@ -103,11 +112,19 @@ fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
                 eprintln!("compositor attached");
                 *shared.compositor.lock().unwrap() = Some(sock);
             }
-            Ok((Attach::Verifier, sock)) => {
+            Ok((Attach::Verifier, sock)) => spawn_verifier(&shared, sock),
+            Ok((Attach::Verifiers, sock)) => {
+                // drv-appd: one `Verifier` per app it launches with auth.
+                eprintln!("drv-appd attached");
                 let shared = shared.clone();
-                thread::spawn(move || {
-                    if let Err(err) = serve_verifier(&shared, sock) {
-                        eprintln!("verifier connection: {err}");
+                thread::spawn(move || loop {
+                    match wire::recv_attach(&sock) {
+                        Ok((Attach::Verifier, verifier)) => spawn_verifier(&shared, verifier),
+                        Ok((other, _)) => eprintln!("ignoring {other:?} from drv-appd"),
+                        Err(err) => {
+                            eprintln!("drv-appd's socket ended: {err}");
+                            return;
+                        }
                     }
                 });
             }

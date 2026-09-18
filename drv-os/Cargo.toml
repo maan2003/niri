@@ -1,0 +1,12 @@
+[package]
+name = "drv-os"
+version.workspace = true
+description = "Small OS helpers shared by the supervisor, the forker and the seat daemon"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "process", "std"] }

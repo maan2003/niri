@@ -6,8 +6,10 @@ members = [
     "drv-seat",
     "drv-auth",
     "drv-lock",
-    "drv-spawn",
-    "drv-identity",
+    "drv-supervisor",
+    "drv-appd",
+    "drv-forker",
+    "drv-os",
     "drv-bridge",
     "niri-visual-tests",
 ]

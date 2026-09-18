@@ -1,7 +1,7 @@
 [package]
-name = "drv-identity"
+name = "drv-appd"
 version.workspace = true
-description = "Identity daemon: one UID per app, its policy, and launching through the spawner"
+description = "The app daemon: knows every app (one fixed UID each), answers who a UID is, starts apps through drv-forker"
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -17,3 +17,7 @@ toml = "1"
 [[bin]]
 name = "drv"
 path = "src/bin/drv.rs"
+
+[[bin]]
+name = "drv-appd"
+path = "src/bin/drv-appd.rs"

@@ -28,6 +28,8 @@ pub enum Attach {
     Verifier,
     /// To the compositor: its connection to `drv-seatd`.
     Seat,
+    /// A socket down which `Verifier` attaches will come (drv-appd's, at drv-authd).
+    Verifiers,
 }
 
 /// The child's end, if the spawner gave us one.

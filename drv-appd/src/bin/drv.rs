@@ -1,4 +1,4 @@
-//! The command line onto the identity daemon: what a launcher's desktop entries run, and a way
+//! The command line onto drv-appd: what a launcher's desktop entries run, and a way
 //! to look at policy from a shell. Talks to the socket like any other client; nothing here is
 //! privileged.
 
@@ -9,11 +9,11 @@ use clap::{Parser, Subcommand};
 use drv_policy::PolicyClient;
 
 #[derive(Parser)]
-#[command(name = "drv", about = "Talk to the identity daemon")]
+#[command(name = "drv", about = "Talk to drv-appd")]
 struct Cli {
-    /// Identity socket; `DRV_IDENTITY_SOCKET` overrides the default.
+    /// drv-appd's socket; `DRV_APPD_SOCKET` overrides the default.
     #[arg(long)]
-    identity: Option<PathBuf>,
+    appd: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -28,15 +28,15 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let identity = cli.identity.unwrap_or_else(|| {
-        std::env::var_os(drv_policy::env::IDENTITY_SOCKET)
+    let appd = cli.appd.unwrap_or_else(|| {
+        std::env::var_os(drv_policy::env::APPD_SOCKET)
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/run/drv/identity.sock"))
+            .unwrap_or_else(|| PathBuf::from("/run/drv/appd.sock"))
     });
-    let mut client = match PolicyClient::connect(identity.clone()) {
+    let mut client = match PolicyClient::connect(appd.clone()) {
         Ok(client) => client,
         Err(err) => {
-            eprintln!("drv: {}: {err}", identity.display());
+            eprintln!("drv: {}: {err}", appd.display());
             return ExitCode::FAILURE;
         }
     };

@@ -49,7 +49,7 @@ struct App {
     /// Waiting for the compositor to finish us after a correct PIN.
     granted: bool,
     granted_ticks: u32,
-    /// Our connection to drv-authd, handed over by the spawner at launch.
+    /// Our connection to drv-authd, handed over by drv-appd at launch.
     auth: OwnedFd,
 }
 
@@ -451,7 +451,7 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 /// could only draw, so we quit and let the compositor try again.
 fn take_auth() -> OwnedFd {
     let Some(wire) = drv_policy::wire::take() else {
-        eprintln!("drv-lock: no wire (DRV_WIRE_FD): not launched by drv-spawnd");
+        eprintln!("drv-lock: no wire (DRV_WIRE_FD): not launched by drv-appd");
         process::exit(1);
     };
     match drv_policy::wire::recv_attach(&wire) {

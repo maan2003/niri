@@ -1,16 +1,20 @@
-//! The brain of app launching, unprivileged. Knows the apps (static manifests generated from the
-//! system configuration: every app has a fixed UID), answers policy lookups, and turns
-//! `Launch { app }` into a request on the spawner's channel. Android's PackageManager plus
+//! drv-appd: the launcher for untrusted things, unprivileged. Knows the apps (a static manifest
+//! generated from the system configuration: every app has a fixed UID), answers policy
+//! lookups, and turns `Launch { app }` into a request to drv-forker, its privileged helper,
+//! over the channel the supervisor made for the two of them. Android's PackageManager plus
 //! ActivityManager, in one small process with its own UID.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use drv_policy::daemon::Handler;
-use drv_policy::{spawn, AppPolicy, Global, Grant};
+use drv_policy::forker::{self, Launch};
+use drv_policy::wire::{self, Attach};
+use drv_policy::{AppPolicy, Global, Grant};
 use serde::{Deserialize, Serialize};
 
 /// `identity.toml`.
@@ -147,32 +151,68 @@ fn check_config(config: &Config) -> Result<(), String> {
 }
 
 /// Whatever actually creates processes: the spawner's channel, or a stub in tests.
-pub trait Spawner: Send + Sync {
-    fn fork(&self, request: &spawn::Request) -> Result<u32, String>;
+/// What forks for us: drv-forker over the channel, or a recorder in tests.
+pub trait Forker: Send + Sync {
+    fn launch(&self, launch: &Launch, fds: &[BorrowedFd<'_>]) -> Result<u32, String>;
+    /// UIDs with a live child.
+    fn running(&self) -> Result<Vec<u32>, String>;
 }
 
-impl Spawner for spawn::Channel {
-    fn fork(&self, request: &spawn::Request) -> Result<u32, String> {
-        spawn::Channel::fork(self, request)
-            .map(|_| request.uid)
-            .map_err(|e| format!("spawner: {e}"))
+impl Forker for forker::Channel {
+    fn launch(&self, launch: &Launch, fds: &[BorrowedFd<'_>]) -> Result<u32, String> {
+        forker::Channel::launch(self, launch, fds)
+            .map(|_| launch.uid)
+            .map_err(|e| format!("forker: {e}"))
+    }
+
+    fn running(&self) -> Result<Vec<u32>, String> {
+        forker::Channel::running(self).map_err(|e| format!("forker: {e}"))
     }
 }
 
-pub struct Identity {
+pub struct Appd {
     config: Config,
-    spawner: Arc<dyn Spawner>,
+    forker: Arc<dyn Forker>,
     /// Environment every launched app gets first: `PATH` and friends from our own environment.
     base_env: Vec<(String, String)>,
+    /// Our socket into drv-authd, from the supervisor: `Verifier` attaches go down it, one per
+    /// app that gets auth.
+    verifiers: Mutex<Option<OwnedFd>>,
 }
 
-impl Identity {
-    pub fn new(config: Config, spawner: Arc<dyn Spawner>, base_env: Vec<(String, String)>) -> Self {
+impl Appd {
+    pub fn new(config: Config, forker: Arc<dyn Forker>, base_env: Vec<(String, String)>) -> Self {
         Self {
             config,
-            spawner,
+            forker,
             base_env,
+            verifiers: Mutex::new(None),
         }
+    }
+
+    /// The supervisor linked us to drv-authd (again).
+    pub fn set_verifiers(&self, sock: OwnedFd) {
+        *self.verifiers.lock().unwrap() = Some(sock);
+    }
+
+    /// A fresh verifier connection: drv-authd gets one end, the app's end comes back. `None`
+    /// when the daemon is not attached, so the app finds an empty wire.
+    fn verifier(&self) -> Option<OwnedFd> {
+        let mut guard = self.verifiers.lock().unwrap();
+        let sock = guard.as_ref()?;
+        let (app_end, daemon_end) = match wire::pair() {
+            Ok(pair) => pair,
+            Err(err) => {
+                eprintln!("drv-appd: socketpair: {err}");
+                return None;
+            }
+        };
+        if let Err(err) = wire::send_attach(sock, Attach::Verifier, daemon_end.as_fd()) {
+            eprintln!("drv-appd: drv-authd's socket: {err}");
+            *guard = None;
+            return None;
+        }
+        Some(app_end)
     }
 
     fn app(&self, name: &str) -> Option<&AppConfig> {
@@ -184,7 +224,7 @@ impl Identity {
     }
 
     /// The child's environment: ours (`PATH`..), the config's `[env]`, the app's own, then
-    /// the compositor's apps socket as `WAYLAND_DISPLAY`. The spawner sets `HOME` and
+    /// the compositor's apps socket as `WAYLAND_DISPLAY`. The forker sets `HOME` and
     /// `XDG_RUNTIME_DIR`.
     fn env_for(&self, app: &AppConfig) -> Vec<(String, String)> {
         let mut env = self.base_env.clone();
@@ -202,34 +242,53 @@ impl Identity {
             .exec
             .clone()
             .ok_or_else(|| format!("{:?} is a service, not a launchable app", app.name))?;
-        let request = spawn::Request {
+        let mut launch = Launch {
             uid: app.uid,
             groups: app.groups.clone(),
             argv,
             env: self.env_for(app),
             network: app.network,
             expose: app.expose.clone(),
-            auth: app.auth,
+            fds: Vec::new(),
         };
-        self.spawner.fork(&request)?;
+        // The app's wire, with its auth connection already on it (or nothing, if the daemon
+        // is not attached: the app sees the wire close).
+        let mut child_wire = None;
+        if app.auth {
+            let (child_end, ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
+            match self.verifier() {
+                Some(auth) => wire::send_attach(&ours, Attach::Auth, auth.as_fd())
+                    .map_err(|e| format!("attaching auth: {e}"))?,
+                None => eprintln!("drv-appd: {:?} gets auth but drv-authd is not attached", app.name),
+            }
+            launch.env.push((wire::WIRE_ENV.to_owned(), wire::WIRE_FD.to_string()));
+            launch.fds.push(wire::WIRE_FD);
+            child_wire = Some(child_end);
+        }
+        let fds: Vec<BorrowedFd<'_>> = child_wire.iter().map(|fd| fd.as_fd()).collect();
+        self.forker.launch(&launch, &fds)?;
         Ok(app.uid)
     }
 
-    /// Starts every `autostart` app whose UID is not in `running`, in manifest order, once
-    /// the compositor's socket is listening (the file alone may be a dead compositor's).
-    /// Waits up to `timeout` for that.
-    pub fn autostart(&self, running: &[u32], timeout: Duration) {
+    /// Starts every `autostart` app that has no live child, in manifest order, once the
+    /// compositor's socket is listening (the file alone may be a dead compositor's). Waits up
+    /// to `timeout` for that.
+    pub fn autostart(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while !socket_listening(&self.config.wayland_socket) {
             if Instant::now() > deadline {
                 eprintln!(
-                    "drv-identityd: nothing listening at {} after {timeout:?}; not autostarting",
+                    "drv-appd: nothing listening at {} after {timeout:?}; not autostarting",
                     self.config.wayland_socket.display()
                 );
                 return;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let running = self.forker.running().unwrap_or_else(|err| {
+            eprintln!("drv-appd: asking what is running: {err}");
+            Vec::new()
+        });
         let apps = self
             .config
             .apps
@@ -237,8 +296,8 @@ impl Identity {
             .filter(|a| a.autostart && !running.contains(&a.uid));
         for app in apps {
             match self.start(app) {
-                Ok(uid) => eprintln!("drv-identityd: autostarted {:?} as uid {uid}", app.name),
-                Err(err) => eprintln!("drv-identityd: autostart {:?}: {err}", app.name),
+                Ok(uid) => eprintln!("drv-appd: autostarted {:?} as uid {uid}", app.name),
+                Err(err) => eprintln!("drv-appd: autostart {:?}: {err}", app.name),
             }
         }
     }
@@ -260,7 +319,7 @@ fn socket_listening(path: &Path) -> bool {
     })
 }
 
-impl Handler for Identity {
+impl Handler for Appd {
     fn lookup(&self, peer: u32, uid: u32) -> Result<AppPolicy, String> {
         if peer != uid {
             let asker = self.by_uid(peer).map(AppConfig::policy);
@@ -288,16 +347,20 @@ mod tests {
 
     use super::*;
 
-    struct Recorder(Mutex<Vec<spawn::Request>>);
+    struct Recorder(Mutex<Vec<Launch>>);
 
-    impl Spawner for Recorder {
-        fn fork(&self, request: &spawn::Request) -> Result<u32, String> {
-            self.0.lock().unwrap().push(request.clone());
+    impl Forker for Recorder {
+        fn launch(&self, launch: &Launch, _fds: &[BorrowedFd<'_>]) -> Result<u32, String> {
+            self.0.lock().unwrap().push(launch.clone());
             Ok(1)
+        }
+
+        fn running(&self) -> Result<Vec<u32>, String> {
+            Ok(Vec::new())
         }
     }
 
-    fn identity() -> (Identity, Arc<Recorder>) {
+    fn identity() -> (Appd, Arc<Recorder>) {
         let config: Config = toml::from_str(
             r#"
             wayland-socket = "/run/drv-wayland/wayland"
@@ -323,7 +386,7 @@ mod tests {
         .unwrap();
         check_config(&config).unwrap();
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
-        let id = Identity::new(
+        let id = Appd::new(
             config,
             recorder.clone(),
             vec![("PATH".to_owned(), "/bin".to_owned())],

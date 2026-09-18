@@ -1,6 +1,6 @@
-# NixOS module for the multi-UID desktop. One app list becomes the passwd entries, the identity
-# daemon's manifest, the session bus policy and the units. Nothing shares a UID: the spawner is
-# root, and the identity daemon, the compositor, the bridge, the session bus and every app
+# NixOS module for the multi-UID desktop. One app list becomes the passwd entries, drv-appd's
+# manifest, the session bus policy and the units. Nothing shares a UID: the supervisor and the
+# forker are root, and drv-appd, the compositor, the bridge, the session bus and every app
 # each have their own. What a process may reach is its UID plus the groups, grants and /run
 # entries listed here; nothing else.
 { niri }:
@@ -10,7 +10,14 @@ let
   toml = pkgs.formats.toml { };
   bridgeSocket = "/run/drv-bridge/bridge.sock";
   sessionBus = "unix:path=/run/drv-session/bus";
-  identitySocket = "/run/drv/identity.sock";
+  appdSocket = "/run/drv/appd.sock";
+  forkerExec = lib.concatStringsSep " " ([
+    "${cfg.package}/bin/drv-forker"
+    "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
+    "--runtime-base /run/drv-apps"
+    "--home-base /var/lib/drv-apps"
+  ] ++ map (g: "--group ${g}") cfg.groups ++ map (p: "--expose ${p}") cfg.expose
+    ++ map (p: "--expose-optional ${p}") optionalExpose);
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
@@ -25,7 +32,7 @@ let
       "${cfg.package}/bin/drv-bridge" "app" "--"
     ] ++ app.exec;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
-  identityFile = toml.generate "identity.toml" {
+  appdFile = toml.generate "appd.toml" {
     wayland-socket = "/run/drv-wayland/wayland";
     env = cfg.env;
     app = [
@@ -92,7 +99,7 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = niri;
-      description = "niri build with drv-spawnd, drv and drv-bridge.";
+      description = "niri build with drv-supervisor, drv-appd, drv-forker, drv and drv-bridge.";
     };
     portalPackage = lib.mkOption {
       type = lib.types.package;
@@ -104,7 +111,7 @@ in
       description = "xdg-desktop-portal frontend, patched for callers on other UIDs.";
     };
     ids = {
-      identity = lib.mkOption { type = lib.types.int; default = 901; };
+      appd = lib.mkOption { type = lib.types.int; default = 901; };
       compositor = lib.mkOption { type = lib.types.int; default = 902; };
       bridge = lib.mkOption { type = lib.types.int; default = 903; };
       bus = lib.mkOption { type = lib.types.int; default = 904; };
@@ -137,7 +144,7 @@ in
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         PULSE_SERVER = "unix:/run/pulse/native";
         DRV_BRIDGE_SOCKET = bridgeSocket;
-        DRV_IDENTITY_SOCKET = identitySocket;
+        DRV_APPD_SOCKET = appdSocket;
         XDG_SESSION_TYPE = "wayland";
         XDG_DATA_DIRS = "/run/current-system/sw/share";
       };
@@ -221,7 +228,7 @@ in
       group = "app-${name}";
       isSystemUser = true;
     }) cfg.apps // {
-      drv-identity = { uid = cfg.ids.identity; group = "drv-identity"; isSystemUser = true; };
+      drv-appd = { uid = cfg.ids.appd; group = "drv-appd"; isSystemUser = true; };
       drv-compositor = {
         uid = cfg.ids.compositor;
         group = "drv-compositor";
@@ -236,7 +243,7 @@ in
       drv-auth = { uid = cfg.ids.auth; group = "drv-auth"; isSystemUser = true; };
     };
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
-      drv-identity.gid = cfg.ids.identity;
+      drv-appd.gid = cfg.ids.appd;
       drv-compositor.gid = cfg.ids.compositor;
       drv-bridge.gid = cfg.ids.bridge;
       drv-bus.gid = cfg.ids.bus;
@@ -253,7 +260,7 @@ in
       alsa.enable = true;
     };
 
-    environment.etc."drv/identity.toml".source = identityFile;
+    environment.etc."drv/appd.toml".source = appdFile;
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
     boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
@@ -288,22 +295,23 @@ in
       };
     };
 
-    # Root. Forks the identity daemon over a socketpair and starts apps for it; also forks
-    # drv-authd and the compositor as their own users and wires the three together (their
-    # logs land here). The compositor's environment is exactly what is listed.
-    systemd.services.drv-spawnd = {
+    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor, drv-appd with its
+    # forker) as their own users, wires them with socketpairs and restarts what dies; their
+    # logs land here. The compositor's environment is exactly what is listed.
+    systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
       after = [ "drv-session-bus.service" ];
       requires = [ "drv-session-bus.service" ];
       serviceConfig = {
         ExecStart = lib.concatStringsSep " " ([
-          "${cfg.package}/bin/drv-spawnd"
-          "--identity-user drv-identity"
-          "--identity-config /etc/drv/identity.toml"
-          "--socket ${identitySocket}"
-          "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
-          "--runtime-base /run/drv-apps"
-          "--home-base /var/lib/drv-apps"
+          "${cfg.package}/bin/drv-supervisor"
+          "--socket ${appdSocket}"
+          "--appd-user drv-appd"
+          "--appd-exec '${cfg.package}/bin/drv-appd --config /etc/drv/appd.toml'"
+          # drv-appd's privileged helper: forks one sandboxed app per request over the channel
+          # the supervisor made for the two of them, checks UIDs, groups and /run entries
+          # against these lists, and nothing else.
+          "--forker-exec '${forkerExec}'"
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
           # The only process on the seat: opens DRM and evdev nodes as root through libseat's
@@ -325,13 +333,12 @@ in
           "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
-          "DRV_IDENTITY_SOCKET=${identitySocket}"
+          "DRV_APPD_SOCKET=${appdSocket}"
           "DRV_APPS_SOCKET=/run/drv-wayland/wayland"
           "XDG_RUNTIME_DIR=/run/drv-compositor"
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
-        ] ++ map (g: "--group ${g}") cfg.groups ++ map (p: "--expose ${p}") cfg.expose
-          ++ map (p: "--expose-optional ${p}") optionalExpose);
+        ]);
         RuntimeDirectory = "drv";
         RuntimeDirectoryMode = "0755";
         # So the spawner may create a cgroup per app under its own.
@@ -341,11 +348,11 @@ in
 
     systemd.services.drv-bridge = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-spawnd.service" "drv-session-bus.service" ];
-      requires = [ "drv-spawnd.service" "drv-session-bus.service" ];
+      after = [ "drv-supervisor.service" "drv-session-bus.service" ];
+      requires = [ "drv-supervisor.service" "drv-session-bus.service" ];
       environment = {
         DBUS_SESSION_BUS_ADDRESS = sessionBus;
-        DRV_IDENTITY_SOCKET = identitySocket;
+        DRV_APPD_SOCKET = appdSocket;
       };
       serviceConfig = {
         User = "drv-bridge";
