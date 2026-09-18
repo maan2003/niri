@@ -47,6 +47,10 @@ fn run(args: Args) -> Result<(), String> {
                 eprintln!("drv-appd: attached to drv-authd");
                 attached.set_verifiers(sock);
             }
+            Ok((Attach::Compositor, sock)) => {
+                eprintln!("drv-appd: the compositor's launch channel attached");
+                attached.serve_launcher("the compositor".to_owned(), sock);
+            }
             Ok((other, _)) => eprintln!("drv-appd: ignoring {other:?} on the wire"),
             Err(err) => {
                 eprintln!("drv-appd: the wire ended: {err}");
@@ -69,11 +73,13 @@ fn run(args: Args) -> Result<(), String> {
     });
 
     // From here on: our fds and what arrives on them, new connections on the listener,
-    // threads, and reading files (`/proc/net/unix` for autostart).
+    // socketpairs for what a launch hands its app, threads, and reading files
+    // (`/proc/net/unix` for autostart).
     if drv_os::seccomp::enabled() {
         let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
         allow.read_files().map_err(|e| e.to_string())?;
         allow.accept();
+        allow.allow(&[libc::SYS_socketpair]);
         allow.apply("drv-appd").map_err(|e| e.to_string())?;
         eprintln!("drv-appd: seccomp: syscall allowlist applied");
     }

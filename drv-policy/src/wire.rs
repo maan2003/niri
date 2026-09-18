@@ -22,8 +22,8 @@ pub const WIRE_ENV: &str = "DRV_WIRE_FD";
 pub enum Attach {
     /// To the compositor or the locker: a connection to `drv-authd`.
     Auth,
-    /// To `drv-authd`, `drv-seatd`, compositor-gpu or the locker: the compositor's connection
-    /// (replaces the previous one).
+    /// To `drv-authd`, `drv-seatd`, compositor-gpu, the locker or drv-appd: the compositor's
+    /// connection (replaces the previous one).
     Compositor,
     /// To `drv-authd`: the locker's connection (or an auth app's, via drv-appd).
     Verifier,
@@ -36,6 +36,8 @@ pub enum Attach {
     Gpu,
     /// To the compositor: the locker's Wayland connection (a stream socket).
     Locker,
+    /// To the compositor: its launch channel to drv-appd (a stream socket speaking `rpc`).
+    Appd,
 }
 
 /// The child's end, if the spawner gave us one.

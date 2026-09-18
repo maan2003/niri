@@ -1,17 +1,21 @@
 //! drv-appd: the launcher for untrusted things, unprivileged. Knows the apps (a static manifest
 //! generated from the system configuration: every app has a fixed UID), answers policy
 //! lookups, and turns `Launch { app }` into a request to drv-forker, its privileged helper,
-//! over the channel the supervisor made for the two of them. Android's PackageManager plus
-//! ActivityManager, in one small process with its own UID.
+//! over the channel the supervisor made for the two of them. Launch is not on the public
+//! socket: it is served on launch channels, one per launcher (an app started with
+//! `launcher = true` gets its end as an fd; the compositor's arrives on our wire from the
+//! supervisor). Android's PackageManager plus ActivityManager, in one small process with its
+//! own UID.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use drv_policy::daemon::Handler;
+use drv_policy::daemon::{self, Handler};
 use drv_policy::forker::{self, Launch};
 use drv_policy::wire::{self, Attach};
 use drv_policy::{AppPolicy, Global, Grant};
@@ -89,6 +93,10 @@ pub struct AppConfig {
     /// Gets a connection to `drv-authd` from the spawner: the lock app.
     #[serde(default)]
     pub auth: bool,
+    /// May start other apps: gets a launch channel to us as an fd (`DRV_LAUNCH_FD` says
+    /// which), inherited by whatever it runs (`drv launch <name>`).
+    #[serde(default)]
+    pub launcher: bool,
 }
 
 impl AppConfig {
@@ -237,7 +245,7 @@ impl Appd {
         env
     }
 
-    fn start(&self, app: &AppConfig) -> Result<u32, String> {
+    fn start(self: &Arc<Self>, app: &AppConfig) -> Result<u32, String> {
         let argv = app
             .exec
             .clone()
@@ -251,9 +259,10 @@ impl Appd {
             expose: app.expose.clone(),
             fds: Vec::new(),
         };
+        // What the child gets beyond its environment, on the fd numbers in `launch.fds`.
+        let mut child_fds: Vec<OwnedFd> = Vec::new();
         // The app's wire, with its auth connection already on it (or nothing, if the daemon
         // is not attached: the app sees the wire close).
-        let mut child_wire = None;
         if app.auth {
             let (child_end, ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
             match self.verifier() {
@@ -263,17 +272,45 @@ impl Appd {
             }
             launch.env.push((wire::WIRE_ENV.to_owned(), wire::WIRE_FD.to_string()));
             launch.fds.push(wire::WIRE_FD);
-            child_wire = Some(child_end);
+            child_fds.push(child_end);
         }
-        let fds: Vec<BorrowedFd<'_>> = child_wire.iter().map(|fd| fd.as_fd()).collect();
+        // A launcher's channel: we serve our end for as long as anything holds the other.
+        let mut launcher_end = None;
+        if app.launcher {
+            let (child_end, ours) = wire::stream_pair().map_err(|e| format!("socketpair: {e}"))?;
+            let fd = wire::WIRE_FD + launch.fds.len() as i32;
+            launch.env.push((drv_policy::env::LAUNCH_FD.to_owned(), fd.to_string()));
+            launch.fds.push(fd);
+            child_fds.push(child_end);
+            launcher_end = Some(ours);
+        }
+        let fds: Vec<BorrowedFd<'_>> = child_fds.iter().map(|fd| fd.as_fd()).collect();
         self.forker.launch(&launch, &fds)?;
+        if let Some(ours) = launcher_end {
+            self.serve_launcher(app.name.clone(), ours);
+        }
         Ok(app.uid)
+    }
+
+    /// Serves launches on `sock` (a stream socket speaking `rpc`) for `who`, on a thread,
+    /// until the other end closes. Lookups are refused there: the public socket answers them.
+    pub fn serve_launcher(self: &Arc<Self>, who: String, sock: OwnedFd) {
+        let launcher = Launcher {
+            appd: self.clone(),
+            who,
+        };
+        std::thread::spawn(move || {
+            let stream = UnixStream::from(sock);
+            if let Err(err) = daemon::serve_connection(stream, 0, &launcher) {
+                eprintln!("drv-appd: {}'s launch channel: {err}", launcher.who);
+            }
+        });
     }
 
     /// Starts every `autostart` app that has no live child, in manifest order, once the
     /// compositor's socket is listening (the file alone may be a dead compositor's). Waits up
     /// to `timeout` for that.
-    pub fn autostart(&self, timeout: Duration) {
+    pub fn autostart(self: &Arc<Self>, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         while !socket_listening(&self.config.wayland_socket) {
             if Instant::now() > deadline {
@@ -333,11 +370,35 @@ impl Handler for Appd {
             .unwrap_or_else(AppPolicy::unknown))
     }
 
+    /// The public socket: reachable by every app, so it launches nothing.
+    fn launch(&self, peer: u32, name: &str) -> Result<u32, String> {
+        Err(format!(
+            "uid {peer} asked to launch {name:?} on the public socket; only a launch channel may"
+        ))
+    }
+}
+
+/// One launch channel's handler: launches for `who`, nothing else.
+pub struct Launcher {
+    appd: Arc<Appd>,
+    who: String,
+}
+
+impl Handler for Launcher {
+    fn lookup(&self, _peer: u32, uid: u32) -> Result<AppPolicy, String> {
+        Err(format!(
+            "lookup of uid {uid} on a launch channel; the public socket answers those"
+        ))
+    }
+
     fn launch(&self, _peer: u32, name: &str) -> Result<u32, String> {
         let app = self
+            .appd
             .app(name)
-            .ok_or_else(|| format!("unknown app {name:?}; add it to identity.toml"))?;
-        self.start(app)
+            .ok_or_else(|| format!("unknown app {name:?}; add it to appd.toml"))?;
+        let uid = self.appd.start(app)?;
+        eprintln!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
+        Ok(uid)
     }
 }
 
@@ -360,7 +421,7 @@ mod tests {
         }
     }
 
-    fn identity() -> (Appd, Arc<Recorder>) {
+    fn identity() -> (Arc<Appd>, Arc<Recorder>) {
         let config: Config = toml::from_str(
             r#"
             wayland-socket = "/run/drv-wayland/wayland"
@@ -381,23 +442,36 @@ mod tests {
             groups = ["render"]
             env = { MOZ_ENABLE_WAYLAND = "1" }
             expose = ["/run/drv-session"]
+
+            [[app]]
+            name = "menu"
+            uid = 100043
+            exec = ["menu"]
+            launcher = true
             "#,
         )
         .unwrap();
         check_config(&config).unwrap();
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
-        let id = Appd::new(
+        let id = Arc::new(Appd::new(
             config,
             recorder.clone(),
             vec![("PATH".to_owned(), "/bin".to_owned())],
-        );
+        ));
         (id, recorder)
+    }
+
+    fn launcher(id: &Arc<Appd>) -> Launcher {
+        Launcher {
+            appd: id.clone(),
+            who: "test".to_owned(),
+        }
     }
 
     #[test]
     fn launch_builds_env_from_manifest_only() {
         let (id, recorder) = identity();
-        assert_eq!(id.launch(5, "firefox"), Ok(100042));
+        assert_eq!(launcher(&id).launch(5, "firefox"), Ok(100042));
         let requests = recorder.0.lock().unwrap();
         let req = &requests[0];
         assert_eq!(req.argv, vec!["firefox"]);
@@ -413,12 +487,34 @@ mod tests {
         assert_eq!(get("PIPEWIRE_RUNTIME_DIR"), Some("/run/pipewire"));
         assert_eq!(get("MOZ_ENABLE_WAYLAND"), Some("1"));
         assert_eq!(get("WAYLAND_DISPLAY"), Some("/run/drv-wayland/wayland"));
+        assert!(req.fds.is_empty());
+    }
+
+    #[test]
+    fn a_launcher_gets_its_channel_as_fd_3() {
+        let (id, recorder) = identity();
+        assert_eq!(launcher(&id).launch(5, "menu"), Ok(100043));
+        let requests = recorder.0.lock().unwrap();
+        let req = &requests[0];
+        assert_eq!(req.fds, vec![3]);
+        assert!(req
+            .env
+            .contains(&(drv_policy::env::LAUNCH_FD.to_owned(), "3".to_owned())));
+    }
+
+    #[test]
+    fn the_public_socket_launches_nothing() {
+        let (id, recorder) = identity();
+        let err = id.launch(5, "firefox").unwrap_err();
+        assert!(err.contains("public socket"), "{err}");
+        assert!(recorder.0.lock().unwrap().is_empty());
+        assert!(launcher(&id).lookup(5, 5).is_err());
     }
 
     #[test]
     fn services_are_not_launchable() {
         let (id, _) = identity();
-        let err = id.launch(5, "compositor").unwrap_err();
+        let err = launcher(&id).launch(5, "compositor").unwrap_err();
         assert!(err.contains("service"), "{err}");
     }
 
@@ -454,7 +550,7 @@ mod tests {
     #[test]
     fn unknown_app_is_refused() {
         let (id, _) = identity();
-        let err = id.launch(5, "nope").unwrap_err();
+        let err = launcher(&id).launch(5, "nope").unwrap_err();
         assert!(err.contains("unknown app"));
     }
 

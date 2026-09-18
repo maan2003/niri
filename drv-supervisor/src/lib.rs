@@ -38,13 +38,14 @@ enum Link {
 }
 
 /// `(a, what a receives, b, what b receives, socket type)`.
-const LINKS: [(Peer, Attach, Peer, Attach, Link); 6] = [
+const LINKS: [(Peer, Attach, Peer, Attach, Link); 7] = [
     (Peer::Compositor, Attach::Seat, Peer::Seatd, Attach::Compositor, Link::Seq),
     (Peer::Compositor, Attach::Auth, Peer::Authd, Attach::Compositor, Link::Seq),
     (Peer::Compositor, Attach::Gpu, Peer::Gpu, Attach::Compositor, Link::Stream),
     (Peer::Compositor, Attach::Locker, Peer::Locker, Attach::Compositor, Link::Stream),
     (Peer::Locker, Attach::Auth, Peer::Authd, Attach::Verifier, Link::Seq),
     (Peer::Appd, Attach::Auth, Peer::Authd, Attach::Verifiers, Link::Seq),
+    (Peer::Compositor, Attach::Appd, Peer::Appd, Attach::Compositor, Link::Stream),
 ];
 
 /// The supervisor's ends of the services' wires, and the links it makes between them.

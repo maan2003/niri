@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -24,8 +24,10 @@ pub enum Request {
     Lookup {
         uid: u32,
     },
-    /// Start an app by manifest name. Not a privilege: anyone may ask. Arguments and
-    /// environment come from the manifest and the daemon, never from here.
+    /// Start an app by manifest name. Only on a launch channel: the fd drv-appd hands an app
+    /// with `launcher = true`, or the compositor's from the supervisor. The public socket
+    /// refuses it. Arguments and environment come from the manifest and the daemon, never
+    /// from here.
     Launch {
         app: String,
     },

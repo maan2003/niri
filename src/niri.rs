@@ -237,6 +237,9 @@ pub struct Niri {
     pub config: Rc<RefCell<Config>>,
     /// Connection to the policy daemon; asked once per new connection, cached per UID.
     pub policy: PolicyClient,
+    /// Our launch channel to drv-appd, from the supervisor's wire (`Attach::Appd`). The public
+    /// socket launches nothing; without this, spawn binds do nothing.
+    pub launcher: Option<PolicyClient>,
 
     /// Output config from the config file.
     ///
@@ -3169,6 +3172,7 @@ impl Niri {
             casting: screencasting,
 
             policy,
+            launcher: None,
         };
 
         niri.reset_pointer_inactivity_timer();
@@ -3176,15 +3180,20 @@ impl Niri {
         niri
     }
 
-    /// Asks the identity daemon to start the named app as its own UID. Only a name: arguments
-    /// and environment come from the app's manifest, so a key binding is just a launcher.
+    /// Asks drv-appd, over our launch channel, to start the named app as its own UID. Only a
+    /// name: arguments and environment come from the app's manifest, so a key binding is just
+    /// a launcher.
     pub fn launch(&mut self, command: Vec<String>) {
         let [app] = command.as_slice() else {
             warn!("spawn takes exactly one app name, got {command:?}");
             return;
         };
         let app = app.clone();
-        match self.policy.launch(app.clone()) {
+        let Some(launcher) = self.launcher.as_mut() else {
+            warn!("cannot launch {app:?}: no launch channel from the supervisor (yet)");
+            return;
+        };
+        match launcher.launch(app.clone()) {
             Ok(uid) => info!("launched {app:?} as uid {uid}"),
             Err(err) => warn!("error launching {app:?}: {err}"),
         }
@@ -6846,6 +6855,14 @@ impl Niri {
         match attach {
             Attach::Auth => self.install_auth(sock),
             Attach::Locker => self.insert_locker(sock),
+            // Our (new) launch channel to drv-appd: the old one's daemon is gone.
+            Attach::Appd => match PolicyClient::from_stream(sock.into()) {
+                Ok(client) => {
+                    info!("launch channel to drv-appd attached");
+                    self.launcher = Some(client);
+                }
+                Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
+            },
             // The seat daemon restarted. Our backend was built on the old one, so start over:
             // the spawner brings us back, wired to the new one, locked as always.
             Attach::Seat => {

@@ -288,6 +288,9 @@ pub mod wire;
 pub mod env {
     /// Path of drv-appd's public socket.
     pub const APPD_SOCKET: &str = "DRV_APPD_SOCKET";
+    /// The fd number of a launcher's channel to drv-appd, set by drv-appd for apps with
+    /// `launcher = true`; `drv launch` uses it. Nothing else may launch.
+    pub const LAUNCH_FD: &str = "DRV_LAUNCH_FD";
     /// Path the compositor listens on for apps (absolute; apps get it as `WAYLAND_DISPLAY`).
     pub const APPS_SOCKET: &str = "DRV_APPS_SOCKET";
 }

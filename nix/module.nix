@@ -22,7 +22,7 @@ let
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart auth;
+    inherit (app) uid groups gpu network globals grants autostart auth launcher;
     env = lib.optionalAttrs app.servicesBus { DBUS_SESSION_BUS_ADDRESS = sessionBus; } // app.env;
     expose = lib.optional app.servicesBus "/run/drv-session" ++ app.expose;
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
@@ -41,8 +41,9 @@ let
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
-  # One launcher entry per app, run by whoever: launch is not a privilege. The file is named
-  # `drv.app.<name>.desktop`: the app id the bridge registers with the portals.
+  # One desktop entry per app; `drv launch` works only where a launch channel was inherited
+  # (an app with `launcher = true`). The file is named `drv.app.<name>.desktop`: the app id
+  # the bridge registers with the portals.
   desktopEntries = pkgs.runCommand "drv-desktop-entries" { } (
     lib.concatStrings (lib.mapAttrsToList (name: app: ''
       mkdir -p $out/share/applications
@@ -214,6 +215,11 @@ in
             type = lib.types.bool;
             default = false;
             description = "Gets a connection to drv-authd from the spawner at launch.";
+          };
+          launcher = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "May start other apps: gets a launch channel to drv-appd as an fd (DRV_LAUNCH_FD), inherited by what it runs.";
           };
         };
       }));
