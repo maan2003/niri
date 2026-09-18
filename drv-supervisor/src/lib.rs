@@ -129,6 +129,7 @@ pub fn capability(name: &str) -> Result<CapabilitySet, String> {
         "fowner" => CapabilitySet::FOWNER,
         "kill" => CapabilitySet::KILL,
         "setgid" => CapabilitySet::SETGID,
+        "setpcap" => CapabilitySet::SETPCAP,
         "setuid" => CapabilitySet::SETUID,
         "net_admin" => CapabilitySet::NET_ADMIN,
         "sys_chroot" => CapabilitySet::SYS_CHROOT,
@@ -176,6 +177,27 @@ fn become_user(uid: u32, gid: u32, groups: &[u32], caps: CapabilitySet) -> io::R
         }
     }
     rustix::thread::set_keep_capabilities(false)?;
+    Ok(())
+}
+
+/// Hands our cgroup v2 subtree (systemd's `Delegate=yes` gave it to us) to a user: the
+/// directory, so it can make `app-<uid>` cgroups, and the process files of this common
+/// ancestor, which moving a process into one of them requires write access to.
+pub fn delegate_cgroup(uid: u32, gid: u32) -> Result<(), String> {
+    let dir = drv_os::own_cgroup()?;
+    let owner = (
+        Some(rustix::process::Uid::from_raw(uid)),
+        Some(rustix::process::Gid::from_raw(gid)),
+    );
+    for path in [
+        dir.clone(),
+        dir.join("cgroup.procs"),
+        dir.join("cgroup.threads"),
+        dir.join("cgroup.subtree_control"),
+    ] {
+        rustix::fs::chown(&path, owner.0, owner.1)
+            .map_err(|e| format!("chown {}: {e}", path.display()))?;
+    }
     Ok(())
 }
 

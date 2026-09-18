@@ -16,10 +16,52 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use clap::Parser;
-use drv_os::{dup_high, ensure_owned_dir, group_id};
+use drv_os::{dup_high, ensure_owned_dir, group_id, own_cgroup};
 use drv_policy::forker::{Launch, Request, Response};
 use drv_policy::{seq, wire};
 use rustix::fs::Mode;
+use rustix::thread::{CapabilitySet, CapabilitySets};
+
+/// What forking an app takes when we are not root: the sandbox (SYS_ADMIN), the UID switch
+/// (SETUID, SETGID), the app's directories (CHOWN) and dropping our own bounding set in the
+/// child (SETPCAP).
+const NEEDED: CapabilitySet = CapabilitySet::SYS_ADMIN
+    .union(CapabilitySet::SETUID)
+    .union(CapabilitySet::SETGID)
+    .union(CapabilitySet::CHOWN)
+    .union(CapabilitySet::SETPCAP);
+
+/// Root, or a user the supervisor left exactly the capabilities above.
+fn privileged() -> bool {
+    if rustix::process::geteuid().is_root() {
+        return true;
+    }
+    rustix::thread::capabilities(None).is_ok_and(|caps| caps.effective.contains(NEEDED))
+}
+
+/// In the child, after the UID switch: a non-root forker's capabilities survive setresuid,
+/// and the ambient set would survive execve, so everything goes explicitly. The bounding set
+/// first (that needs CAP_SETPCAP, which a root forker's child lost with the UID already).
+fn drop_all_capabilities() -> io::Result<()> {
+    let caps = rustix::thread::capabilities(None)?;
+    if caps.effective.contains(CapabilitySet::SETPCAP) {
+        for cap in CapabilitySet::all().iter() {
+            if cap.bits().count_ones() == 1 && rustix::thread::capability_is_in_bounding_set(cap)? {
+                rustix::thread::remove_capability_from_bounding_set(cap)?;
+            }
+        }
+    }
+    rustix::thread::clear_ambient_capability_set()?;
+    rustix::thread::set_capabilities(
+        None,
+        CapabilitySets {
+            effective: CapabilitySet::empty(),
+            permitted: CapabilitySet::empty(),
+            inheritable: CapabilitySet::empty(),
+        },
+    )?;
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(name = "drv-forker", about = "Fork sandboxed apps for drv-appd")]
@@ -93,7 +135,7 @@ impl Forker {
     /// forker (the group restarts around them), and the cgroups are how the next forker sees
     /// them. Our own children otherwise (tests).
     fn running_uids(&self) -> Vec<u32> {
-        let mut uids: Vec<u32> = if rustix::process::geteuid().is_root() {
+        let mut uids: Vec<u32> = if privileged() {
             app_cgroups_in_use().unwrap_or_default()
         } else {
             self.running.lock().unwrap().values().copied().collect()
@@ -108,14 +150,14 @@ impl Forker {
             return Err("empty argv".to_owned());
         }
         let uid = launch.uid;
-        let we_are_root = rustix::process::getuid().is_root();
+        let privileged = privileged();
         // Unprivileged (tests): can only fork as ourselves, with no sandbox and no cgroup.
-        let as_self = !we_are_root && uid == rustix::process::getuid().as_raw();
+        let as_self = !privileged && uid == rustix::process::getuid().as_raw();
         if !as_self && !self.covers(uid) {
             return Err(format!("uid {uid} is outside the app range"));
         }
-        if !as_self && !we_are_root {
-            return Err("forker is not root, can only fork as itself".to_owned());
+        if !as_self && !privileged {
+            return Err("forker is unprivileged, can only fork as itself".to_owned());
         }
         let mut extra_expose = Vec::new();
         for path in &launch.expose {
@@ -153,8 +195,8 @@ impl Forker {
             child_fds.push((dup_high(fd.as_raw_fd())?, *target));
         }
         // One cgroup per app UID under our own delegated subtree, so killing an app is killing
-        // a cgroup. Only as root; unprivileged (tests) has no subtree to write.
-        let cgroup_procs = if we_are_root {
+        // a cgroup. Unprivileged (tests) has no subtree to write.
+        let cgroup_procs = if privileged {
             Some(app_cgroup_procs(uid)?)
         } else {
             None
@@ -173,11 +215,17 @@ impl Forker {
             uid
         };
         let mut sandbox = None;
+        // chdir into the 0700 home only once we are the UID (std's current_dir would do it
+        // first, as us): in the child, below.
+        let mut home_dir = None;
         if !as_self {
             let runtime = self.owned_dir(&self.runtime_base, uid, gid)?;
             let home = self.owned_dir(&self.home_base, uid, gid)?;
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
-            command.current_dir(&home);
+            home_dir = Some(
+                CString::new(home.as_os_str().as_bytes())
+                    .map_err(|_| format!("NUL in {}", home.display()))?,
+            );
             let mut expose = self.expose.clone();
             expose.extend(extra_expose);
             expose.push(runtime);
@@ -185,7 +233,7 @@ impl Forker {
         }
         let mut all_gids = vec![gid];
         all_gids.extend(gids);
-        let switch_uid = we_are_root;
+        let switch_uid = privileged;
         let dups = child_fds.clone();
 
         // SAFETY: only async-signal-safe calls between fork and exec.
@@ -219,6 +267,12 @@ impl Forker {
                         return Err(io::Error::other("uid did not change"));
                     }
                 }
+                if let Some(home) = &home_dir {
+                    if libc::chdir(home.as_ptr()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                drop_all_capabilities()?;
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -337,8 +391,8 @@ impl Sandbox {
         })
     }
 
-    /// Runs as root in the child. On failure the step's name goes to stderr (the forker's
-    /// journal) and the errno comes back to the parent.
+    /// Runs in the child with CAP_SYS_ADMIN still in hand. On failure the step's name goes to
+    /// stderr (the forker's journal) and the errno comes back to the parent.
     fn apply(&self) -> io::Result<()> {
         // Written by hand rather than through a helper closure so every string is a literal.
         fn fail(step: &'static str) -> io::Result<()> {
@@ -451,19 +505,6 @@ impl Sandbox {
         }
         Ok(())
     }
-}
-
-/// Our own cgroup v2 directory.
-fn own_cgroup() -> Result<PathBuf, String> {
-    let own = std::fs::read_to_string("/proc/self/cgroup")
-        .map_err(|e| format!("/proc/self/cgroup: {e}"))?;
-    // cgroup v2: a single line "0::/path".
-    let path = own
-        .lines()
-        .find_map(|l| l.strip_prefix("0::"))
-        .ok_or_else(|| "not on cgroup v2".to_owned())?
-        .trim();
-    Ok(PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
 /// UIDs whose `app-<uid>` cgroup has a process in it. `None` when our cgroup cannot be read.

@@ -35,9 +35,20 @@ struct Args {
     /// drv-appd's command line, whitespace-separated.
     #[arg(long)]
     appd_exec: String,
-    /// drv-forker's command line, whitespace-separated. It runs as root.
+    /// System user drv-forker runs as; root without it.
+    #[arg(long)]
+    forker_user: Option<String>,
+    /// drv-forker's command line, whitespace-separated.
     #[arg(long)]
     forker_exec: String,
+    /// A capability drv-forker keeps, by name (`setuid`, `setgid`, `setpcap`, `sys_admin`,
+    /// `chown` for the UID switch, the sandbox and the apps' directories). Repeatable.
+    #[arg(long = "forker-cap")]
+    forker_caps: Vec<String>,
+    /// `PATH:MODE` (octal): a directory drv-forker owns (the apps' runtime and home parents),
+    /// created before it starts.
+    #[arg(long = "forker-dir")]
+    forker_dirs: Vec<String>,
     /// System user the auth daemon runs as.
     #[arg(long)]
     authd_user: Option<String>,
@@ -159,8 +170,19 @@ fn supervise(args: Args) -> Result<(), String> {
     if locker.is_some() && gpu.is_none() {
         return Err("--locker-exec needs a compositor with --gpu-exec (the locker joins that group)".to_owned());
     }
-    let forker = service("drv-forker", Some("root"), Some(&args.forker_exec), &[], &[], &[])?
-        .ok_or("--forker-exec is required")?;
+    let forker = service(
+        "drv-forker",
+        Some(args.forker_user.as_deref().unwrap_or("root")),
+        Some(&args.forker_exec),
+        &[],
+        &args.forker_dirs,
+        &args.forker_caps,
+    )?
+    .ok_or("--forker-exec is required")?;
+    if forker.uid != 0 {
+        // Its app cgroups live under ours; the subtree stays its across its restarts.
+        drv_supervisor::delegate_cgroup(forker.uid, forker.gid)?;
+    }
     let appd = service(
         "drv-appd",
         Some(&args.appd_user),
@@ -402,7 +424,11 @@ fn start_appd_group(
     let (notices_ours, notices_appd) = seq::pair().map_err(|e| format!("socketpair: {e}"))?;
     let (wire_appd, wire_ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
     let forker_child = start_service(forker, &[(wire::WIRE_FD, channel_forker.as_fd())])?;
-    eprintln!("drv-supervisor: drv-forker running as root, pid {}", forker_child.id());
+    eprintln!(
+        "drv-supervisor: drv-forker running as uid {}, pid {}",
+        forker.uid,
+        forker_child.id()
+    );
     let appd_child = match start_service(
         appd,
         &[

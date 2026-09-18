@@ -119,6 +119,7 @@ in
       auth = lib.mkOption { type = lib.types.int; default = 906; };
       seat = lib.mkOption { type = lib.types.int; default = 907; };
       lock = lib.mkOption { type = lib.types.int; default = 908; };
+      forker = lib.mkOption { type = lib.types.int; default = 909; };
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -252,6 +253,9 @@ in
       drv-seat = { uid = cfg.ids.seat; group = "drv-seat"; isSystemUser = true; extraGroups = [ "video" "input" "tty" ]; };
       # The lock screen: no devices, no sockets; everything it talks to comes down its wire.
       drv-lock = { uid = cfg.ids.lock; group = "drv-lock"; isSystemUser = true; };
+      # The forker: not root. The supervisor leaves it setuid, setgid, setpcap, sys_admin and
+      # chown, and hands it the supervisor's cgroup subtree and the apps' directories.
+      drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -268,6 +272,7 @@ in
       drv-auth.gid = cfg.ids.auth;
       drv-seat.gid = cfg.ids.seat;
       drv-lock.gid = cfg.ids.lock;
+      drv-forker.gid = cfg.ids.forker;
       render = { };
     };
 
@@ -317,7 +322,11 @@ in
           # drv-appd's privileged helper: forks one sandboxed app per request over the channel
           # the supervisor made for the two of them, checks UIDs, groups and /run entries
           # against these lists, and nothing else.
+          "--forker-user drv-forker"
           "--forker-exec '${forkerExec}'"
+          "--forker-dir /run/drv-apps:0711"
+          "--forker-dir /var/lib/drv-apps:0711"
+        ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ] ++ [
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
           # The only process on the seat: opens DRM and evdev nodes through libseat's builtin

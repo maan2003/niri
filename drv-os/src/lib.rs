@@ -3,9 +3,9 @@
 
 use std::ffi::CString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode};
 
 /// `getgrnam_r`, so the command line and requests can use group names.
 pub fn group_id(name: &str) -> Result<u32, String> {
@@ -93,6 +93,18 @@ pub fn dup_high(fd: i32) -> Result<i32, String> {
 }
 
 /// Creates `path` (parents too) owned by `uid:gid` with `mode`, or fixes an existing one.
+/// Our own cgroup v2 directory.
+pub fn own_cgroup() -> Result<PathBuf, String> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")
+        .map_err(|e| format!("/proc/self/cgroup: {e}"))?;
+    // cgroup v2: a single line "0::/path".
+    let path = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| "not on cgroup v2".to_owned())?;
+    Ok(PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
 pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -101,16 +113,29 @@ pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
         Err(err) => return Err(format!("mkdir {}: {err}", path.display())),
     }
-    let fd = rustix::fs::open(path, OFlags::DIRECTORY | OFlags::NOFOLLOW, Mode::empty())
-        .map_err(|err| format!("open {}: {err}", path.display()))?;
-    rustix::fs::fchown(
-        &fd,
-        Some(rustix::process::Uid::from_raw(uid)),
-        Some(rustix::process::Gid::from_raw(gid)),
-    )
-    .map_err(|err| format!("chown {}: {err}", path.display()))?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode))
-        .map_err(|err| format!("chmod {}: {err}", path.display()))
+    // Not opened: once it is the other UID's 0700 directory we may not (no CAP_DAC_OVERRIDE).
+    // lstat, then act by path; the parent is ours, so nothing swaps the entry under us.
+    let st = rustix::fs::lstat(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+    if !FileType::from_raw_mode(st.st_mode).is_dir() {
+        return Err(format!("{}: not a directory", path.display()));
+    }
+    // Mode first, while the directory is still ours: chmod on someone else's needs
+    // CAP_FOWNER, chown only CAP_CHOWN. Both only when something is off.
+    if st.st_mode & 0o7777 != mode {
+        rustix::fs::chmod(path, Mode::from_raw_mode(mode))
+            .map_err(|err| format!("chmod {}: {err}", path.display()))?;
+    }
+    if st.st_uid != uid || st.st_gid != gid {
+        rustix::fs::chownat(
+            rustix::fs::CWD,
+            path,
+            Some(rustix::process::Uid::from_raw(uid)),
+            Some(rustix::process::Gid::from_raw(gid)),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|err| format!("chown {}: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 
