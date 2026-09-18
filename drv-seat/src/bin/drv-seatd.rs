@@ -3,7 +3,12 @@
 //! connection is the fd `compositor` from the supervisor), opens those nodes and only those,
 //! passes the fds, and forwards hotplug and enable/disable. When the compositor hangs up we
 //! exit: the supervisor restarts the whole set. The compositor holds no device groups, no
-//! udev socket, and never sees a VT.
+//! udev socket, and never sees a VT. Both processes here are sealed with the shared seccomp
+//! allowlist: libseat's builtin backend forks the seatd server (the one that opens the
+//! devices and drives the VT), so the seal goes on before that fork and the child inherits
+//! it. What stays: opening existing device nodes and ttys (never creating files), DRM, evdev
+//! and VT ioctls, reading udev's database. The parent loses fork and netlink again once the
+//! seat and udev are up.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -219,8 +224,9 @@ impl Daemon {
         self.drain(client);
     }
 
-    /// Serves the compositor until it hangs up.
-    fn serve(&mut self, control: OwnedFd) -> io::Result<()> {
+    /// Serves the compositor until it hangs up. `events` is the pair made before the seal;
+    /// the compositor gets one end with the Hello.
+    fn serve(&mut self, control: OwnedFd, events: (OwnedFd, OwnedFd)) -> io::Result<()> {
         let (hello, _): (Request, _) = drv_seat::recv(&control)?;
         match hello {
             Request::Hello { version } if version == VERSION => (),
@@ -231,7 +237,7 @@ impl Daemon {
             }
             _ => return Err(io::Error::other("expected Hello")),
         }
-        let (events, their_events) = drv_seat::pair()?;
+        let (events, their_events) = events;
         let hello = Response::Hello {
             version: VERSION,
             seat: self.seat.name().to_owned(),
@@ -326,16 +332,50 @@ fn run(args: Args) -> Result<(), String> {
         activate_vt(vt)?;
         eprintln!("drv-seatd: on VT {vt}");
     }
+    let events = drv_seat::pair().map_err(|e| format!("the events socket pair: {e}"))?;
+    let sealed = drv_os::seccomp::enabled();
+    if sealed {
+        lockdown(true).map_err(|e| format!("sealing: {e}"))?;
+    } else {
+        eprintln!("drv-seatd: seccomp disabled ({}=0)", drv_os::seccomp::DISABLE_ENV);
+    }
     let mut daemon = Daemon::open()?;
     eprintln!(
         "drv-seatd: seat {} ready with {} devices",
         daemon.seat.name(),
         daemon.devices.known.len()
     );
-    match daemon.serve(control) {
+    if sealed {
+        lockdown(false).map_err(|e| format!("sealing: {e}"))?;
+        eprintln!("drv-seatd: seccomp: syscall allowlist applied");
+    }
+    match daemon.serve(control, events) {
         Ok(()) => Err("the compositor hung up".to_owned()),
         Err(err) => Err(format!("compositor failed: {err}")),
     }
+}
+
+/// Seccomp. `opening` is the first, wider seal: libseat still has to fork its server and
+/// udev to make its netlink socket. The second one, on the parent alone, drops those (filters
+/// stack, the strictest verdict wins). Both keep opening the announced device nodes (and
+/// ttys on VT switches), the ioctls on them, and reading udev's database.
+fn lockdown(opening: bool) -> io::Result<()> {
+    let mut allow = drv_os::seccomp::Allowlist::base()?;
+    allow.open_existing()?;
+    // 'd' is DRM (set/drop master), 'E' evdev (revoke), 'K' and 'V' the console: KD* keyboard
+    // mode and VT_* switching.
+    for ty in *b"dEKV" {
+        allow.ioctl_type(ty)?;
+    }
+    if opening {
+        // libseat forks its server with a socketpair to it; udev binds its netlink socket.
+        allow.allow(&[libc::SYS_clone, libc::SYS_wait4, libc::SYS_socketpair, libc::SYS_bind]);
+        #[cfg(target_arch = "x86_64")]
+        allow.allow(&[libc::SYS_fork]);
+        allow.socket(libc::AF_NETLINK)?;
+        allow.reseal()?;
+    }
+    allow.apply("drv-seatd")
 }
 
 fn main() -> ExitCode {

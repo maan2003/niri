@@ -158,8 +158,9 @@ impl Allowlist {
             #[cfg(target_arch = "x86_64")]
             SYS_time,
         ]);
-        // Nonblocking fds and pending byte counts.
-        for req in [FIONBIO, FIONREAD] {
+        // Nonblocking fds, pending byte counts, and "is stderr a terminal" (glibc's isatty
+        // asks with TCGETS2, older libcs with TCGETS).
+        for req in [FIONBIO, FIONREAD, TCGETS, TCGETS2] {
             this.ioctl(req)?;
         }
         // Threads only, never processes.
@@ -253,6 +254,8 @@ impl Allowlist {
         self.allow(&[
             SYS_newfstatat,
             SYS_statx,
+            SYS_fstatfs,
+            SYS_statfs,
             SYS_readlinkat,
             SYS_faccessat,
             SYS_faccessat2,
@@ -273,6 +276,58 @@ impl Allowlist {
             SYS_open,
             vec![Cond::new(1, Len::Dword, Op::MaskedEq(writing), 0).map_err(err)?],
         )?;
+        Ok(self)
+    }
+
+    /// Existing files by path, read or write, never creating, truncating or appending: device
+    /// nodes and ttys, on top of [`Self::read_files`].
+    pub fn open_existing(&mut self) -> io::Result<&mut Self> {
+        self.read_files()?;
+        const O_TMPFILE_BIT: u64 = 0o20000000;
+        let creating = (O_CREAT | O_TRUNC | O_APPEND) as u64 | O_TMPFILE_BIT;
+        self.allow_when(
+            SYS_openat,
+            vec![Cond::new(2, Len::Dword, Op::MaskedEq(creating), 0).map_err(err)?],
+        )?;
+        #[cfg(target_arch = "x86_64")]
+        self.allow_when(
+            SYS_open,
+            vec![Cond::new(1, Len::Dword, Op::MaskedEq(creating), 0).map_err(err)?],
+        )?;
+        Ok(self)
+    }
+
+    /// Anonymous files (`O_TMPFILE`, never linked into a directory): what a memfd is, made
+    /// by a library that asks for a temp file in the runtime dir instead.
+    pub fn anonymous_files(&mut self) -> io::Result<&mut Self> {
+        const O_TMPFILE_BIT: u64 = 0o20000000;
+        self.allow_when(
+            SYS_openat,
+            vec![Cond::new(2, Len::Dword, Op::MaskedEq(O_TMPFILE_BIT), O_TMPFILE_BIT).map_err(err)?],
+        )
+    }
+
+    /// Installing another, stricter filter later (a process that seals in two steps).
+    pub fn reseal(&mut self) -> io::Result<&mut Self> {
+        self.allow(&[SYS_seccomp]);
+        self.allow_when(
+            SYS_prctl,
+            vec![Cond::new(0, Len::Dword, Op::Eq, PR_SET_NO_NEW_PRIVS as u64).map_err(err)?],
+        )
+    }
+
+    /// Making sockets of one address family (`AF_UNIX`, `AF_NETLINK`).
+    pub fn socket(&mut self, family: c_int) -> io::Result<&mut Self> {
+        self.allow_when(
+            SYS_socket,
+            vec![Cond::new(0, Len::Dword, Op::Eq, family as u64).map_err(err)?],
+        )
+    }
+
+    /// Connecting to Unix sockets by path (nothing over the network).
+    pub fn connect_unix(&mut self) -> io::Result<&mut Self> {
+        self.socket(AF_UNIX)?;
+        self.allow(&[SYS_connect]);
         Ok(self)
     }
 
@@ -362,6 +417,24 @@ fn install_sigsys_handler(tag: &'static str) -> io::Result<()> {
     Ok(())
 }
 
+fn push_hex(buf: &mut [u8], len: &mut usize, mut n: u32) {
+    let mut hex = [0u8; 8];
+    let mut d = 0;
+    loop {
+        hex[d] = b"0123456789abcdef"[(n & 0xf) as usize];
+        d += 1;
+        n >>= 4;
+        if n == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        buf[*len] = hex[d];
+        *len += 1;
+    }
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 extern "C" fn on_sigsys(_signal: c_int, info: *mut siginfo_t, ctx: *mut c_void) {
     // SAFETY: the kernel passes a valid siginfo and ucontext. For SIGSYS, `si_syscall` is the
@@ -381,15 +454,65 @@ extern "C" fn on_sigsys(_signal: c_int, info: *mut siginfo_t, ctx: *mut c_void) 
             ctx.uc_mcontext.regs[0] = ret as u64;
         }
     }
-    log_denied(nr);
+    // SAFETY: reading the argument registers of the interrupted context.
+    let args: [u64; 3] = unsafe {
+        let ctx = &*ctx.cast::<ucontext_t>();
+        #[cfg(target_arch = "x86_64")]
+        {
+            let g = &ctx.uc_mcontext.gregs;
+            [g[REG_RDI as usize] as u64, g[REG_RSI as usize] as u64, g[REG_RDX as usize] as u64]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let r = &ctx.uc_mcontext.regs;
+            [r[0], r[1], r[2]]
+        }
+    };
+    log_denied(nr, args);
+}
+
+/// Which argument of `nr` is a path, and which its open flags, so the log names the file
+/// instead of just the number.
+fn path_arg(nr: c_int) -> Option<(usize, Option<usize>)> {
+    let nr = nr as c_long;
+    #[cfg(target_arch = "x86_64")]
+    if nr == SYS_open {
+        return Some((0, Some(1)));
+    }
+    #[cfg(target_arch = "x86_64")]
+    if [SYS_stat, SYS_lstat, SYS_access, SYS_readlink, SYS_unlink, SYS_mkdir, SYS_chmod]
+        .contains(&nr)
+    {
+        return Some((0, None));
+    }
+    if nr == SYS_openat {
+        return Some((1, Some(2)));
+    }
+    if [
+        SYS_newfstatat,
+        SYS_statx,
+        SYS_faccessat,
+        SYS_faccessat2,
+        SYS_readlinkat,
+        SYS_unlinkat,
+        SYS_mkdirat,
+        SYS_fchmodat,
+        SYS_renameat,
+        SYS_renameat2,
+    ]
+    .contains(&nr)
+    {
+        return Some((1, None));
+    }
+    None
 }
 
 /// Async-signal-safe: formats by hand and uses write(2) on stderr.
-fn log_denied(nr: c_int) {
+fn log_denied(nr: c_int, args: [u64; 3]) {
     if LOGGED.fetch_add(1, Ordering::Relaxed) >= LOG_LIMIT {
         return;
     }
-    let mut buf = [0u8; 96];
+    let mut buf = [0u8; 200];
     let mut len = 0;
     let tag_len = TAG_LEN.load(Ordering::Relaxed).min(40);
     let tag = TAG_PTR.load(Ordering::Relaxed);
@@ -422,6 +545,34 @@ fn log_denied(nr: c_int) {
         d -= 1;
         buf[len] = digits[d];
         len += 1;
+    }
+    if let Some((path, flags)) = path_arg(nr) {
+        let ptr = args[path] as *const u8;
+        if !ptr.is_null() {
+            buf[len] = b' ';
+            len += 1;
+            // SAFETY: the interrupted thread passed this pointer to the kernel as a path; we
+            // read it byte by byte up to the NUL, staying within our buffer.
+            for i in 0..80 {
+                let byte = unsafe { *ptr.add(i) };
+                if byte == 0 || len == buf.len() - 24 {
+                    break;
+                }
+                buf[len] = byte;
+                len += 1;
+            }
+        }
+        if let Some(flags) = flags {
+            let msg = b" flags 0x";
+            buf[len..len + msg.len()].copy_from_slice(msg);
+            len += msg.len();
+            push_hex(&mut buf, &mut len, args[flags] as u32);
+        }
+    } else if nr as c_long == SYS_ioctl {
+        let msg = b" request 0x";
+        buf[len..len + msg.len()].copy_from_slice(msg);
+        len += msg.len();
+        push_hex(&mut buf, &mut len, args[1] as u32);
     }
     buf[len] = b'\n';
     len += 1;

@@ -20,6 +20,9 @@ pub fn enabled() -> bool {
 /// Seccomp: after this, the process can only talk to the fds it already holds.
 pub fn lockdown() -> anyhow::Result<()> {
     let mut allow = Allowlist::base().context("seccomp baseline")?;
+    // PipeWire pins the buffers it maps; Mesa stats its device's sysfs entry to learn the
+    // PCI ids (a stat by path, nothing it can open).
+    allow.allow(&[libc::SYS_mlock, libc::SYS_munlock, libc::SYS_newfstatat, libc::SYS_statx]);
     // 'd' is DRM, 'b' dma-buf, '>' sync_file.
     for ty in *b"db>" {
         allow.ioctl_type(ty).context("seccomp ioctl rule")?;
