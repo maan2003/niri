@@ -284,6 +284,18 @@ impl State {
                 break;
             };
 
+            if self.niri.is_locked() {
+                // Casts of a locked session are black, windows included.
+                let now = get_monotonic_time();
+                let res = self
+                    .backend
+                    .with_primary_renderer(|renderer| cast.clear(renderer, now));
+                if let Some(Err(err)) = res {
+                    warn!("error clearing cast: {err:?}");
+                }
+                break;
+            }
+
             let scale = Scale::from(output.current_scale().fractional_scale());
             let bbox = mapped
                 .window
@@ -820,6 +832,14 @@ impl Niri {
             }
 
             if cast.check_time_and_schedule(output, target_presentation_time) {
+                continue;
+            }
+
+            if self.is_locked() {
+                // Casts of a locked session are black, windows included.
+                if let Err(err) = cast.clear(renderer, target_presentation_time) {
+                    warn!("error clearing cast: {err:?}");
+                }
                 continue;
             }
 
