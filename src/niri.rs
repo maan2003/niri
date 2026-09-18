@@ -3167,9 +3167,15 @@ impl Niri {
         } = client;
 
         // Identity is the peer UID; PIDs are reused and never used for this. Any failure along
-        // the way fails closed: the client gets the nothing-optional policy.
+        // the way fails closed: the client gets the nothing-optional policy. Clients without
+        // credentials arrived as an fd over the human's session bus (the Mutter service
+        // channel), so they are the human's own tools.
         let policy = if credentials_unknown {
-            Arc::new(AppPolicy::unknown())
+            let me = rustix::process::getuid().as_raw();
+            self.policy.lookup(me).unwrap_or_else(|err| {
+                warn!("policy lookup for own uid {me} failed, treating as unknown: {err}");
+                Arc::new(AppPolicy::unknown())
+            })
         } else {
             match rustix::net::sockopt::socket_peercred(&client) {
                 Ok(cred) => {

@@ -345,6 +345,8 @@ impl Casting {
                 Ok(PostAction::Continue)
             })
             .map_err(|err| anyhow!("error registering PipeWire loop: {err}"))?;
+
+        preload_video_plugin(&context);
         Ok(context)
     }
 
@@ -483,6 +485,32 @@ impl Casting {
             }
         }
     }
+}
+
+/// Loads `libspa-videoconvert` into PipeWire's plugin registry while files can still be opened.
+///
+/// Since 1.6 a video stream is wrapped in a `video.adapt` node from that library, dlopened
+/// (with ffmpeg behind it) on the first `pw_stream_connect`. By then the sandbox is closed and
+/// the connect fails with EINVAL. The registry reuses an open library by name without touching
+/// the disk, so one handle held for the life of the process is enough.
+fn preload_video_plugin(context: &ContextRc) {
+    let factory = c"video.convert.dummy";
+    // SAFETY: valid context and NUL-terminated name; a NULL info dict is allowed.
+    let handle = unsafe {
+        pipewire::sys::pw_context_load_spa_handle(
+            context.as_raw_ptr(),
+            factory.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        warn!(
+            "error preloading the PipeWire video plugin: {}; \
+             screencasting will fail inside the sandbox",
+            std::io::Error::last_os_error()
+        );
+    }
+    // Kept loaded on purpose: unloading would drop the registry's reference.
 }
 
 impl PipeWire {

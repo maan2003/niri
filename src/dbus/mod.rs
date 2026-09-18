@@ -55,7 +55,8 @@ impl DBusServers {
 
         let mut dbus = Self::default();
 
-        if is_session_instance {
+        // The GNOME portal backend needs the service channel too, not only the screencast API.
+        if is_session_instance || config.debug.dbus_interfaces_in_non_session_instances {
             let (to_niri, from_service_channel) = calloop::channel::channel();
             let service_channel = ServiceChannel::new(to_niri);
             niri.event_loop

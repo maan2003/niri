@@ -5,9 +5,30 @@
 { pkgs, lib, modulesPath, ... }:
 let
   # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire.
-  audioPage = pkgs.writeText "audio.html" ''
-    <title>audio test</title>
+  portalWrapper = pkgs.writeShellScript "portal" ''
+    # The backend's .portal file comes from its share dir; which backend to use comes from
+    # /etc/xdg/xdg-desktop-portal/portals.conf (the module writes it).
+    export XDG_DATA_DIRS=${pkgs.xdg-desktop-portal-gnome}/share:$XDG_DATA_DIRS
+    export XDG_CURRENT_DESKTOP=niri
+    exec ${pkgs.xdg-desktop-portal}/libexec/xdg-desktop-portal --verbose
+  '';
+  sharePage = pkgs.writeText "share.html" ''
+    <!doctype html><title>share</title>
+    <body style="margin:0;background:#224">
     <audio autoplay loop src="file://${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga"></audio>
+    <button id=b style="font-size:60px;width:100%;height:200px">share screen</button>
+    <video id=v autoplay style="width:100%"></video>
+    <pre id=log style="color:#fff;font-size:30px"></pre>
+    <script>
+      const log = m => document.getElementById("log").textContent += m + "\\n";
+      b.onclick = async () => {
+        try {
+          const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
+          v.srcObject = s;
+          log("got stream " + s.getVideoTracks()[0].label);
+        } catch (e) { log("failed: " + e); }
+      };
+    </script>
   '';
   probe = pkgs.writeShellScript "probe" ''
     ${pkgs.coreutils}/bin/id > "$HOME/id.txt"
@@ -76,6 +97,10 @@ in
       spawn-at-startup "hello" "extra-argument"
       spawn-at-startup "mako"
       spawn-at-startup "notify-test"
+      spawn-at-startup "portal"
+      spawn-at-startup "portal-gnome"
+      // The screencast and introspection D-Bus services the GNOME portal backend needs.
+      debug { dbus-interfaces-in-non-session-instances; }
     '';
     apps = {
       # The launcher: the human's own tool, trusted, runs as the human (Mod+D in the stock
@@ -84,6 +109,19 @@ in
       # Notification daemon: the human's tool on the human's bus; apps reach it only through
       # the bridge, which names them.
       mako = { uid = 1000; trusted = true; exec = [ "${pkgs.mako}/bin/mako" ]; };
+      # Portals on the human's bus: the frontend and the GNOME backend (niri speaks its
+      # Mutter screencast API). The human's tools reach them directly; sandboxed apps will
+      # only ever reach them through the bridge.
+      # The frontend hands screencast consumers a PipeWire fd (OpenPipeWireRemote), so it
+      # needs the socket itself.
+      portal = { uid = 1000; trusted = true; exec = [ "${portalWrapper}" ]; groups = [ "pipewire" ]; };
+      portal-gnome = { uid = 1000; trusted = true; exec = [ "${pkgs.xdg-desktop-portal-gnome}/libexec/xdg-desktop-portal-gnome" ]; };
+      # The same browser as the human's own tool: exercises the portal stack without the bridge.
+      chromium-me = {
+        uid = 1000;
+        trusted = true;
+        exec = [ "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland" "file://${sharePage}" ];
+      };
       # Sends one notification from inside the sandbox over its private bus.
       notify-test = {
         uid = 100007;
@@ -102,7 +140,7 @@ in
         bus = true;
         exec = [
           "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
-          "--autoplay-policy=no-user-gesture-required" "file://${audioPage}"
+          "--autoplay-policy=no-user-gesture-required" "file://${sharePage}"
         ];
         gpu = true;
         network = true;

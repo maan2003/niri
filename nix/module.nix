@@ -36,11 +36,13 @@ let
   # the range, not by looking up the human's uid, which would recurse through `users.users`.
   appUsers = lib.filterAttrs (_: app: inRange app.uid) cfg.apps;
   # One launcher entry per app. A launcher runs these as the human; the compositor then asks
-  # the identity daemon, so the entry carries a name and nothing else.
+  # the identity daemon, so the entry carries a name and nothing else. The file is named
+  # `niri.app.<name>.desktop`: the app id the bridge registers with the portals, so their
+  # dialogs can show the name too.
   desktopEntries = pkgs.runCommand "niri-desktop-entries" { } (
     lib.concatStrings (lib.mapAttrsToList (name: app: ''
       mkdir -p $out/share/applications
-      cat > $out/share/applications/${name}.desktop <<EOF
+      cat > $out/share/applications/niri.app.${name}.desktop <<EOF
       [Desktop Entry]
       Type=Application
       Name=${name}
@@ -82,6 +84,7 @@ in
         PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         PULSE_SERVER = "unix:/run/pulse/native";
         NIRI_BRIDGE_SOCKET = bridgeSocket;
+        XDG_SESSION_TYPE = "wayland";
         XDG_DATA_DIRS = "/run/current-system/sw/share";
       };
       description = "Environment every app gets.";
@@ -142,7 +145,7 @@ in
       group = "app-${name}";
       isSystemUser = true;
     }) appUsers // {
-      ${cfg.user}.extraGroups = [ "seat" "video" "input" ];
+      ${cfg.user}.extraGroups = [ "seat" "video" "input" "pipewire" ];
     };
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) appUsers
       // { render = { }; };
@@ -158,6 +161,7 @@ in
 
     environment.etc."niri/identity.toml".source = identityFile;
     environment.etc."niri/config.kdl".text = cfg.config;
+    environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
     environment.systemPackages = [ cfg.package desktopEntries ];
 
     systemd.services.niri-forker = {
@@ -223,6 +227,8 @@ in
       requires = [ "niri-identity.service" "seatd.service" ];
       environment = {
         DBUS_SESSION_BUS_ADDRESS = sessionBus;
+        # Screencasts go to the system PipeWire, like everyone's audio.
+        PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
         LIBSEAT_BACKEND = "seatd";
         NIRI_IDENTITY_SOCKET = "/run/niri-identity/identity.sock";
         NIRI_APPS_SOCKET = "/run/niri-wayland/wayland";

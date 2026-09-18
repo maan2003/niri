@@ -270,12 +270,12 @@ impl Server {
 /// exec (only syscalls on pre-built strings; nothing allocates there). Same UID plus this is
 /// the floor every app gets; what it may reach on top is groups and sockets.
 ///
-/// - a new mount namespace, so none of it leaks out, and unless the app was granted the
-///   network a new network namespace with nothing in it;
+/// - a new mount namespace, so none of it leaks out, and unless the app was granted the network a
+///   new network namespace with nothing in it;
 /// - `/tmp` and `/dev/shm` are fresh tmpfs: no shared scratch space between apps;
 /// - `/proc` shows only the app's own processes;
-/// - `/run` is a fresh, read-only tmpfs holding only the exposed entries: no system D-Bus,
-///   no forker or identity sockets, no other app's runtime directory, no setuid wrappers.
+/// - `/run` is a fresh, read-only tmpfs holding only the exposed entries: no system D-Bus, no
+///   forker or identity sockets, no other app's runtime directory, no setuid wrappers.
 struct Sandbox {
     /// `unshare(CLONE_NEWNET)` too: no interfaces at all.
     no_network: bool,
@@ -367,12 +367,21 @@ impl Sandbox {
         let stage = c"/tmp/.run";
         let run = c"/run";
         let none: *const libc::c_char = std::ptr::null();
-        let mnt = |src: &CStr, dst: &CStr, fstype: *const libc::c_char, flags: libc::c_ulong, data: *const libc::c_char| {
+        let mnt = |src: &CStr,
+                   dst: &CStr,
+                   fstype: *const libc::c_char,
+                   flags: libc::c_ulong,
+                   data: *const libc::c_char| {
             // SAFETY: all pointers are valid C strings (or null where the kernel allows it).
             unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype, flags, data.cast()) }
         };
         let nodev = libc::MS_NOSUID | libc::MS_NODEV;
-        let flags = libc::CLONE_NEWNS | if self.no_network { libc::CLONE_NEWNET } else { 0 };
+        let flags = libc::CLONE_NEWNS
+            | if self.no_network {
+                libc::CLONE_NEWNET
+            } else {
+                0
+            };
         // SAFETY: syscalls only.
         unsafe {
             if libc::unshare(flags) != 0 {
@@ -388,7 +397,14 @@ impl Sandbox {
         if mnt(tmpfs, shm, tmpfs.as_ptr(), nodev, mode1777.as_ptr()) != 0 {
             return fail("tmpfs on /dev/shm");
         }
-        if mnt(proc_, procdir, proc_.as_ptr(), nodev | libc::MS_NOEXEC, hidepid.as_ptr()) != 0 {
+        if mnt(
+            proc_,
+            procdir,
+            proc_.as_ptr(),
+            nodev | libc::MS_NOEXEC,
+            hidepid.as_ptr(),
+        ) != 0
+        {
             return fail("proc with hidepid");
         }
         // SAFETY: syscalls on static strings.
@@ -426,7 +442,14 @@ impl Sandbox {
             libc::rmdir(stage.as_ptr());
         }
         // The tmpfs itself read-only; the bind mounts inside keep their own flags.
-        if mnt(c"none", run, none, libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | nodev, none) != 0 {
+        if mnt(
+            c"none",
+            run,
+            none,
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | nodev,
+            none,
+        ) != 0
+        {
             return fail("remount /run read-only");
         }
         Ok(())
