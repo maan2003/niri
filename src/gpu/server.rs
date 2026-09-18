@@ -65,14 +65,16 @@ pub struct StartupDevice {
     pub fd: OwnedFd,
 }
 
-/// Adds `devices`, seals the process with seccomp (when `sandbox`; never for a server on a
-/// thread of the core), then serves requests on `fd`.
+/// Adds `devices` (or, with `await_start`, the ones the core's first message brings), seals
+/// the process with seccomp (when `sandbox`; never for a server on a thread of the core), then
+/// serves requests on `fd`.
 pub fn run(
     fd: OwnedFd,
     mode: Mode,
     sandbox: bool,
     devices: Vec<StartupDevice>,
     render_node_hint: Option<DevId>,
+    await_start: bool,
 ) -> anyhow::Result<()> {
     let mut event_loop: EventLoop<'static, Server> =
         EventLoop::try_new().context("error creating event loop")?;
@@ -105,6 +107,35 @@ pub fn run(
         signal: event_loop.get_signal(),
         reply_fds: Vec::new(),
         bg,
+    };
+
+    let (devices, render_node_hint) = if await_start {
+        let (request, fds): (Request, Vec<OwnedFd>) = server
+            .chan
+            .recv()
+            .context("waiting for the core's Start")?;
+        match request {
+            Request::Start {
+                devices,
+                render_node_hint,
+            } => {
+                anyhow::ensure!(
+                    devices.len() == fds.len(),
+                    "Start: {} devices but {} fds",
+                    devices.len(),
+                    fds.len()
+                );
+                let devices = devices
+                    .into_iter()
+                    .zip(fds)
+                    .map(|(dev, fd)| StartupDevice { dev, fd })
+                    .collect();
+                (devices, render_node_hint)
+            }
+            other => anyhow::bail!("expected Start from the core, got {other:?}"),
+        }
+    } else {
+        (devices, render_node_hint)
     };
 
     // Mesa initializes here, while the process can still open files.
@@ -407,6 +438,7 @@ impl Server {
                 available: exec.set_custom_shader(kind, src.as_deref())?,
             },
 
+            Request::Start { .. } => anyhow::bail!("Start after startup"),
             Request::AddDevice {
                 dev,
                 path,

@@ -31,10 +31,10 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::ping::{make_ping, Ping};
+use smithay::reexports::calloop::ping::make_ping;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
-    Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
+    Interest, LoopHandle, Mode as CalloopMode, PostAction,
 };
 use smithay::reexports::drm::control::{Mode as DrmMode, ModeFlags, ModeTypeFlags};
 use smithay::reexports::input::{Device as InputDevice, Libinput};
@@ -77,20 +77,14 @@ pub struct Tty {
     /// The input devices libinput currently has; emptied while the session is inactive.
     input_devices: HashMap<dev_t, InputDevice>,
     libinput: Libinput,
-    event_loop: LoopHandle<'static, State>,
     /// Connection to the GPU process; also carries all DRM requests.
     renderer: RemoteRenderer,
     /// Set once the GPU process has a renderer (after the primary device was added).
     renderer_ready: bool,
-    /// The GPU process socket in the event loop.
-    gpu_source: RegistrationToken,
-    /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
-    gpu_ping: Ping,
     /// Devices the current GPU process was started with (whether they worked or not).
     gpu_devices: HashSet<DrmNode>,
     /// Devices the GPU process accepted at startup, registered in `init` (needs `Niri`).
     pending_devices: Vec<PendingDevice>,
-    /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
     /// Where we'd like the GPU process to render: the configured render node, else the seat
     /// daemon's boot VGA card. `None` lets the GPU process take the first device that works.
     render_node_hint: Option<DrmNode>,
@@ -276,10 +270,9 @@ impl Tty {
         let poll_fd = client.as_fd().try_clone_to_owned()?;
         // Events queued during a synchronous request are dispatched via this ping.
         let (ping, ping_source) = make_ping().context("error creating ping")?;
-        let waker_ping = ping.clone();
-        client.set_waker(move || waker_ping.ping());
+        client.set_waker(move || ping.ping());
         let renderer = RemoteRenderer::new(client);
-        let gpu_source = register_gpu_source(&event_loop, poll_fd);
+        register_gpu_source(&event_loop, poll_fd);
 
         event_loop
             .insert_source(ping_source, |_, _, state| {
@@ -295,11 +288,8 @@ impl Tty {
             input_paths,
             input_devices,
             libinput,
-            event_loop,
             renderer,
             renderer_ready: false,
-            gpu_source,
-            gpu_ping: ping,
             gpu_devices,
             pending_devices,
             render_node_hint,
@@ -393,55 +383,13 @@ impl Tty {
         }
     }
 
-    /// Replaces the GPU process with one started on the current device set. For when there is
-    /// no renderer: the sealed process cannot bring one up on a device it did not start with
-    /// (Mesa cannot open anything anymore). Without a renderer nothing lives on the GPU side,
-    /// so the swap only costs re-adding the devices.
+    /// For when there is no renderer: the sealed process cannot bring one up on a device it
+    /// did not start with (Mesa cannot open anything anymore), and only the supervisor can
+    /// start a GPU process. We are one group with it, so exiting brings both back on the
+    /// current device set.
     fn respawn_gpu(&mut self, niri: &mut Niri) {
-        let _span = tracy_client::span!("Tty::respawn_gpu");
-        info!("no renderer; restarting the GPU process with the current devices");
-
-        for node in self.devices.keys().copied().collect::<Vec<_>>() {
-            self.device_removed(node.dev_id(), niri);
-        }
-        self.unusable_devices.clear();
-
-        let res = spawn_gpu(
-            &mut self.session,
-            &self.seat_devices,
-            &self.ignored_nodes,
-            self.render_node_hint,
-        );
-        let (mut client, pending, unusable) = match res {
-            Ok(x) => x,
-            Err(err) => {
-                error!("error restarting the GPU process, exiting: {err:#}");
-                niri.stop_signal.stop();
-                return;
-            }
-        };
-        self.gpu_devices = pending
-            .iter()
-            .map(|p| p.node)
-            .chain(unusable.iter().copied())
-            .collect();
-        self.unusable_devices = unusable;
-
-        let ping = self.gpu_ping.clone();
-        client.set_waker(move || ping.ping());
-        let poll_fd = match client.as_fd().try_clone_to_owned() {
-            Ok(fd) => fd,
-            Err(err) => {
-                error!("error duplicating the GPU socket, exiting: {err}");
-                niri.stop_signal.stop();
-                return;
-            }
-        };
-        self.renderer.replace_client(client);
-        self.event_loop.remove(self.gpu_source);
-        self.gpu_source = register_gpu_source(&self.event_loop, poll_fd);
-
-        self.register_devices(niri, pending);
+        error!("no renderer; exiting so the supervisor restarts the compositor with a fresh GPU process");
+        niri.stop_signal.stop();
     }
 
     /// Adds `devices` (any order), then scans the connectors of the ones that worked.
@@ -2351,12 +2299,11 @@ fn spawn_gpu(
         .iter()
         .map(|(node, fd)| (node.dev_id(), fd.as_fd()))
         .collect();
-    let (socket, pid) = session
-        .start_gpu(&fds, render_node_hint.map(|n| n.dev_id()))
+    let socket =
+        crate::wire::take_gpu().context("no GPU process connection from the supervisor")?;
+    let mut client = GpuClient::start(socket, &fds, render_node_hint.map(|n| n.dev_id()))
         .context("error starting the GPU process")?;
-    debug!("GPU process started by the seat daemon, pid {pid}");
-    let mut client =
-        GpuClient::from_socket(socket).context("error connecting to the GPU process")?;
+    debug!("GPU process started");
 
     let results: HashMap<DevId, DeviceResult> = client
         .take_device_results()
@@ -2408,7 +2355,7 @@ fn spawn_gpu(
 fn register_gpu_source(
     event_loop: &LoopHandle<'static, State>,
     poll_fd: OwnedFd,
-) -> RegistrationToken {
+) {
     event_loop
         .insert_source(
             Generic::new(poll_fd, Interest::READ, CalloopMode::Level),
@@ -2431,7 +2378,7 @@ fn register_gpu_source(
                 Ok(PostAction::Continue)
             },
         )
-        .unwrap()
+        .unwrap();
 }
 
 fn ignored_nodes_from_config(config: &Config) -> HashSet<DrmNode> {

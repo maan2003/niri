@@ -315,9 +315,8 @@ in
           # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
           # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
           # The only process on the seat: opens DRM and evdev nodes as root through libseat's
-          # builtin backend and hands the fds to the compositor. Also forks the GPU process as
-          # drv-gpu on the compositor's request.
-          "--seatd-exec '${cfg.package}/bin/drv-seatd --gpu-exec ${cfg.package}/bin/niri --gpu-user drv-gpu --gpu-group render'"
+          # builtin backend and hands the fds to the compositor.
+          "--seatd-exec '${cfg.package}/bin/drv-seatd'"
           "--seatd-env LIBSEAT_BACKEND=builtin"
           "--seatd-env RUST_BACKTRACE=1"
           "--seatd-env RUST_LOG=niri=debug"
@@ -329,6 +328,16 @@ in
           # Apps as other UIDs must traverse the socket directory.
           "--compositor-dir /run/drv-compositor:0711"
           "--compositor-dir /run/drv-wayland:0711"
+          # DRM and Mesa, as drv-gpu (group render), sealed with seccomp once the compositor
+          # has handed it the devices. One group with the compositor: either dying restarts both.
+          "--gpu-user drv-gpu"
+          "--gpu-exec '${cfg.package}/bin/niri gpu-process --mode drm'"
+        ] ++ map (e: "--gpu-env ${e}") [
+          # No home directory after the seal, so no shader cache on disk.
+          "MESA_SHADER_CACHE_DISABLE=true"
+          "MESA_GLSL_CACHE_DISABLE=true"
+          "RUST_BACKTRACE=1"
+          "RUST_LOG=niri=debug"
         ] ++ map (e: "--compositor-env ${e}") [
           "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           # Screencasts go to the system PipeWire, like everyone's audio.

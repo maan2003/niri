@@ -24,14 +24,23 @@ pub enum Peer {
     Authd,
     Seatd,
     Compositor,
+    Gpu,
     Appd,
 }
 
-/// `(a, what a receives, b, what b receives)`.
-const LINKS: [(Peer, Attach, Peer, Attach); 3] = [
-    (Peer::Compositor, Attach::Seat, Peer::Seatd, Attach::Compositor),
-    (Peer::Compositor, Attach::Auth, Peer::Authd, Attach::Compositor),
-    (Peer::Appd, Attach::Auth, Peer::Authd, Attach::Verifiers),
+/// The socket a link is made of: one message per datagram, or a byte stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Link {
+    Seq,
+    Stream,
+}
+
+/// `(a, what a receives, b, what b receives, socket type)`.
+const LINKS: [(Peer, Attach, Peer, Attach, Link); 4] = [
+    (Peer::Compositor, Attach::Seat, Peer::Seatd, Attach::Compositor, Link::Seq),
+    (Peer::Compositor, Attach::Auth, Peer::Authd, Attach::Compositor, Link::Seq),
+    (Peer::Compositor, Attach::Gpu, Peer::Gpu, Attach::Compositor, Link::Stream),
+    (Peer::Appd, Attach::Auth, Peer::Authd, Attach::Verifiers, Link::Seq),
 ];
 
 /// The supervisor's ends of the services' wires, and the links it makes between them.
@@ -44,9 +53,9 @@ impl Wiring {
     pub fn attach_service(&self, peer: Peer, wire: OwnedFd) {
         let mut wires = self.0.lock().unwrap();
         wires.insert(peer, wire);
-        for (a, for_a, b, for_b) in LINKS {
+        for (a, for_a, b, for_b, kind) in LINKS {
             if a == peer || b == peer {
-                link(&mut wires, a, for_a, b, for_b);
+                link(&mut wires, a, for_a, b, for_b, kind);
             }
         }
     }
@@ -57,11 +66,22 @@ impl Wiring {
 }
 
 /// Links two peers if both are up: a fresh pair, each side's end pushed down its wire.
-fn link(wires: &mut HashMap<Peer, OwnedFd>, a: Peer, for_a: Attach, b: Peer, for_b: Attach) {
+fn link(
+    wires: &mut HashMap<Peer, OwnedFd>,
+    a: Peer,
+    for_a: Attach,
+    b: Peer,
+    for_b: Attach,
+    kind: Link,
+) {
     let (Some(wire_a), Some(wire_b)) = (wires.get(&a), wires.get(&b)) else {
         return;
     };
-    let (end_a, end_b) = match wire::pair() {
+    let pair = match kind {
+        Link::Seq => wire::pair(),
+        Link::Stream => wire::stream_pair(),
+    };
+    let (end_a, end_b) = match pair {
         Ok(pair) => pair,
         Err(err) => {
             eprintln!("drv-supervisor: socketpair: {err}");

@@ -2675,7 +2675,7 @@ impl Niri {
                     )
                     .unwrap();
             }
-            None => error!("no spawner wire (DRV_WIRE_FD): drv-authd can never unlock us"),
+            None => error!("no wire (DRV_WIRE_FD): drv-authd can never unlock us"),
         }
         event_loop.insert_source(executor, |_, _, _| ()).unwrap();
 
@@ -6870,10 +6870,16 @@ impl Niri {
             // The seat daemon restarted. Our backend was built on the old one, so start over:
             // the spawner brings us back, wired to the new one, locked as always.
             Attach::Seat => {
-                warn!("the seat daemon restarted; exiting so the spawner starts us afresh");
+                warn!("the seat daemon restarted; exiting so the supervisor starts us afresh");
                 self.stop_signal.stop();
             }
-            other => warn!("ignoring {other:?} on the spawner's wire"),
+            // Cannot happen without us dying too (we are one group), but a fresh GPU process
+            // would need a fresh core in any case.
+            Attach::Gpu => {
+                warn!("the GPU process restarted; exiting so the supervisor starts us afresh");
+                self.stop_signal.stop();
+            }
+            other => warn!("ignoring {other:?} on the supervisor's wire"),
         }
     }
 

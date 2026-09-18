@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -18,13 +18,6 @@ pub enum Request {
     /// Close a device opened here. The client drops its own fd itself.
     Close { id: u32 },
     SwitchVt { vt: i32 },
-    /// Fork the GPU process as its own user with these DRM devices (one fd attached per
-    /// entry, in order) and hand back the core's end of their socket. What runs is the
-    /// daemon's configured executable, never the caller's choice.
-    StartGpu {
-        devices: Vec<u64>,
-        render_node_hint: Option<u64>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,8 +32,6 @@ pub enum Response {
     },
     /// Carries the device fd.
     Opened { id: u32 },
-    /// Carries the core's socket to the GPU process.
-    GpuStarted { pid: u32 },
     Done,
     Error(String),
 }

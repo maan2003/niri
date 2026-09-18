@@ -30,6 +30,9 @@ pub enum Attach {
     Seat,
     /// A socket down which `Verifier` attaches will come (drv-appd's, at drv-authd).
     Verifiers,
+    /// To the compositor: its connection to compositor-gpu (a stream socket; see
+    /// [`stream_pair`]).
+    Gpu,
 }
 
 /// The child's end, if the spawner gave us one.
@@ -94,6 +97,17 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
     Ok(rustix::net::socketpair(
         rustix::net::AddressFamily::UNIX,
         rustix::net::SocketType::SEQPACKET,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?)
+}
+
+/// A connected `SOCK_STREAM` pair, close-on-exec: for peers whose protocol is a byte stream
+/// (the compositor and its GPU process).
+pub fn stream_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+    Ok(rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
         rustix::net::SocketFlags::CLOEXEC,
         None,
     )?)

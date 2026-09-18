@@ -120,11 +120,25 @@ impl GpuClient {
         Ok(client)
     }
 
-    /// Talks to a GPU process someone else started (the seat daemon) over `socket`. The
-    /// process is nobody's child here: it exits when the socket closes.
-    pub fn from_socket(socket: OwnedFd) -> anyhow::Result<Self> {
+    /// Talks to a GPU process the supervisor started, over the `socket` it handed us. The
+    /// process waits for `Start`: `devices` (DRM fds the caller opened) go over with it, it adds
+    /// them, seals itself, then answers. It is nobody's child here; it exits when the socket
+    /// closes.
+    pub fn start(
+        socket: OwnedFd,
+        devices: &[(DevId, BorrowedFd<'_>)],
+        render_node_hint: Option<DevId>,
+    ) -> anyhow::Result<Self> {
+        let mut chan = Channel::new(socket);
+        let request = Request::Start {
+            devices: devices.iter().map(|(dev, _)| *dev).collect(),
+            render_node_hint,
+        };
+        let fds: Vec<_> = devices.iter().map(|(_, fd)| *fd).collect();
+        chan.send(&request, &fds)
+            .context("sending Start to the GPU process")?;
         let mut client = Self {
-            chan: Channel::new(socket),
+            chan,
             child: None,
             thread: None,
             caps: None,
@@ -141,7 +155,7 @@ impl GpuClient {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
             .name("gpu-server".into())
-            .spawn(move || super::server::run(theirs.into_fd(), mode, false, Vec::new(), None))?;
+            .spawn(move || super::server::run(theirs.into_fd(), mode, false, Vec::new(), None, false))?;
         let mut client = Self {
             chan: ours,
             child: None,

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -546,6 +546,13 @@ impl Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
+    /// The first message to a process the supervisor started (no `--device` on its command
+    /// line): the DRM devices to add before the sandbox seals, one fd attached per entry, in
+    /// order. Answered by `Ready`. Never valid afterwards.
+    Start {
+        devices: Vec<DevId>,
+        render_node_hint: Option<DevId>,
+    },
     Execute {
         commands: Vec<Command>,
     },
@@ -577,8 +584,9 @@ pub enum Request {
     /// KMS and Mesa renders through the display controller's node instead. Every other device
     /// is display-only and scans out buffers allocated on the rendering device.
     ///
-    /// Hot-plug only: the initial devices come with the process's command line so Mesa can
-    /// initialize before the sandbox seals. A sealed process cannot bring up a renderer.
+    /// Hot-plug only: the initial devices come with the process's command line or in
+    /// `Start`, so Mesa can initialize before the sandbox seals. A sealed process cannot bring
+    /// up a renderer.
     AddDevice {
         dev: DevId,
         path: String,

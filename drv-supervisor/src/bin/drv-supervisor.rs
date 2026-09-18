@@ -1,7 +1,7 @@
 //! The supervisor: forks and restarts the trusted set, each as its own user with the fds it
-//! needs already in place, and links them (see the crate docs). drv-appd and drv-forker are
-//! one group: they share a channel nothing else can reach, so when either dies both are
-//! restarted with a fresh one.
+//! needs already in place, and links them (see the crate docs). Two groups restart as a
+//! whole: drv-appd with drv-forker (they share a channel nothing else can reach), and the
+//! compositor with its GPU process (the sealed GPU process cannot be given a new core).
 
 use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
@@ -64,6 +64,16 @@ struct Args {
     /// `PATH:MODE` (octal): a directory the compositor owns, created before it starts.
     #[arg(long = "compositor-dir")]
     compositor_dirs: Vec<String>,
+    /// System user the GPU process runs as (`render` group for Mesa's render nodes).
+    #[arg(long)]
+    gpu_user: Option<String>,
+    /// The GPU process's command line, whitespace-separated (`niri gpu-process --mode drm`).
+    /// It is the compositor's group: either dying restarts both.
+    #[arg(long)]
+    gpu_exec: Option<String>,
+    /// `NAME=VALUE` in the GPU process's environment. Repeatable; it gets nothing else.
+    #[arg(long = "gpu-env")]
+    gpu_env: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -108,6 +118,13 @@ fn supervise(args: Args) -> Result<(), String> {
         &args.compositor_env,
         &args.compositor_dirs,
     )?;
+    let gpu = service(
+        "compositor-gpu",
+        args.gpu_user.as_deref(),
+        args.gpu_exec.as_deref(),
+        &args.gpu_env,
+        &[],
+    )?;
     let forker = service("drv-forker", Some("root"), Some(&args.forker_exec), &[], &[])?
         .ok_or("--forker-exec is required")?;
     let appd = service(
@@ -130,14 +147,22 @@ fn supervise(args: Args) -> Result<(), String> {
 
     let supervisor = Arc::new(Supervisor::default());
     // The services first: the compositor waits for the public socket, which is bound.
-    for (peer, service) in [
-        (Peer::Seatd, seatd),
-        (Peer::Authd, authd),
-        (Peer::Compositor, compositor),
-    ] {
+    for (peer, service) in [(Peer::Seatd, seatd), (Peer::Authd, authd)] {
         let Some(service) = service else { continue };
         let supervisor = supervisor.clone();
         thread::spawn(move || supervise_service(peer, service, &supervisor));
+    }
+    match (compositor, gpu) {
+        (Some(compositor), Some(gpu)) => {
+            let supervisor = supervisor.clone();
+            thread::spawn(move || supervise_compositor(&supervisor, &compositor, &gpu));
+        }
+        (Some(compositor), None) => {
+            let supervisor = supervisor.clone();
+            thread::spawn(move || supervise_service(Peer::Compositor, compositor, &supervisor));
+        }
+        (None, Some(_)) => return Err("--gpu-exec without a compositor".to_owned()),
+        (None, None) => {}
     }
     supervise_appd(&supervisor, &appd, &forker, &listener);
 }
@@ -243,6 +268,66 @@ fn supervise_appd(supervisor: &Supervisor, appd: &Service, forker: &Service, lis
     }
 }
 
+/// The compositor and its GPU process as one group. The GPU process is started first and
+/// gets the core's connection down its wire; it waits there for the core's `Start`. When
+/// either dies the other is stopped and both come back: a sealed GPU process cannot bring up
+/// a renderer for a new core, and a core cannot outlive its renderer.
+fn supervise_compositor(supervisor: &Supervisor, compositor: &Service, gpu: &Service) {
+    loop {
+        match start_compositor_group(compositor, gpu) {
+            Ok((children, wire_compositor, wire_gpu)) => {
+                supervisor.wiring.attach_service(Peer::Gpu, wire_gpu);
+                supervisor.wiring.attach_service(Peer::Compositor, wire_compositor);
+                supervisor.compositor_started();
+                wait_group(children);
+                supervisor.compositor_stopped();
+                supervisor.wiring.detach_service(Peer::Compositor);
+                supervisor.wiring.detach_service(Peer::Gpu);
+            }
+            Err(err) => eprintln!("drv-supervisor: {err}"),
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn start_compositor_group(
+    compositor: &Service,
+    gpu: &Service,
+) -> Result<(Group, std::os::fd::OwnedFd, std::os::fd::OwnedFd), String> {
+    let (gpu_child, wire_gpu) = start_wired(gpu)?;
+    eprintln!(
+        "drv-supervisor: {} running as uid {}, pid {}",
+        gpu.name,
+        gpu.uid,
+        gpu_child.id()
+    );
+    let (compositor_child, wire_compositor) = match start_wired(compositor) {
+        Ok(started) => started,
+        Err(err) => {
+            stop(gpu_child);
+            return Err(err);
+        }
+    };
+    eprintln!(
+        "drv-supervisor: {} running as uid {}, pid {}",
+        compositor.name,
+        compositor.uid,
+        compositor_child.id()
+    );
+    Ok((
+        vec![("compositor-gpu", gpu_child), ("compositor", compositor_child)],
+        wire_compositor,
+        wire_gpu,
+    ))
+}
+
+/// Terminates and reaps a child whose group could not be completed.
+fn stop(mut child: Child) {
+    // SAFETY: our child's pid, not yet reaped.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = child.wait();
+}
+
 type Group = Vec<(&'static str, Child)>;
 
 fn start_appd_group(
@@ -266,10 +351,7 @@ fn start_appd_group(
     ) {
         Ok(child) => child,
         Err(err) => {
-            // SAFETY: our child's pid, not yet reaped.
-            unsafe { libc::kill(forker_child.id() as i32, libc::SIGTERM) };
-            let mut forker_child = forker_child;
-            let _ = forker_child.wait();
+            stop(forker_child);
             return Err(err);
         }
     };

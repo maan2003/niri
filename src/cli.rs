@@ -39,9 +39,11 @@ pub enum Sub {
     /// Run as the GPU process (internal).
     #[command(hide = true)]
     GpuProcess {
-        /// Socket to the compositor core, inherited from the parent.
+        /// Socket to the compositor core, inherited from the parent. Without it the process
+        /// runs under drv-supervisor: the core's connection arrives on the wire (fd 3,
+        /// `DRV_WIRE_FD`) and the startup devices come over it, in the core's `Start`.
         #[arg(long)]
-        socket_fd: i32,
+        socket_fd: Option<i32>,
         /// `headless` or `drm`.
         #[arg(long, default_value = "headless")]
         mode: String,

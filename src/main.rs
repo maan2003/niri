@@ -105,7 +105,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 devices,
                 render_node_hint,
             } => {
-                let fd = niri::gpu::client::inherited_socket(socket_fd);
+                let (fd, await_start) = match socket_fd {
+                    Some(fd) => (niri::gpu::client::inherited_socket(fd), false),
+                    None => (core_from_wire(), true),
+                };
+                if await_start && !devices.is_empty() {
+                    error!("gpu process: --device needs --socket-fd; under the supervisor the devices come from the core");
+                    std::process::exit(1);
+                }
                 let Some(mode) = niri::gpu::client::Mode::parse(&mode) else {
                     error!("unknown gpu process mode {mode:?}");
                     std::process::exit(1);
@@ -132,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 if let Err(err) =
-                    niri::gpu::server::run(fd, mode, sandbox, startup, render_node_hint)
+                    niri::gpu::server::run(fd, mode, sandbox, startup, render_node_hint, await_start)
                 {
                     error!("gpu process failed: {err:?}");
                     std::process::exit(1);
@@ -211,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = connect_policy();
     if !niri::wire::init() {
-        error!("no spawner wire (DRV_WIRE_FD): the compositor runs under drv-spawnd");
+        error!("no wire (DRV_WIRE_FD): the compositor runs under drv-supervisor");
         std::process::exit(1);
     }
 
@@ -491,6 +498,27 @@ impl Drop for ShutdownTracy {
         #[cfg(feature = "profile-with-tracy-ondemand")]
         unsafe {
             tracy_client::sys::___tracy_shutdown_profiler();
+        }
+    }
+}
+
+/// The GPU process under drv-supervisor: the core's connection is the one attachment on the
+/// wire. Anything else is a misconfiguration, and there is nothing to do without a core.
+fn core_from_wire() -> std::os::fd::OwnedFd {
+    use drv_policy::wire::{self, Attach};
+    let Some(wire) = wire::take() else {
+        error!("gpu process: no --socket-fd and no wire (DRV_WIRE_FD): it runs under drv-supervisor");
+        std::process::exit(1);
+    };
+    match wire::recv_attach(&wire) {
+        Ok((Attach::Compositor, sock)) => sock,
+        Ok((other, _)) => {
+            error!("gpu process: expected the core on the wire, got {other:?}");
+            std::process::exit(1);
+        }
+        Err(err) => {
+            error!("gpu process: the wire failed before the core arrived: {err}");
+            std::process::exit(1);
         }
     }
 }

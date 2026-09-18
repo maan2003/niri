@@ -520,6 +520,10 @@ fn main() {
         .expect("timer");
 
     loop {
-        event_loop.dispatch(None, &mut app).expect("dispatch");
+        if let Err(err) = event_loop.dispatch(None, &mut app) {
+            // The compositor went away (it restarts locked and launches us again).
+            eprintln!("drv-lock: connection lost: {err}; exiting");
+            process::exit(0);
+        }
     }
 }
