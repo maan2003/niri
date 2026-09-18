@@ -1,0 +1,218 @@
+diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
+--- a/drivers/gpu/drm/drm_atomic_helper.c	2026-09-18 08:57:24.991672850 +0000
++++ b/drivers/gpu/drm/drm_atomic_helper.c	2026-09-18 08:57:24.995672878 +0000
+@@ -28,6 +28,8 @@
+ #include <linux/export.h>
+ #include <linux/dma-fence.h>
+ #include <linux/ktime.h>
++#include <linux/moduleparam.h>
++#include <linux/slab.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -3821,6 +3823,143 @@
+ }
+ EXPORT_SYMBOL(drm_atomic_helper_suspend);
+ 
++/*
++ * Blank-on-resume: bring displays back from suspend with every plane
++ * disabled, so the panel shows black until userspace commits a new frame
++ * instead of replaying whatever was on screen before suspend. A lock screen
++ * that has not painted yet must not be a window into the old desktop.
++ */
++bool drm_blank_on_resume;
++module_param_named(blank_on_resume, drm_blank_on_resume, bool, 0644);
++MODULE_PARM_DESC(blank_on_resume,
++		 "Resume with all planes disabled (black) until userspace commits (default: false)");
++
++struct drm_atomic_blanked_plane {
++	struct drm_crtc *crtc;
++	struct drm_framebuffer *fb;
++	int32_t crtc_x, crtc_y;
++	uint32_t crtc_w, crtc_h;
++	uint32_t src_x, src_y, src_w, src_h;
++};
++
++/*
++ * Remember every plane's framebuffer (holding a reference) and geometry so a
++ * failed blanked commit can fall back to the plain restore.
++ */
++static struct drm_atomic_blanked_plane *
++drm_atomic_blank_alloc(struct drm_atomic_state *state)
++{
++	struct drm_atomic_blanked_plane *blanked;
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	int i;
++
++	blanked = kcalloc(state->dev->mode_config.num_total_plane,
++			  sizeof(*blanked), GFP_KERNEL);
++	if (!blanked)
++		return NULL;
++
++	for_each_new_plane_in_state(state, plane, plane_state, i) {
++		struct drm_atomic_blanked_plane *b = &blanked[drm_plane_index(plane)];
++
++		b->crtc = plane_state->crtc;
++		b->fb = plane_state->fb;
++		if (b->fb)
++			drm_framebuffer_get(b->fb);
++		b->crtc_x = plane_state->crtc_x;
++		b->crtc_y = plane_state->crtc_y;
++		b->crtc_w = plane_state->crtc_w;
++		b->crtc_h = plane_state->crtc_h;
++		b->src_x = plane_state->src_x;
++		b->src_y = plane_state->src_y;
++		b->src_w = plane_state->src_w;
++		b->src_h = plane_state->src_h;
++	}
++
++	return blanked;
++}
++
++static void drm_atomic_blank_free(struct drm_atomic_state *state,
++				  struct drm_atomic_blanked_plane *blanked)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	int i;
++
++	for_each_new_plane_in_state(state, plane, plane_state, i) {
++		struct drm_atomic_blanked_plane *b = &blanked[drm_plane_index(plane)];
++
++		if (b->fb)
++			drm_framebuffer_put(b->fb);
++	}
++	kfree(blanked);
++}
++
++/**
++ * drm_atomic_helper_blank_planes - detach every plane in a saved state
++ * @state: the state a resume is about to commit
++ * @blanked: what drm_atomic_blank_alloc() saved, or NULL
++ *
++ * Idempotent, so a commit retried after -EDEADLK may call it again. Does
++ * nothing when the blank_on_resume parameter is off.
++ */
++void drm_atomic_helper_blank_planes(struct drm_atomic_state *state,
++				    struct drm_atomic_blanked_plane *blanked)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	int i;
++
++	if (!drm_blank_on_resume)
++		return;
++
++	for_each_new_plane_in_state(state, plane, plane_state, i) {
++		if (!plane_state->crtc && !plane_state->fb)
++			continue;
++
++		/* Failing to detach only means this plane keeps its picture. */
++		if (drm_atomic_set_crtc_for_plane(plane_state, NULL))
++			continue;
++		drm_atomic_set_fb_for_plane(plane_state, NULL);
++		plane_state->crtc_x = 0;
++		plane_state->crtc_y = 0;
++		plane_state->crtc_w = 0;
++		plane_state->crtc_h = 0;
++		plane_state->src_x = 0;
++		plane_state->src_y = 0;
++		plane_state->src_w = 0;
++		plane_state->src_h = 0;
++		plane_state->visible = false;
++	}
++}
++EXPORT_SYMBOL(drm_atomic_helper_blank_planes);
++
++static void drm_atomic_helper_unblank_planes(struct drm_atomic_state *state,
++					     struct drm_atomic_blanked_plane *blanked)
++{
++	struct drm_plane *plane;
++	struct drm_plane_state *plane_state;
++	int i;
++
++	for_each_new_plane_in_state(state, plane, plane_state, i) {
++		struct drm_atomic_blanked_plane *b = &blanked[drm_plane_index(plane)];
++
++		if (!b->crtc && !b->fb)
++			continue;
++		if (drm_atomic_set_crtc_for_plane(plane_state, b->crtc))
++			continue;
++		drm_atomic_set_fb_for_plane(plane_state, b->fb);
++		plane_state->crtc_x = b->crtc_x;
++		plane_state->crtc_y = b->crtc_y;
++		plane_state->crtc_w = b->crtc_w;
++		plane_state->crtc_h = b->crtc_h;
++		plane_state->src_x = b->src_x;
++		plane_state->src_y = b->src_y;
++		plane_state->src_w = b->src_w;
++		plane_state->src_h = b->src_h;
++	}
++}
++
+ /**
+  * drm_atomic_helper_commit_duplicated_state - commit duplicated state
+  * @state: duplicated atomic state to commit
+@@ -3886,15 +4025,34 @@
+ 			     struct drm_atomic_state *state)
+ {
+ 	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_blanked_plane *blanked = NULL;
+ 	int err;
+ 
+ 	drm_mode_config_reset(dev);
+ 
++	if (drm_blank_on_resume)
++		blanked = drm_atomic_blank_alloc(state);
++
+ 	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, err);
+ 
+-	err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
++	if (blanked) {
++		drm_atomic_helper_blank_planes(state, blanked);
++		err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
++		if (err && err != -EDEADLK) {
++			drm_warn(dev, "blank-on-resume commit failed (%d), restoring the last framebuffers\n",
++				 err);
++			drm_atomic_helper_unblank_planes(state, blanked);
++			kfree(blanked);
++			blanked = NULL;
++			err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
++		}
++	} else {
++		err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
++	}
+ 
+ 	DRM_MODESET_LOCK_ALL_END(dev, ctx, err);
++	if (blanked)
++		drm_atomic_blank_free(state, blanked);
+ 	drm_atomic_state_put(state);
+ 
+ 	return err;
+diff -Naur a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c	2026-09-18 08:57:24.993672864 +0000
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c	2026-09-18 08:57:24.997672893 +0000
+@@ -785,6 +785,8 @@
+ 		drm_modeset_backoff(&ctx);
+ 	}
+ 
++	if (!ret && state)
++		drm_atomic_helper_blank_planes(state, NULL);
+ 	if (!ret)
+ 		ret = __intel_display_driver_resume(display, state, &ctx);
+ 
+diff -Naur a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
+--- a/include/drm/drm_atomic_helper.h	2026-09-18 08:57:24.992672857 +0000
++++ b/include/drm/drm_atomic_helper.h	2026-09-18 08:57:24.996672885 +0000
+@@ -170,6 +170,10 @@
+ struct drm_atomic_state *drm_atomic_helper_suspend(struct drm_device *dev);
+ int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_state *state,
+ 					      struct drm_modeset_acquire_ctx *ctx);
++struct drm_atomic_blanked_plane;
++extern bool drm_blank_on_resume;
++void drm_atomic_helper_blank_planes(struct drm_atomic_state *state,
++				    struct drm_atomic_blanked_plane *blanked);
+ int drm_atomic_helper_resume(struct drm_device *dev,
+ 			     struct drm_atomic_state *state);
+ 

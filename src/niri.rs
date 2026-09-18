@@ -188,7 +188,7 @@ use crate::utils::spawning::CHILD_ENV;
 use crate::utils::vblank_throttle::VBlankThrottle;
 use crate::utils::watcher::Watcher;
 use crate::utils::{
-    center, center_f64, expand_home, get_monotonic_time, ipc_transform_to_smithay, logical_output,
+    center, center_f64, expand_home, get_boot_time, get_monotonic_time, ipc_transform_to_smithay, logical_output,
     make_screenshot_path, output_matches_name, output_size, panel_orientation,
     send_scale_transform,
 };
@@ -439,8 +439,10 @@ pub struct Niri {
     pub mods_with_finger_scroll_binds: HashSet<Modifiers>,
 
     pub lock_state: LockState,
-    /// The session is unlocked until this monotonic time; `None` is locked. Only an `Unlock`
-    /// from drv-authd sets it, so a lock client never unlocks anything by itself.
+    /// The session is unlocked until this boot time (`CLOCK_BOOTTIME`, so suspend counts);
+    /// `None` is locked. Only an `Unlock` from drv-authd sets it, so a lock client never
+    /// unlocks anything by itself. `is_locked` compares against now, so every frame and input
+    /// decision sees an expired lease as locked before `check_lease` gets to clean up.
     pub lease_until: Option<Duration>,
     pub lease_idle_timeout: Duration,
     /// A visible idle-inhibiting surface keeps extending the lease.
@@ -5135,6 +5137,7 @@ impl Niri {
     }
 
     fn redraw(&mut self, backend: &mut Backend, output: &Output) {
+        self.check_lease();
         let _span = tracy_client::span!("Niri::redraw");
 
         // Verify our invariant.
@@ -6704,7 +6707,7 @@ impl Niri {
     }
 
     pub fn is_locked(&self) -> bool {
-        self.lease_until.is_none()
+        !self.lease_until.is_some_and(|until| get_boot_time() < until)
     }
 
     /// A client asks to lock: fine only while we are locked ourselves, otherwise `finished`.
@@ -6740,7 +6743,7 @@ impl Niri {
 
     /// Lock now: no lease, black outputs, launch the lock app.
     pub fn lock_now(&mut self) {
-        if self.is_locked() {
+        if self.lease_until.is_none() {
             return;
         }
         info!("locking session");
@@ -6750,14 +6753,14 @@ impl Niri {
             .set_cursor_image(CursorImageStatus::default_named());
         self.cancel_mru();
         self.queue_redraw_all();
-        self.lock_tick();
+        self.launch_lock_app(get_boot_time());
     }
 
     /// drv-authd verified the PIN: unlock and send the lock client away.
     pub fn unlock_with_lease(&mut self, idle_timeout: Duration) {
         info!("unlocked by drv-authd; locking again after {idle_timeout:?} of inactivity");
         self.lease_idle_timeout = idle_timeout;
-        self.lease_until = Some(get_monotonic_time() + idle_timeout);
+        self.lease_until = Some(get_boot_time() + idle_timeout);
         if let LockState::Locked(lock) = &self.lock_state {
             if lock.is_alive() {
                 lock.finished();
@@ -6767,8 +6770,27 @@ impl Niri {
     }
 
     fn touch_lease(&mut self) {
-        if self.lease_until.is_some() {
-            self.lease_until = Some(get_monotonic_time() + self.lease_idle_timeout);
+        let now = get_boot_time();
+        if self.lease_until.is_some_and(|until| now < until) {
+            self.lease_until = Some(now + self.lease_idle_timeout);
+        }
+    }
+
+    /// The one place an expired lease turns into the locked state: called before every frame
+    /// and every input event, and from the 1 s tick. An idle-inhibited session gets extended
+    /// instead.
+    pub fn check_lease(&mut self) {
+        let now = get_boot_time();
+        let Some(until) = self.lease_until else {
+            return;
+        };
+        if now < until {
+            return;
+        }
+        if self.idle_inhibited {
+            self.lease_until = Some(now + self.lease_idle_timeout);
+        } else {
+            self.lock_now();
         }
     }
 
@@ -6781,22 +6803,17 @@ impl Niri {
     }
 
     pub fn lock_tick(&mut self) {
-        let now = get_monotonic_time();
-        if let Some(until) = self.lease_until {
-            if now >= until {
-                if self.idle_inhibited {
-                    self.lease_until = Some(now + self.lease_idle_timeout);
-                } else {
-                    self.lock_now();
-                    return;
-                }
-            }
-        }
+        self.check_lease();
+        let now = get_boot_time();
 
         if self.auth_link.is_none() {
             self.connect_auth(now);
         }
 
+        self.launch_lock_app(now);
+    }
+
+    fn launch_lock_app(&mut self, now: Duration) {
         if !self.is_locked() || self.lock_client_alive() {
             return;
         }

@@ -138,6 +138,9 @@ impl State {
     {
         let _span = tracy_client::span!("process_input_event");
 
+        // An expired lease locks before this event can touch anything.
+        self.niri.check_lease();
+
         // Make sure some logic like workspace clean-up has a chance to run before doing actions.
         self.niri.advance_animations();
 

@@ -162,6 +162,12 @@ pub fn get_monotonic_time() -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
+/// Like `get_monotonic_time`, but keeps counting through suspend.
+pub fn get_boot_time() -> Duration {
+    let ts = clock_gettime(ClockId::Boottime);
+    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 pub fn center(rect: Rectangle<i32, Logical>) -> Point<i32, Logical> {
     rect.loc + rect.size.downscale(2).to_point()
 }
