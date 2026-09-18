@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Kind {
@@ -41,10 +41,15 @@ pub enum Request {
         app: String,
         uid: u32,
         cursor: Cursor,
+        /// A token from an earlier `Cast` answer to this app: the same screen again, with
+        /// no dialog, if the consent still stands.
+        again: Option<String>,
     },
     /// The app withdrew the request, or closed its session: the dialog goes down, or the
     /// cast stops. No answer follows.
     Cancel { id: u64 },
+    /// The app is gone: what the person allowed it ends with it.
+    Forget { app: String, uid: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +65,8 @@ pub enum Response {
         output: String,
         width: i32,
         height: i32,
+        /// Names this consent in a later `Cast { again }` by the same app.
+        token: String,
     },
     /// The cast ended: the person stopped it, or the screen went away.
     Closed { id: u64 },

@@ -24,7 +24,7 @@ use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
 use zbus::zvariant::serialized::Context;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, Value};
+use zbus::zvariant::{Array, ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, Value};
 use zbus::AuthMechanism;
 
 #[derive(Parser)]
@@ -152,17 +152,64 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
     use pipewire::loop_::Timeout;
     use pipewire::main_loop::MainLoopRc;
     use pipewire::permissions::{Permission, PermissionFlags};
+    use pipewire::types::ObjectType;
+    use std::cell::Cell;
 
     let main_loop = MainLoopRc::new(None).context("PipeWire main loop")?;
     let context = ContextRc::new(&main_loop, None).context("PipeWire context")?;
     let core = context.connect_rc(None).context("connecting to PipeWire")?;
+    // A round trip: what was sent before it is in.
+    let roundtrip = || -> anyhow::Result<()> {
+        let done = Rc::new(Cell::new(false));
+        let pending = core.sync(0).context("PipeWire sync")?;
+        let _listener = {
+            let done = done.clone();
+            core.add_listener_local()
+                .done(move |id, seq| {
+                    if id == PW_ID_CORE && seq == pending {
+                        done.set(true);
+                    }
+                })
+                .error(|id, seq, res, message| {
+                    eprintln!("bridge: PipeWire error on {id} ({seq}): {res} {message}");
+                })
+                .register()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.get() {
+            anyhow::ensure!(Instant::now() < deadline, "PipeWire did not answer");
+            main_loop.loop_().iterate(Timeout::Finite(Duration::from_millis(200)));
+        }
+        Ok(())
+    };
+    // The app makes its own stream node through the client-node factory, which it must
+    // be able to name: that one factory stays visible.
+    let registry = core.get_registry_rc().context("PipeWire registry")?;
+    let factory = Rc::new(Cell::new(0u32));
+    let _globals = {
+        let factory = factory.clone();
+        registry
+            .add_listener_local()
+            .global(move |g| {
+                let client_node = g.props.is_some_and(|p| {
+                    p.get("factory.type.name") == Some("PipeWire:Interface:ClientNode")
+                });
+                if g.type_ == ObjectType::Factory && client_node {
+                    factory.set(g.id);
+                }
+            })
+            .register()
+    };
+    roundtrip()?;
+    anyhow::ensure!(factory.get() != 0, "PipeWire has no client-node factory");
     // SAFETY: the core is connected; the client proxy it returns lives as long as the core.
     let client = unsafe { pipewire::sys::pw_core_get_client(core.as_raw_ptr()) };
     anyhow::ensure!(!client.is_null(), "PipeWire gave no client");
-    let rx = PermissionFlags::R | PermissionFlags::X;
+    let rwx = PermissionFlags::R | PermissionFlags::W | PermissionFlags::X;
     let perms = [
-        Permission::new(PW_ID_CORE, rx),
-        Permission::new(node_id, rx),
+        Permission::new(PW_ID_CORE, rwx),
+        Permission::new(factory.get(), PermissionFlags::R),
+        Permission::new(node_id, rwx),
         Permission::new(pipewire::sys::PW_ID_ANY, PermissionFlags::empty()),
     ];
     // SAFETY: a live client proxy, and the array is `pw_permission` in memory.
@@ -175,27 +222,10 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
             perms.as_ptr().cast()
         );
     }
-    // A round trip, so the permissions are in before the fd changes hands.
-    let done = Rc::new(std::cell::Cell::new(false));
-    let pending = core.sync(0).context("PipeWire sync")?;
-    let _listener = {
-        let done = done.clone();
-        core.add_listener_local()
-            .done(move |id, seq| {
-                if id == PW_ID_CORE && seq == pending {
-                    done.set(true);
-                }
-            })
-            .error(|id, seq, res, message| {
-                eprintln!("bridge: PipeWire error on {id} ({seq}): {res} {message}");
-            })
-            .register()
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !done.get() {
-        anyhow::ensure!(Instant::now() < deadline, "PipeWire did not answer");
-        main_loop.loop_().iterate(Timeout::Finite(Duration::from_millis(200)));
-    }
+    // So the permissions are in before the fd changes hands.
+    roundtrip()?;
+    drop(_globals);
+    drop(registry);
     // SAFETY: after steal_fd the core no longer owns the fd; nothing else here uses it.
     let fd = unsafe { pipewire::sys::pw_core_steal_fd(core.as_raw_ptr()) };
     anyhow::ensure!(fd >= 0, "PipeWire kept its fd");
@@ -396,6 +426,7 @@ impl Portal {
         app: &str,
         uid: u32,
         cursor: protocol::Cursor,
+        again: Option<String>,
         on: impl Fn(protocol::Response) + Send + Sync + 'static,
     ) -> anyhow::Result<u64> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -405,12 +436,21 @@ impl Portal {
             app: app.to_owned(),
             uid,
             cursor,
+            again,
         };
         if let Err(err) = seq::send(&self.sock, &req, &[]) {
             self.casts.lock().unwrap().remove(&id);
             return Err(err).context("asking drv-portal");
         }
         Ok(id)
+    }
+
+    /// The app's connection ended: its screen consents end with it.
+    fn forget(&self, app: &str, uid: u32) {
+        let req = protocol::Request::Forget { app: app.to_owned(), uid };
+        if let Err(err) = seq::send(&self.sock, &req, &[]) {
+            eprintln!("bridge: forgetting {app} at drv-portal: {err}");
+        }
     }
 
     /// Withdraws a chooser, or a cast: a live one stops.
@@ -426,6 +466,11 @@ impl Portal {
 /// A screencast session of one app: from `CreateSession` to `Close`, or the cast's end.
 struct CastSession {
     cursor: protocol::Cursor,
+    /// The app asked for a restore token (any `persist_mode`); it gets one that lasts while
+    /// it runs.
+    persist: bool,
+    /// The token the app gave back, for the same screen with no dialog.
+    again: Option<String>,
     /// Set by `Start`.
     portal_id: Option<u64>,
     /// The node, once the person consented and it streams.
@@ -531,6 +576,7 @@ impl AppLink {
         for id in ids {
             link.portal.cancel(id);
         }
+        link.portal.forget(&link.app.name, link.uid);
         // Dropping our bus connection ends the other thread; sessions the portal still holds
         // for this connection go away with it.
         zbus::block_on(link.bus.inner().clone().close())?;
@@ -686,6 +732,8 @@ impl AppLink {
                     session.clone(),
                     CastSession {
                         cursor: protocol::Cursor::Embedded,
+                        persist: false,
+                        again: None,
                         portal_id: None,
                         node: None,
                     },
@@ -705,10 +753,14 @@ impl AppLink {
                     Some(4) => protocol::Cursor::Metadata,
                     _ => protocol::Cursor::Embedded,
                 };
+                let persist = options.get("persist_mode").cloned().and_then(|v| u32::try_from(v).ok()).unwrap_or(0) != 0;
+                let again = options.get("restore_token").cloned().and_then(|v| String::try_from(v).ok());
                 {
                     let mut state = self.state.lock().unwrap();
                     let s = state.sessions.get_mut(session.as_str()).context("no such session")?;
                     s.cursor = cursor;
+                    s.persist = persist;
+                    s.again = again;
                 }
                 let handle = self.handle(msg, &caller, &options, "handle_token");
                 self.p2p.send(&reply_handle(&handle)?)?;
@@ -718,34 +770,54 @@ impl AppLink {
             "Start" => {
                 let (session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
                     msg.body().deserialize()?;
-                let cursor = {
+                let (cursor, again) = {
                     let state = self.state.lock().unwrap();
                     let s = state.sessions.get(session.as_str()).context("no such session")?;
                     anyhow::ensure!(s.portal_id.is_none(), "the session was started already");
-                    s.cursor
+                    (s.cursor, s.again.clone())
                 };
                 let handle = self.handle(msg, &caller, &options, "handle_token");
                 let link = self.clone();
                 let session_path = session.as_str().to_owned();
                 let (caller2, handle2) = (caller.clone(), handle.clone());
-                let id = self.portal.cast(&self.app.name, self.uid, cursor, move |resp| {
+                let id = self.portal.cast(&self.app.name, self.uid, cursor, again, move |resp| {
                     let res = match resp {
-                        protocol::Response::Cast { node_id, output, width, height, .. } => {
+                        protocol::Response::Cast { node_id, output, width, height, token, .. } => {
                             let mut state = link.state.lock().unwrap();
                             state.ours.remove(&handle2);
-                            match state.sessions.get_mut(&session_path) {
-                                Some(s) => s.node = Some(node_id),
+                            let persist = match state.sessions.get_mut(&session_path) {
+                                Some(s) => {
+                                    s.node = Some(node_id);
+                                    s.persist
+                                }
                                 None => return, // closed meanwhile; drv-portal has the Cancel
-                            }
+                            };
                             drop(state);
                             let mut stream: HashMap<&str, Value<'_>> = HashMap::new();
                             stream.insert("source_type", Value::U32(1));
                             stream.insert("id", Value::from(output));
                             stream.insert("position", Value::from((0i32, 0i32)));
                             stream.insert("size", Value::from((width, height)));
-                            let streams = vec![Value::from(Structure::from((node_id, stream)))];
+                            // `a(ua{sv})` as the spec has it; a Vec of Values would go
+                            // out as `av`, which apps' parsers read as node 0.
+                            let streams = Signature::try_from("(ua{sv})").map_err(|e| anyhow::anyhow!("{e:?}")).and_then(|sig| {
+                                let mut streams = Array::new(&sig);
+                                streams.append(Value::from(Structure::from((node_id, stream))))?;
+                                Ok(streams)
+                            });
                             let mut results: HashMap<&str, Value<'_>> = HashMap::new();
-                            results.insert("streams", Value::from(streams));
+                            match streams {
+                                Ok(streams) => results.insert("streams", Value::from(streams)),
+                                Err(err) => {
+                                    eprintln!("bridge: {}: screencast streams: {err:#}", link.app.name);
+                                    return;
+                                }
+                            };
+                            if persist {
+                                // 1: for as long as the app runs, whatever it asked for.
+                                results.insert("persist_mode", Value::U32(1));
+                                results.insert("restore_token", Value::from(token));
+                            }
                             link.respond(&handle2, &caller2, 0, results)
                         }
                         protocol::Response::Cancelled { .. } => {
@@ -857,6 +929,22 @@ impl AppLink {
             builder = builder.interface(interface.clone())?;
         }
         let forwarded = with_body(builder, body)?;
+        // Which portals apps still need from xdg-desktop-portal, for retiring it.
+        let iface = hdr.interface().map_or("", |i| i.as_str());
+        let about = if iface == PROPERTIES {
+            msg.body()
+                .deserialize::<(String, String)>()
+                .map(|(i, p)| format!(" {i}.{p}"))
+                .or_else(|_| msg.body().deserialize::<(String,)>().map(|(i,)| format!(" {i}")))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "bridge: {}: forwards {iface}.{}{about} to xdg-desktop-portal",
+            self.app.name,
+            hdr.member().map_or("", |m| m.as_str())
+        );
         {
             let mut state = self.state.lock().unwrap();
             state

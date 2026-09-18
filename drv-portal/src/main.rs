@@ -79,6 +79,14 @@ struct Live {
     app: String,
     uid: u32,
     output: Output,
+    token: String,
+}
+
+/// A screen the person let an app share, good for that app until the bridge says it is gone.
+struct Consent {
+    app: String,
+    uid: u32,
+    output: String,
 }
 
 /// The dialog that is up.
@@ -138,6 +146,9 @@ struct App {
     outputs: Vec<Output>,
     /// Casts by the bridge's request id.
     casts: HashMap<u64, Live>,
+    /// Consents by token.
+    consents: HashMap<String, Consent>,
+    next_token: u64,
 }
 
 impl App {
@@ -153,10 +164,23 @@ impl App {
                 self.queue.push_back(Pending { id, app, uid, title, what: What::Choose(kind) });
                 self.next(qh);
             }
-            Request::Cast { id, app, uid, cursor } => {
+            Request::Cast { id, app, uid, cursor, again } => {
                 self.tell(ToCompositor::Outputs);
+                if let Some(token) = again {
+                    let standing = self.consents.get(&token).filter(|c| c.app == app && c.uid == uid);
+                    if let Some(output) = standing.and_then(|c| self.outputs.iter().find(|o| o.name == c.output)).cloned() {
+                        eprintln!("drv-portal: {app} (uid {uid}) shares {} again", output.name);
+                        let name = output.name.clone();
+                        self.casts.insert(id, Live { app, uid, output, token });
+                        self.tell(ToCompositor::Start { cast: id, output: name, cursor });
+                        return;
+                    }
+                }
                 self.queue.push_back(Pending { id, app, uid, title: String::new(), what: What::Cast(cursor) });
                 self.next(qh);
+            }
+            Request::Forget { app, uid } => {
+                self.consents.retain(|_, c| !(c.app == app && c.uid == uid));
             }
             Request::Cancel { id } => {
                 self.queue.retain(|p| p.id != id);
@@ -198,6 +222,7 @@ impl App {
                         output: live.output.name.clone(),
                         width: live.output.width,
                         height: live.output.height,
+                        token: live.token.clone(),
                     });
                 }
                 // Cancelled in between: the compositor started it for nobody.
@@ -390,7 +415,11 @@ impl App {
         };
         let id = d.req.id;
         eprintln!("drv-portal: {} (uid {}) may share {name}", d.req.app, d.req.uid);
-        self.casts.insert(id, Live { app: d.req.app.clone(), uid: d.req.uid, output });
+        // Tokens only mean something with the app they were given to, so plain counting does.
+        self.next_token += 1;
+        let token = format!("drv{}", self.next_token);
+        self.consents.insert(token.clone(), Consent { app: d.req.app.clone(), uid: d.req.uid, output: name.clone() });
+        self.casts.insert(id, Live { app: d.req.app.clone(), uid: d.req.uid, output, token });
         self.tell(ToCompositor::Start { cast: id, output: name, cursor });
         self.dialog = None;
         self.layer = None;
@@ -621,6 +650,8 @@ fn run() -> Result<(), String> {
         dialog: None,
         outputs: Vec::new(),
         casts: HashMap::new(),
+        consents: HashMap::new(),
+        next_token: 0,
     };
 
     let src_qh = qh.clone();
