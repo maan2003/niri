@@ -120,6 +120,7 @@ in
       seat = lib.mkOption { type = lib.types.int; default = 907; };
       lock = lib.mkOption { type = lib.types.int; default = 908; };
       forker = lib.mkOption { type = lib.types.int; default = 909; };
+      supervisor = lib.mkOption { type = lib.types.int; default = 910; };
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -256,6 +257,8 @@ in
       # The forker: not root. The supervisor leaves it setuid, setgid, setpcap, sys_admin and
       # chown, and hands it the supervisor's cgroup subtree and the apps' directories.
       drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
+      # The supervisor: the capabilities its unit grants it (below), nothing else.
+      drv-supervisor = { uid = cfg.ids.supervisor; group = "drv-supervisor"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -273,6 +276,7 @@ in
       drv-seat.gid = cfg.ids.seat;
       drv-lock.gid = cfg.ids.lock;
       drv-forker.gid = cfg.ids.forker;
+      drv-supervisor.gid = cfg.ids.supervisor;
       render = { };
     };
 
@@ -306,14 +310,24 @@ in
       };
     };
 
-    # Root. Starts the trusted set (drv-seatd, drv-authd, the compositor with its GPU process
-    # and locker, drv-appd with its forker) as their own users, wires them with socketpairs and restarts what dies; their
-    # logs land here. The compositor's environment is exactly what is listed.
+    # Starts the trusted set (drv-seatd, drv-authd, the compositor with its GPU process and
+    # locker, drv-appd with its forker) as their own users, wires them with socketpairs and
+    # restarts what dies; their logs land here. The compositor's environment is exactly what
+    # is listed. Not root: it holds the union of what its children keep plus what switching
+    # them takes, and nothing outside that bounding set.
     systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
       after = [ "drv-session-bus.service" ];
       requires = [ "drv-session-bus.service" ];
       serviceConfig = {
+        User = "drv-supervisor";
+        # setuid/setgid/setpcap: become each child's user with its own bounding set; chown:
+        # the children's directories and the forker's cgroup subtree; kill: stopping a group
+        # member of another UID; sys_admin and sys_tty_config only to hand on to the forker
+        # and seatd.
+        AmbientCapabilities = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_KILL" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
+        CapabilityBoundingSet = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_KILL" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
+        NoNewPrivileges = true;
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/drv-supervisor"
           "--socket ${appdSocket}"
@@ -372,12 +386,21 @@ in
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
         ]);
-        RuntimeDirectory = "drv";
+        # Fresh per start, made as ours and handed over (chown is ours, mkdir under /run is
+        # not). What must outlive a start (the apps' directories, the PIN store) is a tmpfiles
+        # rule below: StateDirectory= would chown their contents to us on every start.
+        RuntimeDirectory = [ "drv" "drv-compositor" "drv-wayland" ];
         RuntimeDirectoryMode = "0755";
-        # So the spawner may create a cgroup per app under its own.
+        # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
         Delegate = true;
       };
     };
+
+    systemd.tmpfiles.rules = [
+      "d /run/drv-apps 0711 drv-forker drv-forker -"
+      "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
+      "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
+    ];
 
     systemd.services.drv-bridge = {
       wantedBy = [ "multi-user.target" ];

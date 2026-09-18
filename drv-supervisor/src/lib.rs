@@ -141,8 +141,9 @@ pub fn capability(name: &str) -> Result<CapabilitySet, String> {
     })
 }
 
-/// Between fork and exec, as root: become `uid`/`gid`/`groups` keeping exactly `caps`, and
-/// make `caps` the bounding set. Everything here is async-signal-safe (raw syscalls).
+/// Between fork and exec: become `uid`/`gid`/`groups` keeping exactly `caps`, and make `caps`
+/// the bounding set. Works for a root supervisor and for one that holds `caps` itself plus
+/// SETUID, SETGID and SETPCAP. Everything here is async-signal-safe (raw syscalls).
 fn become_user(uid: u32, gid: u32, groups: &[u32], caps: CapabilitySet) -> io::Result<()> {
     // The bounding set first, while CAP_SETPCAP is still effective.
     for cap in CapabilitySet::all().iter() {
