@@ -848,7 +848,12 @@ impl AppLink {
                     let s = state.sessions.get(session.as_str()).context("no such session")?;
                     s.node.context("the session is not streaming")?
                 };
-                let fd = pipewire_remote(node)?;
+                // Seen once in many tries: a round trip that never came back. A fresh
+                // connection is cheap, and the app would otherwise drop the whole share.
+                let fd = pipewire_remote(node).or_else(|err| {
+                    eprintln!("bridge: {}: {err:#}; once more", self.app.name);
+                    pipewire_remote(node)
+                })?;
                 Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
             }
             other => bail!("no {other} on {SCREEN_CAST}"),
