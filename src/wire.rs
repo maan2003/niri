@@ -1,58 +1,83 @@
-//! The supervisor's wire (see `drv_policy::wire`): our peers arrive on it already connected.
-//! The seat and the GPU process are needed before anything else exists, so they are read
-//! blocking at startup; what else arrives meanwhile is kept for the event loop.
+//! Our peers, handed over by the supervisor as named fds (`drv_os::fds`): the seat daemon
+//! and the GPU process are needed before anything else exists and are taken at backend init;
+//! the rest are taken by the event loop once it is up. Nothing arrives at runtime.
 
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
 
-use drv_policy::wire::{self, Attach};
+use drv_os::fds::{Fds, Kind};
 
-static WIRE: Mutex<Option<OwnedFd>> = Mutex::new(None);
-static PENDING: Mutex<Vec<(Attach, OwnedFd)>> = Mutex::new(Vec::new());
+static FDS: Mutex<Option<Fds>> = Mutex::new(None);
 
-/// Whether the supervisor gave us a wire at all.
+/// Peers the event loop installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peer {
+    /// Our connection to drv-authd: unlocks arrive on it.
+    Auth,
+    /// The locker's Wayland connection.
+    Locker,
+    /// Our launch channel to drv-appd.
+    Appd,
+}
+
+/// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
 pub fn init() -> bool {
-    match wire::take() {
-        Some(wire) => {
-            *WIRE.lock().unwrap() = Some(wire);
+    match drv_os::fds::take() {
+        Ok(fds) if fds.is_empty() => false,
+        Ok(fds) => {
+            *FDS.lock().unwrap() = Some(fds);
             true
         }
-        None => false,
-    }
-}
-
-/// Blocks until the seat connection arrives: the supervisor sends it as soon as both we and
-/// the seat daemon are up, and there is nothing to do before that.
-pub fn take_seat() -> Option<OwnedFd> {
-    take_attach(Attach::Seat)
-}
-
-/// Blocks until the GPU process's connection arrives (it is started alongside us).
-pub fn take_gpu() -> Option<OwnedFd> {
-    take_attach(Attach::Gpu)
-}
-
-fn take_attach(wanted: Attach) -> Option<OwnedFd> {
-    let wire = WIRE.lock().unwrap();
-    let wire = wire.as_ref()?;
-    let mut pending = PENDING.lock().unwrap();
-    if let Some(i) = pending.iter().position(|(a, _)| *a == wanted) {
-        return Some(pending.remove(i).1);
-    }
-    loop {
-        match wire::recv_attach(wire) {
-            Ok((attach, fd)) if attach == wanted => return Some(fd),
-            Ok(other) => pending.push(other),
-            Err(err) => {
-                error!("the supervisor's wire failed before {wanted:?} arrived: {err}");
-                return None;
-            }
+        Err(err) => {
+            error!("the supervisor's fds: {err}");
+            std::process::exit(1);
         }
     }
 }
 
-/// The wire for the event loop, and what arrived before it took over.
-pub fn take() -> Option<(OwnedFd, Vec<(Attach, OwnedFd)>)> {
-    let wire = WIRE.lock().unwrap().take()?;
-    Some((wire, std::mem::take(&mut *PENDING.lock().unwrap())))
+/// The seat connection.
+pub fn take_seat() -> Option<OwnedFd> {
+    take_socket("seat", Kind::SeqPacket)
+}
+
+/// The GPU process's connection.
+pub fn take_gpu() -> Option<OwnedFd> {
+    take_socket("gpu", Kind::Stream)
+}
+
+fn take_socket(name: &str, kind: Kind) -> Option<OwnedFd> {
+    let mut fds = FDS.lock().unwrap();
+    let fds = fds.as_mut()?;
+    match fds.socket(name, kind) {
+        Ok(fd) => Some(fd),
+        Err(err) => {
+            error!("fd {name:?} from the supervisor: {err}");
+            None
+        }
+    }
+}
+
+/// What the event loop installs: every peer that was handed over (a missing one is logged
+/// and skipped; the piece it belongs to is simply not there).
+pub fn take() -> Vec<(Peer, OwnedFd)> {
+    let mut out = Vec::new();
+    let mut fds = FDS.lock().unwrap();
+    let Some(fds) = fds.as_mut() else {
+        return out;
+    };
+    for (peer, name, kind) in [
+        (Peer::Auth, "auth", Kind::SeqPacket),
+        (Peer::Locker, "locker", Kind::Stream),
+        (Peer::Appd, "appd", Kind::Stream),
+    ] {
+        match fds.socket(name, kind) {
+            Ok(fd) => out.push((peer, fd)),
+            Err(err) => warn!("fd {name:?} from the supervisor: {err}"),
+        }
+    }
+    let leftover = fds.leftover();
+    if !leftover.is_empty() {
+        warn!("fds from the supervisor nobody took: {leftover:?}");
+    }
+    out
 }

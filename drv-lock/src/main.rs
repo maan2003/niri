@@ -10,15 +10,13 @@ use std::os::unix::net::UnixStream;
 use std::process;
 use std::time::Duration;
 
-use drv_policy::wire::Attach;
 
 use pangocairo::cairo::{Format, ImageSurface};
 use pangocairo::pango::{Alignment, FontDescription};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
-use smithay_client_toolkit::reexports::calloop::generic::Generic;
 use smithay_client_toolkit::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
+use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::registry_handlers;
@@ -181,10 +179,9 @@ impl App {
             }
             Ok(other) => self.message = format!("Auth failed: {other:?}"),
             Err(err) => {
-                // A restarted daemon comes back down the wire as a new connection.
-                eprintln!("drv-lock: auth daemon unreachable: {err}");
-                self.auth = None;
-                self.message = NO_AUTH.to_owned();
+                // drv-authd is gone; so is the set, us included, in a moment.
+                eprintln!("drv-lock: auth daemon unreachable: {err}; exiting");
+                process::exit(1);
             }
         }
         self.draw_all();
@@ -486,24 +483,19 @@ wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
 smithay_client_toolkit::delegate_dispatch2!(App);
 
 fn main() {
-    let Some(wire) = drv_policy::wire::take() else {
-        eprintln!("drv-lock: no wire (DRV_WIRE_FD): the locker runs under drv-supervisor");
-        process::exit(1);
-    };
-    // The compositor first: there is nothing to draw on without it. drv-authd's connection
-    // may be on the wire already or come later (it is up when it is up).
-    let mut auth = None;
-    let compositor = loop {
-        match drv_policy::wire::recv_attach(&wire) {
-            Ok((Attach::Compositor, fd)) => break fd,
-            Ok((Attach::Auth, fd)) => auth = Some(fd),
-            Ok((other, _)) => eprintln!("drv-lock: ignoring {other:?} on the wire"),
-            Err(err) => {
-                eprintln!("drv-lock: the supervisor's wire failed: {err}");
-                process::exit(1);
-            }
+    // Our peers, from the supervisor: the compositor (our Wayland connection) and drv-authd.
+    let (compositor, auth) = match drv_os::fds::take().and_then(|mut fds| {
+        let compositor = fds.socket("compositor", drv_os::fds::Kind::Stream)?;
+        let auth = fds.socket("auth", drv_os::fds::Kind::SeqPacket)?;
+        Ok((compositor, auth))
+    }) {
+        Ok(peers) => peers,
+        Err(err) => {
+            eprintln!("drv-lock: fds from the supervisor: {err} (the locker runs under drv-supervisor)");
+            process::exit(1);
         }
     };
+    let auth = Some(auth);
     let conn = Connection::from_socket(UnixStream::from(compositor)).expect("wayland connection");
     let (globals, event_queue) = registry_queue_init(&conn).expect("registry");
     let qh: QueueHandle<App> = event_queue.handle();
@@ -532,31 +524,6 @@ fn main() {
         auth,
     };
     app.relock(&qh);
-
-    // The wire stays: drv-authd comes back down it after a restart.
-    event_loop
-        .handle()
-        .insert_source(
-            Generic::new(wire, Interest::READ, Mode::Level),
-            |_, wire, app: &mut App| {
-                match drv_policy::wire::recv_attach(wire) {
-                    Ok((Attach::Auth, fd)) => {
-                        app.auth = Some(fd);
-                        if app.message == NO_AUTH {
-                            app.message.clear();
-                            app.draw_all();
-                        }
-                    }
-                    Ok((other, _)) => eprintln!("drv-lock: ignoring {other:?} on the wire"),
-                    Err(err) => {
-                        eprintln!("drv-lock: the supervisor's wire closed: {err}; exiting");
-                        process::exit(1);
-                    }
-                }
-                Ok(PostAction::Continue)
-            },
-        )
-        .expect("wire source");
 
     // If the compositor never finishes us after a grant, take the PIN again.
     event_loop

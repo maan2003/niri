@@ -24,8 +24,8 @@ pub enum Request {
     Lookup {
         uid: u32,
     },
-    /// Start an app by manifest name. Only on a launch channel: the fd drv-appd hands an app
-    /// with `launcher = true`, or the compositor's from the supervisor. The public socket
+    /// Start an app by manifest name. Only on a launch channel: a socketpair the supervisor
+    /// made between drv-appd and a launcher it started (the compositor). The public socket
     /// refuses it. Arguments and environment come from the manifest and the daemon, never
     /// from here.
     Launch {

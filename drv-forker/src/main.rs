@@ -1,13 +1,13 @@
 //! drv-appd's privileged helper, kept dumb on purpose. It hears from exactly one peer, drv-appd,
 //! over the socketpair the supervisor made for the two of them. Each `Launch` it checks against
 //! the UID range and group list it was started with, puts the child in a per-UID cgroup,
-//! sandboxes it, hands it the fds that came with the request, becomes the UID and execs. No
-//! config files, no policy, no idea what an "app" is. drv-appd is the brain; a bug here is
+//! sandboxes it, becomes the UID and execs. Apps get no fds: nothing forked here holds
+//! authority. No config files, no policy, no idea what an "app" is. drv-appd is the brain; a bug here is
 //! reachable only through it. Zygote on Android has the same shape.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use clap::Parser;
-use drv_os::{dup_high, ensure_owned_dir, group_id, own_cgroup};
+use drv_os::{ensure_owned_dir, group_id, own_cgroup};
 use drv_policy::forker::{Launch, Request, Response};
-use drv_policy::{seq, wire};
+use drv_policy::seq;
 use rustix::fs::Mode;
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
@@ -112,40 +112,25 @@ impl Forker {
     /// supervisor restarts us both).
     fn serve(&self, channel: OwnedFd) -> io::Result<()> {
         loop {
-            let (request, fds): (Request, Vec<OwnedFd>) = match seq::recv(&channel) {
+            let (request, _fds): (Request, Vec<OwnedFd>) = match seq::recv(&channel) {
                 Ok(r) => r,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(err) => return Err(err),
             };
             let response = match request {
-                Request::Launch(launch) => match self.launch(&launch, fds) {
+                Request::Launch(launch) => match self.launch(&launch) {
                     Ok(pid) => Response::Forked { pid },
                     Err(err) => {
                         eprintln!("drv-forker: refused uid {}: {err}", launch.uid);
                         Response::Error(err)
                     }
                 },
-                Request::Running => Response::Running { uids: self.running_uids() },
             };
             seq::send(&channel, &response, &[])?;
         }
     }
 
-    /// UIDs with a live process. From the app cgroups when we have them: apps outlive a
-    /// forker (the group restarts around them), and the cgroups are how the next forker sees
-    /// them. Our own children otherwise (tests).
-    fn running_uids(&self) -> Vec<u32> {
-        let mut uids: Vec<u32> = if privileged() {
-            app_cgroups_in_use().unwrap_or_default()
-        } else {
-            self.running.lock().unwrap().values().copied().collect()
-        };
-        uids.sort_unstable();
-        uids.dedup();
-        uids
-    }
-
-    fn launch(&self, launch: &Launch, fds: Vec<OwnedFd>) -> Result<u32, String> {
+    fn launch(&self, launch: &Launch) -> Result<u32, String> {
         if launch.argv.is_empty() {
             return Err("empty argv".to_owned());
         }
@@ -178,21 +163,6 @@ impl Forker {
                 .find(|(n, _)| n == name)
                 .ok_or_else(|| format!("group {name:?} is not on the forker's list"))?;
             gids.push(*gid);
-        }
-        if launch.fds.len() != fds.len() {
-            return Err(format!(
-                "{} fd targets but {} fds attached",
-                launch.fds.len(),
-                fds.len()
-            ));
-        }
-        // Copies above the target numbers, so the dup2s in the child never clobber each other.
-        let mut child_fds = Vec::new();
-        for (fd, target) in fds.iter().zip(&launch.fds) {
-            if !(3..10).contains(target) {
-                return Err(format!("fd target {target} is not in 3..10"));
-            }
-            child_fds.push((dup_high(fd.as_raw_fd())?, *target));
         }
         // One cgroup per app UID under our own delegated subtree, so killing an app is killing
         // a cgroup. Unprivileged (tests) has no subtree to write.
@@ -234,16 +204,10 @@ impl Forker {
         let mut all_gids = vec![gid];
         all_gids.extend(gids);
         let switch_uid = privileged;
-        let dups = child_fds.clone();
 
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                for (high, target) in &dups {
-                    if libc::dup2(*high, *target) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                }
                 if let Some(sandbox) = &sandbox {
                     sandbox.apply()?;
                 }
@@ -283,12 +247,6 @@ impl Forker {
         let spawned = command
             .spawn()
             .map_err(|err| format!("spawn {:?}: {err}", launch.argv[0]));
-        for (high, _) in child_fds {
-            // SAFETY: our duplicates for the child.
-            unsafe {
-                libc::close(high);
-            }
-        }
         let mut child = spawned?;
         let pid = child.id();
         let name = launch.argv[0].clone();
@@ -507,28 +465,10 @@ impl Sandbox {
     }
 }
 
-/// UIDs whose `app-<uid>` cgroup has a process in it. `None` when our cgroup cannot be read.
-fn app_cgroups_in_use() -> Option<Vec<u32>> {
-    let entries = std::fs::read_dir(own_cgroup().ok()?).ok()?;
-    let mut uids = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(uid) = name.to_str().and_then(|n| n.strip_prefix("app-")) else {
-            continue;
-        };
-        let Ok(uid) = uid.parse::<u32>() else { continue };
-        let procs = std::fs::read_to_string(entry.path().join("cgroup.procs")).ok()?;
-        if procs.lines().any(|l| !l.trim().is_empty()) {
-            uids.push(uid);
-        }
-    }
-    Some(uids)
-}
-
-/// `cgroup.procs` of `<our cgroup>/app-<uid>`, created if needed. Requires cgroup v2 and a
-/// delegated subtree (`Delegate=yes` on the supervisor's unit).
+/// `cgroup.procs` of `<our cgroup>/apps/app-<uid>`, created if needed. The supervisor made
+/// `apps` ours (and keeps its `cgroup.kill`, which ends every app when the set restarts).
 fn app_cgroup_procs(uid: u32) -> Result<std::fs::File, String> {
-    let dir = own_cgroup()?.join(format!("app-{uid}"));
+    let dir = own_cgroup()?.join("apps").join(format!("app-{uid}"));
     match std::fs::create_dir(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -554,7 +494,9 @@ fn parse_range(s: &str) -> Result<(u32, u32), String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let channel = wire::take().ok_or("no channel on fd 3: drv-forker runs under drv-supervisor")?;
+    let channel = drv_os::fds::take()
+        .and_then(|mut fds| fds.socket("channel", drv_os::fds::Kind::SeqPacket))
+        .map_err(|e| format!("the channel from the supervisor: {e}"))?;
     let (start, count) = parse_range(&args.range)?;
     let groups = args
         .groups
@@ -589,7 +531,6 @@ mod tests {
     use drv_policy::forker::Channel;
 
     use super::*;
-    use std::os::fd::AsFd;
 
     #[test]
     fn forks_as_ourselves_over_the_channel_and_refuses_the_rest() {
@@ -618,54 +559,35 @@ mod tests {
             env: vec![("PATH".into(), path.clone())],
             network: false,
             expose: Vec::new(),
-            fds: Vec::new(),
         };
 
         let pid = channel
-            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]), &[])
+            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]))
             .unwrap();
         assert!(pid > 0);
 
         let err = channel
-            .launch(&launch(uid, vec!["render"], vec!["sh"]), &[])
+            .launch(&launch(uid, vec!["render"], vec!["sh"]))
             .unwrap_err();
         assert!(err.to_string().contains("forker's list"), "{err}");
 
         let err = channel
-            .launch(&launch(uid.wrapping_add(1), vec![], vec!["sh"]), &[])
+            .launch(&launch(uid.wrapping_add(1), vec![], vec!["sh"]))
             .unwrap_err();
         assert!(err.to_string().contains("outside"), "{err}");
 
         let err = channel
-            .launch(
-                &Launch {
-                    expose: vec!["/run/secret".into()],
-                    ..launch(uid, vec![], vec!["sh"])
-                },
-                &[],
-            )
+            .launch(&Launch {
+                expose: vec!["/run/secret".into()],
+                ..launch(uid, vec![], vec!["sh"])
+            })
             .unwrap_err();
         assert!(err.to_string().contains("optional expose"), "{err}");
 
-        // An fd for the child lands where asked: sh reads it as fd 3.
-        let (a, b) = seq::pair().unwrap();
-        seq::send(&a, &"hi", &[]).unwrap();
-        let pid = channel
-            .launch(
-                &Launch {
-                    fds: vec![3],
-                    ..launch(uid, vec![], vec!["sh", "-c", "test -e /proc/self/fd/3"])
-                },
-                &[b.as_fd()],
-            )
-            .unwrap();
-        assert!(pid > 0);
-
         // The channel survives refusals: still answering.
         channel
-            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]), &[])
+            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]))
             .unwrap();
-        assert!(channel.running().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

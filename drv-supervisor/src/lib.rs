@@ -1,111 +1,21 @@
-//! The supervisor starts the trusted set and hands each piece its peers. Every child with
-//! peers gets a wire on fd 3 (see `drv_policy::wire`) down which the supervisor pushes
-//! connections it made with `socketpair`: nobody connects to anybody, nobody is found, the
-//! process that forked both ends hands them over. It takes input from no one.
+//! The supervisor starts the trusted set, each piece as its own user with its peers already
+//! in hand: every connection between two pieces is a socketpair the supervisor made before
+//! forking either, handed over by name (`drv_os::fds`). Nobody connects to anybody, nobody is
+//! found, nothing arrives at runtime. It takes input from no one. The set is one group: when
+//! any member dies the apps are killed, the rest stopped, and everything starts again, locked.
 
-use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::fs::File;
+use std::io::{self, Write as _};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::io;
 
 use drv_os::{dup_high, ensure_owned_dir};
-use drv_policy::forker::Notice;
-use drv_policy::wire::{self, Attach};
-use drv_policy::seq;
 use rustix::thread::{CapabilitySet, CapabilitySets};
 
-/// The pieces the supervisor wires. Each pair below gets a fresh socketpair whenever either
-/// side (re)starts while the other is up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Peer {
-    Authd,
-    Seatd,
-    Compositor,
-    Gpu,
-    Locker,
-    Appd,
-}
-
-/// The socket a link is made of: one message per datagram, or a byte stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Link {
-    Seq,
-    Stream,
-}
-
-/// `(a, what a receives, b, what b receives, socket type)`.
-const LINKS: [(Peer, Attach, Peer, Attach, Link); 7] = [
-    (Peer::Compositor, Attach::Seat, Peer::Seatd, Attach::Compositor, Link::Seq),
-    (Peer::Compositor, Attach::Auth, Peer::Authd, Attach::Compositor, Link::Seq),
-    (Peer::Compositor, Attach::Gpu, Peer::Gpu, Attach::Compositor, Link::Stream),
-    (Peer::Compositor, Attach::Locker, Peer::Locker, Attach::Compositor, Link::Stream),
-    (Peer::Locker, Attach::Auth, Peer::Authd, Attach::Verifier, Link::Seq),
-    (Peer::Appd, Attach::Auth, Peer::Authd, Attach::Verifiers, Link::Seq),
-    (Peer::Compositor, Attach::Appd, Peer::Appd, Attach::Compositor, Link::Stream),
-];
-
-/// The supervisor's ends of the services' wires, and the links it makes between them.
-#[derive(Default)]
-pub struct Wiring(Mutex<HashMap<Peer, OwnedFd>>);
-
-impl Wiring {
-    /// A service came up (again): keep its wire and link it to its counterparts that are up.
-    /// Exactly the pairs the newcomer is part of, so nobody is linked twice for one start.
-    pub fn attach_service(&self, peer: Peer, wire: OwnedFd) {
-        let mut wires = self.0.lock().unwrap();
-        wires.insert(peer, wire);
-        for (a, for_a, b, for_b, kind) in LINKS {
-            if a == peer || b == peer {
-                link(&mut wires, a, for_a, b, for_b, kind);
-            }
-        }
-    }
-
-    pub fn detach_service(&self, peer: Peer) {
-        self.0.lock().unwrap().remove(&peer);
-    }
-}
-
-/// Links two peers if both are up: a fresh pair, each side's end pushed down its wire.
-fn link(
-    wires: &mut HashMap<Peer, OwnedFd>,
-    a: Peer,
-    for_a: Attach,
-    b: Peer,
-    for_b: Attach,
-    kind: Link,
-) {
-    let (Some(wire_a), Some(wire_b)) = (wires.get(&a), wires.get(&b)) else {
-        return;
-    };
-    let pair = match kind {
-        Link::Seq => wire::pair(),
-        Link::Stream => wire::stream_pair(),
-    };
-    let (end_a, end_b) = match pair {
-        Ok(pair) => pair,
-        Err(err) => {
-            eprintln!("drv-supervisor: socketpair: {err}");
-            return;
-        }
-    };
-    if let Err(err) = wire::send_attach(wire_a, for_a, end_a.as_fd()) {
-        eprintln!("drv-supervisor: {a:?}'s wire: {err}");
-        wires.remove(&a);
-        return;
-    }
-    if let Err(err) = wire::send_attach(wire_b, for_b, end_b.as_fd()) {
-        eprintln!("drv-supervisor: {b:?}'s wire: {err}");
-        wires.remove(&b);
-    }
-}
-
-/// A service the supervisor forks and keeps running: its own user (or root), no sandbox (it
-/// is trusted and needs the real `/run`), its environment exactly as listed.
+/// A service the supervisor forks and keeps running: its own user, no sandbox (it is trusted
+/// and needs the real `/run`), its environment exactly as listed.
 pub struct Service {
     pub name: String,
     pub uid: u32,
@@ -182,41 +92,68 @@ fn become_user(uid: u32, gid: u32, groups: &[u32], caps: CapabilitySet) -> io::R
     Ok(())
 }
 
-/// Hands our cgroup v2 subtree (systemd's `Delegate=yes` gave it to us) to a user: the
-/// directory, so it can make `app-<uid>` cgroups, and the process files of this common
-/// ancestor, which moving a process into one of them requires write access to.
-pub fn delegate_cgroup(uid: u32, gid: u32) -> Result<(), String> {
-    let dir = drv_os::own_cgroup()?;
-    let owner = (
-        Some(rustix::process::Uid::from_raw(uid)),
-        Some(rustix::process::Gid::from_raw(gid)),
-    );
-    for path in [
-        dir.clone(),
-        dir.join("cgroup.procs"),
-        dir.join("cgroup.threads"),
-        dir.join("cgroup.subtree_control"),
-    ] {
-        rustix::fs::chown(&path, owner.0, owner.1)
-            .map_err(|e| format!("chown {}: {e}", path.display()))?;
-    }
-    Ok(())
+/// The apps' cgroup: `<ours>/apps`, made once. drv-forker owns the directory (it makes
+/// `app-<uid>` cgroups in it) and its process files (moving a process in needs write access
+/// to those of the common ancestor, so our own `cgroup.procs` goes to it too); `cgroup.kill`
+/// stays ours, and one write to it ends every app at once.
+pub struct AppsCgroup {
+    kill: PathBuf,
 }
 
-/// Forks a service with `fds` on the given numbers in the child (3 is the wire by
-/// convention; `DRV_WIRE_FD` is set when something is there). Everything else we hold stays
-/// close-on-exec and never reaches it.
-pub fn start_service(service: &Service, fds: &[(i32, BorrowedFd<'_>)]) -> Result<Child, String> {
+impl AppsCgroup {
+    /// systemd's `Delegate=yes` made our subtree ours; hand the apps part of it to the forker.
+    pub fn create(forker_uid: u32, forker_gid: u32) -> Result<Self, String> {
+        let ours = drv_os::own_cgroup()?;
+        let dir = ours.join("apps");
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("mkdir {}: {e}", dir.display())),
+        }
+        let owner = (
+            Some(rustix::process::Uid::from_raw(forker_uid)),
+            Some(rustix::process::Gid::from_raw(forker_gid)),
+        );
+        for path in [
+            ours.join("cgroup.procs"),
+            dir.clone(),
+            dir.join("cgroup.procs"),
+            dir.join("cgroup.threads"),
+            dir.join("cgroup.subtree_control"),
+        ] {
+            rustix::fs::chown(&path, owner.0, owner.1)
+                .map_err(|e| format!("chown {}: {e}", path.display()))?;
+        }
+        Ok(Self {
+            kill: dir.join("cgroup.kill"),
+        })
+    }
+
+    /// SIGKILLs every process in every app cgroup. Returns once the kernel has taken the
+    /// request; the processes go shortly after.
+    pub fn kill_all(&self) -> Result<(), String> {
+        File::options()
+            .write(true)
+            .open(&self.kill)
+            .and_then(|mut f| f.write_all(b"1"))
+            .map_err(|e| format!("write {}: {e}", self.kill.display()))
+    }
+}
+
+/// Forks a service with `fds` as its named fds (`LISTEN_FDS`/`LISTEN_FDNAMES`, from 3 up).
+/// Everything else we hold stays close-on-exec and never reaches it.
+pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Result<Child, String> {
     for (dir, mode) in &service.dirs {
         ensure_owned_dir(dir, service.uid, service.gid, *mode)?;
     }
     if service.argv.is_empty() {
         return Err(format!("service {}: empty command", service.name));
     }
+    let (fd_env, placed) = drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
     // Copies above the target numbers, so the dup2s in the child never clobber each other
     // and are never a same-fd no-op (which would keep close-on-exec set).
     let mut dups = Vec::new();
-    for (target, fd) in fds {
+    for (target, fd) in &placed {
         dups.push((dup_high(fd.as_raw_fd())?, *target));
     }
     let mut command = Command::new(&service.argv[0]);
@@ -224,10 +161,8 @@ pub fn start_service(service: &Service, fds: &[(i32, BorrowedFd<'_>)]) -> Result
         .args(&service.argv[1..])
         .env_clear()
         .envs(service.env.iter().cloned())
+        .envs(fd_env)
         .stdin(Stdio::null());
-    if fds.iter().any(|(target, _)| *target == wire::WIRE_FD) {
-        command.env(wire::WIRE_ENV, wire::WIRE_FD.to_string());
-    }
     let (uid, gid, caps) = (service.uid, service.gid, service.caps);
     let groups = service.groups.clone();
     let child_dups = dups.clone();
@@ -258,55 +193,4 @@ pub fn start_service(service: &Service, fds: &[(i32, BorrowedFd<'_>)]) -> Result
         }
     }
     child
-}
-
-/// Forks a service with a fresh wire on fd 3; returns the child and our end of the wire.
-pub fn start_wired(service: &Service) -> Result<(Child, OwnedFd), String> {
-    let (child_end, ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
-    let child = start_service(service, &[(wire::WIRE_FD, child_end.as_fd())])?;
-    Ok((child, ours))
-}
-
-/// What the supervisor knows between starts: the wiring, and the notice socket of the
-/// current drv-appd, told about compositor starts.
-#[derive(Default)]
-pub struct Supervisor {
-    pub wiring: Wiring,
-    notices: Mutex<Option<OwnedFd>>,
-    compositor_up: AtomicBool,
-}
-
-impl Supervisor {
-    /// A new drv-appd: it hears `CompositorStarted` right away if one is up, so it autostarts
-    /// what is missing.
-    pub fn appd_started(&self, notices: OwnedFd) {
-        *self.notices.lock().unwrap() = Some(notices);
-        if self.compositor_up.load(Ordering::SeqCst) {
-            self.notify(&Notice::CompositorStarted);
-        }
-    }
-
-    pub fn appd_stopped(&self) {
-        *self.notices.lock().unwrap() = None;
-    }
-
-    pub fn compositor_started(&self) {
-        self.compositor_up.store(true, Ordering::SeqCst);
-        self.notify(&Notice::CompositorStarted);
-    }
-
-    pub fn compositor_stopped(&self) {
-        self.compositor_up.store(false, Ordering::SeqCst);
-    }
-
-    /// One-way; a dead drv-appd is forgotten (its successor announces itself).
-    fn notify(&self, notice: &Notice) {
-        let mut guard = self.notices.lock().unwrap();
-        if let Some(sock) = guard.as_ref() {
-            if let Err(err) = seq::send(sock, notice, &[]) {
-                eprintln!("drv-supervisor: notifying drv-appd: {err}");
-                *guard = None;
-            }
-        }
-    }
 }

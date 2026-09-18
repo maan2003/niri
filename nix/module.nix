@@ -22,7 +22,7 @@ let
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart auth launcher;
+    inherit (app) uid groups gpu network globals grants autostart;
     env = lib.optionalAttrs app.servicesBus { DBUS_SESSION_BUS_ADDRESS = sessionBus; } // app.env;
     expose = lib.optional app.servicesBus "/run/drv-session" ++ app.expose;
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
@@ -41,21 +41,6 @@ let
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
-  # One desktop entry per app; `drv launch` works only where a launch channel was inherited
-  # (an app with `launcher = true`). The file is named `drv.app.<name>.desktop`: the app id
-  # the bridge registers with the portals.
-  desktopEntries = pkgs.runCommand "drv-desktop-entries" { } (
-    lib.concatStrings (lib.mapAttrsToList (name: app: ''
-      mkdir -p $out/share/applications
-      cat > $out/share/applications/drv.app.${name}.desktop <<EOF
-      [Desktop Entry]
-      Type=Application
-      Name=${name}
-      Exec=${cfg.package}/bin/drv launch ${name}
-      ${lib.optionalString (app.icon != null) "Icon=${app.icon}"}
-      EOF
-    '') cfg.apps)
-  );
   # Names only the compositor owns, and only screencast-granted users may call.
   compositorNames = [
     "org.gnome.Mutter.ScreenCast" "org.gnome.Mutter.ServiceChannel" "org.gnome.Mutter.DisplayConfig"
@@ -211,16 +196,6 @@ in
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
-          auth = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "Gets a connection to drv-authd from the spawner at launch.";
-          };
-          launcher = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "May start other apps: gets a launch channel to drv-appd as an fd (DRV_LAUNCH_FD), inherited by what it runs.";
-          };
         };
       }));
     };
@@ -302,7 +277,7 @@ in
 
     environment.etc."drv/config.kdl".text = cfg.config;
     environment.etc."xdg/xdg-desktop-portal/portals.conf".text = "[preferred]\ndefault=gnome\n";
-    environment.systemPackages = [ cfg.package desktopEntries ];
+    environment.systemPackages = [ cfg.package ];
 
     # The services' bus: the compositor, the bridge, the notification daemon and the portals,
     # each its own UID. Sandboxed apps never see it.

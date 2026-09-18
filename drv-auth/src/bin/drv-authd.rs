@@ -1,17 +1,15 @@
-//! `drv-authd`: verifies the lock PIN and pushes the unlock to the compositor. Its peers come
-//! down the spawner's wire, already connected: the compositor's connection, and one verifier
-//! connection per lock app launch. Nothing on the filesystem, nobody to check.
+//! `drv-authd`: verifies the lock PIN and pushes the unlock to the compositor. Its two peers
+//! are fds from the supervisor, already connected: `compositor` (unlocks go there) and
+//! `locker` (verifies come from there). Nothing on the filesystem, nobody to check.
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use drv_auth::{Auth, Event, Outcome, Request, Response, Store};
-use drv_policy::wire::{self, Attach};
 use zeroize::Zeroize;
 
 #[derive(Parser)]
@@ -41,15 +39,6 @@ struct Shared {
     auth: Mutex<Auth>,
     compositor: Mutex<Option<OwnedFd>>,
     idle_timeout: Duration,
-}
-
-fn spawn_verifier(shared: &Arc<Shared>, sock: OwnedFd) {
-    let shared = shared.clone();
-    thread::spawn(move || {
-        if let Err(err) = serve_verifier(&shared, sock) {
-            eprintln!("verifier connection: {err}");
-        }
-    });
 }
 
 fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
@@ -94,13 +83,14 @@ fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
 }
 
 fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
-    let wire = wire::take()
-        .ok_or_else(|| io::Error::other("no wire on fd 3: drv-authd runs under drv-supervisor"))?;
+    let mut fds = drv_os::fds::take()?;
+    let compositor = fds.socket("compositor", drv_os::fds::Kind::SeqPacket)?;
+    let locker = fds.socket("locker", drv_os::fds::Kind::SeqPacket)?;
     let store = Store::new(state_dir);
     if !store.has_pin() {
         eprintln!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
     }
-    // From here on: the wire and what arrives on it, threads, and the state directory.
+    // From here on: our two fds, threads, and the state directory.
     if drv_os::seccomp::enabled() {
         let mut allow = drv_os::seccomp::Allowlist::base()?;
         allow.write_files()?;
@@ -109,39 +99,13 @@ fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
     }
     let shared = Arc::new(Shared {
         auth: Mutex::new(Auth::new(store)),
-        compositor: Mutex::new(None),
+        compositor: Mutex::new(Some(compositor)),
         idle_timeout: Duration::from_secs(idle_timeout),
     });
-    loop {
-        match wire::recv_attach(&wire) {
-            Ok((Attach::Compositor, sock)) => {
-                // The compositor only listens; the newest connection replaces the old.
-                eprintln!("compositor attached");
-                *shared.compositor.lock().unwrap() = Some(sock);
-            }
-            Ok((Attach::Verifier, sock)) => spawn_verifier(&shared, sock),
-            Ok((Attach::Verifiers, sock)) => {
-                // drv-appd: one `Verifier` per app it launches with auth.
-                eprintln!("drv-appd attached");
-                let shared = shared.clone();
-                thread::spawn(move || loop {
-                    match wire::recv_attach(&sock) {
-                        Ok((Attach::Verifier, verifier)) => spawn_verifier(&shared, verifier),
-                        Ok((other, _)) => eprintln!("ignoring {other:?} from drv-appd"),
-                        Err(err) => {
-                            eprintln!("drv-appd's socket ended: {err}");
-                            return;
-                        }
-                    }
-                });
-            }
-            Ok((other, _)) => eprintln!("ignoring {other:?} on the wire"),
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                return Err(io::Error::other("the spawner closed the wire"));
-            }
-            Err(err) => eprintln!("wire: {err}"),
-        }
-    }
+    eprintln!("serving the locker");
+    serve_verifier(&shared, locker)?;
+    // The locker is gone; the supervisor restarts the set, us included.
+    Err(io::Error::other("the locker hung up"))
 }
 
 fn main() {

@@ -8,6 +8,7 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+drv-os = { version = "26.4.0", path = "../drv-os" }
 clap = { version = "4.5", features = ["derive"] }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
 libc = "0.2"

@@ -453,7 +453,8 @@ pub struct Niri {
     pub idle_inhibited: bool,
     pub auth_link: Option<RegistrationToken>,
     /// What the wire delivered before the event loop ran; `State::new` hands them over.
-    pub pending_attachments: Vec<(drv_policy::wire::Attach, OwnedFd)>,
+    /// Peers from the supervisor, installed once the state exists (see [`Self::on_attach`]).
+    pub pending_attachments: Vec<(crate::wire::Peer, OwnedFd)>,
 
     // State that we last sent to the logind LockedHint.
     pub locked_hint: Option<bool>,
@@ -2653,33 +2654,11 @@ impl Niri {
 
         let (executor, scheduler) = calloop::futures::executor().unwrap();
 
-        // The spawner's wire: our peers arrive on it already connected (drv-authd now, and
-        // again whenever it restarts). Without a wire nothing ever unlocks.
-        let mut pending_attachments = Vec::new();
-        match crate::wire::take() {
-            Some((wire, pending)) => {
-                pending_attachments = pending;
-                rustix::io::ioctl_fionbio(&wire, true).unwrap();
-                event_loop
-                    .insert_source(
-                        Generic::new(wire, Interest::READ, Mode::Level),
-                        |_, wire, state| match drv_policy::wire::recv_attach(&wire) {
-                            Ok((attach, sock)) => {
-                                state.niri.on_attach(attach, sock);
-                                Ok(PostAction::Continue)
-                            }
-                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                Ok(PostAction::Continue)
-                            }
-                            Err(err) => {
-                                error!("the spawner's wire closed: {err}");
-                                Ok(PostAction::Remove)
-                            }
-                        },
-                    )
-                    .unwrap();
-            }
-            None => error!("no wire (DRV_WIRE_FD): drv-authd can never unlock us"),
+        // Our peers, from the supervisor, already connected: drv-authd (without it nothing
+        // ever unlocks), the locker and drv-appd. Installed once `Niri` exists.
+        let pending_attachments = crate::wire::take();
+        if pending_attachments.is_empty() {
+            error!("no peers from the supervisor: drv-authd can never unlock us");
         }
         event_loop.insert_source(executor, |_, _, _| ()).unwrap();
 
@@ -6849,33 +6828,20 @@ impl Niri {
         }
     }
 
-    /// Something arrived on the spawner's wire.
-    pub fn on_attach(&mut self, attach: drv_policy::wire::Attach, sock: OwnedFd) {
-        use drv_policy::wire::Attach;
-        match attach {
-            Attach::Auth => self.install_auth(sock),
-            Attach::Locker => self.insert_locker(sock),
-            // Our (new) launch channel to drv-appd: the old one's daemon is gone.
-            Attach::Appd => match PolicyClient::from_stream(sock.into()) {
+    /// Installs a peer the supervisor handed us. Peers never change: if one dies the whole
+    /// set restarts, us included.
+    pub fn on_attach(&mut self, peer: crate::wire::Peer, sock: OwnedFd) {
+        use crate::wire::Peer;
+        match peer {
+            Peer::Auth => self.install_auth(sock),
+            Peer::Locker => self.insert_locker(sock),
+            Peer::Appd => match PolicyClient::from_stream(sock.into()) {
                 Ok(client) => {
                     info!("launch channel to drv-appd attached");
                     self.launcher = Some(client);
                 }
                 Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
             },
-            // The seat daemon restarted. Our backend was built on the old one, so start over:
-            // the spawner brings us back, wired to the new one, locked as always.
-            Attach::Seat => {
-                warn!("the seat daemon restarted; exiting so the supervisor starts us afresh");
-                self.stop_signal.stop();
-            }
-            // Cannot happen without us dying too (we are one group), but a fresh GPU process
-            // would need a fresh core in any case.
-            Attach::Gpu => {
-                warn!("the GPU process restarted; exiting so the supervisor starts us afresh");
-                self.stop_signal.stop();
-            }
-            other => warn!("ignoring {other:?} on the supervisor's wire"),
         }
     }
 

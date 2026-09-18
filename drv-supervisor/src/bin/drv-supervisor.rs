@@ -1,32 +1,26 @@
-//! The supervisor: forks and restarts the trusted set, each as its own user with the fds it
-//! needs already in place, and links them (see the crate docs). Two groups restart as a
-//! whole: drv-appd with drv-forker (they share a channel nothing else can reach), and the
-//! compositor with its GPU process (the sealed GPU process cannot be given a new core).
+//! The supervisor: forks the trusted set, each as its own user with its peers already in
+//! hand, and restarts the whole set when any of it dies (see the crate docs). Every
+//! connection between two members is a socketpair made here, before either exists.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, ExitCode};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::time::Duration;
 use std::{fs, thread};
 
 use clap::Parser;
+use drv_os::fds::{seqpacket_pair, stream_pair};
 use drv_os::{user_groups, user_ids};
-use drv_policy::{seq, wire};
-use drv_supervisor::{capability, start_service, start_wired, Peer, Service, Supervisor};
+use drv_supervisor::{capability, start_service, AppsCgroup, Service};
 use rustix::thread::CapabilitySet;
-
-/// Where drv-appd finds what the supervisor put in place (its wire is fd 3).
-const APPD_LISTENER_FD: i32 = 4;
-const APPD_NOTICE_FD: i32 = 5;
-const APPD_CHANNEL_FD: i32 = 6;
 
 #[derive(Parser)]
 #[command(name = "drv-supervisor", about = "Start and wire the trusted set")]
 struct Args {
-    /// drv-appd's public socket, world-connectable: lookups of other UIDs are gated inside.
+    /// drv-appd's public socket, world-connectable: lookups only, gated inside.
     #[arg(long, default_value = "/run/drv/appd.sock")]
     socket: PathBuf,
     /// System user drv-appd runs as.
@@ -35,9 +29,9 @@ struct Args {
     /// drv-appd's command line, whitespace-separated.
     #[arg(long)]
     appd_exec: String,
-    /// System user drv-forker runs as; root without it.
+    /// System user drv-forker runs as.
     #[arg(long)]
-    forker_user: Option<String>,
+    forker_user: String,
     /// drv-forker's command line, whitespace-separated.
     #[arg(long)]
     forker_exec: String,
@@ -51,20 +45,19 @@ struct Args {
     forker_dirs: Vec<String>,
     /// System user the auth daemon runs as.
     #[arg(long)]
-    authd_user: Option<String>,
-    /// The auth daemon's command line, whitespace-separated. Without it no app gets auth.
+    authd_user: String,
+    /// The auth daemon's command line, whitespace-separated.
     #[arg(long)]
-    authd_exec: Option<String>,
+    authd_exec: String,
     /// `PATH:MODE` (octal): a directory the auth daemon owns, created before it starts.
     #[arg(long = "authd-dir")]
     authd_dirs: Vec<String>,
-    /// System user the seat daemon runs as (groups video, input, tty for the devices it opens);
-    /// root without it.
+    /// System user the seat daemon runs as (groups video, input, tty for the devices it opens).
     #[arg(long)]
-    seatd_user: Option<String>,
+    seatd_user: String,
     /// The seat daemon's command line, whitespace-separated.
     #[arg(long)]
-    seatd_exec: Option<String>,
+    seatd_exec: String,
     /// A capability the seat daemon keeps, by name (`sys_tty_config` for the VT ioctls).
     /// Repeatable.
     #[arg(long = "seatd-cap")]
@@ -74,10 +67,10 @@ struct Args {
     seatd_env: Vec<String>,
     /// System user the compositor runs as.
     #[arg(long)]
-    compositor_user: Option<String>,
+    compositor_user: String,
     /// The compositor's command line, whitespace-separated.
     #[arg(long)]
-    compositor_exec: Option<String>,
+    compositor_exec: String,
     /// `NAME=VALUE` in the compositor's environment. Repeatable; it gets nothing else.
     #[arg(long = "compositor-env")]
     compositor_env: Vec<String>,
@@ -86,21 +79,19 @@ struct Args {
     compositor_dirs: Vec<String>,
     /// System user the GPU process runs as (`render` group for Mesa's render nodes).
     #[arg(long)]
-    gpu_user: Option<String>,
+    gpu_user: String,
     /// The GPU process's command line, whitespace-separated (`niri gpu-process --mode drm`).
-    /// It is the compositor's group: either dying restarts both.
     #[arg(long)]
-    gpu_exec: Option<String>,
+    gpu_exec: String,
     /// `NAME=VALUE` in the GPU process's environment. Repeatable; it gets nothing else.
     #[arg(long = "gpu-env")]
     gpu_env: Vec<String>,
     /// System user the locker runs as.
     #[arg(long)]
-    locker_user: Option<String>,
-    /// The locker's command line, whitespace-separated. It joins the compositor's group; its
-    /// Wayland connection and its drv-authd connection come down its wire.
+    locker_user: String,
+    /// The locker's command line, whitespace-separated.
     #[arg(long)]
-    locker_exec: Option<String>,
+    locker_exec: String,
     /// `NAME=VALUE` in the locker's environment. Repeatable; it gets nothing else.
     #[arg(long = "locker-env")]
     locker_env: Vec<String>,
@@ -126,72 +117,44 @@ fn base_env() -> Vec<(String, String)> {
     env
 }
 
+/// The set, in start order.
+struct Set {
+    seatd: Service,
+    authd: Service,
+    gpu: Service,
+    compositor: Service,
+    locker: Service,
+    forker: Service,
+    appd: Service,
+}
+
 fn supervise(args: Args) -> Result<(), String> {
-    let authd = service(
-        "drv-authd",
-        args.authd_user.as_deref(),
-        args.authd_exec.as_deref(),
-        &[],
-        &args.authd_dirs,
-        &[],
-    )?;
-    let seatd = service(
-        "drv-seatd",
-        args.seatd_exec.as_deref().map(|_| args.seatd_user.as_deref().unwrap_or("root")),
-        args.seatd_exec.as_deref(),
-        &args.seatd_env,
-        &[],
-        &args.seatd_caps,
-    )?;
-    let compositor = service(
-        "compositor",
-        args.compositor_user.as_deref(),
-        args.compositor_exec.as_deref(),
-        &args.compositor_env,
-        &args.compositor_dirs,
-        &[],
-    )?;
-    let gpu = service(
-        "compositor-gpu",
-        args.gpu_user.as_deref(),
-        args.gpu_exec.as_deref(),
-        &args.gpu_env,
-        &[],
-        &[],
-    )?;
-    let locker = service(
-        "locker",
-        args.locker_user.as_deref(),
-        args.locker_exec.as_deref(),
-        &args.locker_env,
-        &[],
-        &[],
-    )?;
-    if locker.is_some() && gpu.is_none() {
-        return Err("--locker-exec needs a compositor with --gpu-exec (the locker joins that group)".to_owned());
-    }
-    let forker = service(
-        "drv-forker",
-        Some(args.forker_user.as_deref().unwrap_or("root")),
-        Some(&args.forker_exec),
-        &[],
-        &args.forker_dirs,
-        &args.forker_caps,
-    )?
-    .ok_or("--forker-exec is required")?;
-    if forker.uid != 0 {
-        // Its app cgroups live under ours; the subtree stays its across its restarts.
-        drv_supervisor::delegate_cgroup(forker.uid, forker.gid)?;
-    }
-    let appd = service(
-        "drv-appd",
-        Some(&args.appd_user),
-        Some(&args.appd_exec),
-        &[],
-        &[],
-        &[],
-    )?
-    .ok_or("--appd-exec is required")?;
+    let set = Set {
+        seatd: service("drv-seatd", &args.seatd_user, &args.seatd_exec, &args.seatd_env, &[], &args.seatd_caps)?,
+        authd: service("drv-authd", &args.authd_user, &args.authd_exec, &[], &args.authd_dirs, &[])?,
+        gpu: service("compositor-gpu", &args.gpu_user, &args.gpu_exec, &args.gpu_env, &[], &[])?,
+        compositor: service(
+            "compositor",
+            &args.compositor_user,
+            &args.compositor_exec,
+            &args.compositor_env,
+            &args.compositor_dirs,
+            &[],
+        )?,
+        locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[])?,
+        forker: service(
+            "drv-forker",
+            &args.forker_user,
+            &args.forker_exec,
+            &[],
+            &args.forker_dirs,
+            &args.forker_caps,
+        )?,
+        appd: service("drv-appd", &args.appd_user, &args.appd_exec, &[], &[], &[])?,
+    };
+    // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
+    // kill switch stays ours.
+    let apps = AppsCgroup::create(set.forker.uid, set.forker.gid)?;
 
     if let Some(parent) = args.socket.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -202,48 +165,166 @@ fn supervise(args: Args) -> Result<(), String> {
     fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o666))
         .map_err(|e| format!("chmod {}: {e}", args.socket.display()))?;
 
-    let supervisor = Arc::new(Supervisor::default());
-    // The services first: the compositor waits for the public socket, which is bound.
-    for (peer, service) in [(Peer::Seatd, seatd), (Peer::Authd, authd)] {
-        let Some(service) = service else { continue };
-        let supervisor = supervisor.clone();
-        thread::spawn(move || supervise_service(peer, service, &supervisor));
-    }
-    match (compositor, gpu) {
-        (Some(compositor), Some(gpu)) => {
-            let supervisor = supervisor.clone();
-            thread::spawn(move || {
-                supervise_compositor(&supervisor, &compositor, &gpu, locker.as_ref())
-            });
+    loop {
+        match start_set(&set, &listener) {
+            Ok(children) => {
+                let (name, status) = wait_first(&children);
+                eprintln!("drv-supervisor: {name} exited ({status}); restarting the set");
+                stop_set(&apps, children);
+            }
+            Err(err) => eprintln!("drv-supervisor: {err}"),
         }
-        (Some(compositor), None) => {
-            let supervisor = supervisor.clone();
-            thread::spawn(move || supervise_service(Peer::Compositor, compositor, &supervisor));
-        }
-        (None, Some(_)) => return Err("--gpu-exec without a compositor".to_owned()),
-        (None, None) => {}
+        thread::sleep(Duration::from_secs(1));
     }
-    supervise_appd(&supervisor, &appd, &forker, &listener);
 }
 
-/// A service from the command line: its user must exist, and be root only for the pieces that
-/// need it. `None` when it is not configured at all.
+/// Every link is a socketpair made here; each member gets its ends by name.
+struct Links {
+    compositor_seat: (OwnedFd, OwnedFd),
+    compositor_auth: (OwnedFd, OwnedFd),
+    compositor_gpu: (OwnedFd, OwnedFd),
+    compositor_locker: (OwnedFd, OwnedFd),
+    compositor_appd: (OwnedFd, OwnedFd),
+    locker_auth: (OwnedFd, OwnedFd),
+    appd_forker: (OwnedFd, OwnedFd),
+}
+
+impl Links {
+    fn make() -> Result<Self, String> {
+        let seq = || seqpacket_pair().map_err(|e| format!("socketpair: {e}"));
+        let stream = || stream_pair().map_err(|e| format!("socketpair: {e}"));
+        Ok(Self {
+            compositor_seat: seq()?,
+            compositor_auth: seq()?,
+            compositor_gpu: stream()?,
+            compositor_locker: stream()?,
+            compositor_appd: stream()?,
+            locker_auth: seq()?,
+            appd_forker: seq()?,
+        })
+    }
+}
+
+type Group = Vec<(&'static str, Child)>;
+
+/// Starts the set in order; a member that fails to start takes the ones already up down.
+fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
+    let l = Links::make()?;
+    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 7] = [
+        ("drv-seatd", &set.seatd, vec![("compositor", l.compositor_seat.1.as_fd())]),
+        (
+            "drv-authd",
+            &set.authd,
+            vec![
+                ("compositor", l.compositor_auth.1.as_fd()),
+                ("locker", l.locker_auth.1.as_fd()),
+            ],
+        ),
+        ("compositor-gpu", &set.gpu, vec![("compositor", l.compositor_gpu.1.as_fd())]),
+        (
+            "compositor",
+            &set.compositor,
+            vec![
+                ("seat", l.compositor_seat.0.as_fd()),
+                ("auth", l.compositor_auth.0.as_fd()),
+                ("gpu", l.compositor_gpu.0.as_fd()),
+                ("locker", l.compositor_locker.0.as_fd()),
+                ("appd", l.compositor_appd.0.as_fd()),
+            ],
+        ),
+        (
+            "locker",
+            &set.locker,
+            vec![
+                ("compositor", l.compositor_locker.1.as_fd()),
+                ("auth", l.locker_auth.0.as_fd()),
+            ],
+        ),
+        ("drv-forker", &set.forker, vec![("channel", l.appd_forker.1.as_fd())]),
+        (
+            "drv-appd",
+            &set.appd,
+            vec![
+                ("listener", listener.as_fd()),
+                ("channel", l.appd_forker.0.as_fd()),
+                ("compositor", l.compositor_appd.1.as_fd()),
+            ],
+        ),
+    ];
+    let mut children: Group = Vec::new();
+    for (name, service, fds) in members {
+        match start_service(service, &fds) {
+            Ok(child) => {
+                eprintln!(
+                    "drv-supervisor: {name} running as uid {}, pid {}",
+                    service.uid,
+                    child.id()
+                );
+                children.push((name, child));
+            }
+            Err(err) => {
+                for (_, child) in children {
+                    stop(child);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(children)
+}
+
+/// Terminates and reaps a child.
+fn stop(mut child: Child) {
+    // SAFETY: our child's pid, not yet reaped.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = child.wait();
+}
+
+/// The apps first (one cgroup write), then every member of the set.
+fn stop_set(apps: &AppsCgroup, children: Group) {
+    if let Err(err) = apps.kill_all() {
+        eprintln!("drv-supervisor: killing the apps: {err}");
+    }
+    for (_, child) in children {
+        stop(child);
+    }
+}
+
+/// Waits for the first of the group to exit: `(name, status)`. The children are not reaped
+/// here (waiting on a `&Child` is not possible); `stop_set` reaps them all.
+fn wait_first(children: &Group) -> (&'static str, String) {
+    let (tx, rx) = mpsc::channel();
+    for (name, child) in children {
+        let name: &'static str = name;
+        let pid = child.id() as i32;
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waitid with WNOWAIT leaves the child for `Child::wait` to reap.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+            };
+            if rc == 0 {
+                status = unsafe { info.si_status() };
+            }
+            let _ = tx.send((name, format!("status {status}")));
+        });
+    }
+    rx.recv().unwrap_or(("?", "lost".to_owned()))
+}
+
+/// A service from the command line: its user must exist and must not be root.
 fn service(
     name: &str,
-    user: Option<&str>,
-    exec: Option<&str>,
+    user: &str,
+    exec: &str,
     env: &[String],
     dirs: &[String],
     caps: &[String],
-) -> Result<Option<Service>, String> {
-    let (Some(user), Some(exec)) = (user, exec) else {
-        if user.is_some() || exec.is_some() {
-            return Err(format!("{name}: both --*-user and --*-exec are needed"));
-        }
-        return Ok(None);
-    };
+) -> Result<Service, String> {
     let (uid, gid) = user_ids(user)?;
-    if uid == 0 && !matches!(name, "drv-seatd" | "drv-forker") {
+    if uid == 0 {
         return Err(format!("{name} must not be root"));
     }
     let mut env = env
@@ -271,10 +352,7 @@ fn service(
     for cap in caps {
         capset |= capability(cap).map_err(|e| format!("{name}: {e}"))?;
     }
-    if uid == 0 && !capset.is_empty() {
-        return Err(format!("{name}: capabilities are for a non-root user"));
-    }
-    Ok(Some(Service {
+    Ok(Service {
         name: name.to_owned(),
         uid,
         gid,
@@ -283,207 +361,5 @@ fn service(
         env,
         dirs,
         caps: capset,
-    }))
-}
-
-/// Keeps one service running; its wire goes to the wiring on every start, and a compositor
-/// start is announced to drv-appd (autostart).
-fn supervise_service(peer: Peer, service: Service, supervisor: &Supervisor) {
-    loop {
-        match start_wired(&service) {
-            Ok((mut child, wire)) => {
-                eprintln!(
-                    "drv-supervisor: {} running as uid {}, pid {}",
-                    service.name,
-                    service.uid,
-                    child.id()
-                );
-                supervisor.wiring.attach_service(peer, wire);
-                if peer == Peer::Compositor {
-                    supervisor.compositor_started();
-                }
-                match child.wait() {
-                    Ok(status) => eprintln!("drv-supervisor: {} exited: {status}", service.name),
-                    Err(err) => eprintln!("drv-supervisor: waiting for {}: {err}", service.name),
-                }
-                if peer == Peer::Compositor {
-                    supervisor.compositor_stopped();
-                }
-                supervisor.wiring.detach_service(peer);
-            }
-            Err(err) => eprintln!("drv-supervisor: {err}"),
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
-/// drv-appd and drv-forker as one group: a fresh channel between them on every start, the
-/// public listener, a notice socket and a wire for drv-appd. When either dies the other is
-/// stopped and both come back.
-fn supervise_appd(supervisor: &Supervisor, appd: &Service, forker: &Service, listener: &UnixListener) -> ! {
-    loop {
-        match start_appd_group(appd, forker, listener) {
-            Ok((children, wire, notices)) => {
-                supervisor.wiring.attach_service(Peer::Appd, wire);
-                supervisor.appd_started(notices);
-                wait_group(children);
-                supervisor.appd_stopped();
-                supervisor.wiring.detach_service(Peer::Appd);
-            }
-            Err(err) => eprintln!("drv-supervisor: {err}"),
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
-/// The compositor, its GPU process and the locker as one group. The GPU process is started
-/// first and gets the core's connection down its wire; it waits there for the core's `Start`.
-/// The locker's Wayland connection is a link like any other. When any of them dies the rest
-/// are stopped and all come back: a sealed GPU process cannot bring up a renderer for a new
-/// core, a core cannot outlive its renderer, and a locker is only ever wired to one core.
-fn supervise_compositor(
-    supervisor: &Supervisor,
-    compositor: &Service,
-    gpu: &Service,
-    locker: Option<&Service>,
-) {
-    loop {
-        match start_compositor_group(compositor, gpu, locker) {
-            Ok((children, wires)) => {
-                let peers: Vec<Peer> = wires.iter().map(|(peer, _)| *peer).collect();
-                for (peer, wire) in wires {
-                    supervisor.wiring.attach_service(peer, wire);
-                }
-                supervisor.compositor_started();
-                wait_group(children);
-                supervisor.compositor_stopped();
-                for peer in peers {
-                    supervisor.wiring.detach_service(peer);
-                }
-            }
-            Err(err) => eprintln!("drv-supervisor: {err}"),
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
-/// Starts the group in wiring order (the compositor's links complete when it attaches, the
-/// locker's when it does); a member that fails to start takes the ones already up down.
-fn start_compositor_group(
-    compositor: &Service,
-    gpu: &Service,
-    locker: Option<&Service>,
-) -> Result<(Group, Vec<(Peer, std::os::fd::OwnedFd)>), String> {
-    let mut members = vec![
-        ("compositor-gpu", Peer::Gpu, gpu),
-        ("compositor", Peer::Compositor, compositor),
-    ];
-    if let Some(locker) = locker {
-        members.push(("locker", Peer::Locker, locker));
-    }
-    let mut children: Group = Vec::new();
-    let mut wires = Vec::new();
-    for (name, peer, service) in members {
-        match start_wired(service) {
-            Ok((child, wire)) => {
-                eprintln!(
-                    "drv-supervisor: {} running as uid {}, pid {}",
-                    service.name,
-                    service.uid,
-                    child.id()
-                );
-                children.push((name, child));
-                wires.push((peer, wire));
-            }
-            Err(err) => {
-                for (_, child) in children {
-                    stop(child);
-                }
-                return Err(err);
-            }
-        }
-    }
-    Ok((children, wires))
-}
-
-/// Terminates and reaps a child whose group could not be completed.
-fn stop(mut child: Child) {
-    // SAFETY: our child's pid, not yet reaped.
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    let _ = child.wait();
-}
-
-type Group = Vec<(&'static str, Child)>;
-
-fn start_appd_group(
-    appd: &Service,
-    forker: &Service,
-    listener: &UnixListener,
-) -> Result<(Group, std::os::fd::OwnedFd, std::os::fd::OwnedFd), String> {
-    let (channel_appd, channel_forker) = seq::pair().map_err(|e| format!("socketpair: {e}"))?;
-    let (notices_ours, notices_appd) = seq::pair().map_err(|e| format!("socketpair: {e}"))?;
-    let (wire_appd, wire_ours) = wire::pair().map_err(|e| format!("socketpair: {e}"))?;
-    let forker_child = start_service(forker, &[(wire::WIRE_FD, channel_forker.as_fd())])?;
-    eprintln!(
-        "drv-supervisor: drv-forker running as uid {}, pid {}",
-        forker.uid,
-        forker_child.id()
-    );
-    let appd_child = match start_service(
-        appd,
-        &[
-            (wire::WIRE_FD, wire_appd.as_fd()),
-            (APPD_LISTENER_FD, listener.as_fd()),
-            (APPD_NOTICE_FD, notices_appd.as_fd()),
-            (APPD_CHANNEL_FD, channel_appd.as_fd()),
-        ],
-    ) {
-        Ok(child) => child,
-        Err(err) => {
-            stop(forker_child);
-            return Err(err);
-        }
-    };
-    eprintln!(
-        "drv-supervisor: drv-appd running as uid {}, pid {}",
-        appd.uid,
-        appd_child.id()
-    );
-    Ok((
-        vec![("drv-forker", forker_child), ("drv-appd", appd_child)],
-        wire_ours,
-        notices_ours,
-    ))
-}
-
-/// Waits for the first of the group to exit, stops the rest, and reaps them all.
-fn wait_group(children: Group) {
-    let (tx, rx) = mpsc::channel();
-    let mut pids = Vec::new();
-    for (name, mut child) in children {
-        pids.push((name, child.id()));
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let result = child.wait();
-            let _ = tx.send((name, result));
-        });
-    }
-    drop(tx);
-    let Ok((first, result)) = rx.recv() else { return };
-    match result {
-        Ok(status) => eprintln!("drv-supervisor: {first} exited: {status}; restarting the group"),
-        Err(err) => eprintln!("drv-supervisor: waiting for {first}: {err}; restarting the group"),
-    }
-    for (name, pid) in pids {
-        if name != first {
-            // SAFETY: our child's pid; its waiter thread has not returned, so not reaped.
-            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        }
-    }
-    for (name, result) in rx {
-        match result {
-            Ok(status) => eprintln!("drv-supervisor: {name} exited: {status}"),
-            Err(err) => eprintln!("drv-supervisor: waiting for {name}: {err}"),
-        }
-    }
+    })
 }

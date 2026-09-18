@@ -103,9 +103,9 @@ in
       debug { dbus-interfaces-in-non-session-instances; }
     '';
     apps = {
-      # The launcher (Mod+D in the stock binds): the one app with a launch channel. Its
-      # entries run `drv launch`, which inherits the channel.
-      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; globals = [ "layer-shell" ]; launcher = true; };
+      # Mod+D in the stock binds. An app, so it holds no launch authority: its entries cannot
+      # launch anything until the menu is a supervisor service (next milestone).
+      fuzzel = { uid = 100010; exec = [ "${pkgs.fuzzel}/bin/fuzzel" ]; globals = [ "layer-shell" ]; };
       # Notification daemon on the services' bus; apps reach it only through the bridge, which
       # names them.
       mako = {

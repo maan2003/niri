@@ -218,7 +218,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = connect_policy();
     if !niri::wire::init() {
-        error!("no wire (DRV_WIRE_FD): the compositor runs under drv-supervisor");
+        error!("no fds from the supervisor (LISTEN_FDS): the compositor runs under drv-supervisor");
         std::process::exit(1);
     }
 
@@ -502,22 +502,14 @@ impl Drop for ShutdownTracy {
     }
 }
 
-/// The GPU process under drv-supervisor: the core's connection is the one attachment on the
-/// wire. Anything else is a misconfiguration, and there is nothing to do without a core.
+/// The GPU process under drv-supervisor: the core's connection is the fd named `compositor`.
+/// Anything else is a misconfiguration, and there is nothing to do without a core.
 fn core_from_wire() -> std::os::fd::OwnedFd {
-    use drv_policy::wire::{self, Attach};
-    let Some(wire) = wire::take() else {
-        error!("gpu process: no --socket-fd and no wire (DRV_WIRE_FD): it runs under drv-supervisor");
-        std::process::exit(1);
-    };
-    match wire::recv_attach(&wire) {
-        Ok((Attach::Compositor, sock)) => sock,
-        Ok((other, _)) => {
-            error!("gpu process: expected the core on the wire, got {other:?}");
-            std::process::exit(1);
-        }
+    let sock = drv_os::fds::take().and_then(|mut fds| fds.socket("compositor", drv_os::fds::Kind::Stream));
+    match sock {
+        Ok(sock) => sock,
         Err(err) => {
-            error!("gpu process: the wire failed before the core arrived: {err}");
+            error!("gpu process: no --socket-fd and no `compositor` fd from the supervisor: {err}");
             std::process::exit(1);
         }
     }
