@@ -54,6 +54,7 @@
             ./drv-auth
             ./drv-lock
             ./drv-menu
+            ./drv-portal
             ./drv-ui
               ./niri-visual-tests
               ./resources
@@ -81,8 +82,8 @@
 
           strictDeps = true;
 
-          # The supervisor, drv-appd, drv-forker, the drv CLI and the bridge ship with the
-          # compositor.
+          # The supervisor, drv-appd, drv-forker, the drv CLI, the bridge (with its chooser
+          # probe) and the set's windows ship with the compositor.
           cargoBuildFlags = [
             "-p"
             "niri"
@@ -102,6 +103,8 @@
             "drv-lock"
             "-p"
             "drv-menu"
+            "-p"
+            "drv-portal"
           ];
 
           nativeBuildInputs = [

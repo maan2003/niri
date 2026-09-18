@@ -22,6 +22,8 @@ pub enum Peer {
     Menu,
     /// drv-menu's Wayland connection.
     MenuClient,
+    /// drv-portal's Wayland connection: a layer-shell client for its dialogs.
+    PortalClient,
 }
 
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
@@ -75,6 +77,7 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
         (Peer::Appd, "appd", Kind::Stream),
         (Peer::Menu, "menu", Kind::Stream),
         (Peer::MenuClient, "menu-client", Kind::Stream),
+        (Peer::PortalClient, "portal-client", Kind::Stream),
     ] {
         match fds.socket(name, kind) {
             Ok(fd) => out.push((peer, fd)),

@@ -6859,7 +6859,8 @@ impl Niri {
                 }
                 Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
             },
-            Peer::MenuClient => self.insert_menu(sock),
+            Peer::MenuClient => self.insert_layer_client(sock, "menu"),
+            Peer::PortalClient => self.insert_layer_client(sock, "portal"),
             Peer::Menu => {
                 let sock = std::os::unix::net::UnixStream::from(sock);
                 if let Err(err) = sock.set_nonblocking(true) {
@@ -6930,7 +6931,9 @@ impl Niri {
 
     /// drv-menu's Wayland connection, from the supervisor: a layer-shell client and nothing
     /// else, no lookup.
-    fn insert_menu(&mut self, sock: OwnedFd) {
+    /// A supervisor service that draws layer-shell surfaces (the menu, the portal's dialogs):
+    /// its connection came down our wire, its policy is this and nothing in the manifest.
+    fn insert_layer_client(&mut self, sock: OwnedFd, name: &str) {
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
             compositor_state: Default::default(),
@@ -6939,7 +6942,7 @@ impl Niri {
             restricted: false,
             credentials_unknown: false,
             policy: Arc::new(AppPolicy {
-                name: "menu".to_owned(),
+                name: name.to_owned(),
                 gpu: false,
                 globals: vec![PolicyGlobal::LayerShell],
                 grants: Vec::new(),
@@ -6947,8 +6950,8 @@ impl Niri {
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
-            Ok(_) => info!("menu client attached"),
-            Err(err) => warn!("error inserting the menu client: {err}"),
+            Ok(_) => info!("{name} client attached"),
+            Err(err) => warn!("error inserting the {name} client: {err}"),
         }
     }
 

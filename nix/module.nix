@@ -100,6 +100,7 @@ in
       appd = lib.mkOption { type = lib.types.int; default = 901; };
       compositor = lib.mkOption { type = lib.types.int; default = 902; };
       bridge = lib.mkOption { type = lib.types.int; default = 903; };
+      portal = lib.mkOption { type = lib.types.int; default = 912; };
       bus = lib.mkOption { type = lib.types.int; default = 904; };
       gpu = lib.mkOption { type = lib.types.int; default = 905; };
       auth = lib.mkOption { type = lib.types.int; default = 906; };
@@ -130,8 +131,13 @@ in
     };
     expose = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/opengl-driver" "/run/current-system" "/run/pipewire" "/run/pulse" ];
+      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" "/run/current-system" "/run/pipewire" "/run/pulse" ];
       description = "Entries of /run apps may see; the rest of /run is hidden.";
+    };
+    files = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/drv-files";
+      description = "The person's files: owned by drv-portal, shown by its file chooser, handed to apps one at a time through /run/drv-doc.";
     };
     env = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
@@ -142,6 +148,8 @@ in
         DRV_APPD_SOCKET = appdSocket;
         XDG_SESSION_TYPE = "wayland";
         XDG_DATA_DIRS = "/run/current-system/sw/share";
+        # GTK asks the portal for files instead of browsing a home that holds nothing.
+        GTK_USE_PORTAL = "1";
       };
       description = "Environment every app gets.";
     };
@@ -249,6 +257,8 @@ in
       # The app menu: a launcher because the supervisor handed it a channel; its Wayland
       # connection is a supervisor fd too.
       drv-menu = { uid = cfg.ids.menu; group = "drv-menu"; isSystemUser = true; };
+      # The portal: owns the person's files, shows the chooser, serves the documents mount.
+      drv-portal = { uid = cfg.ids.portal; group = "drv-portal"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -268,6 +278,7 @@ in
       drv-forker.gid = cfg.ids.forker;
       drv-supervisor.gid = cfg.ids.supervisor;
       drv-menu.gid = cfg.ids.menu;
+      drv-portal.gid = cfg.ids.portal;
       render = { };
     };
 
@@ -376,7 +387,24 @@ in
           "--menu-user drv-menu"
           "--menu-exec '${cfg.package}/bin/drv-menu'"
           "--menu-env RUST_BACKTRACE=1"
-        ] ++ map (e: "--gpu-env ${e}") [
+          # The file chooser and the documents mount (drv-portal): the supervisor mounts a
+          # FUSE filesystem at /run/drv-doc and hands the portal its serving end; apps see
+          # the files they were given under it, as their own UID only.
+          "--portal-user drv-portal"
+          "--portal-exec '${cfg.package}/bin/drv-portal --files ${cfg.files} --docs /run/drv-doc'"
+          "--portal-env RUST_BACKTRACE=1"
+          "--docs /run/drv-doc"
+          # The bridge: the apps' desktop services, keyed on the peer UID. Notifications and
+          # the rest of the portals still go to the services' bus; the file chooser goes down
+          # its supervisor link to drv-portal.
+          "--bridge-user drv-bridge"
+          "--bridge-exec '${cfg.package}/bin/drv-bridge serve'"
+          "--bridge-socket ${bridgeSocket}"
+          "--bridge-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
+          "--bridge-env DRV_APPD_SOCKET=${appdSocket}"
+          "--bridge-env RUST_BACKTRACE=1"
+        ] ++ map (p: "--bridge-expose ${p}") [ "/run/drv" "/run/drv-session" ]
+          ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.
           "MESA_SHADER_CACHE_DISABLE=true"
           "MESA_GLSL_CACHE_DISABLE=true"
@@ -395,7 +423,7 @@ in
         # Fresh per start, made as ours and handed over (chown is ours, mkdir under /run is
         # not). What must outlive a start (the apps' directories, the PIN store) is a tmpfiles
         # rule below: StateDirectory= would chown their contents to us on every start.
-        RuntimeDirectory = [ "drv" "drv-compositor" "drv-wayland" ];
+        RuntimeDirectory = [ "drv" "drv-compositor" "drv-wayland" "drv-bridge" "drv-doc" ];
         RuntimeDirectoryMode = "0755";
         # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
         Delegate = true;
@@ -406,25 +434,8 @@ in
       "d /run/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
+      "d ${cfg.files} 0700 drv-portal drv-portal -"
     ];
-
-    systemd.services.drv-bridge = {
-      wantedBy = [ "multi-user.target" ];
-      after = [ "drv-supervisor.service" "drv-session-bus.service" ];
-      requires = [ "drv-supervisor.service" "drv-session-bus.service" ];
-      environment = {
-        DBUS_SESSION_BUS_ADDRESS = sessionBus;
-        DRV_APPD_SOCKET = appdSocket;
-      };
-      serviceConfig = {
-        User = "drv-bridge";
-        ExecStart = "${cfg.package}/bin/drv-bridge serve --socket ${bridgeSocket}";
-        RuntimeDirectory = "drv-bridge";
-        RuntimeDirectoryMode = "0755";
-        Restart = "on-failure";
-        RestartSec = 1;
-      };
-    };
 
   };
 }

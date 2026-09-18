@@ -75,6 +75,12 @@ in
   };
 
   services.openssh.enable = true;
+  # Something for the chooser to show.
+  systemd.tmpfiles.rules = [
+    "d /var/lib/drv-files/notes 0700 drv-portal drv-portal -"
+    "f+ /var/lib/drv-files/hello.txt 0600 drv-portal drv-portal - hello from the persons files\\n"
+    "f+ /var/lib/drv-files/notes/todo.txt 0600 drv-portal drv-portal - build the portal\\n"
+  ];
   services.openssh.settings.PermitRootLogin = "yes";
   users.users.root.openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4pE2ZiZIJvxrTMzKzwfVBtUPp2Ek7MGselzb0w6wDE maan2003@devbox-01" ];
   networking.firewall.enable = false;
@@ -160,6 +166,10 @@ in
         network = true;
         groups = [ "render" "pipewire" ];
       };
+      # A client of the file chooser, as a GTK app would use it: asks its private bus, the
+      # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
+      # Then it saves a copy the same way. Results in its home, result.txt.
+      chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; };
       # Plays a sound: audio is just the `pipewire` group plus the exposed socket directory.
       beep = {
         uid = 100006;

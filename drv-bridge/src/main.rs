@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::fs::Permissions;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{self, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
@@ -14,12 +14,15 @@ use drv_bridge::{
     rewrite_handle, rewrite_structure, sender_component, tokens_owned_by, unique_from_component,
     APP_ID_PREFIX, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH,
 };
+use drv_os::fds::Kind;
+use drv_policy::seq;
 use drv_policy::{AppPolicy, PolicyClient};
+use drv_portal::protocol::{self, Kind as ChooserKind};
 use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
 use zbus::zvariant::serialized::Context;
-use zbus::zvariant::{OwnedValue, Signature, Structure, Value};
+use zbus::zvariant::{ObjectPath, OwnedValue, Signature, Structure, Value};
 use zbus::AuthMechanism;
 
 #[derive(Parser)]
@@ -31,11 +34,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run as the human: accept apps, key each connection on the peer UID, forward to the
-    /// human's session bus.
+    /// Run as its own user under the supervisor: fd `listener` is the apps' socket, fd
+    /// `portal` the line to drv-portal. Each connection is keyed on the peer UID and
+    /// forwarded to the services' bus.
     Serve {
-        #[arg(long)]
-        socket: PathBuf,
         #[arg(long, env = "DRV_APPD_SOCKET")]
         appd: PathBuf,
     },
@@ -51,7 +53,7 @@ enum Cmd {
 
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
-        Cmd::Serve { socket, appd } => serve(socket, appd),
+        Cmd::Serve { appd } => serve(appd),
         Cmd::App { socket, command } => app(socket, command),
     }
 }
@@ -125,13 +127,31 @@ fn failed(call: &Header<'_>, text: String) -> zbus::Result<Message> {
     Message::error(call, "org.freedesktop.DBus.Error.Failed")?.build(&text)
 }
 
+const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
+const REQUEST_IFACE: &str = "org.freedesktop.portal.Request";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+/// What we claim `org.freedesktop.portal.FileChooser` is (`current_name`, `current_folder`).
+const FILE_CHOOSER_VERSION: u32 = 4;
+
+/// `file://` with everything outside the unreserved set escaped.
+fn file_uri(path: &str) -> String {
+    let mut out = String::from("file://");
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 fn is_portal_call(hdr: &Header<'_>) -> bool {
     let on_portal_path = hdr.path().is_some_and(|p| {
         p.as_str() == PORTAL_PATH || p.as_str().starts_with(&format!("{PORTAL_PATH}/"))
     });
     on_portal_path
         && hdr.interface().is_some_and(|i| {
-            i.starts_with("org.freedesktop.portal.")
+            i.starts_with("org.freedesktop.portal.") || i.as_str() == PROPERTIES
                 || i.as_str() == "org.freedesktop.DBus.Properties"
                 || i.as_str() == "org.freedesktop.DBus.Introspectable"
         })
@@ -159,20 +179,21 @@ trait Notifications {
     ) -> zbus::Result<u32>;
 }
 
-fn serve(socket: PathBuf, identity: PathBuf) -> anyhow::Result<()> {
+fn serve(identity: PathBuf) -> anyhow::Result<()> {
+    let mut fds = drv_os::fds::take().context("fds from the supervisor")?;
+    // Bound by the supervisor, any UID may connect; who they are is decided per connection.
+    let listener = fds.listener("listener")?;
+    let portal = Portal::start(fds.socket("portal", Kind::SeqPacket)?)?;
     // Fail at startup, not on the first app, if there is no session bus.
-    drop(Connection::session().context("the human's session bus")?);
+    drop(Connection::session().context("the services' bus")?);
     let policy = Arc::new(Mutex::new(
         PolicyClient::connect(identity).context("identity daemon")?,
     ));
 
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).with_context(|| socket.display().to_string())?;
-    // Any UID may connect; who they are is decided per connection, below.
-    std::fs::set_permissions(&socket, Permissions::from_mode(0o666))?;
     for stream in listener.incoming() {
         let stream = stream?;
         let policy = policy.clone();
+        let portal = portal.clone();
         std::thread::spawn(move || {
             let uid = match rustix::net::sockopt::socket_peercred(&stream) {
                 Ok(cred) => cred.uid.as_raw(),
@@ -193,7 +214,7 @@ fn serve(socket: PathBuf, identity: PathBuf) -> anyhow::Result<()> {
                 }
             };
             eprintln!("bridge: {} (uid {uid}) connected", app.name);
-            if let Err(err) = AppLink::run(app, stream) {
+            if let Err(err) = AppLink::run(app, uid, stream, portal) {
                 eprintln!("bridge: {err:#}");
             }
         });
@@ -201,9 +222,92 @@ fn serve(socket: PathBuf, identity: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Our line to drv-portal. Requests carry an id; answers come back on one reader thread
+/// and find their asker here. Losing the portal ends us: the set restarts as one.
+struct Portal {
+    sock: OwnedFd,
+    next: AtomicU64,
+    waiting: Mutex<HashMap<u64, Box<dyn FnOnce(protocol::Response) + Send>>>,
+}
+
+impl Portal {
+    fn start(sock: OwnedFd) -> anyhow::Result<Arc<Self>> {
+        seq::send(&sock, &protocol::Request::Hello { version: protocol::VERSION }, &[])
+            .context("hello to drv-portal")?;
+        let (hello, _) = seq::recv::<protocol::Response>(&sock).context("hello from drv-portal")?;
+        match hello {
+            protocol::Response::Hello { version } if version == protocol::VERSION => {}
+            other => bail!("drv-portal answered {other:?}, not version {}", protocol::VERSION),
+        }
+        let portal = Arc::new(Self {
+            sock,
+            next: AtomicU64::new(1),
+            waiting: Mutex::new(HashMap::new()),
+        });
+        let reader = portal.clone();
+        thread::spawn(move || loop {
+            match seq::recv::<protocol::Response>(&reader.sock) {
+                Ok((resp, _)) => reader.dispatch(resp),
+                Err(err) => {
+                    eprintln!("bridge: drv-portal: {err}");
+                    process::exit(1);
+                }
+            }
+        });
+        Ok(portal)
+    }
+
+    fn dispatch(&self, resp: protocol::Response) {
+        let id = match &resp {
+            protocol::Response::Chosen { id, .. }
+            | protocol::Response::Cancelled { id }
+            | protocol::Response::Failed { id, .. } => *id,
+            protocol::Response::Hello { .. } => return,
+        };
+        let waiter = self.waiting.lock().unwrap().remove(&id);
+        match waiter {
+            Some(done) => done(resp),
+            None => eprintln!("bridge: drv-portal answered {id}, which nobody asked"),
+        }
+    }
+
+    fn ask(
+        &self,
+        app: &str,
+        uid: u32,
+        title: String,
+        kind: ChooserKind,
+        done: impl FnOnce(protocol::Response) + Send + 'static,
+    ) -> anyhow::Result<u64> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.waiting.lock().unwrap().insert(id, Box::new(done));
+        let req = protocol::Request::Choose {
+            id,
+            app: app.to_owned(),
+            uid,
+            title,
+            kind,
+        };
+        if let Err(err) = seq::send(&self.sock, &req, &[]) {
+            self.waiting.lock().unwrap().remove(&id);
+            return Err(err).context("asking drv-portal");
+        }
+        Ok(id)
+    }
+
+    fn cancel(&self, id: u64) {
+        self.waiting.lock().unwrap().remove(&id);
+        if let Err(err) = seq::send(&self.sock, &protocol::Request::Cancel { id }, &[]) {
+            eprintln!("bridge: cancelling {id} at drv-portal: {err}");
+        }
+    }
+}
+
 /// One connected app: its peer-to-peer link and its own connection on the human's bus.
 struct AppLink {
     app: Arc<AppPolicy>,
+    uid: u32,
+    portal: Arc<Portal>,
     p2p: Connection,
     bus: Connection,
     /// The sender component of `bus`'s unique name.
@@ -217,10 +321,13 @@ struct LinkState {
     pending: HashMap<NonZeroU32, Message>,
     /// Portal handle token → the app-side sender component that owns it.
     owners: HashMap<String, String>,
+    /// Request handles we answer ourselves (the file chooser), by path, with the id at
+    /// drv-portal: `Request.Close` on one cancels there.
+    ours: HashMap<String, u64>,
 }
 
 impl AppLink {
-    fn run(app: Arc<AppPolicy>, stream: UnixStream) -> anyhow::Result<()> {
+    fn run(app: Arc<AppPolicy>, uid: u32, stream: UnixStream, portal: Arc<Portal>) -> anyhow::Result<()> {
         // Who the peer is was settled by SO_PEERCRED, so no D-Bus authentication on top.
         #[allow(deprecated)] // the async-io variant needs an Async wrapper for nothing
         let p2p_iter = zbus::blocking::connection::Builder::unix_stream(stream)
@@ -251,6 +358,8 @@ impl AppLink {
 
         let link = Arc::new(AppLink {
             app,
+            uid,
+            portal,
             p2p,
             bus,
             me,
@@ -281,12 +390,14 @@ impl AppLink {
         Ok(())
     }
 
-    fn on_app_message(&self, msg: &Message) -> anyhow::Result<()> {
+    fn on_app_message(self: &Arc<Self>, msg: &Message) -> anyhow::Result<()> {
         let hdr = msg.header();
         if hdr.message_type() != MessageType::MethodCall {
             return Ok(());
         }
-        let reply = if is_portal_call(&hdr) {
+        let reply = if let Some(reply) = self.ours(msg, &hdr)? {
+            reply
+        } else if is_portal_call(&hdr) {
             match self.forward_to_portal(msg, &hdr) {
                 Ok(()) => return Ok(()),
                 Err(err) => failed(&hdr, format!("{err:#}"))?,
@@ -305,6 +416,107 @@ impl AppLink {
         };
         self.p2p.send(&reply)?;
         Ok(())
+    }
+
+    /// What we answer without xdg-desktop-portal: the file chooser (drv-portal's), its
+    /// `version`, and `Close` on a request of ours. `None` is "not ours, forward it".
+    fn ours(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<Option<Message>> {
+        let path = hdr.path().context("no path")?.as_str().to_owned();
+        let interface = hdr.interface().map(|i| i.as_str().to_owned()).unwrap_or_default();
+        let member = hdr.member().map(|m| m.as_str().to_owned()).unwrap_or_default();
+        if path == PORTAL_PATH && interface == FILE_CHOOSER {
+            return self.file_chooser(msg, hdr, &member).map(Some);
+        }
+        if path == PORTAL_PATH && interface == PROPERTIES {
+            match member.as_str() {
+                "Get" => {
+                    let (iface, prop): (String, String) = msg.body().deserialize()?;
+                    if iface == FILE_CHOOSER {
+                        return Ok(Some(if prop == "version" {
+                            Message::method_return(hdr)?.build(&Value::U32(FILE_CHOOSER_VERSION))?
+                        } else {
+                            Message::error(hdr, "org.freedesktop.DBus.Error.InvalidArgs")?
+                                .build(&format!("no property {prop} on {FILE_CHOOSER}"))?
+                        }));
+                    }
+                }
+                "GetAll" => {
+                    let (iface,): (String,) = msg.body().deserialize()?;
+                    if iface == FILE_CHOOSER {
+                        let mut all: HashMap<&str, Value<'_>> = HashMap::new();
+                        all.insert("version", Value::U32(FILE_CHOOSER_VERSION));
+                        return Ok(Some(Message::method_return(hdr)?.build(&all)?));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(None);
+        }
+        if interface == REQUEST_IFACE && member == "Close" {
+            let id = self.state.lock().unwrap().ours.remove(&path);
+            if let Some(id) = id {
+                self.portal.cancel(id);
+                return Ok(Some(Message::method_return(hdr)?.build(&())?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `OpenFile`/`SaveFile`: the handle goes back now, the `Response` signal when the
+    /// person has picked. The app's `title` is shown as a hint under our own line naming it.
+    fn file_chooser(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Message> {
+        let caller = match hdr.destination() {
+            Some(BusName::Unique(name)) => sender_component(name.as_str()),
+            _ => bail!("no caller"),
+        };
+        let (_parent, title, options): (String, String, HashMap<String, OwnedValue>) =
+            msg.body().deserialize().context("FileChooser arguments")?;
+        let string = |key: &str| options.get(key).cloned().and_then(|v| String::try_from(v).ok());
+        let flag = |key: &str| options.get(key).cloned().and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
+        let kind = match member {
+            "OpenFile" if flag("directory") => bail!("directories are not handed out yet"),
+            "OpenFile" => ChooserKind::Open,
+            "SaveFile" => ChooserKind::Save {
+                name: string("current_name").unwrap_or_default(),
+            },
+            other => bail!("no {other} on {FILE_CHOOSER}"),
+        };
+        // The token is the app's; it must be one path element.
+        let token: String = string("handle_token")
+            .unwrap_or_else(|| format!("drv{}", msg.primary_header().serial_num()))
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let handle = format!("{PORTAL_PATH}/request/{caller}/{token}");
+        let link = self.clone();
+        let signal_path = handle.clone();
+        let id = self.portal.ask(&self.app.name, self.uid, title, kind, move |resp| {
+            link.state.lock().unwrap().ours.remove(&signal_path);
+            let (code, uris): (u32, Vec<String>) = match resp {
+                protocol::Response::Chosen { paths, .. } => {
+                    (0, paths.iter().map(|p| file_uri(p)).collect())
+                }
+                protocol::Response::Cancelled { .. } => (1, Vec::new()),
+                protocol::Response::Failed { reason, .. } => {
+                    eprintln!("bridge: {}: file chooser: {reason}", link.app.name);
+                    (2, Vec::new())
+                }
+                protocol::Response::Hello { .. } => return,
+            };
+            let mut results: HashMap<&str, Value<'_>> = HashMap::new();
+            if code == 0 {
+                results.insert("uris", Value::from(uris));
+            }
+            let signal = Message::signal(signal_path.as_str(), REQUEST_IFACE, "Response")
+                .and_then(|b| b.destination(unique_from_component(&caller)))
+                .and_then(|b| b.build(&(code, results)));
+            let sent = signal.and_then(|s| link.p2p.send(&s));
+            if let Err(err) = sent {
+                eprintln!("bridge: {}: file chooser response: {err}", link.app.name);
+            }
+        })?;
+        self.state.lock().unwrap().ours.insert(handle.clone(), id);
+        Ok(Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)
     }
 
     fn forward_to_portal(&self, msg: &Message, hdr: &Header<'_>) -> anyhow::Result<()> {

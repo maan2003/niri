@@ -2,10 +2,13 @@
 //! hand, and restarts the whole set when any of it dies (see the crate docs). Every
 //! connection between two members is a socketpair made here, before either exists.
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -128,6 +131,36 @@ struct Args {
     /// `NAME=VALUE` in the menu's environment. Repeatable; it gets nothing else.
     #[arg(long = "menu-env")]
     menu_env: Vec<String>,
+    /// System user the portal (file chooser and documents mount) runs as.
+    #[arg(long)]
+    portal_user: String,
+    /// The portal's command line, whitespace-separated (`drv-portal --files DIR`).
+    #[arg(long)]
+    portal_exec: String,
+    /// An entry under `/run` the portal sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "portal-expose")]
+    portal_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the portal's environment. Repeatable; it gets nothing else.
+    #[arg(long = "portal-env")]
+    portal_env: Vec<String>,
+    /// Where the documents mount goes: the portal serves it, apps see their files under it.
+    #[arg(long, default_value = "/run/drv-doc")]
+    docs: PathBuf,
+    /// System user the bridge (desktop services for apps) runs as.
+    #[arg(long)]
+    bridge_user: String,
+    /// The bridge's command line, whitespace-separated (`drv-bridge serve`).
+    #[arg(long)]
+    bridge_exec: String,
+    /// An entry under `/run` the bridge sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "bridge-expose")]
+    bridge_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the bridge's environment. Repeatable; it gets nothing else.
+    #[arg(long = "bridge-env")]
+    bridge_env: Vec<String>,
+    /// The bridge's socket, world-connectable: every connection is keyed on the peer UID.
+    #[arg(long, default_value = "/run/drv-bridge/bridge.sock")]
+    bridge_socket: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -158,8 +191,10 @@ struct Set {
     compositor: Service,
     locker: Service,
     menu: Service,
+    portal: Service,
     forker: Service,
     appd: Service,
+    bridge: Service,
 }
 
 fn supervise(args: Args) -> Result<(), String> {
@@ -178,6 +213,7 @@ fn supervise(args: Args) -> Result<(), String> {
         )?,
         locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[], &args.locker_expose)?,
         menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[], &args.menu_expose)?,
+        portal: service("drv-portal", &args.portal_user, &args.portal_exec, &args.portal_env, &[], &[], &args.portal_expose)?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -188,22 +224,17 @@ fn supervise(args: Args) -> Result<(), String> {
             &args.forker_expose,
         )?,
         appd: service("drv-appd", &args.appd_user, &args.appd_exec, &[], &[], &[], &args.appd_expose)?,
+        bridge: service("drv-bridge", &args.bridge_user, &args.bridge_exec, &args.bridge_env, &[], &[], &args.bridge_expose)?,
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switch stays ours.
     let apps = AppsCgroup::create(set.forker.uid, set.forker.gid)?;
 
-    if let Some(parent) = args.socket.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    let _ = fs::remove_file(&args.socket);
-    let listener = UnixListener::bind(&args.socket)
-        .map_err(|e| format!("listen on {}: {e}", args.socket.display()))?;
-    fs::set_permissions(&args.socket, fs::Permissions::from_mode(0o666))
-        .map_err(|e| format!("chmod {}: {e}", args.socket.display()))?;
+    let listener = listen(&args.socket)?;
+    let bridge_listener = listen(&args.bridge_socket)?;
 
     loop {
-        match start_set(&set, &listener) {
+        match start_set(&set, &listener, &bridge_listener, &args.docs) {
             Ok(children) => {
                 let (name, status) = wait_first(&children);
                 eprintln!("drv-supervisor: {name} exited ({status}); restarting the set");
@@ -213,6 +244,54 @@ fn supervise(args: Args) -> Result<(), String> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// A world-connectable socket for a member that keys every connection on the peer UID.
+fn listen(path: &Path) -> Result<UnixListener, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let _ = fs::remove_file(path);
+    let listener =
+        UnixListener::bind(path).map_err(|e| format!("listen on {}: {e}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    Ok(listener)
+}
+
+/// The documents mount, fresh for this set: a FUSE connection whose serving end goes to the
+/// portal as fd `fuse`. `allow_other` because the apps are the readers; who may see what is
+/// the portal's check, per request, by the caller's UID. What the last set served is gone
+/// with it, like the apps that held it.
+fn mount_docs(at: &Path, uid: u32, gid: u32) -> Result<OwnedFd, String> {
+    let target = CString::new(at.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated path; a stale mount from the last set is the expected case.
+    unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    fs::create_dir_all(at).map_err(|e| format!("mkdir {}: {e}", at.display()))?;
+    let fuse = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .map_err(|e| format!("open /dev/fuse: {e}"))?;
+    let data = CString::new(format!(
+        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other",
+        fuse.as_raw_fd()
+    ))
+    .map_err(|e| e.to_string())?;
+    // SAFETY: NUL-terminated strings, flags and data as mount(2) wants them.
+    let rc = unsafe {
+        libc::mount(
+            c"drv-doc".as_ptr(),
+            target.as_ptr(),
+            c"fuse".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            data.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!("mount fuse on {}: {}", at.display(), io::Error::last_os_error()));
+    }
+    Ok(OwnedFd::from(fuse))
 }
 
 /// Every link is a socketpair made here; each member gets its ends by name.
@@ -225,6 +304,8 @@ struct Links {
     compositor_menu: (OwnedFd, OwnedFd),
     menu_client: (OwnedFd, OwnedFd),
     menu_appd: (OwnedFd, OwnedFd),
+    portal_client: (OwnedFd, OwnedFd),
+    bridge_portal: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
 }
@@ -242,6 +323,8 @@ impl Links {
             compositor_menu: stream()?,
             menu_client: stream()?,
             menu_appd: stream()?,
+            portal_client: stream()?,
+            bridge_portal: seq()?,
             locker_auth: seq()?,
             appd_forker: seq()?,
         })
@@ -251,9 +334,15 @@ impl Links {
 type Group = Vec<(&'static str, Child)>;
 
 /// Starts the set in order; a member that fails to start takes the ones already up down.
-fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
+fn start_set(
+    set: &Set,
+    listener: &UnixListener,
+    bridge_listener: &UnixListener,
+    docs: &Path,
+) -> Result<Group, String> {
     let l = Links::make()?;
-    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 8] = [
+    let fuse = mount_docs(docs, set.portal.uid, set.portal.gid)?;
+    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 10] = [
         ("drv-seatd", &set.seatd, vec![("compositor", l.compositor_seat.1.as_fd())]),
         (
             "drv-authd",
@@ -275,6 +364,7 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("appd", l.compositor_appd.0.as_fd()),
                 ("menu", l.compositor_menu.0.as_fd()),
                 ("menu-client", l.menu_client.0.as_fd()),
+                ("portal-client", l.portal_client.0.as_fd()),
             ],
         ),
         (
@@ -294,6 +384,15 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("appd", l.menu_appd.0.as_fd()),
             ],
         ),
+        (
+            "drv-portal",
+            &set.portal,
+            vec![
+                ("wayland", l.portal_client.1.as_fd()),
+                ("bridge", l.bridge_portal.1.as_fd()),
+                ("fuse", fuse.as_fd()),
+            ],
+        ),
         ("drv-forker", &set.forker, vec![("channel", l.appd_forker.1.as_fd())]),
         (
             "drv-appd",
@@ -303,6 +402,14 @@ fn start_set(set: &Set, listener: &UnixListener) -> Result<Group, String> {
                 ("channel", l.appd_forker.0.as_fd()),
                 ("compositor", l.compositor_appd.1.as_fd()),
                 ("menu", l.menu_appd.1.as_fd()),
+            ],
+        ),
+        (
+            "drv-bridge",
+            &set.bridge,
+            vec![
+                ("listener", bridge_listener.as_fd()),
+                ("portal", l.bridge_portal.0.as_fd()),
             ],
         ),
     ];

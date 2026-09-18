@@ -1,0 +1,15 @@
+[package]
+name = "drv-portal"
+version = "26.4.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "The file chooser and the documents mount: the person picks a file for an app, and that one file is what the app gets."
+
+[dependencies]
+clap = { workspace = true }
+drv-os = { version = "26.4.0", path = "../drv-os" }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+drv-ui = { version = "26.4.0", path = "../drv-ui" }
+fuser = { version = "0.18", default-features = false }
+libc = "0.2"
+serde.workspace = true

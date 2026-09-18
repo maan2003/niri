@@ -13,7 +13,6 @@ use std::io;
 use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 
-use rustix::fs::FileType;
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
 /// The first passed fd, as systemd defines it.
@@ -93,10 +92,7 @@ fn take_inner() -> io::Result<Fds> {
         }
         // SAFETY: the process that started us put a live fd on this number and it is ours.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let stat = rustix::fs::fstat(&fd).map_err(|e| invalid(format!("fd {raw} ({name}): {e}")))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::Socket {
-            return Err(invalid(format!("fd {raw} ({name}) is not a socket")));
-        }
+        rustix::fs::fstat(&fd).map_err(|e| invalid(format!("fd {raw} ({name}): {e}")))?;
         rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
         if fds.insert((*name).to_owned(), fd).is_some() {
             return Err(invalid(format!("two fds named {name:?}")));
@@ -112,6 +108,12 @@ impl Fds {
         let fd = self.remove(name)?;
         check_unix(&fd, name, Some(kind.socket_type()), false)?;
         Ok(fd)
+    }
+
+    /// Whatever fd was handed over under `name`, for what is not a socket (a device the
+    /// supervisor opened for us).
+    pub fn file(&mut self, name: &str) -> io::Result<OwnedFd> {
+        self.remove(name)
     }
 
     /// A listening unix stream socket.

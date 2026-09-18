@@ -430,11 +430,20 @@ pub fn warm_fonts() {
 
 /// The syscall allowlist for a sealed window: the baseline plus reading files (fonts).
 pub fn seal(name: &'static str) -> Result<(), String> {
+    seal_with(name, |_| Ok(()))
+}
+
+/// [`seal`] with `extend` adding what this window needs on top.
+pub fn seal_with(
+    name: &'static str,
+    extend: impl FnOnce(&mut drv_os::seccomp::Allowlist) -> std::io::Result<()>,
+) -> Result<(), String> {
     if !drv_os::seccomp::enabled() {
         return Ok(());
     }
     let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
     allow.read_files().map_err(|e| e.to_string())?;
+    extend(&mut allow).map_err(|e| e.to_string())?;
     allow.apply(name).map_err(|e| e.to_string())?;
     eprintln!("{name}: seccomp: syscall allowlist applied");
     Ok(())
