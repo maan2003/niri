@@ -251,6 +251,11 @@ in
     };
 
     environment.etc."drv/identity.toml".source = identityFile;
+    # Suspend must not hand the old desktop back before the compositor paints: the kernel
+    # resumes with every plane off until the first commit (see the patch).
+    boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
+    boot.kernelParams = [ "drm_kms_helper.blank_on_resume=1" ];
+
     environment.etc."drv/config.kdl".text = cfg.config + ''
 
       // The lock screen app, launched by the compositor whenever the session is locked.

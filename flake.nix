@@ -283,6 +283,12 @@
                 })
               ];
             }).config.system.build.vm;
+          # Kernel blank-on-resume check, no desktop: `nix build .#resume-vm`, nix/resume-test.sh.
+          resume-vm =
+            (lib.nixosSystem {
+              inherit system;
+              modules = [ ./nix/resume-vm.nix ];
+            }).config.system.build.vm;
         }
       );
 

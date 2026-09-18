@@ -1,6 +1,6 @@
 diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_helper.c
 --- a/drivers/gpu/drm/drm_atomic_helper.c	2026-09-18 08:57:24.991672850 +0000
-+++ b/drivers/gpu/drm/drm_atomic_helper.c	2026-09-18 08:57:24.995672878 +0000
++++ b/drivers/gpu/drm/drm_atomic_helper.c	2026-09-18 09:00:05.045821125 +0000
 @@ -28,6 +28,8 @@
  #include <linux/export.h>
  #include <linux/dma-fence.h>
@@ -10,7 +10,7 @@ diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_he
  
  #include <drm/drm_atomic.h>
  #include <drm/drm_atomic_helper.h>
-@@ -3821,6 +3823,143 @@
+@@ -3821,6 +3823,147 @@
  }
  EXPORT_SYMBOL(drm_atomic_helper_suspend);
  
@@ -95,6 +95,7 @@ diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_he
 + * nothing when the blank_on_resume parameter is off.
 + */
 +void drm_atomic_helper_blank_planes(struct drm_atomic_state *state,
++				    struct drm_modeset_acquire_ctx *ctx,
 +				    struct drm_atomic_blanked_plane *blanked)
 +{
 +	struct drm_plane *plane;
@@ -103,6 +104,9 @@ diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_he
 +
 +	if (!drm_blank_on_resume)
 +		return;
++
++	/* Detaching touches the CRTC states, which want the lock context set. */
++	state->acquire_ctx = ctx;
 +
 +	for_each_new_plane_in_state(state, plane, plane_state, i) {
 +		if (!plane_state->crtc && !plane_state->fb)
@@ -170,13 +174,13 @@ diff -Naur a/drivers/gpu/drm/drm_atomic_helper.c b/drivers/gpu/drm/drm_atomic_he
  
 -	err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
 +	if (blanked) {
-+		drm_atomic_helper_blank_planes(state, blanked);
++		drm_atomic_helper_blank_planes(state, &ctx, blanked);
 +		err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
 +		if (err && err != -EDEADLK) {
 +			drm_warn(dev, "blank-on-resume commit failed (%d), restoring the last framebuffers\n",
 +				 err);
 +			drm_atomic_helper_unblank_planes(state, blanked);
-+			kfree(blanked);
++			drm_atomic_blank_free(state, blanked);
 +			blanked = NULL;
 +			err = drm_atomic_helper_commit_duplicated_state(state, &ctx);
 +		}
@@ -198,20 +202,21 @@ diff -Naur a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/d
  	}
  
 +	if (!ret && state)
-+		drm_atomic_helper_blank_planes(state, NULL);
++		drm_atomic_helper_blank_planes(state, &ctx, NULL);
  	if (!ret)
  		ret = __intel_display_driver_resume(display, state, &ctx);
  
 diff -Naur a/include/drm/drm_atomic_helper.h b/include/drm/drm_atomic_helper.h
 --- a/include/drm/drm_atomic_helper.h	2026-09-18 08:57:24.992672857 +0000
 +++ b/include/drm/drm_atomic_helper.h	2026-09-18 08:57:24.996672885 +0000
-@@ -170,6 +170,10 @@
+@@ -170,6 +170,11 @@
  struct drm_atomic_state *drm_atomic_helper_suspend(struct drm_device *dev);
  int drm_atomic_helper_commit_duplicated_state(struct drm_atomic_state *state,
  					      struct drm_modeset_acquire_ctx *ctx);
 +struct drm_atomic_blanked_plane;
 +extern bool drm_blank_on_resume;
 +void drm_atomic_helper_blank_planes(struct drm_atomic_state *state,
++				    struct drm_modeset_acquire_ctx *ctx,
 +				    struct drm_atomic_blanked_plane *blanked);
  int drm_atomic_helper_resume(struct drm_device *dev,
  			     struct drm_atomic_state *state);
