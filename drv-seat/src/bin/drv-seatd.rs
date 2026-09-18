@@ -1,7 +1,8 @@
-//! Root seat daemon: the only process on the seat. Holds the libseat session, opens DRM and
-//! evdev nodes for one client at a time (the compositor, whose connection the spawner hands
-//! down the wire), passes the fds, and forwards enable/disable. The compositor holds no
-//! device groups and never sees a VT.
+//! Root seat daemon: the only process on the seat. Holds the libseat session and udev,
+//! announces the seat's DRM and evdev nodes to one client at a time (the compositor, whose
+//! connection the spawner hands down the wire), opens those nodes and only those, passes the
+//! fds, and forwards hotplug and enable/disable. The compositor holds no device groups, no
+//! udev socket, and never sees a VT.
 //!
 //! It also forks the GPU process on the compositor's request, as its own user, so the
 //! compositor never execs anything and a Mesa exploit lands in a UID that holds no client
@@ -19,9 +20,10 @@ use std::rc::Rc;
 
 use clap::Parser;
 use drv_policy::wire::{self, Attach};
-use drv_seat::{Event, Request, Response, VERSION};
+use drv_seat::{Device, DeviceKind, Event, Request, Response, VERSION};
 use libseat::{Seat, SeatEvent};
 use rustix::event::{PollFd, PollFlags};
+use udev::{EventType, MonitorBuilder, MonitorSocket};
 
 #[derive(Parser)]
 #[command(name = "drv-seatd", about = "Hand seat devices to the compositor")]
@@ -122,11 +124,128 @@ fn dup_high(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
+/// The seat's devices as udev sees them: what the client is told about and allowed to open.
+struct Devices {
+    seat: String,
+    monitor: MonitorSocket,
+    known: HashMap<u64, Device>,
+}
+
+impl Devices {
+    fn new(seat: &str) -> io::Result<Self> {
+        // Listen before enumerating so nothing slips between the two.
+        let monitor = MonitorBuilder::new()?
+            .match_subsystem("drm")?
+            .match_subsystem("input")?
+            .listen()?;
+        let mut known = HashMap::new();
+        for subsystem in ["drm", "input"] {
+            let mut enumerator = udev::Enumerator::new()?;
+            enumerator.match_subsystem(subsystem)?;
+            for device in enumerator.scan_devices()? {
+                if let Some(device) = describe(seat, &device) {
+                    known.insert(device.dev, device);
+                }
+            }
+        }
+        Ok(Devices {
+            seat: seat.to_owned(),
+            monitor,
+            known,
+        })
+    }
+
+    fn is_announced(&self, path: &str) -> bool {
+        self.known.values().any(|d| d.path == path)
+    }
+
+    /// The seat's devices, in a stable order.
+    fn snapshot(&self) -> Vec<Device> {
+        let mut devices: Vec<_> = self.known.values().cloned().collect();
+        devices.sort_by(|a, b| a.path.cmp(&b.path));
+        devices
+    }
+
+    /// Applies queued udev events, telling the client if there is one.
+    fn dispatch(&mut self, client: Option<&OwnedFd>) {
+        let mut out = Vec::new();
+        for event in self.monitor.iter() {
+            let device = event.device();
+            match event.event_type() {
+                EventType::Add => {
+                    if let Some(device) = describe(&self.seat, &device) {
+                        self.known.insert(device.dev, device.clone());
+                        out.push(Event::Added(device));
+                    }
+                }
+                EventType::Remove => {
+                    if let Some(dev) = device.devnum() {
+                        if self.known.remove(&dev).is_some() {
+                            out.push(Event::Removed { dev });
+                        }
+                    }
+                }
+                EventType::Change => {
+                    if let Some(dev) = device.devnum() {
+                        if self.known.get(&dev).is_some_and(|d| d.kind == DeviceKind::Drm) {
+                            out.push(Event::Changed { dev });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for event in out {
+            eprintln!("drv-seatd: {event:?}");
+            if let Some(client) = client {
+                if let Err(err) = drv_seat::send(client, &event, &[]) {
+                    eprintln!("drv-seatd: sending {event:?}: {err}");
+                }
+            }
+        }
+    }
+}
+
+/// What a udev device is to us, if it is one of this seat's card or event nodes.
+fn describe(seat: &str, device: &udev::Device) -> Option<Device> {
+    let path = device.devnode()?.to_str()?;
+    if !drv_seat::is_allowed_device(path) {
+        return None;
+    }
+    let dev = device.devnum()?;
+    let device_seat = device
+        .property_value("ID_SEAT")
+        .and_then(|s| s.to_str())
+        .unwrap_or("seat0");
+    if device_seat != seat {
+        return None;
+    }
+    let kind = if path.starts_with("/dev/dri/") {
+        DeviceKind::Drm
+    } else {
+        DeviceKind::Input
+    };
+    let boot_vga = kind == DeviceKind::Drm
+        && device
+            .parent_with_subsystem("pci")
+            .ok()
+            .flatten()
+            .and_then(|pci| pci.attribute_value("boot_vga").map(|v| v == "1"))
+            .unwrap_or(false);
+    Some(Device {
+        kind,
+        dev,
+        path: path.to_owned(),
+        boot_vga,
+    })
+}
+
 struct Daemon {
     seat: Seat,
     events: Rc<RefCell<VecDeque<SeatEvent>>>,
     active: bool,
     gpu: Option<GpuSpawn>,
+    devices: Devices,
 }
 
 impl Daemon {
@@ -137,11 +256,14 @@ impl Daemon {
             .map_err(|err| format!("opening the seat: {err:?}"))?;
         seat.dispatch(0)
             .map_err(|err| format!("dispatching the seat: {err:?}"))?;
+        let devices = Devices::new(seat.name())
+            .map_err(|err| format!("listing the seat's devices: {err}"))?;
         let mut daemon = Daemon {
             seat,
             events,
             active: false,
             gpu,
+            devices,
         };
         daemon.drain(None);
         Ok(daemon)
@@ -196,6 +318,7 @@ impl Daemon {
             version: VERSION,
             seat: self.seat.name().to_owned(),
             active: self.active,
+            devices: self.devices.snapshot(),
         };
         drv_seat::send(&control, &hello, &[their_events.as_fd()])?;
         drop(their_events);
@@ -211,16 +334,21 @@ impl Daemon {
                 PollFd::new(&control, PollFlags::IN),
                 PollFd::new(&seat_fd, PollFlags::IN),
                 PollFd::new(wire, PollFlags::IN),
+                PollFd::new(&self.devices.monitor, PollFlags::IN),
             ];
             rustix::event::poll(&mut fds, None)?;
-            let (control_ready, seat_ready, wire_ready) = (
+            let (control_ready, seat_ready, wire_ready, udev_ready) = (
                 !fds[0].revents().is_empty(),
                 !fds[1].revents().is_empty(),
                 !fds[2].revents().is_empty(),
+                !fds[3].revents().is_empty(),
             );
             drop(fds);
             if seat_ready {
                 self.dispatch(Some(&events));
+            }
+            if udev_ready {
+                self.devices.dispatch(Some(&events));
             }
             if wire_ready {
                 match next_client(wire) {
@@ -239,7 +367,7 @@ impl Daemon {
             };
             let (reply, fd) = match request {
                 Request::Open { path } => {
-                    if !drv_seat::is_allowed_device(&path) {
+                    if !drv_seat::is_allowed_device(&path) || !self.devices.is_announced(&path) {
                         (Response::Error(format!("{path} is not a seat device")), None)
                     } else {
                         match self.seat.open_device(&path) {
@@ -315,15 +443,20 @@ impl Daemon {
             let mut fds = [
                 PollFd::new(wire, PollFlags::IN),
                 PollFd::new(&seat_fd, PollFlags::IN),
+                PollFd::new(&self.devices.monitor, PollFlags::IN),
             ];
             rustix::event::poll(&mut fds, None)?;
-            let (wire_ready, seat_ready) = (
+            let (wire_ready, seat_ready, udev_ready) = (
                 !fds[0].revents().is_empty(),
                 !fds[1].revents().is_empty(),
+                !fds[2].revents().is_empty(),
             );
             drop(fds);
             if seat_ready {
                 self.dispatch(None);
+            }
+            if udev_ready {
+                self.devices.dispatch(None);
             }
             if wire_ready {
                 if let Some(control) = next_client(wire)? {
@@ -423,7 +556,11 @@ fn run(args: Args) -> Result<(), String> {
     // GPU processes are not waited for.
     unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
     let mut daemon = Daemon::open(gpu)?;
-    eprintln!("drv-seatd: seat {} ready", daemon.seat.name());
+    eprintln!(
+        "drv-seatd: seat {} ready with {} devices",
+        daemon.seat.name(),
+        daemon.devices.known.len()
+    );
     let mut next = None;
     loop {
         let control = match next.take() {

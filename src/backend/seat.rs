@@ -1,5 +1,7 @@
 //! The compositor's seat: devices come from `drv-seatd` over the connection the spawner
-//! handed us, so this process holds no device groups and no VT. Implements smithay's `Session` for libinput and the DRM code.
+//! handed us, so this process holds no device groups, no udev socket and no VT. The daemon
+//! tells us which devices exist (in `Hello`, then as events) and we open only those. Implements
+//! smithay's `Session` for libinput and the DRM code.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -11,9 +13,9 @@ use std::rc::Rc;
 use anyhow::{bail, Context as _};
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
-use drv_seat::{Event, Request, Response, VERSION};
+use drv_seat::{Device, Event, Request, Response, VERSION};
 use rustix::fs::OFlags;
-use smithay::backend::session::{AsErrno, Event as SessionEvent, Session};
+use smithay::backend::session::{AsErrno, Session};
 
 struct Inner {
     control: OwnedFd,
@@ -57,16 +59,18 @@ impl From<io::Error> for Error {
 }
 
 impl DrvSeatSession {
-    /// `control` is the connection the spawner handed us.
-    pub fn attach(control: OwnedFd) -> anyhow::Result<(Self, DrvSeatNotifier)> {
+    /// `control` is the connection the spawner handed us. Also returns the seat's devices as
+    /// of now; the notifier carries changes.
+    pub fn attach(control: OwnedFd) -> anyhow::Result<(Self, DrvSeatNotifier, Vec<Device>)> {
         drv_seat::send(&control, &Request::Hello { version: VERSION }, &[])?;
         let (reply, mut fds): (Response, _) = drv_seat::recv(&control)?;
-        let (seat, active) = match reply {
+        let (seat, active, devices) = match reply {
             Response::Hello {
                 version,
                 seat,
                 active,
-            } if version == VERSION => (seat, active),
+                devices,
+            } if version == VERSION => (seat, active, devices),
             Response::Hello { version, .. } => {
                 bail!("seat daemon speaks version {version}, we speak {VERSION}")
             }
@@ -86,7 +90,7 @@ impl DrvSeatSession {
             events: Generic::new(events, Interest::READ, Mode::Level),
             inner: inner.clone(),
         };
-        Ok((Self { inner }, notifier))
+        Ok((Self { inner }, notifier, devices))
     }
 
     fn call(&self, request: &Request) -> Result<(Response, Vec<OwnedFd>), Error> {
@@ -171,7 +175,7 @@ impl Session for DrvSeatSession {
 }
 
 impl EventSource for DrvSeatNotifier {
-    type Event = SessionEvent;
+    type Event = Event;
     type Metadata = ();
     type Ret = ();
     type Error = io::Error;
@@ -183,18 +187,18 @@ impl EventSource for DrvSeatNotifier {
         mut callback: F,
     ) -> io::Result<PostAction>
     where
-        F: FnMut(SessionEvent, &mut ()),
+        F: FnMut(Event, &mut ()),
     {
         let inner = &self.inner;
         self.events.process_events(readiness, token, |_, fd| loop {
             match drv_seat::recv::<Event>(&*fd) {
-                Ok((Event::Enable, _)) => {
-                    inner.active.set(true);
-                    callback(SessionEvent::ActivateSession, &mut ());
-                }
-                Ok((Event::Disable, _)) => {
-                    inner.active.set(false);
-                    callback(SessionEvent::PauseSession, &mut ());
+                Ok((event, _)) => {
+                    match event {
+                        Event::Enable => inner.active.set(true),
+                        Event::Disable => inner.active.set(false),
+                        _ => {}
+                    }
+                    callback(event, &mut ());
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     return Ok(PostAction::Continue)

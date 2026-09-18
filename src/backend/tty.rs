@@ -1,6 +1,6 @@
 //! TTY backend, core side.
 //!
-//! Owns the session (libseat), udev and libinput, and decides output policy: which connector
+//! Owns the seat connection and libinput, and decides output policy: which connector
 //! is on, which mode, VRR, gamma. Everything that touches DRM/KMS or the GPU lives in the GPU
 //! process (`crate::gpu::drm`); this side talks to it over the [`GpuClient`] connection.
 
@@ -17,6 +17,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure, Context};
 use drm_ffi::drm_mode_modeinfo;
 use drv_policy::Global as PolicyGlobal;
+use drv_seat::{DeviceKind, Event as SeatEvent};
 use libc::dev_t;
 use niri_config::output::{HdrMode, Modeline};
 use niri_config::{Config, OutputName};
@@ -27,17 +28,16 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::ImportDma as _;
 use smithay::backend::session::{Event as SessionEvent, Session};
-use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::{make_ping, Ping};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
-    Dispatcher, Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
+    Interest, LoopHandle, Mode as CalloopMode, PostAction, RegistrationToken,
 };
 use smithay::reexports::drm::control::{Mode as DrmMode, ModeFlags, ModeTypeFlags};
-use smithay::reexports::input::Libinput;
+use smithay::reexports::input::{Device as InputDevice, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -70,7 +70,12 @@ use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOri
 pub struct Tty {
     config: Rc<RefCell<Config>>,
     session: DrvSeatSession,
-    udev_dispatcher: Dispatcher<'static, UdevBackend, State>,
+    /// The seat daemon's DRM devices, kept current from its events.
+    seat_devices: HashMap<dev_t, PathBuf>,
+    /// The seat daemon's input devices, likewise.
+    input_paths: HashMap<dev_t, PathBuf>,
+    /// The input devices libinput currently has; emptied while the session is inactive.
+    input_devices: HashMap<dev_t, InputDevice>,
     libinput: Libinput,
     event_loop: LoopHandle<'static, State>,
     /// Connection to the GPU process; also carries all DRM requests.
@@ -86,13 +91,13 @@ pub struct Tty {
     /// Devices the GPU process accepted at startup, registered in `init` (needs `Niri`).
     pending_devices: Vec<PendingDevice>,
     /// Wakes the event loop to dispatch GPU events queued while waiting for a reply.
-    /// Where we'd like the GPU process to render: the configured render node, else udev's
-    /// primary GPU. `None` lets the GPU process take the first device that works.
+    /// Where we'd like the GPU process to render: the configured render node, else the seat
+    /// daemon's boot VGA card. `None` lets the GPU process take the first device that works.
     render_node_hint: Option<DrmNode>,
     /// The render node the GPU process actually renders on, once it has a renderer.
     render_node: Option<DrmNode>,
     /// Devices the GPU process refused (no KMS, e.g. a render-only card). Not retried until
-    /// udev removes them.
+    /// the seat daemon removes them.
     unusable_devices: HashSet<DrmNode>,
     ignored_nodes: HashSet<DrmNode>,
     devices: HashMap<DrmNode, OutputDevice>,
@@ -172,30 +177,42 @@ impl Tty {
         let _span = tracy_client::span!("Tty::new");
 
         let control = crate::wire::take_seat().context("no seat connection from the spawner")?;
-        let (session, notifier) =
+        let (session, notifier, announced) =
             DrvSeatSession::attach(control).context("error attaching to the seat daemon")?;
         let seat_name = session.seat();
 
-        let udev_backend =
-            UdevBackend::new(session.seat()).context("error creating a udev backend")?;
-        let udev_dispatcher = Dispatcher::new(udev_backend, move |event, _, state: &mut State| {
-            state.backend.tty().on_udev_event(&mut state.niri, event);
-        });
-        event_loop
-            .register_dispatcher(udev_dispatcher.clone())
-            .unwrap();
-
-        let mut libinput = Libinput::new_with_udev(LibinputSessionInterface::from(session.clone()));
-        unsafe { init_libinput_plugin_system(&libinput) };
-        {
-            let _span = tracy_client::span!("Libinput::udev_assign_seat");
-            libinput.udev_assign_seat(&seat_name)
+        let mut seat_devices = HashMap::new();
+        let mut input_paths = HashMap::new();
+        let mut boot_vga = None;
+        for device in announced {
+            let path = PathBuf::from(device.path);
+            match device.kind {
+                DeviceKind::Drm => {
+                    if device.boot_vga {
+                        boot_vga = Some(path.clone());
+                    }
+                    seat_devices.insert(device.dev as dev_t, path);
+                }
+                DeviceKind::Input => {
+                    input_paths.insert(device.dev as dev_t, path);
+                }
+            }
         }
-        .map_err(|()| anyhow!("error assigning the seat to libinput"))?;
+        debug!(
+            "seat {seat_name}: {} DRM and {} input devices",
+            seat_devices.len(),
+            input_paths.len()
+        );
 
-        if !session.is_active() {
-            debug!("session is not active, starting libinput in paused state");
-            libinput.suspend();
+        let mut libinput = Libinput::new_from_path(LibinputSessionInterface::from(session.clone()));
+        unsafe { init_libinput_plugin_system(&libinput) };
+        let mut input_devices = HashMap::new();
+        if session.is_active() {
+            for (dev, path) in &input_paths {
+                add_input_device(&mut libinput, &mut input_devices, *dev, path);
+            }
+        } else {
+            debug!("session is not active, starting libinput without devices");
         }
 
         let input_backend = LibinputInputBackend::new(libinput.clone());
@@ -208,19 +225,16 @@ impl Tty {
 
         event_loop
             .insert_source(notifier, move |event, _, state| {
-                state.backend.tty().on_session_event(&mut state.niri, event);
+                state.backend.tty().on_seat_event(&mut state.niri, event);
             })
             .unwrap();
 
         let render_node_hint = render_node_from_config(&config.borrow()).or_else(|| {
-            let path = match udev::primary_gpu(&seat_name) {
-                Ok(Some(path)) => path,
-                Ok(None) => {
-                    warn!("couldn't find a primary GPU; letting the GPU process pick one");
-                    return None;
-                }
-                Err(err) => {
-                    warn!("error getting the primary GPU: {err:?}");
+            let first_card = seat_devices.values().min().cloned();
+            let path = match boot_vga.or(first_card) {
+                Some(path) => path,
+                None => {
+                    warn!("the seat has no GPU; letting the GPU process pick one");
                     return None;
                 }
             };
@@ -250,7 +264,7 @@ impl Tty {
         let mut session = session;
         let (mut client, pending_devices, unusable_devices) = spawn_gpu(
             &mut session,
-            &udev_dispatcher,
+            &seat_devices,
             &ignored_nodes,
             render_node_hint,
         )?;
@@ -277,7 +291,9 @@ impl Tty {
         Ok(Self {
             config,
             session,
-            udev_dispatcher,
+            seat_devices,
+            input_paths,
+            input_devices,
             libinput,
             event_loop,
             renderer,
@@ -392,7 +408,7 @@ impl Tty {
 
         let res = spawn_gpu(
             &mut self.session,
-            &self.udev_dispatcher,
+            &self.seat_devices,
             &self.ignored_nodes,
             self.render_node_hint,
         );
@@ -457,31 +473,62 @@ impl Tty {
         }
     }
 
-    fn on_udev_event(&mut self, niri: &mut Niri, event: UdevEvent) {
-        let _span = tracy_client::span!("Tty::on_udev_event");
+    /// Session changes and hotplug from the seat daemon. Device lists are kept current even
+    /// while inactive; the DRM side is reconciled against them on resume.
+    fn on_seat_event(&mut self, niri: &mut Niri, event: SeatEvent) {
+        let _span = tracy_client::span!("Tty::on_seat_event");
         match event {
-            UdevEvent::Added { device_id, path } => {
+            SeatEvent::Enable => self.on_session_event(niri, SessionEvent::ActivateSession),
+            SeatEvent::Disable => self.on_session_event(niri, SessionEvent::PauseSession),
+            SeatEvent::Added(device) => {
+                let dev = device.dev as dev_t;
+                let path = PathBuf::from(device.path);
+                match device.kind {
+                    DeviceKind::Input => {
+                        self.input_paths.insert(dev, path.clone());
+                        if self.session.is_active() {
+                            add_input_device(&mut self.libinput, &mut self.input_devices, dev, &path);
+                        }
+                    }
+                    DeviceKind::Drm => {
+                        self.seat_devices.insert(dev, path.clone());
+                        if !self.session.is_active() {
+                            debug!("skipping added device as session is inactive");
+                            return;
+                        }
+                        self.ignored_nodes = self.compute_ignored_nodes();
+                        self.add_devices(niri, vec![(dev, path)]);
+                    }
+                }
+            }
+            SeatEvent::Changed { dev } => {
                 if !self.session.is_active() {
-                    debug!("skipping UdevEvent::Added as session is inactive");
+                    debug!("skipping changed device as session is inactive");
                     return;
                 }
-                self.ignored_nodes = self.compute_ignored_nodes();
-                self.add_devices(niri, vec![(device_id, path)]);
+                self.device_changed(dev as dev_t, niri, false)
             }
-            UdevEvent::Changed { device_id } => {
-                if !self.session.is_active() {
-                    debug!("skipping UdevEvent::Changed as session is inactive");
-                    return;
+            SeatEvent::Removed { dev } => {
+                let dev = dev as dev_t;
+                if let Some(device) = self.input_devices.remove(&dev) {
+                    self.libinput.path_remove_device(device);
                 }
-                self.device_changed(device_id, niri, false)
-            }
-            UdevEvent::Removed { device_id } => {
-                if !self.session.is_active() {
-                    debug!("skipping UdevEvent::Removed as session is inactive");
-                    return;
+                self.input_paths.remove(&dev);
+                if self.seat_devices.remove(&dev).is_some() {
+                    if !self.session.is_active() {
+                        debug!("skipping removed device as session is inactive");
+                        return;
+                    }
+                    self.device_removed(dev, niri)
                 }
-                self.device_removed(device_id, niri)
             }
+        }
+    }
+
+    /// Gives libinput every announced input device it doesn't have yet.
+    fn sync_input_devices(&mut self) {
+        for (dev, path) in &self.input_paths {
+            add_input_device(&mut self.libinput, &mut self.input_devices, *dev, path);
         }
     }
 
@@ -490,7 +537,10 @@ impl Tty {
         match event {
             SessionEvent::PauseSession => {
                 debug!("pausing session");
-                self.libinput.suspend();
+                // The kernel revoked the evdev fds; they are reopened on resume.
+                for (_, device) in self.input_devices.drain() {
+                    self.libinput.path_remove_device(device);
+                }
                 if let Err(err) = self.request_ack(Request::PauseDevices) {
                     warn!("error pausing DRM devices: {err:?}");
                 }
@@ -498,9 +548,7 @@ impl Tty {
             SessionEvent::ActivateSession => {
                 debug!("resuming session");
 
-                if self.libinput.resume().is_err() {
-                    warn!("error resuming libinput");
-                }
+                self.sync_input_devices();
 
                 self.ignored_nodes = self.compute_ignored_nodes();
 
@@ -509,12 +557,7 @@ impl Tty {
                     // GPU process cannot bring up a renderer, so start over with a fresh one.
                     self.respawn_gpu(niri);
                 } else {
-                    let mut device_list = self
-                        .udev_dispatcher
-                        .as_source_ref()
-                        .device_list()
-                        .map(|(device_id, path)| (device_id, path.to_owned()))
-                        .collect::<HashMap<_, _>>();
+                    let mut device_list = self.seat_devices.clone();
 
                     let removed_devices = self
                         .devices
@@ -1924,12 +1967,7 @@ impl Tty {
         }
         self.ignored_nodes = ignored_nodes;
 
-        let mut device_list = self
-            .udev_dispatcher
-            .as_source_ref()
-            .device_list()
-            .map(|(device_id, path)| (device_id, path.to_owned()))
-            .collect::<HashMap<_, _>>();
+        let mut device_list = self.seat_devices.clone();
 
         let removed_devices = self
             .devices
@@ -2234,6 +2272,29 @@ fn compute_ignored_nodes(config: &Config, render_node_hint: Option<DrmNode>) -> 
     ignored_nodes
 }
 
+/// Hands an announced input device to libinput, which opens it through the seat daemon.
+/// libinput declines nodes udev did not tag as input devices; that is not an error.
+fn add_input_device(
+    libinput: &mut Libinput,
+    devices: &mut HashMap<dev_t, InputDevice>,
+    dev: dev_t,
+    path: &Path,
+) {
+    if devices.contains_key(&dev) {
+        return;
+    }
+    let Some(path) = path.to_str() else {
+        warn!("skipping input device with a non-UTF-8 path: {path:?}");
+        return;
+    };
+    match libinput.path_add_device(path) {
+        Some(device) => {
+            devices.insert(dev, device);
+        }
+        None => debug!("libinput did not take {path}"),
+    }
+}
+
 /// Checks that `path` is a primary node we're not ignoring and opens it through the session.
 fn open_device(
     session: &mut DrvSeatSession,
@@ -2264,7 +2325,7 @@ fn open_device(
 /// not to be retried).
 fn spawn_gpu(
     session: &mut DrvSeatSession,
-    udev: &Dispatcher<'static, UdevBackend, State>,
+    seat_devices: &HashMap<dev_t, PathBuf>,
     ignored_nodes: &HashSet<DrmNode>,
     render_node_hint: Option<DrmNode>,
 ) -> anyhow::Result<(GpuClient, Vec<PendingDevice>, HashSet<DrmNode>)> {
@@ -2272,11 +2333,9 @@ fn spawn_gpu(
 
     let mut opened = Vec::new();
     if session.is_active() {
-        let devices: Vec<(dev_t, PathBuf)> = udev
-            .as_source_ref()
-            .device_list()
-            .map(|(id, path)| (id, path.to_owned()))
-            .collect();
+        let mut devices: Vec<(dev_t, PathBuf)> =
+            seat_devices.iter().map(|(id, path)| (*id, path.clone())).collect();
+        devices.sort();
         for (device_id, path) in devices {
             match open_device(session, ignored_nodes, device_id, &path) {
                 Ok(Some(device)) => opened.push(device),

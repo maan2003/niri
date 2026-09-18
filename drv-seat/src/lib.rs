@@ -1,7 +1,9 @@
 //! Seat protocol: the compositor gets its DRM and evdev fds from a root daemon instead of
 //! holding device groups itself. One `SOCK_SEQPACKET` connection, handed to both sides by the
-//! spawner, requests in lock step, a reply may carry one fd. Session enable/disable arrive on
-//! a second socket handed over with `Hello`, so they never interleave with replies.
+//! spawner, requests in lock step, a reply may carry one fd. The daemon also owns udev: `Hello`
+//! answers with the seat's current devices, and hotplug plus session enable/disable arrive on
+//! a second socket handed over with `Hello`, so they never interleave with replies. Only an
+//! announced device can be opened.
 
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
@@ -15,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// Datagrams larger than this are refused.
 pub const MAX_MSG: usize = 4096;
 /// Fds per message: a `StartGpu` carries one per device.
@@ -24,7 +26,7 @@ pub const MAX_FDS: usize = 16;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Hello { version: u32 },
-    /// Open a device node; only what [`is_allowed_device`] accepts.
+    /// Open a device the daemon announced (in `Hello` or `Event::Added`).
     Open { path: String },
     /// Close a device opened here. The client drops its own fd itself.
     Close { id: u32 },
@@ -40,11 +42,13 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
-    /// Carries the events socket as its fd.
+    /// Carries the events socket as its fd. `devices` is the seat right now; changes follow
+    /// as events.
     Hello {
         version: u32,
         seat: String,
         active: bool,
+        devices: Vec<Device>,
     },
     /// Carries the device fd.
     Opened { id: u32 },
@@ -54,13 +58,37 @@ pub enum Response {
     Error(String),
 }
 
-/// Session state changes, on the events socket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Session state changes and hotplug, on the events socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     /// Devices are live (again).
     Enable,
     /// The seat went elsewhere (VT switch): devices are revoked until `Enable`.
     Disable,
+    Added(Device),
+    /// A DRM device's connectors changed.
+    Changed { dev: u64 },
+    Removed { dev: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceKind {
+    /// `/dev/dri/cardN`.
+    Drm,
+    /// `/dev/input/eventN`.
+    Input,
+}
+
+/// A device on the seat, as udev describes it to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub kind: DeviceKind,
+    /// `st_rdev` of the node.
+    pub dev: u64,
+    pub path: String,
+    /// The card on the firmware's boot display adapter: where to render absent other
+    /// preference.
+    pub boot_vga: bool,
 }
 
 /// Only the seat's display and input nodes, by their canonical names: no render nodes, no
