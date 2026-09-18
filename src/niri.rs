@@ -131,8 +131,6 @@ use crate::dbus::freedesktop_locale1::Locale1ToNiri;
 use crate::dbus::freedesktop_login1::Login1ToNiri;
 #[cfg(feature = "dbus")]
 use crate::dbus::gnome_shell_introspect::{self, IntrospectToNiri, NiriToIntrospect};
-#[cfg(feature = "dbus")]
-use crate::dbus::gnome_shell_screenshot::{NiriToScreenshot, ScreenshotToNiri};
 use crate::frame_clock::FrameClock;
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::handlers::image_copy_capture::{
@@ -2288,63 +2286,6 @@ impl State {
 
     #[cfg(not(feature = "xdp-gnome-screencast"))]
     pub fn set_dynamic_cast_target(&mut self, _target: CastTarget) {}
-
-    #[cfg(feature = "dbus")]
-    pub fn on_screen_shot_msg(
-        &mut self,
-        to_screenshot: &async_channel::Sender<NiriToScreenshot>,
-        msg: ScreenshotToNiri,
-    ) {
-        match msg {
-            ScreenshotToNiri::TakeScreenshot { include_cursor } => {
-                self.handle_take_screenshot(to_screenshot, include_cursor);
-            }
-            ScreenshotToNiri::PickColor(tx) => {
-                self.handle_pick_color(tx);
-            }
-        }
-    }
-
-    #[cfg(feature = "dbus")]
-    fn handle_take_screenshot(
-        &mut self,
-        to_screenshot: &async_channel::Sender<NiriToScreenshot>,
-        include_cursor: bool,
-    ) {
-        let _span = tracy_client::span!("TakeScreenshot");
-
-        let rv = self.backend.with_primary_renderer(|renderer| {
-            let on_done = {
-                let to_screenshot = to_screenshot.clone();
-                move |path| {
-                    let msg = NiriToScreenshot::ScreenshotResult(Some(path));
-                    if let Err(err) = to_screenshot.send_blocking(msg) {
-                        warn!("error sending path to screenshot: {err:?}");
-                    }
-                }
-            };
-
-            let res = self
-                .niri
-                .screenshot_all_outputs(renderer, include_cursor, on_done);
-
-            if let Err(err) = res {
-                warn!("error taking a screenshot: {err:?}");
-
-                let msg = NiriToScreenshot::ScreenshotResult(None);
-                if let Err(err) = to_screenshot.send_blocking(msg) {
-                    warn!("error sending None to screenshot: {err:?}");
-                }
-            }
-        });
-
-        if rv.is_none() {
-            let msg = NiriToScreenshot::ScreenshotResult(None);
-            if let Err(err) = to_screenshot.send_blocking(msg) {
-                warn!("error sending None to screenshot: {err:?}");
-            }
-        }
-    }
 
     #[cfg(feature = "dbus")]
     pub fn on_introspect_msg(

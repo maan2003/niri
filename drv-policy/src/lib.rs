@@ -82,10 +82,6 @@ impl Global {
 pub enum Grant {
     /// Ask the identity daemon about UIDs other than its own (the compositor, the bridge).
     Lookup,
-    /// Use the compositor's screencast, screenshot and service-channel D-Bus services (the
-    /// portal backend). Apps never get this: they get one portal session at a time, with
-    /// consent.
-    Screencast,
 }
 
 /// What one UID is allowed. The identity daemon's record.
@@ -125,7 +121,7 @@ impl AppPolicy {
             name: name.to_owned(),
             gpu: true,
             globals: Global::ALL.to_vec(),
-            grants: vec![Grant::Lookup, Grant::Screencast],
+            grants: vec![Grant::Lookup],
             icon: None,
         }
     }
@@ -321,7 +317,6 @@ mod tests {
 
         assert!(store.lookup(1000).allows(Global::Screencopy));
         assert!(store.lookup(1000).has(Grant::Lookup));
-        assert!(!store.lookup(1000).has(Grant::Screencast));
         let sandboxed = store.lookup(150000);
         assert_eq!(sandboxed.name, "sandboxed");
         assert!(sandboxed.allows(Global::Dmabuf));

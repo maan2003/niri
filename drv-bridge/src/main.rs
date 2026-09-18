@@ -139,7 +139,7 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
     let context = ContextRc::new(&main_loop, None).context("PipeWire context")?;
     let core = context.connect_rc(None).context("connecting to PipeWire")?;
     // A round trip: what was sent before it is in.
-    let roundtrip = || -> anyhow::Result<()> {
+    let roundtrip = |what: &str| -> anyhow::Result<()> {
         let done = Rc::new(Cell::new(false));
         let pending = core.sync(0).context("PipeWire sync")?;
         let _listener = {
@@ -157,7 +157,7 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !done.get() {
-            anyhow::ensure!(Instant::now() < deadline, "PipeWire did not answer");
+            anyhow::ensure!(Instant::now() < deadline, "PipeWire did not answer ({what})");
             main_loop.loop_().iterate(Timeout::Finite(Duration::from_millis(200)));
         }
         Ok(())
@@ -180,7 +180,7 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
             })
             .register()
     };
-    roundtrip()?;
+    roundtrip("registry")?;
     anyhow::ensure!(factory.get() != 0, "PipeWire has no client-node factory");
     // SAFETY: the core is connected; the client proxy it returns lives as long as the core.
     let client = unsafe { pipewire::sys::pw_core_get_client(core.as_raw_ptr()) };
@@ -203,7 +203,7 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
         );
     }
     // So the permissions are in before the fd changes hands.
-    roundtrip()?;
+    roundtrip("permissions")?;
     drop(_globals);
     drop(registry);
     // SAFETY: after steal_fd the core no longer owns the fd; nothing else here uses it.

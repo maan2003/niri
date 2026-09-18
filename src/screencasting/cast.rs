@@ -12,8 +12,7 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::backend::renderer::element::{Element, RenderElement};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale, Size, Transform};
-use super::CastNotify;
-use crate::dbus::mutter_screen_cast::CursorMode;
+use super::CursorMode;
 use crate::gpu::protocol::{CastCursorMode, CastInfo, CursorMeta, Request};
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::RemoteRenderer;
@@ -32,7 +31,8 @@ pub struct Cast {
     pub dynamic_target: bool,
     /// Effective cursor mode (the GPU may downgrade metadata to embedded).
     pub cursor_mode: CursorMode,
-    pub notify: CastNotify,
+    /// drv-portal's id for this cast.
+    pub portal_cast: u64,
     pub node_id: Option<u32>,
     /// Presentation time of the last frame the GPU actually sent.
     pub last_frame_time: Duration,
@@ -129,7 +129,7 @@ impl Cast {
         size: Size<i32, Physical>,
         refresh: u32,
         cursor_mode: CursorMode,
-        notify: CastNotify,
+        portal_cast: u64,
     ) -> Self {
         Self {
             event_loop,
@@ -138,7 +138,7 @@ impl Cast {
             target,
             dynamic_target: false,
             cursor_mode,
-            notify,
+            portal_cast,
             node_id: None,
             last_frame_time: Duration::ZERO,
             pending_frame_time: None,

@@ -1,6 +1,6 @@
-//! Screencasting through xdg-desktop-portal-gnome.
+//! Screencasting for drv-portal.
 //!
-//! The core owns the portal session, picks targets and paces frames; the GPU process owns the
+//! The core owns the cast session, picks targets and paces frames; the GPU process owns the
 //! PipeWire streams and buffers (see `gpu::cast`).
 
 use std::collections::hash_map::Entry;
@@ -16,9 +16,7 @@ use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement
 use smithay::desktop::Window;
 use smithay::output::Output;
 use smithay::utils::{Physical, Point, Scale, Size};
-use zbus::object_server::SignalEmitter;
 
-use crate::dbus::mutter_screen_cast::{self, CursorMode, ScreenCastToNiri, StreamTargetId};
 use crate::gpu::protocol::{CastEvent, Request};
 use crate::gpu::remote::RemoteRenderer;
 use crate::niri::{CastTarget, Niri, OutputRenderElements, PointerRenderElements, State};
@@ -46,11 +44,30 @@ pub struct Screencasting {
     pub dynamic_cast_id_for_portal: MappedId,
 }
 
-/// Who hears about a cast: the Mutter D-Bus stream (xdg-desktop-portal's GNOME backend),
-/// or drv-portal over its link, by the id it started the cast with.
-pub enum CastNotify {
-    Mutter(SignalEmitter<'static>),
-    Portal { cast: u64 },
+/// How the pointer goes into a cast.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMode {
+    #[default]
+    Hidden,
+    Embedded,
+    Metadata,
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamTargetId {
+    Output { name: String },
+    Window { id: u64 },
+}
+
+pub enum ScreenCastToNiri {
+    StartCast {
+        session_id: CastSessionId,
+        stream_id: CastStreamId,
+        target: StreamTargetId,
+        cursor_mode: CursorMode,
+        /// drv-portal's id for the cast: what it hears the node id and the end under.
+        portal_cast: u64,
+    },
 }
 
 /// A screencast request that hasn't been started yet.
@@ -58,7 +75,7 @@ pub struct PendingCast {
     pub session_id: CastSessionId,
     pub stream_id: CastStreamId,
     pub cursor_mode: CursorMode,
-    pub notify: CastNotify,
+    pub portal_cast: u64,
 }
 
 impl Screencasting {
@@ -88,7 +105,7 @@ struct StartCast {
     refresh: u32,
     alpha: bool,
     cursor_mode: CursorMode,
-    notify: CastNotify,
+    portal_cast: u64,
 }
 
 impl State {
@@ -110,7 +127,7 @@ impl State {
             refresh,
             alpha,
             cursor_mode,
-            notify,
+            portal_cast,
         } = params;
 
         // The sandboxed GPU process cannot connect to PipeWire itself; it gets a connected
@@ -140,7 +157,7 @@ impl State {
             size,
             refresh,
             from_gpu_cursor_mode(cursor_mode),
-            notify,
+            portal_cast,
         ))
     }
 
@@ -153,26 +170,10 @@ impl State {
                         continue;
                     };
                     cast.node_id = Some(node_id);
-                    let session_id = cast.session_id;
-                    match &cast.notify {
-                        CastNotify::Mutter(ctx) => {
-                            debug!("sending PipeWireStreamAdded with {node_id}");
-                            let _span = tracy_client::span!("sending PipeWireStreamAdded");
-                            let res = async_io::block_on(
-                                mutter_screen_cast::Stream::pipe_wire_stream_added(ctx, node_id),
-                            );
-                            if let Err(err) = res {
-                                warn!("error sending PipeWireStreamAdded: {err:?}");
-                                self.niri.stop_cast(session_id);
-                            }
-                        }
-                        CastNotify::Portal { cast } => {
-                            let cast = *cast;
-                            debug!("telling drv-portal cast {cast} is node {node_id}");
-                            self.niri
-                                .tell_portal(drv_portal::compositor::ToPortal::Started { cast, node_id });
-                        }
-                    }
+                    let cast = cast.portal_cast;
+                    debug!("telling drv-portal cast {cast} is node {node_id}");
+                    self.niri
+                        .tell_portal(drv_portal::compositor::ToPortal::Started { cast, node_id });
                 }
                 CastEvent::State {
                     stream,
@@ -436,7 +437,7 @@ impl State {
                 refresh,
                 alpha,
                 cursor_mode: pending.cursor_mode,
-                notify: pending.notify,
+                portal_cast: pending.portal_cast,
             });
             match res {
                 Ok(mut cast) => {
@@ -463,7 +464,7 @@ impl State {
                 stream_id,
                 target,
                 cursor_mode,
-                notify,
+                portal_cast,
             } => {
                 let _span = tracy_client::span!("StartCast");
                 let _span = debug_span!("StartCast", %session_id, %stream_id).entered();
@@ -489,7 +490,7 @@ impl State {
                             session_id,
                             stream_id,
                             cursor_mode,
-                            notify,
+                            portal_cast,
                         });
                         self.niri.refresh_cast_indicator();
                         return;
@@ -512,7 +513,7 @@ impl State {
                     refresh,
                     alpha,
                     cursor_mode,
-                    notify,
+                    portal_cast,
                 });
                 match res {
                     Ok(cast) => {
@@ -525,7 +526,6 @@ impl State {
                 }
                 self.niri.refresh_cast_indicator();
             }
-            ScreenCastToNiri::StopCast { session_id } => self.niri.stop_cast(session_id),
         }
     }
 
@@ -576,7 +576,7 @@ impl State {
                     stream_id,
                     target: StreamTargetId::Output { name: output },
                     cursor_mode,
-                    notify: CastNotify::Portal { cast },
+                    portal_cast: cast,
                 });
             }
             ToCompositor::Stop { cast } => {
@@ -860,23 +860,6 @@ impl Niri {
 
             let cast = self.casting.casts.swap_remove(i);
             self.stop_cast_stream(&cast);
-        }
-
-        // The Mutter service only exists where the bus let the compositor own its name; a cast
-        // that drv-portal started has no Mutter session either way.
-        if let Some(conn) = self.dbus.as_ref().and_then(|d| d.conn_screen_cast.as_ref()) {
-            let server = conn.object_server();
-            let path = format!("/org/gnome/Mutter/ScreenCast/Session/u{}", session_id.get());
-            if let Ok(iface) = server.interface::<_, mutter_screen_cast::Session>(path) {
-                let _span = tracy_client::span!("invoking Session::stop");
-
-                async_io::block_on(async move {
-                    iface
-                        .get()
-                        .stop(server.inner(), iface.signal_emitter().clone())
-                        .await
-                });
-            }
         }
 
         if let Some(cast) = self.casting.portal_casts.remove(&session_id) {
