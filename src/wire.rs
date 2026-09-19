@@ -24,6 +24,8 @@ pub enum Peer {
     MenuClient,
     /// drv-portal's Wayland connection: a layer-shell client for its dialogs.
     PortalClient,
+    /// The notification daemon's Wayland connection: a layer-shell client.
+    NotifierClient,
     /// The cast line to drv-portal: it starts and stops screencasts the person consented to.
     Portal,
 }
@@ -80,6 +82,7 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
         (Peer::Menu, "menu", Kind::Stream),
         (Peer::MenuClient, "menu-client", Kind::Stream),
         (Peer::PortalClient, "portal-client", Kind::Stream),
+        (Peer::NotifierClient, "notifier-client", Kind::Stream),
         (Peer::Portal, "portal", Kind::SeqPacket),
     ] {
         match fds.socket(name, kind) {

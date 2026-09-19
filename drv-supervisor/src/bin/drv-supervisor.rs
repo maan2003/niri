@@ -131,6 +131,19 @@ struct Args {
     /// `NAME=VALUE` in the menu's environment. Repeatable; it gets nothing else.
     #[arg(long = "menu-env")]
     menu_env: Vec<String>,
+    /// System user the notification daemon runs as.
+    #[arg(long)]
+    notifier_user: String,
+    /// The notification daemon's command line, whitespace-separated (`mako`). Its Wayland
+    /// connection is its only fd, so fd 3: `WAYLAND_SOCKET=3` in its environment reaches it.
+    #[arg(long)]
+    notifier_exec: String,
+    /// An entry under `/run` the notification daemon sees. Repeatable.
+    #[arg(long = "notifier-expose")]
+    notifier_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the notification daemon's environment. Repeatable; it gets nothing else.
+    #[arg(long = "notifier-env")]
+    notifier_env: Vec<String>,
     /// System user the portal (file chooser and documents mount) runs as.
     #[arg(long)]
     portal_user: String,
@@ -192,6 +205,7 @@ struct Set {
     locker: Service,
     menu: Service,
     portal: Service,
+    notifier: Service,
     forker: Service,
     appd: Service,
     bridge: Service,
@@ -214,6 +228,7 @@ fn supervise(args: Args) -> Result<(), String> {
         locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[], &args.locker_expose)?,
         menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[], &args.menu_expose)?,
         portal: service("drv-portal", &args.portal_user, &args.portal_exec, &args.portal_env, &[], &[], &args.portal_expose)?,
+        notifier: service("drv-notifier", &args.notifier_user, &args.notifier_exec, &args.notifier_env, &[], &[], &args.notifier_expose)?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -305,6 +320,7 @@ struct Links {
     menu_client: (OwnedFd, OwnedFd),
     menu_appd: (OwnedFd, OwnedFd),
     portal_client: (OwnedFd, OwnedFd),
+    notifier_client: (OwnedFd, OwnedFd),
     compositor_portal: (OwnedFd, OwnedFd),
     bridge_portal: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
@@ -325,6 +341,7 @@ impl Links {
             menu_client: stream()?,
             menu_appd: stream()?,
             portal_client: stream()?,
+            notifier_client: stream()?,
             compositor_portal: seq()?,
             bridge_portal: seq()?,
             locker_auth: seq()?,
@@ -344,7 +361,7 @@ fn start_set(
 ) -> Result<Group, String> {
     let l = Links::make()?;
     let fuse = mount_docs(docs, set.portal.uid, set.portal.gid)?;
-    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 10] = [
+    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 11] = [
         ("drv-seatd", &set.seatd, vec![("compositor", l.compositor_seat.1.as_fd())]),
         (
             "drv-authd",
@@ -367,6 +384,7 @@ fn start_set(
                 ("menu", l.compositor_menu.0.as_fd()),
                 ("menu-client", l.menu_client.0.as_fd()),
                 ("portal-client", l.portal_client.0.as_fd()),
+                ("notifier-client", l.notifier_client.0.as_fd()),
                 ("portal", l.compositor_portal.0.as_fd()),
             ],
         ),
@@ -397,6 +415,7 @@ fn start_set(
                 ("fuse", fuse.as_fd()),
             ],
         ),
+        ("drv-notifier", &set.notifier, vec![("wayland", l.notifier_client.1.as_fd())]),
         ("drv-forker", &set.forker, vec![("channel", l.appd_forker.1.as_fd())]),
         (
             "drv-appd",

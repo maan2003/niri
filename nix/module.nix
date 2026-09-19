@@ -23,8 +23,7 @@ let
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
     inherit (app) uid groups gpu network globals grants autostart menu;
-    env = lib.optionalAttrs app.servicesBus { DBUS_SESSION_BUS_ADDRESS = sessionBus; } // app.env;
-    expose = lib.optional app.servicesBus "/run/drv-session" ++ app.expose;
+    inherit (app) env expose;
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
     # keys everything on the app's UID.
     exec = lib.optionals app.bus [
@@ -42,9 +41,9 @@ let
     ] ++ appEntries;
   };
   # Everything any app may ask to see; the spawner refuses anything else.
-  optionalExpose = lib.unique (lib.concatMap (a: lib.optional a.servicesBus "/run/drv-session" ++ a.expose) (lib.attrValues cfg.apps));
-  xmlRules = f: names: lib.concatMapStrings (n: "    ${f n}\n") names;
-  # The services' bus: distinct UIDs, so the bus itself says who may own what.
+  optionalExpose = lib.unique (lib.concatMap (a: a.expose) (lib.attrValues cfg.apps));
+  # The services' bus: distinct UIDs, so the bus itself says who may own what: the
+  # notification daemon its name, nobody else anything.
   sessionBusConfig = pkgs.writeText "drv-session-bus.conf" ''
     <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
      "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
@@ -58,11 +57,9 @@ let
         <allow receive_sender="*"/>
         <deny own="*"/>
       </policy>
-    ${lib.concatStrings (lib.mapAttrsToList (name: app: ''
-      <policy user="app-${name}">
-    ${xmlRules (n: "<allow own=\"${n}\"/>") app.sessionBusNames}
+      <policy user="drv-notifier">
+        <allow own="org.freedesktop.Notifications"/>
       </policy>
-    '') cfg.apps)}
     </busconfig>
   '';
 in
@@ -87,6 +84,12 @@ in
       forker = lib.mkOption { type = lib.types.int; default = 909; };
       supervisor = lib.mkOption { type = lib.types.int; default = 910; };
       menu = lib.mkOption { type = lib.types.int; default = 911; };
+      notifier = lib.mkOption { type = lib.types.int; default = 913; };
+    };
+    notifier = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "${pkgs.mako}/bin/mako" ];
+      description = "The notification daemon's command line: a member of the set, the one owner of org.freedesktop.Notifications on the services' bus, its Wayland connection on fd 3.";
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -159,20 +162,10 @@ in
             default = false;
             description = "Give the app a private session bus with the bridge shim on it (notifications).";
           };
-          servicesBus = lib.mkOption {
-            type = lib.types.bool;
-            default = false;
-            description = "A desktop service: sees the services' bus (the notification daemon).";
-          };
           expose = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
             description = "Extra entries of /run this app sees.";
-          };
-          sessionBusNames = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = "Names the app may own on the services' bus (a notification daemon).";
           };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           grants = lib.mkOption {
@@ -238,6 +231,8 @@ in
       drv-menu = { uid = cfg.ids.menu; group = "drv-menu"; isSystemUser = true; };
       # The portal: owns the person's files, shows the chooser, serves the documents mount.
       drv-portal = { uid = cfg.ids.portal; group = "drv-portal"; isSystemUser = true; };
+      # The notification daemon: sees every notification, so a member of the set, not an app.
+      drv-notifier = { uid = cfg.ids.notifier; group = "drv-notifier"; isSystemUser = true; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
@@ -258,6 +253,7 @@ in
       drv-supervisor.gid = cfg.ids.supervisor;
       drv-menu.gid = cfg.ids.menu;
       drv-portal.gid = cfg.ids.portal;
+      drv-notifier.gid = cfg.ids.notifier;
       render = { };
     };
 
@@ -384,6 +380,14 @@ in
           "--portal-exec '${cfg.package}/bin/drv-portal --files ${cfg.files} --docs /run/drv-doc'"
           "--portal-env RUST_BACKTRACE=1"
           "--docs /run/drv-doc"
+          # The notification daemon: on the services' bus, where it alone owns
+          # org.freedesktop.Notifications; the bridge forwards apps' notifications to it under
+          # their manifest names. Its Wayland connection is the supervisor's fd 3.
+          "--notifier-user drv-notifier"
+          "--notifier-exec '${lib.concatStringsSep " " cfg.notifier}'"
+          "--notifier-env WAYLAND_SOCKET=3"
+          "--notifier-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
+          "--notifier-expose /run/drv-session"
           # The bridge: the apps' desktop services, keyed on the peer UID. Notifications go
           # to the services' bus; the file chooser and the screencast go down its supervisor
           # link to drv-portal; settings it answers itself. PipeWire is for the screencast

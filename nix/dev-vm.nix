@@ -101,18 +101,8 @@ in
     # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
     config = builtins.replaceStrings [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" ] [ "skip-at-startup" "{ show-launcher; }" ] (builtins.readFile ../resources/default-config.kdl);
     apps = {
-      # Notification daemon on the services' bus; apps reach it only through the bridge, which
-      # names them.
-      mako = {
-        uid = 100011;
-        exec = [ "${pkgs.mako}/bin/mako" ];
-        globals = [ "layer-shell" ];
-        servicesBus = true;
-        sessionBusNames = [ "org.freedesktop.Notifications" ];
-        autostart = true; menu = false;
-      };
       # Sends one notification from inside the sandbox over its private bus. Not autostarted:
-      # it would race the notification daemon; `drv launch notify-test`.
+      # launch it from the menu.
       notify-test = {
         uid = 100007;
         bus = true;

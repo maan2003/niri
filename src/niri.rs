@@ -452,6 +452,8 @@ pub struct Niri {
     /// decision sees an expired lease as locked before `check_lease` gets to clean up.
     pub lease_until: Option<Duration>,
     pub lease_idle_timeout: Duration,
+    /// `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC` at the last check: it only grows while asleep.
+    pub sleep_skew: Duration,
     /// A visible idle-inhibiting surface keeps extending the lease.
     pub idle_inhibited: bool,
     pub auth_link: Option<RegistrationToken>,
@@ -3061,6 +3063,7 @@ impl Niri {
             lock_state: LockState::Unlocked,
             lease_until: None,
             lease_idle_timeout: Duration::from_secs(300),
+            sleep_skew: get_boot_time().saturating_sub(get_monotonic_time()),
             idle_inhibited: false,
             auth_link: None,
             pending_attachments,
@@ -6778,6 +6781,16 @@ impl Niri {
     /// instead.
     pub fn check_lease(&mut self) {
         let now = get_boot_time();
+        // A jump of the boot clock against the monotonic one means we just woke up: locked
+        // now, whatever the lease had left (it would have expired on its own eventually).
+        let skew = now.saturating_sub(get_monotonic_time());
+        let slept = skew.saturating_sub(self.sleep_skew) > Duration::from_secs(2);
+        self.sleep_skew = skew;
+        if slept && self.lease_until.is_some() {
+            info!("back from sleep");
+            self.lock_now();
+            return;
+        }
         let Some(until) = self.lease_until else {
             return;
         };
@@ -6807,6 +6820,7 @@ impl Niri {
             },
             Peer::MenuClient => self.insert_layer_client(sock, "menu"),
             Peer::PortalClient => self.insert_layer_client(sock, "portal"),
+            Peer::NotifierClient => self.insert_layer_client(sock, "notifier"),
             Peer::Portal => self.install_portal(sock),
             Peer::Menu => {
                 let sock = std::os::unix::net::UnixStream::from(sock);
