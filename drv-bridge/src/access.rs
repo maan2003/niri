@@ -65,6 +65,9 @@ enum Cmd {
     /// Disconnect a camera remote.
     Drop { client: u32 },
     Cameras(mpsc::Sender<Vec<u32>>),
+    /// A remote handed out: what its streams may reach, under its client id; answered
+    /// once PipeWire has it, so it is in before the app can act on the fd.
+    Mark { client: u32, what: String, done: mpsc::Sender<()> },
 }
 
 #[derive(Default)]
@@ -129,6 +132,10 @@ impl Access {
         // The apps' clients (id to uid) and the cameras.
         let clients: Rc<RefCell<HashMap<u32, u32>>> = Rc::default();
         let cameras: Rc<RefCell<HashSet<u32>>> = Rc::default();
+        // Remotes marked in the metadata: the mark goes with the client, since PipeWire
+        // reuses ids.
+        let marks: Rc<RefCell<HashSet<u32>>> = Rc::default();
+        let (marks2, metadata3) = (marks.clone(), metadata.clone());
         let _globals = {
             let (clients, cameras) = (clients.clone(), cameras.clone());
             let (clients2, cameras2) = (clients.clone(), cameras.clone());
@@ -182,6 +189,11 @@ impl Access {
                 })
                 .global_remove(move |id| {
                     cameras2.borrow_mut().remove(&id);
+                    if marks2.borrow_mut().remove(&id) {
+                        if let Some((m, _)) = metadata2.borrow().as_ref() {
+                            m.set_property(id, "drv.remote", None, None);
+                        }
+                    }
                     if metadata_id2.get() == Some(id) {
                         metadata_id2.set(None);
                         *metadata2.borrow_mut() = None;
@@ -202,7 +214,37 @@ impl Access {
                 m.set_property(0, key, None, value);
             }
         };
+        // Marks waiting for their round trip, by sequence number.
+        let pending: Rc<RefCell<Vec<(pipewire::spa::utils::result::AsyncSeq, mpsc::Sender<()>)>>> = Rc::default();
+        let _done = {
+            let pending = pending.clone();
+            core.add_listener_local()
+                .done(move |id, seq| {
+                    if id == pipewire::core::PW_ID_CORE {
+                        let mut pending = pending.borrow_mut();
+                        if let Some(i) = pending.iter().position(|(s, _)| *s == seq) {
+                            let _ = pending.remove(i).1.send(());
+                        }
+                    }
+                })
+                .register()
+        };
+        let core2 = core.clone();
         let _cmds = rx.attach(main_loop.loop_(), move |cmd| match cmd {
+            Cmd::Mark { client, what, done } => {
+                match metadata3.borrow().as_ref() {
+                    Some((m, _)) => m.set_property(client, "drv.remote", None, Some(&what)),
+                    // Dropped `done` answers the caller with an error.
+                    None => return eprintln!("bridge: no {METADATA} metadata to mark a remote in"),
+                }
+                marks.borrow_mut().insert(client);
+                match core2.sync(0) {
+                    Ok(seq) => {
+                        pending.borrow_mut().push((seq, done));
+                    }
+                    Err(err) => eprintln!("bridge: PipeWire sync: {err}"),
+                }
+            }
             Cmd::Write { uid, kinds } => {
                 if kinds.is_empty() {
                     grants.borrow_mut().remove(&uid);
@@ -348,6 +390,14 @@ impl Access {
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::Cameras(tx));
         rx.recv().unwrap_or_default()
+    }
+
+    /// A remote went out as PipeWire client `client`: its streams may reach `what` only
+    /// ("camera", or "node:<id>"), which WirePlumber enforces. Back once that is in.
+    pub fn mark(&self, client: u32, what: &str) -> anyhow::Result<()> {
+        let (done, back) = mpsc::channel();
+        self.send(Cmd::Mark { client, what: what.to_owned(), done });
+        back.recv().context("marking the remote")
     }
 
     /// A camera remote went to `uid`: revoking the camera disconnects it.

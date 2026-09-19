@@ -66,6 +66,16 @@ function owner_uid (node_props)
   return client_uid (tonumber (node_props["client.id"]))
 end
 
+-- What a remote the bridge handed out is for, if the node's client is one: the bridge
+-- marks the client id in the metadata ("camera", or "node:<id>" for a cast). The remote
+-- sees only those nodes, but linking is ours, so its streams reach nothing else either.
+function remote_of (node_props)
+  if not metadata_ready then
+    return nil
+  end
+  return metadata:find (tonumber (node_props["client.id"]) or 0, "drv.remote")
+end
+
 -- The bridge writes grants here, and reads requests; WirePlumber holds it so that a
 -- bridge restart loses nothing and a WirePlumber restart makes the bridge write again.
 metadata = ImplMetadata (METADATA)
@@ -80,8 +90,9 @@ end)
 
 -- Objects an app's client may see. Its own client and nodes; sinks and sources (so it
 -- can list them); nothing of another app's; only the factory its streams come through.
+-- Nothing by default: a new object is announced to the client only once decided here.
 pm = PermissionManager ()
-pm:set_default_permissions (Perm.RX)
+pm:set_default_permissions (Perm.NONE)
 -- Without M: metadata (the default sink, say) is set on the core as subject.
 pm:set_core_permissions (Perm.RWX)
 
@@ -145,11 +156,6 @@ pm:add_interest_match (function (_, client, obj)
   end
   return Perm.R
 end, Interest { type = "metadata" })
-
--- Modules have no type of their own here: any global with a module.name.
-pm:add_interest_match (function (_, client, obj)
-  return Perm.NONE
-end, Interest { type = "globalProxy", Constraint { "module.name", "+" } })
 
 SimpleEventHook {
   name = "client/find-drv-access",
@@ -252,11 +258,26 @@ SimpleEventHook {
       return
     end
     local node = si:get_associated_proxy ("node")
+    local target_node = target:get_associated_proxy ("node")
+    local remote = node and remote_of (node.properties)
+    if remote then
+      local ok
+      if remote == "camera" then
+        ok = target_node and target_node.properties["media.class"] == "Video/Source"
+      else
+        ok = target_node and tostring (target_node["bound-id"]) == remote:match ("^node:(%d+)$")
+      end
+      if not ok then
+        log:warning (node, "a remote's stream aimed past its remote (" .. remote .. ")")
+        node:request_destroy ()
+        event:stop_processing ()
+      end
+      return
+    end
     local uid = node and owner_uid (node.properties)
     if not uid then
       return
     end
-    local target_node = target:get_associated_proxy ("node")
     local kind = kind_of (si_props["media.class"])
     if target_node and kind_of (target_node.properties["media.class"]) == "camera" then
       kind = "camera"

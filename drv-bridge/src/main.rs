@@ -123,6 +123,9 @@ const SETTINGS: &str = "org.freedesktop.portal.Settings";
 const SETTINGS_VERSION: u32 = 2;
 const CAMERA: &str = "org.freedesktop.portal.Camera";
 const CAMERA_VERSION: u32 = 1;
+
+/// Every call an app makes, logged: for finding out what a portal client does.
+static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DRV_BRIDGE_TRACE").is_some());
 /// `AvailableSourceTypes`: monitors and windows.
 const SOURCE_TYPES: u32 = 1 | 2;
 /// `AvailableCursorModes`: hidden, embedded, metadata.
@@ -139,7 +142,7 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     use pipewire::main_loop::MainLoopRc;
     use pipewire::permissions::{Permission, PermissionFlags};
     use pipewire::types::ObjectType;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     let main_loop = MainLoopRc::new(None).context("PipeWire main loop")?;
     let context = ContextRc::new(&main_loop, None).context("PipeWire context")?;
@@ -172,17 +175,24 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     // be able to name: that one factory stays visible.
     let registry = core.get_registry_rc().context("PipeWire registry")?;
     let factory = Rc::new(Cell::new(0u32));
+    // What this connection is shown: after the permissions, what the app will see.
+    let seen = Rc::new(RefCell::new(std::collections::BTreeSet::new()));
     let _globals = {
         let factory = factory.clone();
+        let (seen_add, seen_remove) = (seen.clone(), seen.clone());
         registry
             .add_listener_local()
             .global(move |g| {
+                seen_add.borrow_mut().insert(g.id);
                 let client_node = g.props.is_some_and(|p| {
                     p.get("factory.type.name") == Some("PipeWire:Interface:ClientNode")
                 });
                 if g.type_ == ObjectType::Factory && client_node {
                     factory.set(g.id);
                 }
+            })
+            .global_remove(move |id| {
+                seen_remove.borrow_mut().remove(&id);
             })
             .register()
     };
@@ -209,6 +219,9 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     roundtrip("permissions")?;
     // SAFETY: the client proxy is live; bound after the round trip.
     let client_id = unsafe { pipewire::sys::pw_proxy_get_bound_id(client.cast()) };
+    if *TRACE {
+        eprintln!("bridge: remote client {client_id} for nodes {nodes:?} sees {:?}", seen.borrow());
+    }
     drop(_globals);
     drop(registry);
     // SAFETY: after steal_fd the core no longer owns the fd; nothing else here uses it.
@@ -579,10 +592,23 @@ impl AppLink {
         if hdr.message_type() != MessageType::MethodCall {
             return Ok(());
         }
+        let what = || {
+            format!(
+                "{}.{}",
+                hdr.interface().map(|i| i.as_str()).unwrap_or("?"),
+                hdr.member().map(|m| m.as_str()).unwrap_or("?")
+            )
+        };
+        if *TRACE {
+            eprintln!("bridge: {}: {}", self.app.name, what());
+        }
         let reply = match self.ours(msg, &hdr) {
             Ok(Ours::Reply(reply)) => reply,
             Ok(Ours::Done) => return Ok(()),
-            Err(err) => failed(&hdr, format!("{err:#}"))?,
+            Err(err) => {
+                eprintln!("bridge: {}: {}: {err:#}", self.app.name, what());
+                failed(&hdr, format!("{err:#}"))?
+            }
             Ok(Ours::No) => self.other(msg, &hdr)?,
         };
         self.p2p.send(&reply)?;
@@ -915,10 +941,11 @@ impl AppLink {
                 };
                 // Seen once in many tries: a round trip that never came back. A fresh
                 // connection is cheap, and the app would otherwise drop the whole share.
-                let (fd, _) = pipewire_remote(&[node]).or_else(|err| {
+                let (fd, client) = pipewire_remote(&[node]).or_else(|err| {
                     eprintln!("bridge: {}: {err:#}; once more", self.app.name);
                     pipewire_remote(&[node])
                 })?;
+                self.access.mark(client, &format!("node:{node}"))?;
                 Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
             }
             other => bail!("no {other} on {SCREEN_CAST}"),
@@ -956,6 +983,7 @@ impl AppLink {
                     eprintln!("bridge: {}: {err:#}; once more", self.app.name);
                     pipewire_remote(&cameras)
                 })?;
+                self.access.mark(client, "camera")?;
                 self.access.remote(self.uid, client);
                 Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
             }

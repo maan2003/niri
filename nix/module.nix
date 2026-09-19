@@ -81,6 +81,11 @@ in
 {
   options.services.drv = {
     enable = lib.mkEnableOption "the multi-UID desktop";
+    debug = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Log every portal call apps make to the bridge.";
+    };
     package = lib.mkOption {
       type = lib.types.package;
       default = niri;
@@ -470,6 +475,8 @@ in
           "--bridge-env DRV_APPD_SOCKET=${appdSocket}"
           "--bridge-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
           "--bridge-env RUST_BACKTRACE=1"
+        ] ++ lib.optionals cfg.debug [
+          "--bridge-env DRV_BRIDGE_TRACE=1"
         ] ++ map (p: "--bridge-expose ${p}") [ "/run/drv" "/run/drv-session" "/run/pipewire" ]
           ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.

@@ -119,6 +119,7 @@ in
   '';
 
   services.drv = {
+    debug = true;
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
     # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
@@ -143,7 +144,9 @@ in
         bus = true;
         exec = [
           "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
-          "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRTCPipeWireCamera"
+          "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRtcPipeWireCamera"
+          # Its log, for the camera: the portal dance happens in its video utility process.
+          "--enable-logging=stderr" "--v=0" "--vmodule=camera_portal=2,pipewire_session=2,video_capture_device_factory_webrtc=2"
           "file://${sharePage}"
         ];
         gpu = true;
@@ -175,6 +178,22 @@ in
     pkgs.weston
     pkgs.foot
   ];
+
+  # A camera for the portal: a loopback device fed a test pattern, which WirePlumber
+  # picks up like any v4l2 camera (the spa videotestsrc node lacks node-level formats,
+  # which browsers ask for).
+  boot.extraModulePackages = [ config.boot.kernelPackages.v4l2loopback ];
+  boot.kernelModules = [ "v4l2loopback" ];
+  boot.extraModprobeConfig = ''options v4l2loopback card_label="Test camera"'';
+  systemd.services.test-camera = {
+    wantedBy = [ "multi-user.target" ];
+    after = [ "systemd-modules-load.service" ];
+    serviceConfig = {
+      ExecStart = "${pkgs.ffmpeg-headless}/bin/ffmpeg -loglevel error -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video0";
+      Restart = "always";
+      RestartSec = 2;
+    };
+  };
 
   system.stateVersion = "25.11";
 }
