@@ -1,8 +1,8 @@
 //! Exercises screen sharing from inside an app sandbox, as a browser would: creates a
 //! portal session on its private bus, asks to start (the person consents at drv-portal),
 //! opens the PipeWire remote and lists what that connection can see, which should be the
-//! core and the one node. Then holds the cast for a while and closes the session. Results
-//! in `$HOME/cast.txt` as they come.
+//! core and the one node. Then holds the cast for a while, or until the desktop ends it
+//! (Session.Closed), and closes the session. Results in `$HOME/cast.txt` as they come.
 
 use std::collections::HashMap;
 use std::fs;
@@ -153,11 +153,23 @@ fn run(result: &str, out: &mut String) -> anyhow::Result<()> {
     }
     save(out)?;
 
-    // Hold the cast so the indicator can be seen, then close.
-    let session_proxy = Proxy::new(&conn, PORTAL_NAME, session_path.as_str(), SESSION)?;
-    std::thread::sleep(Duration::from_secs(20));
-    session_proxy.call_method("Close", &())?;
-    *out += "Close: ok\n";
+    // Hold the cast so the indicator can be seen: 20 s, or until the desktop ends it (a
+    // revoke sends Session.Closed and the session is gone; Close would only fail).
+    let session_proxy = Proxy::new(&conn, PORTAL_NAME, session_path.clone(), SESSION)?;
+    let closed = session_proxy.receive_signal("Closed")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if closed.into_iter().next().is_some() {
+            let _ = tx.send(());
+        }
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(()) => *out += "Closed by the desktop\n",
+        Err(_) => match session_proxy.call_method("Close", &()) {
+            Ok(_) => *out += "Close: ok\n",
+            Err(err) => *out += &format!("Close: {err}\n"),
+        },
+    }
     save(out)?;
     Ok(())
 }
