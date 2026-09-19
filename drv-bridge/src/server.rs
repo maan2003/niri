@@ -79,22 +79,22 @@ pub fn serve(identity: PathBuf) -> anyhow::Result<()> {
             let uid = match rustix::net::sockopt::socket_peercred(&sock) {
                 Ok(cred) => cred.uid.as_raw(),
                 Err(err) => {
-                    eprintln!("bridge: no peer credentials: {err}");
+                    drv_os::say!("bridge: no peer credentials: {err}");
                     return;
                 }
             };
             let app = match policy.lock().unwrap().lookup(uid) {
                 Ok(app) if *app != AppPolicy::unknown() => app,
                 Ok(_) => {
-                    eprintln!("bridge: refusing uid {uid}: not an app");
+                    drv_os::say!("bridge: refusing uid {uid}: not an app");
                     return;
                 }
                 Err(err) => {
-                    eprintln!("bridge: identity lookup for uid {uid}: {err}");
+                    drv_os::say!("bridge: identity lookup for uid {uid}: {err}");
                     return;
                 }
             };
-            eprintln!("bridge: {} (uid {uid}) connected", app.name);
+            drv_os::say!("bridge: {} (uid {uid}) connected", app.name);
             let link = Arc::new(AppLink {
                 app,
                 uid,
@@ -107,7 +107,7 @@ pub fn serve(identity: PathBuf) -> anyhow::Result<()> {
                 state: Mutex::new(LinkState::default()),
             });
             if let Err(err) = link.run() {
-                eprintln!("bridge: {}: {err:#}", link.app.name);
+                drv_os::say!("bridge: {}: {err:#}", link.app.name);
             }
             link.gone();
         });
@@ -145,7 +145,7 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
                     }
                 })
                 .error(|id, seq, res, message| {
-                    eprintln!("bridge: PipeWire error on {id} ({seq}): {res} {message}");
+                    drv_os::say!("bridge: PipeWire error on {id} ({seq}): {res} {message}");
                 })
                 .register()
         };
@@ -205,7 +205,7 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     // SAFETY: the client proxy is live; bound after the round trip.
     let client_id = unsafe { pipewire::sys::pw_proxy_get_bound_id(client.cast()) };
     if *TRACE {
-        eprintln!("bridge: remote client {client_id} for nodes {nodes:?} sees {:?}", seen.borrow());
+        drv_os::say!("bridge: remote client {client_id} for nodes {nodes:?} sees {:?}", seen.borrow());
     }
     drop(_globals);
     drop(registry);
@@ -219,7 +219,7 @@ fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
 /// cheap, and the app would otherwise drop the whole share.
 fn remote_twice(nodes: &[u32], who: &str) -> anyhow::Result<(OwnedFd, u32)> {
     pipewire_remote(nodes).or_else(|err| {
-        eprintln!("bridge: {who}: {err:#}; once more");
+        drv_os::say!("bridge: {who}: {err:#}; once more");
         pipewire_remote(nodes)
     })
 }
@@ -257,7 +257,7 @@ impl Portal {
             match seq::recv::<protocol::Response>(&reader.sock) {
                 Ok((resp, _)) => reader.dispatch(resp),
                 Err(err) => {
-                    eprintln!("bridge: drv-portal: {err}");
+                    drv_os::say!("bridge: drv-portal: {err}");
                     process::exit(1);
                 }
             }
@@ -286,7 +286,7 @@ impl Portal {
         };
         match cast {
             Some(on) => on(resp),
-            None => eprintln!("bridge: drv-portal answered {id}, which nobody asked"),
+            None => drv_os::say!("bridge: drv-portal answered {id}, which nobody asked"),
         }
     }
 
@@ -352,7 +352,7 @@ impl Portal {
     fn forget(&self, app: &str, uid: u32) {
         let req = protocol::Request::Forget { app: app.to_owned(), uid };
         if let Err(err) = seq::send(&self.sock, &req, &[]) {
-            eprintln!("bridge: forgetting {app} at drv-portal: {err}");
+            drv_os::say!("bridge: forgetting {app} at drv-portal: {err}");
         }
     }
 
@@ -361,7 +361,7 @@ impl Portal {
         self.waiting.lock().unwrap().remove(&id);
         self.casts.lock().unwrap().remove(&id);
         if let Err(err) = seq::send(&self.sock, &protocol::Request::Cancel { id }, &[]) {
-            eprintln!("bridge: cancelling {id} at drv-portal: {err}");
+            drv_os::say!("bridge: cancelling {id} at drv-portal: {err}");
         }
     }
 }
@@ -374,7 +374,7 @@ impl access::Prompter for Portal {
             protocol::Response::Closed { .. } => on(access::Answer::Revoked),
             protocol::Response::Cancelled { .. } => on(access::Answer::Refused),
             protocol::Response::Failed { reason, .. } => {
-                eprintln!("bridge: {app_name}: device: {reason}");
+                drv_os::say!("bridge: {app_name}: device: {reason}");
                 on(access::Answer::Refused)
             }
             _ => {}
@@ -427,13 +427,13 @@ impl AppLink {
     fn send(&self, msg: &ToShim, fds: &[BorrowedFd<'_>]) {
         let _one = self.sending.lock().unwrap();
         if let Err(err) = seq::send(&self.sock, msg, fds) {
-            eprintln!("bridge: {}: to its shim: {err}", self.app.name);
+            drv_os::say!("bridge: {}: to its shim: {err}", self.app.name);
         }
     }
 
     fn fail(&self, req: u64, err: impl std::fmt::Display) {
         let reason = format!("{err:#}");
-        eprintln!("bridge: {}: request {req}: {reason}", self.app.name);
+        drv_os::say!("bridge: {}: request {req}: {reason}", self.app.name);
         self.send(&ToShim::Failed { req, reason }, &[]);
     }
 
@@ -452,7 +452,7 @@ impl AppLink {
             };
             drop(fds);
             if *TRACE {
-                eprintln!("bridge: {}: {msg:?}", self.app.name);
+                drv_os::say!("bridge: {}: {msg:?}", self.app.name);
             }
             self.on(msg);
         }
@@ -525,7 +525,7 @@ impl AppLink {
                 }
                 match self.launcher.lock().unwrap().open(uri.clone()) {
                     Ok(uid) => {
-                        eprintln!("bridge: {}: {uri:?} opens as uid {uid}", self.app.name);
+                        drv_os::say!("bridge: {}: {uri:?} opens as uid {uid}", self.app.name);
                         self.send(&ToShim::Done { req }, &[]);
                     }
                     Err(err) => self.fail(req, format!("OpenURI {uri:?}: {err}")),
@@ -650,7 +650,7 @@ impl AppLink {
 
     /// The app disconnected: what drv-portal holds for it goes, dialogs down, casts stopped.
     fn gone(&self) {
-        eprintln!("bridge: {} disconnected", self.app.name);
+        drv_os::say!("bridge: {} disconnected", self.app.name);
         let state = std::mem::take(&mut *self.state.lock().unwrap());
         for id in state.pending.into_values() {
             self.portal.cancel(id);

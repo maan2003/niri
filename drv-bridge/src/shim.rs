@@ -70,7 +70,7 @@ pub fn run(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
             for msg in bus_iter {
                 let Ok(msg) = msg else { break };
                 if let Err(err) = shim.on_app_message(&msg) {
-                    eprintln!("drv-bridge: from app: {err:#}");
+                    drv_os::say!("drv-bridge: from app: {err:#}");
                 }
             }
         });
@@ -81,7 +81,7 @@ pub fn run(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
             match seq::recv::<ToShim>(&shim.sock) {
                 Ok((msg, fds)) => shim.on_server_message(msg, fds),
                 Err(err) => {
-                    eprintln!("drv-bridge: lost the bridge server: {err}");
+                    drv_os::say!("drv-bridge: lost the bridge server: {err}");
                     break;
                 }
             }
@@ -226,7 +226,7 @@ impl Shim {
                 let waiter = self.waiting.lock().unwrap().remove(&req);
                 match waiter {
                     Some(on) => on(msg, fds),
-                    None => eprintln!("drv-bridge: the bridge answered {req}, which nobody asked"),
+                    None => drv_os::say!("drv-bridge: the bridge answered {req}, which nobody asked"),
                 }
             }
             None => match msg {
@@ -242,7 +242,7 @@ impl Shim {
                             .and_then(|b| b.build(&HashMap::<&str, Value<'_>>::new()))
                             .and_then(|signal| self.bus.send(&signal));
                         if let Err(err) = sent {
-                            eprintln!("drv-bridge: session closed signal: {err}");
+                            drv_os::say!("drv-bridge: session closed signal: {err}");
                         }
                     }
                 }
@@ -265,13 +265,13 @@ impl Shim {
             )
         };
         if *TRACE {
-            eprintln!("drv-bridge: {}", what());
+            drv_os::say!("drv-bridge: {}", what());
         }
         let reply = match self.call(msg, &hdr) {
             Ok(Ours::Reply(reply)) => reply,
             Ok(Ours::Done) => return Ok(()),
             Err(err) => {
-                eprintln!("drv-bridge: {}: {err:#}", what());
+                drv_os::say!("drv-bridge: {}: {err:#}", what());
                 failed(&hdr, format!("{err:#}"))?
             }
         };
@@ -377,7 +377,7 @@ impl Shim {
             let present = matches!(answer, ToShim::Present { present: true, .. });
             let props = vec![("version", Value::U32(CAMERA_VERSION)), ("IsCameraPresent", Value::Bool(present))];
             if let Err(err) = reply(props, &hdr).and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                eprintln!("drv-bridge: camera properties: {err:#}");
+                drv_os::say!("drv-bridge: camera properties: {err:#}");
             }
         })?;
         Ok(Ours::Done)
@@ -449,7 +449,7 @@ impl Shim {
                 ToShim::Files { paths, .. } => (0, paths.iter().map(|p| file_uri(p)).collect()),
                 ToShim::Cancelled { .. } => (1, Vec::new()),
                 other => {
-                    eprintln!("drv-bridge: file chooser: {other:?}");
+                    drv_os::say!("drv-bridge: file chooser: {other:?}");
                     (2, Vec::new())
                 }
             };
@@ -458,7 +458,7 @@ impl Shim {
                 results.insert("uris", Value::from(uris));
             }
             if let Err(err) = shim.respond(&handle, &caller, code, results) {
-                eprintln!("drv-bridge: file chooser response: {err}");
+                drv_os::say!("drv-bridge: file chooser response: {err}");
             }
         })?;
         Ok(Ours::Done)
@@ -581,7 +581,7 @@ impl Shim {
                             match streams {
                                 Ok(streams) => results.insert("streams", Value::from(streams)),
                                 Err(err) => {
-                                    eprintln!("drv-bridge: screencast streams: {err:#}");
+                                    drv_os::say!("drv-bridge: screencast streams: {err:#}");
                                     return;
                                 }
                             };
@@ -594,12 +594,12 @@ impl Shim {
                         }
                         ToShim::Cancelled { .. } => shim.respond(&handle, &caller, 1, HashMap::new()),
                         other => {
-                            eprintln!("drv-bridge: screencast: {other:?}");
+                            drv_os::say!("drv-bridge: screencast: {other:?}");
                             shim.respond(&handle, &caller, 2, HashMap::new())
                         }
                     };
                     if let Err(err) = res {
-                        eprintln!("drv-bridge: screencast: {err:#}");
+                        drv_os::say!("drv-bridge: screencast: {err:#}");
                     }
                 })?;
                 Ok(Ours::Done)
@@ -639,7 +639,7 @@ impl Shim {
                 (other, _) => failed(&hdr, format!("no remote: {other:?}")),
             };
             if let Err(err) = reply.and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                eprintln!("drv-bridge: remote: {err:#}");
+                drv_os::say!("drv-bridge: remote: {err:#}");
             }
         })?;
         Ok(Ours::Done)
@@ -669,12 +669,12 @@ impl Shim {
                         }
                         ToShim::Cancelled { .. } => 1,
                         other => {
-                            eprintln!("drv-bridge: camera: {other:?}");
+                            drv_os::say!("drv-bridge: camera: {other:?}");
                             2
                         }
                     };
                     if let Err(err) = shim.respond(&handle, &caller, code, HashMap::new()) {
-                        eprintln!("drv-bridge: camera response: {err}");
+                        drv_os::say!("drv-bridge: camera response: {err}");
                     }
                 })?;
                 Ok(Ours::Done)
@@ -704,12 +704,12 @@ impl Shim {
             let code = match answer {
                 ToShim::Done { .. } => 0,
                 other => {
-                    eprintln!("drv-bridge: OpenURI: {other:?}");
+                    drv_os::say!("drv-bridge: OpenURI: {other:?}");
                     2
                 }
             };
             if let Err(err) = shim.respond(&handle, &caller, code, HashMap::new()) {
-                eprintln!("drv-bridge: OpenURI response: {err}");
+                drv_os::say!("drv-bridge: OpenURI response: {err}");
             }
         })?;
         Ok(Ours::Done)
@@ -748,7 +748,7 @@ impl Shim {
                         other => failed(&hdr, format!("{other:?}")),
                     };
                     if let Err(err) = reply.and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                        eprintln!("drv-bridge: notification reply: {err:#}");
+                        drv_os::say!("drv-bridge: notification reply: {err:#}");
                     }
                 })?;
                 return Ok(Ours::Done);

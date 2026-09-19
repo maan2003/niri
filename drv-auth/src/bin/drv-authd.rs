@@ -52,7 +52,7 @@ fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
         secret.zeroize();
         let reply = match outcome {
             Ok(Outcome::Granted) => {
-                eprintln!("PIN accepted; unlocking");
+                drv_os::say!("PIN accepted; unlocking");
                 let event = Event::Unlock {
                     idle_timeout_ms: shared.idle_timeout.as_millis() as u64,
                 };
@@ -60,7 +60,7 @@ fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
                 match comp.as_ref().map(|c| drv_auth::send_msg(c, &event)) {
                     Some(Ok(())) => Response::Granted,
                     Some(Err(err)) => {
-                        eprintln!("compositor connection lost: {err}");
+                        drv_os::say!("compositor connection lost: {err}");
                         *comp = None;
                         Response::Error("compositor not connected".into())
                     }
@@ -68,13 +68,13 @@ fn serve_verifier(shared: &Shared, sock: OwnedFd) -> io::Result<()> {
                 }
             }
             Ok(Outcome::Denied { retry_after }) => {
-                eprintln!("PIN rejected; retry after {retry_after:?}");
+                drv_os::say!("PIN rejected; retry after {retry_after:?}");
                 Response::Denied {
                     retry_after_ms: retry_after.as_millis() as u64,
                 }
             }
             Err(err) => {
-                eprintln!("verify failed: {err}");
+                drv_os::say!("verify failed: {err}");
                 Response::Error(err.to_string())
             }
         };
@@ -88,21 +88,21 @@ fn serve(state_dir: PathBuf, idle_timeout: u64) -> io::Result<()> {
     let locker = fds.socket("locker", drv_os::fds::Kind::SeqPacket)?;
     let store = Store::new(state_dir);
     if !store.has_pin() {
-        eprintln!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
+        drv_os::say!("no PIN enrolled: run `drv-authd set-pin`; every verify is refused until then");
     }
     // From here on: our two fds, threads, and the state directory.
     if drv_os::seccomp::enabled() {
         let mut allow = drv_os::seccomp::Allowlist::base()?;
         allow.write_files()?;
         allow.apply("drv-authd")?;
-        eprintln!("seccomp: syscall allowlist applied");
+        drv_os::say!("seccomp: syscall allowlist applied");
     }
     let shared = Arc::new(Shared {
         auth: Mutex::new(Auth::new(store)),
         compositor: Mutex::new(Some(compositor)),
         idle_timeout: Duration::from_secs(idle_timeout),
     });
-    eprintln!("serving the locker");
+    drv_os::say!("serving the locker");
     serve_verifier(&shared, locker)?;
     // The locker is gone; the supervisor restarts the set, us included.
     Err(io::Error::other("the locker hung up"))
@@ -129,7 +129,7 @@ fn main() {
         }
     };
     if let Err(err) = res {
-        eprintln!("drv-authd: {err}");
+        drv_os::say!("drv-authd: {err}");
         std::process::exit(1);
     }
 }

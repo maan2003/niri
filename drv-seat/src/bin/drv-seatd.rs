@@ -122,10 +122,10 @@ impl Devices {
             }
         }
         for event in out {
-            eprintln!("drv-seatd: {event:?}");
+            drv_os::say!("drv-seatd: {event:?}");
             if let Some(client) = client {
                 if let Err(err) = drv_seat::send(client, &event, &[]) {
-                    eprintln!("drv-seatd: sending {event:?}: {err}");
+                    drv_os::say!("drv-seatd: sending {event:?}: {err}");
                 }
             }
         }
@@ -202,16 +202,16 @@ impl Daemon {
                 SeatEvent::Disable => (false, Event::Disable),
             };
             self.active = active;
-            eprintln!("drv-seatd: seat {msg:?}");
+            drv_os::say!("drv-seatd: seat {msg:?}");
             if let Some(client) = client {
                 if let Err(err) = drv_seat::send(client, &msg, &[]) {
-                    eprintln!("drv-seatd: sending {msg:?}: {err}");
+                    drv_os::say!("drv-seatd: sending {msg:?}: {err}");
                 }
             }
             if !active {
                 // Acknowledge at once, like smithay does; the kernel revoked the devices.
                 if let Err(err) = self.seat.disable() {
-                    eprintln!("drv-seatd: acknowledging disable: {err:?}");
+                    drv_os::say!("drv-seatd: acknowledging disable: {err:?}");
                 }
             }
         }
@@ -219,7 +219,7 @@ impl Daemon {
 
     fn dispatch(&mut self, client: Option<&OwnedFd>) {
         if let Err(err) = self.seat.dispatch(0) {
-            eprintln!("drv-seatd: dispatching the seat: {err:?}");
+            drv_os::say!("drv-seatd: dispatching the seat: {err:?}");
         }
         self.drain(client);
     }
@@ -317,7 +317,7 @@ impl Daemon {
         };
         for (_, device) in devices.drain() {
             if let Err(err) = self.seat.close_device(device) {
-                eprintln!("drv-seatd: closing a device after hangup: {err:?}");
+                drv_os::say!("drv-seatd: closing a device after hangup: {err:?}");
             }
         }
         result
@@ -330,24 +330,24 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("the compositor's connection from the supervisor: {e}"))?;
     if let Some(vt) = args.vt {
         activate_vt(vt)?;
-        eprintln!("drv-seatd: on VT {vt}");
+        drv_os::say!("drv-seatd: on VT {vt}");
     }
     let events = drv_seat::pair().map_err(|e| format!("the events socket pair: {e}"))?;
     let sealed = drv_os::seccomp::enabled();
     if sealed {
         lockdown(true).map_err(|e| format!("sealing: {e}"))?;
     } else {
-        eprintln!("drv-seatd: seccomp disabled ({}=0)", drv_os::seccomp::DISABLE_ENV);
+        drv_os::say!("drv-seatd: seccomp disabled ({}=0)", drv_os::seccomp::DISABLE_ENV);
     }
     let mut daemon = Daemon::open()?;
-    eprintln!(
+    drv_os::say!(
         "drv-seatd: seat {} ready with {} devices",
         daemon.seat.name(),
         daemon.devices.known.len()
     );
     if sealed {
         lockdown(false).map_err(|e| format!("sealing: {e}"))?;
-        eprintln!("drv-seatd: seccomp: syscall allowlist applied");
+        drv_os::say!("drv-seatd: seccomp: syscall allowlist applied");
     }
     match daemon.serve(control, events) {
         Ok(()) => Err("the compositor hung up".to_owned()),
@@ -382,7 +382,7 @@ fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("drv-seatd: {err}");
+            drv_os::say!("drv-seatd: {err}");
             ExitCode::FAILURE
         }
     }

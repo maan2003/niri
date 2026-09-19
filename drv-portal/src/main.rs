@@ -188,7 +188,7 @@ impl App {
         match req {
             Request::Hello { version } => {
                 if version != VERSION {
-                    eprintln!("drv-portal: the bridge speaks version {version}, we speak {VERSION}");
+                    drv_os::say!("drv-portal: the bridge speaks version {version}, we speak {VERSION}");
                 }
                 self.send(Response::Hello { version: VERSION });
             }
@@ -202,7 +202,7 @@ impl App {
                 if let Some(token) = again {
                     let standing = self.consents.get(&token).filter(|c| c.app == app && c.uid == uid);
                     if let Some((source, label)) = standing.and_then(|c| self.label(&c.source).map(|l| (c.source.clone(), l))) {
-                        eprintln!("drv-portal: {app} (uid {uid}) shares {label} again");
+                        drv_os::say!("drv-portal: {app} (uid {uid}) shares {label} again");
                         self.casts.insert(id, Live { app, uid, source: source.clone(), label, token });
                         self.tell(ToCompositor::Start { cast: id, source, cursor });
                         return;
@@ -230,11 +230,11 @@ impl App {
                     self.next(qh);
                 }
                 if let Some(live) = self.casts.remove(&id) {
-                    eprintln!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.label);
+                    drv_os::say!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.label);
                     self.tell(ToCompositor::Stop { cast: id });
                 }
                 if let Some(live) = self.devices.remove(&id) {
-                    eprintln!("drv-portal: {} (uid {}) is done with the {}", live.app, live.uid, device_name(live.device));
+                    drv_os::say!("drv-portal: {} (uid {}) is done with the {}", live.app, live.uid, device_name(live.device));
                     self.show_devices();
                 }
             }
@@ -245,7 +245,7 @@ impl App {
         match ev {
             ToPortal::Hello { version } => {
                 if version != compositor::VERSION {
-                    eprintln!("drv-portal: the compositor speaks version {version}, we speak {}", compositor::VERSION);
+                    drv_os::say!("drv-portal: the compositor speaks version {version}, we speak {}", compositor::VERSION);
                 }
             }
             ToPortal::Outputs(outputs) => {
@@ -258,7 +258,7 @@ impl App {
             }
             ToPortal::Started { cast, node_id, width, height } => match self.casts.get(&cast) {
                 Some(live) => {
-                    eprintln!("drv-portal: {} (uid {}) shares {} on PipeWire node {node_id}", live.app, live.uid, live.label);
+                    drv_os::say!("drv-portal: {} (uid {}) shares {} on PipeWire node {node_id}", live.app, live.uid, live.label);
                     self.send(Response::Cast {
                         id: cast,
                         node_id,
@@ -273,14 +273,14 @@ impl App {
             },
             ToPortal::Stopped { cast } => {
                 if let Some(live) = self.casts.remove(&cast) {
-                    eprintln!("drv-portal: the cast of {} for {} ended", live.label, live.app);
+                    drv_os::say!("drv-portal: the cast of {} for {} ended", live.label, live.app);
                     self.send(Response::Closed { id: cast });
                 }
             }
             ToPortal::Revoke => {
                 let devices: Vec<_> = self.devices.drain().collect();
                 for (id, live) in devices {
-                    eprintln!("drv-portal: {} (uid {}) loses the {}", live.app, live.uid, device_name(live.device));
+                    drv_os::say!("drv-portal: {} (uid {}) loses the {}", live.app, live.uid, device_name(live.device));
                     self.send(Response::Closed { id });
                 }
                 self.show_devices();
@@ -290,7 +290,7 @@ impl App {
 
     fn send(&self, resp: Response) {
         if let Err(err) = seq::send(&self.bridge, &resp, &[]) {
-            eprintln!("drv-portal: to the bridge: {err}");
+            drv_os::say!("drv-portal: to the bridge: {err}");
         }
     }
 
@@ -308,7 +308,7 @@ impl App {
 
     fn tell(&self, msg: ToCompositor) {
         if let Err(err) = seq::send(&self.compositor, &msg, &[]) {
-            eprintln!("drv-portal: to the compositor: {err}");
+            drv_os::say!("drv-portal: to the compositor: {err}");
         }
     }
 
@@ -437,7 +437,7 @@ impl App {
         let Some(d) = self.dialog.as_mut() else { return };
         if let Some(device) = d.granting() {
             let id = d.req.id;
-            eprintln!("drv-portal: {} (uid {}) may use the {}", d.req.app, d.req.uid, device_name(device));
+            drv_os::say!("drv-portal: {} (uid {}) may use the {}", d.req.app, d.req.uid, device_name(device));
             self.devices.insert(id, LiveDevice { app: d.req.app.clone(), uid: d.req.uid, device });
             self.show_devices();
             self.finish(qh, Response::Granted { id });
@@ -505,7 +505,7 @@ impl App {
         let (id_req, uid, app) = (d.req.id, d.req.uid, d.req.app.clone());
         let id = self.grants.lock().unwrap().add(Grant { uid, name: name.clone(), file, write });
         let doc = self.docs.join(id.to_string()).join(&name);
-        eprintln!(
+        drv_os::say!(
             "drv-portal: {app} (uid {uid}) gets {} as {}{}",
             path.display(),
             doc.display(),
@@ -526,7 +526,7 @@ impl App {
             return;
         };
         let id = d.req.id;
-        eprintln!("drv-portal: {} (uid {}) may share {label}", d.req.app, d.req.uid);
+        drv_os::say!("drv-portal: {} (uid {}) may share {label}", d.req.app, d.req.uid);
         // Tokens only mean something with the app they were given to, so plain counting does.
         self.next_token += 1;
         let token = format!("drv{}", self.next_token);
@@ -559,7 +559,7 @@ impl App {
         let shown = d.shown();
         let surface = layer.wl_surface().clone();
         if let Err(err) = self.ui.draw(&surface, width, height, |p| paint(p, d, &shown)) {
-            eprintln!("drv-portal: {err}");
+            drv_os::say!("drv-portal: {err}");
         }
     }
 }
@@ -741,7 +741,7 @@ fn run() -> Result<(), String> {
     .map_err(|e| format!("the documents mount: {e}"))?;
     thread::spawn(move || {
         if let Err(err) = session.run() {
-            eprintln!("drv-portal: the documents mount: {err}");
+            drv_os::say!("drv-portal: the documents mount: {err}");
         }
         process::exit(1);
     });
@@ -818,7 +818,7 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("drv-portal: {err}");
+        drv_os::say!("drv-portal: {err}");
         process::exit(1);
     }
 }

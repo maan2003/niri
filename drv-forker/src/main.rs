@@ -122,7 +122,7 @@ impl Forker {
                 Request::Launch(launch) => match self.launch(&launch) {
                     Ok(pid) => Response::Forked { pid },
                     Err(err) => {
-                        eprintln!("drv-forker: refused uid {}: {err}", launch.uid);
+                        drv_os::say!("drv-forker: refused uid {}: {err}", launch.uid);
                         Response::Error(err)
                     }
                 },
@@ -259,8 +259,8 @@ impl Forker {
         // Reap it, or every launched app leaves a zombie under us.
         thread::spawn(move || {
             match child.wait() {
-                Ok(status) => eprintln!("drv-forker: {name} (pid {pid}, uid {uid}) exited: {status}"),
-                Err(err) => eprintln!("drv-forker: waiting for {name} (pid {pid}): {err}"),
+                Ok(status) => drv_os::say!("drv-forker: {name} (pid {pid}, uid {uid}) exited: {status}"),
+                Err(err) => drv_os::say!("drv-forker: waiting for {name} (pid {pid}): {err}"),
             }
             running.lock().unwrap().remove(&pid);
         });
@@ -334,7 +334,7 @@ fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("drv-forker: {err}");
+            drv_os::say!("drv-forker: {err}");
             ExitCode::FAILURE
         }
     }

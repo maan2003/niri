@@ -45,7 +45,7 @@ fn run(args: Args) -> Result<(), String> {
         let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
         allow.accept();
         allow.apply("drv-appd").map_err(|e| e.to_string())?;
-        eprintln!("drv-appd: seccomp: syscall allowlist applied");
+        drv_os::say!("drv-appd: seccomp: syscall allowlist applied");
     }
     drv_policy::daemon::serve(listener, appd).map_err(|e| format!("serving: {e}"))
 }
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("drv-appd: {err}");
+            drv_os::say!("drv-appd: {err}");
             ExitCode::FAILURE
         }
     }

@@ -152,7 +152,7 @@ macro_rules! client {
                 if capability == $crate::sctk::seat::Capability::Keyboard && ui.keyboard.is_none() {
                     match ui.seat_state.get_keyboard(qh, &seat, None) {
                         Ok(kb) => ui.keyboard = Some(kb),
-                        Err(err) => eprintln!("keyboard: {err}"),
+                        Err(err) => drv_os::say!("keyboard: {err}"),
                     }
                 }
             }
@@ -445,6 +445,6 @@ pub fn seal_with(
     allow.read_files().map_err(|e| e.to_string())?;
     extend(&mut allow).map_err(|e| e.to_string())?;
     allow.apply(name).map_err(|e| e.to_string())?;
-    eprintln!("{name}: seccomp: syscall allowlist applied");
+    drv_os::say!("{name}: seccomp: syscall allowlist applied");
     Ok(())
 }

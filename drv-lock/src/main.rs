@@ -84,7 +84,7 @@ impl App {
         let message = self.message.clone();
         let wl_surface = surface.lock_surface.wl_surface().clone();
         if let Err(err) = self.ui.draw(&wl_surface, width, height, |p| paint(p, &prompt, &message)) {
-            eprintln!("drv-lock: {err}");
+            drv_os::say!("drv-lock: {err}");
         }
     }
 
@@ -93,7 +93,7 @@ impl App {
         match self.session_lock_state.lock(qh) {
             Ok(lock) => self.session_lock = Some(lock),
             Err(err) => {
-                eprintln!("drv-lock: no session-lock global: {err}");
+                drv_os::say!("drv-lock: no session-lock global: {err}");
                 process::exit(1);
             }
         }
@@ -125,7 +125,7 @@ impl App {
             Ok(other) => self.message = format!("Auth failed: {other:?}"),
             Err(err) => {
                 // drv-authd is gone; so is the set, us included, in a moment.
-                eprintln!("drv-lock: auth daemon unreachable: {err}; exiting");
+                drv_os::say!("drv-lock: auth daemon unreachable: {err}; exiting");
                 process::exit(1);
             }
         }
@@ -260,7 +260,7 @@ fn run() -> Result<(), String> {
             if app.granted {
                 app.granted_ticks += 1;
                 if app.granted_ticks > 10 {
-                    eprintln!("drv-lock: no finish after grant");
+                    drv_os::say!("drv-lock: no finish after grant");
                     app.granted = false;
                     app.granted_ticks = 0;
                     app.message = "Unlock did not go through, try again".to_owned();
@@ -284,7 +284,7 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("drv-lock: {err}");
+        drv_os::say!("drv-lock: {err}");
         process::exit(1);
     }
 }

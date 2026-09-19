@@ -48,7 +48,7 @@ impl App {
         self.apps = match self.appd.apps() {
             Ok(apps) => apps,
             Err(err) => {
-                eprintln!("drv-menu: asking drv-appd for the apps: {err}");
+                drv_os::say!("drv-menu: asking drv-appd for the apps: {err}");
                 return;
             }
         };
@@ -90,8 +90,8 @@ impl App {
             return;
         };
         match self.appd.launch(name.clone()) {
-            Ok(uid) => eprintln!("drv-menu: launched {name:?} as uid {uid}"),
-            Err(err) => eprintln!("drv-menu: launching {name:?}: {err}"),
+            Ok(uid) => drv_os::say!("drv-menu: launched {name:?} as uid {uid}"),
+            Err(err) => drv_os::say!("drv-menu: launching {name:?}: {err}"),
         }
     }
 
@@ -110,7 +110,7 @@ impl App {
         if let Err(err) = self.ui.draw(&surface, width, height, |p| {
             paint(p, &filter, &matches, selected)
         }) {
-            eprintln!("drv-menu: {err}");
+            drv_os::say!("drv-menu: {err}");
         }
     }
 }
@@ -262,7 +262,7 @@ fn run() -> Result<(), String> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("drv-menu: {err}");
+        drv_os::say!("drv-menu: {err}");
         process::exit(1);
     }
 }

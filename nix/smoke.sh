@@ -6,54 +6,14 @@
 # Wants: the monitor at /tmp/niri-vm/monitor, /tmp/niri-vm/ssh, socat. Run once per boot: the
 # unlock step types the dev PIN, and the chooser walks the dialog from its start.
 set -uo pipefail
-SSH=${SSH:-/tmp/niri-vm/ssh}
-MON=${MON:-/tmp/niri-vm/monitor}
-fails=0
-mon() { printf '%s\n' "$1" | socat - UNIX-CONNECT:"$MON" >/dev/null; }
-key() { for k in "$@"; do mon "sendkey $k"; sleep 0.08; done; }
-# Types a word letter by letter (sendkey has no hyphen; menu names are matched by prefix).
-type_word() { local w=$1; for ((i = 0; i < ${#w}; i++)); do key "${w:i:1}"; done; }
-menu() { key meta_l-d; sleep 0.8; type_word "$1"; sleep 0.5; key ret; }
-since=""
-mark() { since=$($SSH "date '+%F %T'"); }
-journal() { $SSH "journalctl -b -o cat --no-pager --since '$since'"; }
-# expect NAME PATTERN: the journal since the last mark must match PATTERN.
-expect() {
-  local name=$1 pat=$2 out
-  out=$(journal | grep -E -- "$pat" | head -3)
-  if [ -n "$out" ]; then echo "PASS $name: $out"; else echo "FAIL $name: nothing matched '$pat'"; fails=$((fails + 1)); fi
-}
-# file_has NAME PATH PATTERN: the guest file must match PATTERN (waits up to 30 s for it).
-file_has() {
-  local name=$1 path=$2 pat=$3 out content
-  for _ in $(seq 1 30); do
-    content=$($SSH "cat '$path' 2>/dev/null")
-    out=$(grep -E -- "$pat" <<<"$content" | head -2)
-    [ -n "$out" ] && break
-    sleep 1
-  done
-  if [ -n "$out" ]; then echo "PASS $name: $out"; else echo "FAIL $name: '$pat' not in $path ($(head -5 <<<"$content"))"; fails=$((fails + 1)); fi
-}
-# absent NAME PATTERN: nothing in the whole boot's journal matches.
-absent() {
-  local name=$1 pat=$2 out
-  out=$($SSH "journalctl -b -o cat --no-pager" | grep -E -- "$pat" | head -3)
-  if [ -z "$out" ]; then echo "PASS $name"; else echo "FAIL $name: $out"; fails=$((fails + 1)); fi
-}
-# count NAME PATTERN N: exactly N whole-boot matches.
-count() {
-  local name=$1 pat=$2 want=$3 n
-  n=$($SSH "journalctl -b -o cat --no-pager" | grep -cE -- "$pat")
-  if [ "$n" = "$want" ]; then echo "PASS $name: $n"; else echo "FAIL $name: $n matches of '$pat', wanted $want"; fails=$((fails + 1)); fi
-}
+. "$(dirname "$0")/vm-lib.sh"
 
 echo "== waiting for ssh"
-for _ in $(seq 1 120); do $SSH true 2>/dev/null && break; sleep 2; done
-$SSH true || { echo "FAIL ssh: the VM is not up"; exit 1; }
+wait_ssh
 
 echo "== the set"
 for m in compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-portal drv-notifier drv-forker drv-appd drv-bridge; do
-  since="1970-01-01"; expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
+  expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
 expect "sneaky refused" 'autostart "sneaky": forker: group "wheel" is not on the forker'"'"'s list'
@@ -63,12 +23,12 @@ H=/var/lib/drv-apps/100001
 for _ in $(seq 1 30); do $SSH test -e $H/done && break; sleep 1; done
 file_has "own uid" $H/id.txt '^uid=100001\(app-hello\) gid=100001\(app-hello\) groups=100001\(app-hello\)$'
 file_has "only loopback" $H/net.txt '^ *lo:'
-count_ifaces=$($SSH cat $H/net.txt | grep -c ':'); [ "$count_ifaces" = 1 ] && echo "PASS no other interface" || { echo "FAIL other interfaces: $count_ifaces"; fails=$((fails + 1)); }
-others=$($SSH cat $H/ps.txt | tail -n +2 | grep -v '^app-hel'); [ -z "$others" ] && echo "PASS sees only its own processes" || { echo "FAIL sees other processes: $others"; fails=$((fails + 1)); }
+count_ifaces=$($SSH cat $H/net.txt | grep -c ':'); [ "$count_ifaces" = 1 ] && echo "PASS no other interface" || fail "other interfaces: $count_ifaces"
+others=$($SSH cat $H/ps.txt | tail -n +2 | grep -v '^app-hel'); [ -z "$others" ] && echo "PASS sees only its own processes" || fail "sees other processes: $others"
 file_has "no PipeWire without audio" $H/pipewire.txt 'failed to connect|Host is down'
 hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_capture_source|output_management|output_power|foreign_toplevel|virtual_pointer|virtual_keyboard|security_context|gamma_control|input_method|ext_transient_seat|zwlr_data_control|ext_data_control'
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")
-[ -z "$leaked" ] && echo "PASS no privileged globals" || { echo "FAIL privileged globals: $leaked"; fails=$((fails + 1)); }
+[ -z "$leaked" ] && echo "PASS no privileged globals" || fail "privileged globals: $leaked"
 file_has "but the ordinary ones" $H/globals.txt "interface: 'xdg_wm_base'"
 
 echo "== unlock"
@@ -127,7 +87,7 @@ absent "no panics" 'panicked at|RUST_BACKTRACE'
 absent "no members died" 'drv-supervisor: .* (exited|died|killed)|restarting the set'
 absent "no seccomp kills" 'exited: signal: 31|SIGSYS'
 count "set still started once" "drv-supervisor: compositor running as uid" 1
-cores=$($SSH "coredumpctl list --no-pager 2>&1 | tail -1"); case "$cores" in *"No coredumps"*) echo "PASS no coredumps";; *) echo "FAIL coredumps: $cores"; fails=$((fails + 1));; esac
+cores=$($SSH "coredumpctl list --no-pager 2>&1 | tail -1"); case "$cores" in *"No coredumps"*) echo "PASS no coredumps";; *) fail "coredumps: $cores";; esac
 
 echo "== $fails failures"
 exit $fails

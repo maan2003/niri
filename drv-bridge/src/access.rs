@@ -107,7 +107,7 @@ impl Access {
         let me = access.clone();
         thread::spawn(move || {
             if let Err(err) = me.run(rx, ready_tx) {
-                eprintln!("bridge: PipeWire: {err:#}");
+                drv_os::say!("bridge: PipeWire: {err:#}");
             }
             process::exit(1);
         });
@@ -162,7 +162,7 @@ impl Access {
                             let bound: Metadata = match registry2.bind(g) {
                                 Ok(m) => m,
                                 Err(err) => {
-                                    eprintln!("bridge: binding the {METADATA} metadata: {err}");
+                                    drv_os::say!("bridge: binding the {METADATA} metadata: {err}");
                                     return;
                                 }
                             };
@@ -235,14 +235,14 @@ impl Access {
                 match metadata3.borrow().as_ref() {
                     Some((m, _)) => m.set_property(client, "drv.remote", None, Some(&what)),
                     // Dropped `done` answers the caller with an error.
-                    None => return eprintln!("bridge: no {METADATA} metadata to mark a remote in"),
+                    None => return drv_os::say!("bridge: no {METADATA} metadata to mark a remote in"),
                 }
                 marks.borrow_mut().insert(client);
                 match core2.sync(0) {
                     Ok(seq) => {
                         pending.borrow_mut().push((seq, done));
                     }
-                    Err(err) => eprintln!("bridge: PipeWire sync: {err}"),
+                    Err(err) => drv_os::say!("bridge: PipeWire sync: {err}"),
                 }
             }
             Cmd::Write { uid, kinds } => {
@@ -278,7 +278,7 @@ impl Access {
 
     fn send(&self, cmd: Cmd) {
         if self.tx.send(cmd).is_err() {
-            eprintln!("bridge: the PipeWire thread is gone");
+            drv_os::say!("bridge: the PipeWire thread is gone");
             process::exit(1);
         }
     }
@@ -300,7 +300,7 @@ impl Access {
     /// WirePlumber has a stream waiting on this.
     fn asked(self: &Arc<Self>, uid: u32, device: Device) {
         let Some(app) = (self.name_of)(uid) else {
-            eprintln!("bridge: uid {uid} asks for the {}: not an app", kind(device));
+            drv_os::say!("bridge: uid {uid} asks for the {}: not an app", kind(device));
             self.send(Cmd::Answered { uid, device });
             return;
         };
@@ -332,7 +332,7 @@ impl Access {
                 st.asking.insert((uid, device), id);
             }
             Err(err) => {
-                eprintln!("bridge: {app}: asking for the {}: {err:#}", kind(device));
+                drv_os::say!("bridge: {app}: asking for the {}: {err:#}", kind(device));
                 let waiting = st.waiting.remove(&(uid, device)).unwrap_or_default();
                 drop(st);
                 self.send(Cmd::Answered { uid, device });

@@ -275,7 +275,7 @@ impl Appd {
         std::thread::spawn(move || {
             let stream = UnixStream::from(sock);
             if let Err(err) = daemon::serve_connection(stream, 0, &launcher) {
-                eprintln!("drv-appd: {}'s launch channel: {err}", launcher.who);
+                drv_os::say!("drv-appd: {}'s launch channel: {err}", launcher.who);
             }
         });
     }
@@ -286,8 +286,8 @@ impl Appd {
         self.autostarted.call_once(|| {
             for app in self.config.apps.iter().filter(|a| a.autostart) {
                 match self.start(app, None) {
-                    Ok(uid) => eprintln!("drv-appd: autostarted {:?} as uid {uid}", app.name),
-                    Err(err) => eprintln!("drv-appd: autostart {:?}: {err}", app.name),
+                    Ok(uid) => drv_os::say!("drv-appd: autostarted {:?} as uid {uid}", app.name),
+                    Err(err) => drv_os::say!("drv-appd: autostart {:?}: {err}", app.name),
                 }
             }
         });
@@ -348,7 +348,7 @@ impl Handler for Launcher {
             .app(name)
             .ok_or_else(|| format!("unknown app {name:?}; add it to appd.toml"))?;
         let uid = self.appd.start(app, None)?;
-        eprintln!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
+        drv_os::say!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
         Ok(uid)
     }
 
@@ -366,7 +366,7 @@ impl Handler for Launcher {
             .find(|a| a.opens.contains(&scheme))
             .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
         let uid = self.appd.start(app, Some(uri))?;
-        eprintln!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {}", app.name, self.who);
+        drv_os::say!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {}", app.name, self.who);
         Ok(uid)
     }
 

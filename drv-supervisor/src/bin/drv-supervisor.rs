@@ -180,7 +180,7 @@ fn main() -> ExitCode {
     match supervise(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("drv-supervisor: {err}");
+            drv_os::say!("drv-supervisor: {err}");
             ExitCode::FAILURE
         }
     }
@@ -252,11 +252,11 @@ fn supervise(args: Args) -> Result<(), String> {
     loop {
         match start_set(&set, &listener, &bridge_listener, &args.docs) {
             Ok(children) => {
-                let (name, status) = wait_first(&children);
-                eprintln!("drv-supervisor: {name} exited ({status}); restarting the set");
+                let gone = wait_first(&children);
+                drv_os::say!("drv-supervisor: {gone} exited; restarting the set");
                 stop_set(&apps, children);
             }
-            Err(err) => eprintln!("drv-supervisor: {err}"),
+            Err(err) => drv_os::say!("drv-supervisor: {err}"),
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -463,7 +463,7 @@ fn start_set(
     for (name, service, fds) in members {
         match start_service(service, &fds) {
             Ok(child) => {
-                eprintln!(
+                drv_os::say!(
                     "drv-supervisor: {name} running as uid {}, pid {}",
                     service.uid,
                     child.id()
@@ -491,35 +491,55 @@ fn stop(mut child: Child) {
 /// The apps first (one cgroup write), then every member of the set.
 fn stop_set(apps: &AppsCgroup, children: Group) {
     if let Err(err) = apps.kill_all() {
-        eprintln!("drv-supervisor: killing the apps: {err}");
+        drv_os::say!("drv-supervisor: killing the apps: {err}");
     }
     for (_, child) in children {
         stop(child);
     }
 }
 
-/// Waits for the first of the group to exit: `(name, status)`. The children are not reaped
-/// here (waiting on a `&Child` is not possible); `stop_set` reaps them all.
-fn wait_first(children: &Group) -> (&'static str, String) {
+/// Waits for the first of the group to exit, then names every member already gone, with
+/// how ("compositor-gpu (signal 9), compositor (exit status 1)"): a member's death takes
+/// its peers down within the same instant, and which thread reports first says nothing
+/// about who died first. The children are not reaped here (waiting on a `&Child` is not
+/// possible); `stop_set` reaps them all.
+fn wait_first(children: &Group) -> String {
     let (tx, rx) = mpsc::channel();
-    for (name, child) in children {
-        let name: &'static str = name;
+    for (_, child) in children {
         let pid = child.id() as i32;
         let tx = tx.clone();
         thread::spawn(move || {
-            let mut status = 0;
-            // SAFETY: waitid with WNOWAIT leaves the child for `Child::wait` to reap.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
-            };
-            if rc == 0 {
-                status = unsafe { info.si_status() };
-            }
-            let _ = tx.send((name, format!("status {status}")));
+            let _ = exited(pid, 0);
+            let _ = tx.send(());
         });
     }
-    rx.recv().unwrap_or(("?", "lost".to_owned()))
+    if rx.recv().is_err() {
+        return "? (lost)".to_owned();
+    }
+    // A moment for the cascade, so the report has the cause and not only its first victim.
+    thread::sleep(Duration::from_millis(200));
+    let gone: Vec<String> = children
+        .iter()
+        .filter_map(|(name, child)| exited(child.id() as i32, libc::WNOHANG).map(|how| format!("{name} ({how})")))
+        .collect();
+    if gone.is_empty() { "? (lost)".to_owned() } else { gone.join(", ") }
+}
+
+/// Whether `pid` has exited, and how, without reaping it. `flags` adds `WNOHANG` to poll.
+fn exited(pid: i32, flags: libc::c_int) -> Option<String> {
+    // SAFETY: waitid with WNOWAIT leaves the child for `Child::wait` to reap.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT | flags) };
+    // SAFETY: a successful waitid filled the child fields.
+    if rc != 0 || unsafe { info.si_pid() } == 0 {
+        return None;
+    }
+    let status = unsafe { info.si_status() };
+    Some(match info.si_code {
+        libc::CLD_EXITED => format!("exit status {status}"),
+        libc::CLD_DUMPED => format!("signal {status}, core dumped"),
+        _ => format!("signal {status}"),
+    })
 }
 
 /// A service from the command line: its user must exist and must not be root.

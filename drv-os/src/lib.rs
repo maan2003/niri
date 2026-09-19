@@ -11,6 +11,17 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, FileType, Mode};
 
+/// `eprintln!` for daemons: one `write(2)` per line. `eprintln!` writes every fragment of
+/// the format string on its own, and journald has split a line between two of them.
+#[macro_export]
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use ::std::io::Write as _;
+        let line = format!("{}\n", format_args!($($arg)*));
+        let _ = ::std::io::stderr().lock().write_all(line.as_bytes());
+    }};
+}
+
 /// `getgrnam_r`, so the command line and requests can use group names.
 pub fn group_id(name: &str) -> Result<u32, String> {
     let cname = CString::new(name).map_err(|_| format!("bad group name {name:?}"))?;
