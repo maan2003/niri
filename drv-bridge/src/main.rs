@@ -513,6 +513,9 @@ struct CastSession {
     portal_id: Option<u64>,
     /// The node, once the person consented and it streams.
     node: Option<u32>,
+    /// The remotes handed out for it: PipeWire client ids, disconnected when it ends, so
+    /// that their marks do not outlive the node.
+    remotes: Vec<u32>,
 }
 
 /// What `ours` did with a call.
@@ -574,13 +577,19 @@ impl AppLink {
         }
         eprintln!("bridge: {} disconnected", link.app.name);
         // What drv-portal holds for this connection: dialogs down, casts stopped.
-        let ids: Vec<u64> = {
+        let (ids, remotes): (Vec<u64>, Vec<u32>) = {
             let state = link.state.lock().unwrap();
             let sessions = state.sessions.values().filter_map(|s| s.portal_id);
-            state.ours.values().copied().chain(sessions).collect()
+            (
+                state.ours.values().copied().chain(sessions).collect(),
+                state.sessions.values().flat_map(|s| s.remotes.iter().copied()).collect(),
+            )
         };
         for id in ids {
             link.portal.cancel(id);
+        }
+        for client in remotes {
+            link.access.drop_client(client);
         }
         link.portal.forget(&link.app.name, link.uid);
         link.access.forget(link.uid);
@@ -739,8 +748,11 @@ impl AppLink {
                     other => bail!("no {other} on {SESSION_IFACE}"),
                 }
             };
-            if let Some(id) = session.and_then(|s| s.portal_id) {
-                self.portal.cancel(id);
+            if let Some(s) = session {
+                if let Some(id) = s.portal_id {
+                    self.portal.cancel(id);
+                }
+                self.end_cast(&s);
             }
             return Ok(Ours::Reply(Message::method_return(hdr)?.build(&())?));
         }
@@ -755,6 +767,13 @@ impl AppLink {
     }
 
     /// The portal `Response` signal on a request handle, to the app-side caller.
+    /// A cast session is over: the remotes it handed out go with it.
+    fn end_cast(&self, session: &CastSession) {
+        for client in &session.remotes {
+            self.access.drop_client(*client);
+        }
+    }
+
     fn respond(&self, handle: &str, caller: &str, code: u32, results: HashMap<&str, Value<'_>>) -> anyhow::Result<()> {
         let signal = Message::signal(handle, REQUEST_IFACE, "Response")?
             .destination(unique_from_component(caller))?
@@ -800,6 +819,7 @@ impl AppLink {
                         again: None,
                         portal_id: None,
                         node: None,
+                        remotes: Vec::new(),
                     },
                 );
                 // The reply first, then the signal: the spec's order.
@@ -845,7 +865,7 @@ impl AppLink {
                     let state = self.state.lock().unwrap();
                     let s = state.sessions.get(session.as_str()).context("no such session")?;
                     anyhow::ensure!(s.portal_id.is_none(), "the session was started already");
-                    CastSession { again: s.again.clone(), ..*s }
+                    CastSession { again: s.again.clone(), remotes: Vec::new(), ..*s }
                 };
                 let handle = self.handle(msg, &caller, &options, "handle_token");
                 let link = self.clone();
@@ -905,9 +925,10 @@ impl AppLink {
                             link.respond(&handle2, &caller2, 2, HashMap::new())
                         }
                         protocol::Response::Closed { .. } => {
-                            if link.state.lock().unwrap().sessions.remove(&session_path).is_none() {
+                            let Some(s) = link.state.lock().unwrap().sessions.remove(&session_path) else {
                                 return;
-                            }
+                            };
+                            link.end_cast(&s);
                             Message::signal(session_path.as_str(), SESSION_IFACE, "Closed")
                                 .and_then(|b| b.destination(unique_from_component(&caller2)))
                                 .and_then(|b| b.build(&HashMap::<&str, Value<'_>>::new()))
@@ -946,6 +967,9 @@ impl AppLink {
                     pipewire_remote(&[node])
                 })?;
                 self.access.mark(client, &format!("node:{node}"))?;
+                if let Some(s) = self.state.lock().unwrap().sessions.get_mut(session.as_str()) {
+                    s.remotes.push(client);
+                }
                 Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
             }
             other => bail!("no {other} on {SCREEN_CAST}"),

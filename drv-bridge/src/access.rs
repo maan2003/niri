@@ -400,6 +400,11 @@ impl Access {
         back.recv().context("marking the remote")
     }
 
+    /// Disconnect a remote.
+    pub fn drop_client(&self, client: u32) {
+        self.send(Cmd::Drop { client });
+    }
+
     /// A camera remote went to `uid`: revoking the camera disconnects it.
     pub fn remote(&self, uid: u32, client: u32) {
         self.state.lock().unwrap().remotes.entry(uid).or_default().push(client);
