@@ -11,6 +11,17 @@ let
   bridgeSocket = "/run/drv-bridge/bridge.sock";
   sessionBus = "unix:path=/run/drv-session/bus";
   appdSocket = "/run/drv/appd.sock";
+  # Sound. Apps reach PipeWire through this socket alone (the daemon marks its clients
+  # "drv-app", and WirePlumber's drv-access.lua decides what they may do), and PulseAudio
+  # through a pipewire-pulse of their own, run as their UID, so what it does is theirs.
+  appsSocket = "/run/drv-audio/apps";
+  pulseDir = name: "/run/drv-pulse/${name}";
+  pulseConfig = name: pkgs.writeTextDir "pipewire/pipewire-pulse.conf.d/10-drv.conf" ''
+    pulse.properties = {
+      server.address = [ "unix:${pulseDir name}/native" ]
+      pulse.allow-module-loading = false
+    }
+  '';
   forkerExec = lib.concatStringsSep " " ([
     "${cfg.package}/bin/drv-forker"
     "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
@@ -23,7 +34,11 @@ let
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
     inherit (app) uid groups gpu network globals grants autostart menu;
-    inherit (app) env expose;
+    env = app.env // lib.optionalAttrs app.audio {
+      PIPEWIRE_REMOTE = appsSocket;
+      PULSE_SERVER = "unix:${pulseDir name}/native";
+    };
+    expose = app.expose ++ lib.optionals app.audio [ "/run/drv-audio" "/run/drv-pulse" ];
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
     # keys everything on the app's UID.
     exec = lib.optionals app.bus [
@@ -41,7 +56,7 @@ let
     ] ++ appEntries;
   };
   # Everything any app may ask to see; the spawner refuses anything else.
-  optionalExpose = lib.unique (lib.concatMap (a: a.expose) (lib.attrValues cfg.apps));
+  optionalExpose = lib.unique (lib.concatMap (a: a.expose ++ lib.optionals a.audio [ "/run/drv-audio" "/run/drv-pulse" ]) (lib.attrValues cfg.apps));
   # The services' bus: distinct UIDs, so the bus itself says who may own what: the
   # notification daemon its name, nobody else anything.
   sessionBusConfig = pkgs.writeText "drv-session-bus.conf" ''
@@ -107,12 +122,12 @@ in
     };
     groups = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "render" "pipewire" ];
+      default = [ "render" ];
       description = "Supplementary groups the spawner may hand out to apps.";
     };
     expose = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" "/run/current-system" "/run/pipewire" "/run/pulse" ];
+      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" "/run/current-system" ];
       description = "Entries of /run apps may see; the rest of /run is hidden.";
     };
     files = lib.mkOption {
@@ -123,8 +138,6 @@ in
     env = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {
-        PIPEWIRE_RUNTIME_DIR = "/run/pipewire";
-        PULSE_SERVER = "unix:/run/pulse/native";
         DRV_BRIDGE_SOCKET = bridgeSocket;
         DRV_APPD_SOCKET = appdSocket;
         XDG_SESSION_TYPE = "wayland";
@@ -162,6 +175,11 @@ in
             default = false;
             description = "Give the app a private session bus with the bridge shim on it (notifications).";
           };
+          audio = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "PipeWire and a PulseAudio server of its own: playback freely, capture when the person allows it.";
+          };
           expose = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
@@ -186,7 +204,37 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable (lib.mkMerge [ {
+    # One PulseAudio server per audio app, as the app's uid: so PipeWire sees whose
+    # streams they are.
+    systemd.services = lib.mapAttrs' (name: app: lib.nameValuePair "drv-pulse-${name}" {
+      description = "PulseAudio server of ${name}";
+      wantedBy = [ "multi-user.target" ];
+      wants = [ "pipewire.service" ];
+      after = [ "pipewire.service" ];
+      environment = {
+        PIPEWIRE_REMOTE = appsSocket;
+        PIPEWIRE_RUNTIME_DIR = pulseDir name;
+        PULSE_RUNTIME_PATH = pulseDir name;
+        XDG_CONFIG_HOME = pulseConfig name;
+      };
+      serviceConfig = {
+        User = "app-${name}";
+        Group = "app-${name}";
+        RuntimeDirectory = "drv-pulse/${name}";
+        RuntimeDirectoryMode = "0700";
+        ExecStart = "${config.services.pipewire.package}/bin/pipewire -c pipewire-pulse.conf";
+        # Until PipeWire listens.
+        Restart = "always";
+        RestartSec = 1;
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+      };
+    }) (lib.filterAttrs (_: app: app.audio) cfg.apps);
+
+  } {
     assertions = lib.mapAttrsToList (name: app: {
       assertion = inRange app.uid;
       message = "services.drv.apps.${name}.uid ${toString app.uid} is outside ${toString cfg.uidRange.start}..${toString rangeEnd}";
@@ -261,22 +309,45 @@ in
     services.pipewire = {
       enable = true;
       systemWide = true;
-      pulse.enable = true;
+      # Each audio app has a pipewire-pulse of its own (below).
+      pulse.enable = false;
       alsa.enable = true;
-      # The bridge only connects to PipeWire to hand apps a remote cut down to one
-      # stream. WirePlumber grants every new client everything a moment after it
-      # connects, which would undo that cut, so the bridge's clients get nothing
-      # from it. The uid is set by PipeWire itself, an app holding the fd can't forge it.
+      # The apps' socket: anyone may connect, and gets nothing until WirePlumber decides
+      # (drv-access.lua). The daemon records which socket a client came through; the
+      # client cannot change that.
+      extraConfig.pipewire."50-drv" = {
+        "module.protocol-native.args".sockets = [
+          { name = "pipewire-0"; }
+          # The bridge's line for grants and cameras.
+          { name = "pipewire-0-manager"; mode = "0660"; }
+          { name = appsSocket; mode = "0666"; }
+        ];
+        "module.access.args"."access.socket" = {
+          "pipewire-0" = "unrestricted";
+          "pipewire-0-manager" = "unrestricted";
+          ${appsSocket} = "drv-app";
+        };
+      };
+      wireplumber.extraScripts."drv-access.lua" = builtins.readFile ./drv-access.lua;
+      wireplumber.extraConfig."50-drv-access" = {
+        "wireplumber.components" = [
+          { name = "drv-access.lua"; type = "script/lua"; provides = "script.drv-access"; }
+        ];
+        "wireplumber.profiles".main."script.drv-access" = "required";
+      };
+      # The bridge hands apps remotes cut down to a few nodes (a cast, the cameras).
+      # WirePlumber grants every new client everything a moment after it connects, which
+      # would undo that cut, so those clients get nothing from it. The bridge's own
+      # connection uses the manager socket and is left alone.
       wireplumber.extraConfig."50-drv-bridge" = {
         "access.rules" = [
           {
-            matches = [ { "pipewire.sec.uid" = toString cfg.ids.bridge; } ];
+            matches = [ { "pipewire.sec.uid" = toString cfg.ids.bridge; "pipewire.sec.socket" = "pipewire-0"; } ];
             actions.update-props.default_permissions = "-";
           }
         ];
       };
     };
-
     environment.etc."drv/appd.toml".source = appdFile;
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
@@ -428,10 +499,11 @@ in
 
     systemd.tmpfiles.rules = [
       "d /run/drv-apps 0711 drv-forker drv-forker -"
+      "d /run/drv-audio 0755 pipewire pipewire -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
       "d ${cfg.files} 0700 drv-portal drv-portal -"
     ];
 
-  };
+  } ]);
 }

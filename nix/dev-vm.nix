@@ -11,6 +11,8 @@ let
     <body style="margin:0;background:#224">
     <audio autoplay loop src="file://${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga"></audio>
     <button id=b style="font-size:60px;width:100%;height:200px">share screen</button>
+    <button id=m style="font-size:60px;width:49%;height:200px">mic</button>
+    <button id=c style="font-size:60px;width:49%;height:200px">camera</button>
     <video id=v autoplay style="width:100%"></video>
     <pre id=log style="color:#fff;font-size:30px"></pre>
     <script>
@@ -22,7 +24,28 @@ let
           log("got stream " + s.getVideoTracks()[0].label);
         } catch (e) { log("failed: " + e); }
       };
+      m.onclick = async () => {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const t = s.getAudioTracks()[0];
+          log("mic: " + t.label);
+          t.onended = () => log("mic ended");
+        } catch (e) { log("mic failed: " + e); }
+      };
+      c.onclick = async () => {
+        try {
+          const s = await navigator.mediaDevices.getUserMedia({ video: true });
+          v.srcObject = s;
+          const t = s.getVideoTracks()[0];
+          log("camera: " + t.label);
+          t.onended = () => log("camera ended");
+        } catch (e) { log("camera failed: " + e); }
+      };
     </script>
+  '';
+  # Records the microphone into its home: the stream waits until the person allows it.
+  micTest = pkgs.writeShellScript "mic-test" ''
+    exec ${pkgs.pipewire}/bin/pw-record "$HOME/rec.wav"
   '';
   probe = pkgs.writeShellScript "probe" ''
     ${pkgs.coreutils}/bin/id > "$HOME/id.txt"
@@ -120,11 +143,13 @@ in
         bus = true;
         exec = [
           "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
-          "--autoplay-policy=no-user-gesture-required" "file://${sharePage}"
+          "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRTCPipeWireCamera"
+          "file://${sharePage}"
         ];
         gpu = true;
         network = true;
-        groups = [ "render" "pipewire" ];
+        audio = true;
+        groups = [ "render" ];
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
@@ -133,13 +158,15 @@ in
       # A client of screen sharing, as a browser would use it: session, Start (the person
       # picks a screen at drv-portal), the PipeWire remote, and what that remote can see.
       # Holds the cast 20 s, then closes. Results in its home, cast.txt.
-      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; groups = [ "pipewire" ]; };
-      # Plays a sound: audio is just the `pipewire` group plus the exposed socket directory.
+      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; audio = true; };
+      # Plays a sound: playback is free for an audio app.
       beep = {
         uid = 100006;
         exec = [ "${pkgs.pipewire}/bin/pw-play" "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga" ];
-        groups = [ "pipewire" ];
+        audio = true;
       };
+      # Records: the person is asked at drv-portal; Mod+Shift+Esc ends it.
+      mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; };
     };
   };
 

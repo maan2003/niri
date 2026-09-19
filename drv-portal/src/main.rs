@@ -23,7 +23,7 @@ use clap::Parser;
 use drv_os::fds::Kind;
 use drv_policy::seq;
 use drv_portal::compositor::{self, Output, ToCompositor, ToPortal, Window};
-use drv_portal::protocol::{Cursor, Kind as Ask, Request, Response, Source, VERSION};
+use drv_portal::protocol::{Cursor, Device, Kind as Ask, Request, Response, Source, VERSION};
 use drv_ui::sctk::reexports::calloop::generic::Generic;
 use drv_ui::sctk::reexports::calloop::{Interest, Mode, PostAction};
 use drv_ui::sctk::seat::keyboard::{KeyEvent, Keysym};
@@ -65,6 +65,22 @@ struct Pending {
 enum What {
     Choose(Ask),
     Cast { cursor: Cursor, screens: bool, windows: bool },
+    Grant(Device),
+}
+
+fn device_name(device: Device) -> &'static str {
+    match device {
+        Device::Microphone => "microphone",
+        Device::Camera => "camera",
+    }
+}
+
+/// A device the person let an app use, until they revoke it or the bridge says the app is
+/// gone.
+struct LiveDevice {
+    app: String,
+    uid: u32,
+    device: Device,
 }
 
 struct Entry {
@@ -115,6 +131,13 @@ impl Dialog {
         matches!(self.req.what, What::Cast { .. })
     }
 
+    fn granting(&self) -> Option<Device> {
+        match self.req.what {
+            What::Grant(device) => Some(device),
+            _ => None,
+        }
+    }
+
     /// Entries that pass the filter, as indices into `entries`.
     fn shown(&self) -> Vec<usize> {
         if self.saving() || self.typed.is_empty() {
@@ -155,6 +178,8 @@ struct App {
     casts: HashMap<u64, Live>,
     /// Consents by token.
     consents: HashMap<String, Consent>,
+    /// Devices the person allowed, by the bridge's id for the request.
+    devices: HashMap<u64, LiveDevice>,
     next_token: u64,
 }
 
@@ -187,8 +212,14 @@ impl App {
                 self.queue.push_back(Pending { id, app, uid, title: String::new(), what });
                 self.next(qh);
             }
+            Request::Grant { id, app, uid, device } => {
+                let what = What::Grant(device);
+                self.queue.push_back(Pending { id, app, uid, title: String::new(), what });
+                self.next(qh);
+            }
             Request::Forget { app, uid } => {
                 self.consents.retain(|_, c| !(c.app == app && c.uid == uid));
+                self.devices.retain(|_, d| !(d.app == app && d.uid == uid));
             }
             Request::Cancel { id } => {
                 self.queue.retain(|p| p.id != id);
@@ -200,6 +231,9 @@ impl App {
                 if let Some(live) = self.casts.remove(&id) {
                     eprintln!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.label);
                     self.tell(ToCompositor::Stop { cast: id });
+                }
+                if let Some(live) = self.devices.remove(&id) {
+                    eprintln!("drv-portal: {} (uid {}) is done with the {}", live.app, live.uid, device_name(live.device));
                 }
             }
         }
@@ -239,6 +273,13 @@ impl App {
                 if let Some(live) = self.casts.remove(&cast) {
                     eprintln!("drv-portal: the cast of {} for {} ended", live.label, live.app);
                     self.send(Response::Closed { id: cast });
+                }
+            }
+            ToPortal::Revoke => {
+                let devices: Vec<_> = self.devices.drain().collect();
+                for (id, live) in devices {
+                    eprintln!("drv-portal: {} (uid {}) loses the {}", live.app, live.uid, device_name(live.device));
+                    self.send(Response::Closed { id });
                 }
             }
         }
@@ -327,6 +368,9 @@ impl App {
     fn list(&self, d: &mut Dialog) {
         d.entries.clear();
         d.note = None;
+        if d.granting().is_some() {
+            return;
+        }
         if let What::Cast { screens, windows, .. } = d.req.what {
             if screens {
                 for o in &self.outputs {
@@ -376,6 +420,13 @@ impl App {
 
     fn enter(&mut self, qh: &QueueHandle<Self>) {
         let Some(d) = self.dialog.as_mut() else { return };
+        if let Some(device) = d.granting() {
+            let id = d.req.id;
+            eprintln!("drv-portal: {} (uid {}) may use the {}", d.req.app, d.req.uid, device_name(device));
+            self.devices.insert(id, LiveDevice { app: d.req.app.clone(), uid: d.req.uid, device });
+            self.finish(qh, Response::Granted { id });
+            return;
+        }
         let shown = d.shown();
         let picked = d.selected.and_then(|i| shown.get(i)).map(|&i| (d.entries[i].name.clone(), d.entries[i].dir));
         if d.casting() {
@@ -510,7 +561,9 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     let dim = (0.6, 0.6, 0.65, 1.);
     let blue = (0.55, 0.75, 1., 1.);
     p.fill(0.08, 0.09, 0.12);
-    let head = if d.casting() {
+    let head = if let Some(device) = d.granting() {
+        format!("{} wants to use your {}", d.req.app, device_name(device))
+    } else if d.casting() {
         format!("{} wants to see your screen", d.req.app)
     } else {
         let verb = if d.saving() { "save" } else { "open" };
@@ -520,7 +573,9 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     if !d.req.title.is_empty() {
         p.text(PAD, PAD + 30., 14., &d.req.title, Align::Left, dim);
     }
-    let line = if d.casting() {
+    let line = if d.granting().is_some() {
+        "until it exits or you revoke it (Mod+Shift+Esc revokes everything)".to_owned()
+    } else if d.casting() {
         "what it may see, until you stop it (Mod+Shift+Esc stops them all)".to_owned()
     } else {
         format!("/{}", d.dir.display())
@@ -530,7 +585,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     let top = PAD + 86.;
     let bottom = p.height - PAD - 2. * ROW;
     let rows = ((bottom - top) / ROW).max(0.) as usize;
-    if shown.is_empty() {
+    if shown.is_empty() && d.granting().is_none() {
         let what = if d.casting() { "nothing to share" } else { "nothing here" };
         p.text(PAD, top, 16., what, Align::Left, dim);
     }
@@ -549,7 +604,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
         }
     }
 
-    if !d.casting() {
+    if !d.casting() && d.granting().is_none() {
         let (label, cursor) = if d.saving() {
             ("name", if d.selected.is_none() { "_" } else { "" })
         } else {
@@ -559,6 +614,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     }
     let (hint, color) = match &d.note {
         Some(note) => (note.as_str(), (1., 0.6, 0.5, 1.)),
+        None if d.granting().is_some() => ("Enter allow   Esc refuse", dim),
         None if d.casting() => ("Enter share   Esc refuse", dim),
         None => ("Enter choose   Backspace up   Esc cancel", dim),
     };
@@ -572,6 +628,11 @@ impl Client for App {
 
     fn key(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
         let Some(d) = self.dialog.as_mut() else { return };
+        // A yes or no: nothing to type, nothing to pick.
+        let yes_or_no = matches!(event.keysym, Keysym::Escape | Keysym::Return | Keysym::KP_Enter);
+        if d.granting().is_some() && !yes_or_no {
+            return;
+        }
         match event.keysym {
             Keysym::Escape => {
                 let id = d.req.id;
@@ -697,6 +758,7 @@ fn run() -> Result<(), String> {
         windows: Vec::new(),
         casts: HashMap::new(),
         consents: HashMap::new(),
+        devices: HashMap::new(),
         next_token: 0,
     };
 

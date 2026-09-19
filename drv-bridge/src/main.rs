@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _};
 use clap::{Parser, Subcommand};
+
+mod access;
+use access::Access;
 use drv_bridge::{
     sender_component, unique_from_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME,
     PORTAL_PATH,
@@ -19,7 +22,7 @@ use drv_bridge::{
 use drv_os::fds::Kind;
 use drv_policy::seq;
 use drv_policy::{AppPolicy, PolicyClient};
-use drv_portal::protocol::{self, Kind as ChooserKind};
+use drv_portal::protocol::{self, Device, Kind as ChooserKind};
 use zbus::blocking::Connection;
 use zbus::message::{Builder, Header, Message, Type as MessageType};
 use zbus::names::BusName;
@@ -118,15 +121,18 @@ const FILE_CHOOSER_VERSION: u32 = 4;
 const SCREEN_CAST_VERSION: u32 = 4;
 const SETTINGS: &str = "org.freedesktop.portal.Settings";
 const SETTINGS_VERSION: u32 = 2;
+const CAMERA: &str = "org.freedesktop.portal.Camera";
+const CAMERA_VERSION: u32 = 1;
 /// `AvailableSourceTypes`: monitors and windows.
 const SOURCE_TYPES: u32 = 1 | 2;
 /// `AvailableCursorModes`: hidden, embedded, metadata.
 const CURSOR_MODES: u32 = 1 | 2 | 4;
 
-/// A PipeWire connection an app may have: it sees the core, the one node and the factory
+/// A PipeWire connection an app may have: it sees the core, these nodes and the factory
 /// for its own stream node, nothing else. The permissions live in the daemon, so they hold
-/// whatever the app does with the fd.
-fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
+/// whatever the app does with the fd. With it, the daemon's id for the connection, to end
+/// it later.
+fn pipewire_remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     use pipewire::context::ContextRc;
     use pipewire::core::PW_ID_CORE;
     use pipewire::loop_::Timeout;
@@ -186,12 +192,9 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
     let client = unsafe { pipewire::sys::pw_core_get_client(core.as_raw_ptr()) };
     anyhow::ensure!(!client.is_null(), "PipeWire gave no client");
     let rwx = PermissionFlags::R | PermissionFlags::W | PermissionFlags::X;
-    let perms = [
-        Permission::new(PW_ID_CORE, rwx),
-        Permission::new(factory.get(), PermissionFlags::R),
-        Permission::new(node_id, rwx),
-        Permission::new(pipewire::sys::PW_ID_ANY, PermissionFlags::empty()),
-    ];
+    let mut perms = vec![Permission::new(PW_ID_CORE, rwx), Permission::new(factory.get(), PermissionFlags::R)];
+    perms.extend(nodes.iter().map(|node| Permission::new(*node, rwx)));
+    perms.push(Permission::new(pipewire::sys::PW_ID_ANY, PermissionFlags::empty()));
     // SAFETY: a live client proxy, and the array is `pw_permission` in memory.
     unsafe {
         pipewire::spa::spa_interface_call_method!(
@@ -204,12 +207,14 @@ fn pipewire_remote(node_id: u32) -> anyhow::Result<OwnedFd> {
     }
     // So the permissions are in before the fd changes hands.
     roundtrip("permissions")?;
+    // SAFETY: the client proxy is live; bound after the round trip.
+    let client_id = unsafe { pipewire::sys::pw_proxy_get_bound_id(client.cast()) };
     drop(_globals);
     drop(registry);
     // SAFETY: after steal_fd the core no longer owns the fd; nothing else here uses it.
     let fd = unsafe { pipewire::sys::pw_core_steal_fd(core.as_raw_ptr()) };
     anyhow::ensure!(fd >= 0, "PipeWire kept its fd");
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, client_id))
 }
 
 /// `file://` with everything outside the unreserved set escaped.
@@ -260,18 +265,26 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
     // Bound by the supervisor, any UID may connect; who they are is decided per connection.
     let listener = fds.listener("listener")?;
     let portal = Portal::start(fds.socket("portal", Kind::SeqPacket)?)?;
-    // For the screencast remotes.
+    // For the remotes, and the microphone and camera consents.
     pipewire::init();
     // Fail at startup, not on the first app, if there is no session bus.
     drop(Connection::session().context("the services' bus")?);
     let policy = Arc::new(Mutex::new(
         PolicyClient::connect(identity).context("identity daemon")?,
     ));
+    let access = {
+        let policy = policy.clone();
+        Access::start(portal.clone(), move |uid| {
+            let app = policy.lock().unwrap().lookup(uid).ok()?;
+            (*app != AppPolicy::unknown()).then(|| app.name.clone())
+        })?
+    };
 
     for stream in listener.incoming() {
         let stream = stream?;
         let policy = policy.clone();
         let portal = portal.clone();
+        let access = access.clone();
         std::thread::spawn(move || {
             let uid = match rustix::net::sockopt::socket_peercred(&stream) {
                 Ok(cred) => cred.uid.as_raw(),
@@ -292,7 +305,7 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
                 }
             };
             eprintln!("bridge: {} (uid {uid}) connected", app.name);
-            if let Err(err) = AppLink::run(app, uid, stream, portal) {
+            if let Err(err) = AppLink::run(app, uid, stream, portal, access) {
                 eprintln!("bridge: {err:#}");
             }
         });
@@ -343,6 +356,7 @@ impl Portal {
         let id = match &resp {
             protocol::Response::Chosen { id, .. }
             | protocol::Response::Cast { id, .. }
+            | protocol::Response::Granted { id }
             | protocol::Response::Closed { id }
             | protocol::Response::Cancelled { id }
             | protocol::Response::Failed { id, .. } => *id,
@@ -352,7 +366,7 @@ impl Portal {
         if let Some(done) = waiter {
             return done(resp);
         }
-        let last = !matches!(resp, protocol::Response::Cast { .. });
+        let last = !matches!(resp, protocol::Response::Cast { .. } | protocol::Response::Granted { .. });
         let cast = {
             let mut casts = self.casts.lock().unwrap();
             if last { casts.remove(&id) } else { casts.get(&id).cloned() }
@@ -414,6 +428,25 @@ impl Portal {
         Ok(id)
     }
 
+    /// Asks whether `app` may use `device`. `on` hears `Granted` then, one day, `Closed`;
+    /// or `Cancelled`/`Failed` instead.
+    fn grant(
+        &self,
+        app: &str,
+        uid: u32,
+        device: Device,
+        on: impl Fn(protocol::Response) + Send + Sync + 'static,
+    ) -> anyhow::Result<u64> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.casts.lock().unwrap().insert(id, Arc::new(on));
+        let req = protocol::Request::Grant { id, app: app.to_owned(), uid, device };
+        if let Err(err) = seq::send(&self.sock, &req, &[]) {
+            self.casts.lock().unwrap().remove(&id);
+            return Err(err).context("asking drv-portal");
+        }
+        Ok(id)
+    }
+
     /// The app's connection ended: its screen consents end with it.
     fn forget(&self, app: &str, uid: u32) {
         let req = protocol::Request::Forget { app: app.to_owned(), uid };
@@ -429,6 +462,26 @@ impl Portal {
         if let Err(err) = seq::send(&self.sock, &protocol::Request::Cancel { id }, &[]) {
             eprintln!("bridge: cancelling {id} at drv-portal: {err}");
         }
+    }
+}
+
+impl access::Prompter for Portal {
+    fn grant(&self, app: &str, uid: u32, device: Device, on: Box<dyn Fn(access::Answer) + Send + Sync>) -> anyhow::Result<u64> {
+        let app_name = app.to_owned();
+        Portal::grant(self, app, uid, device, move |resp| match resp {
+            protocol::Response::Granted { .. } => on(access::Answer::Granted),
+            protocol::Response::Closed { .. } => on(access::Answer::Revoked),
+            protocol::Response::Cancelled { .. } => on(access::Answer::Refused),
+            protocol::Response::Failed { reason, .. } => {
+                eprintln!("bridge: {app_name}: device: {reason}");
+                on(access::Answer::Refused)
+            }
+            _ => {}
+        })
+    }
+
+    fn cancel(&self, id: u64) {
+        Portal::cancel(self, id)
     }
 }
 
@@ -462,6 +515,7 @@ struct AppLink {
     app: Arc<AppPolicy>,
     uid: u32,
     portal: Arc<Portal>,
+    access: Arc<Access>,
     p2p: Connection,
     /// The human's session bus, for the notification daemon.
     bus: Connection,
@@ -478,7 +532,7 @@ struct LinkState {
 }
 
 impl AppLink {
-    fn run(app: Arc<AppPolicy>, uid: u32, stream: UnixStream, portal: Arc<Portal>) -> anyhow::Result<()> {
+    fn run(app: Arc<AppPolicy>, uid: u32, stream: UnixStream, portal: Arc<Portal>, access: Arc<Access>) -> anyhow::Result<()> {
         // Who the peer is was settled by SO_PEERCRED, so no D-Bus authentication on top.
         #[allow(deprecated)] // the async-io variant needs an Async wrapper for nothing
         let p2p_iter = zbus::blocking::connection::Builder::unix_stream(stream)
@@ -494,6 +548,7 @@ impl AppLink {
             app,
             uid,
             portal,
+            access,
             p2p,
             bus,
             state: Mutex::new(LinkState::default()),
@@ -515,6 +570,7 @@ impl AppLink {
             link.portal.cancel(id);
         }
         link.portal.forget(&link.app.name, link.uid);
+        link.access.forget(link.uid);
         Ok(())
     }
 
@@ -603,11 +659,18 @@ impl AppLink {
         if path == PORTAL_PATH && interface == SCREEN_CAST {
             return self.screen_cast(msg, hdr, &member);
         }
+        if path == PORTAL_PATH && interface == CAMERA {
+            return self.camera(msg, hdr, &member);
+        }
         if path == PORTAL_PATH && interface == PROPERTIES {
             let props = |iface: &str| -> Option<Vec<(&'static str, Value<'static>)>> {
                 match iface {
                     FILE_CHOOSER => Some(vec![("version", Value::U32(FILE_CHOOSER_VERSION))]),
                     SETTINGS => Some(vec![("version", Value::U32(SETTINGS_VERSION))]),
+                    CAMERA => Some(vec![
+                        ("version", Value::U32(CAMERA_VERSION)),
+                        ("IsCameraPresent", Value::Bool(!self.access.cameras().is_empty())),
+                    ]),
                     SCREEN_CAST => Some(vec![
                         ("version", Value::U32(SCREEN_CAST_VERSION)),
                         ("AvailableSourceTypes", Value::U32(SOURCE_TYPES)),
@@ -825,7 +888,9 @@ impl AppLink {
                                 .map_err(anyhow::Error::from)
                                 .and_then(|s| link.p2p.send(&s).map_err(anyhow::Error::from))
                         }
-                        protocol::Response::Hello { .. } | protocol::Response::Chosen { .. } => return,
+                        protocol::Response::Hello { .. }
+                        | protocol::Response::Chosen { .. }
+                        | protocol::Response::Granted { .. } => return,
                     };
                     if let Err(err) = res {
                         eprintln!("bridge: {}: screencast: {err:#}", link.app.name);
@@ -850,13 +915,51 @@ impl AppLink {
                 };
                 // Seen once in many tries: a round trip that never came back. A fresh
                 // connection is cheap, and the app would otherwise drop the whole share.
-                let fd = pipewire_remote(node).or_else(|err| {
+                let (fd, _) = pipewire_remote(&[node]).or_else(|err| {
                     eprintln!("bridge: {}: {err:#}; once more", self.app.name);
-                    pipewire_remote(node)
+                    pipewire_remote(&[node])
                 })?;
                 Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
             }
             other => bail!("no {other} on {SCREEN_CAST}"),
+        }
+    }
+
+    /// `org.freedesktop.portal.Camera`: the person is asked once per run of the app, and
+    /// the remote sees every camera, for as long as the consent stands.
+    fn camera(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
+        match member {
+            "AccessCamera" => {
+                let caller = caller_of(hdr)?;
+                let (options,): (HashMap<String, OwnedValue>,) = msg.body().deserialize()?;
+                let handle = self.handle(msg, &caller, &options, "handle_token");
+                let reply = Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?;
+                if self.access.has(self.uid, Device::Camera) {
+                    // The reply first, then the signal: the spec's order.
+                    self.p2p.send(&reply)?;
+                    self.respond(&handle, &caller, 0, HashMap::new())?;
+                    return Ok(Ours::Done);
+                }
+                let link = self.clone();
+                self.access.camera(&self.app.name, self.uid, move |allowed| {
+                    let code = if allowed { 0 } else { 1 };
+                    if let Err(err) = link.respond(&handle, &caller, code, HashMap::new()) {
+                        eprintln!("bridge: {}: camera response: {err}", link.app.name);
+                    }
+                });
+                Ok(Ours::Reply(reply))
+            }
+            "OpenPipeWireRemote" => {
+                anyhow::ensure!(self.access.has(self.uid, Device::Camera), "the camera was not allowed");
+                let cameras = self.access.cameras();
+                let (fd, client) = pipewire_remote(&cameras).or_else(|err| {
+                    eprintln!("bridge: {}: {err:#}; once more", self.app.name);
+                    pipewire_remote(&cameras)
+                })?;
+                self.access.remote(self.uid, client);
+                Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(fd))?))
+            }
+            other => bail!("no {other} on {CAMERA}"),
         }
     }
 

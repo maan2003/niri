@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Kind {
@@ -15,8 +15,17 @@ pub enum Kind {
     Save { name: String },
 }
 
+/// A device an app may be let use: the microphone stands for any audio capture (sink
+/// monitors included), the camera for any video source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Device {
+    Microphone,
+    Camera,
+}
+
 /// What a cast shows: a whole screen by connector name, or one window by the compositor's
 /// id for it.
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     Screen(String),
@@ -56,6 +65,14 @@ pub enum Request {
         /// no dialog, if the consent still stands.
         again: Option<String>,
     },
+    /// Ask the person to let `app` use `device`. `Granted` answers; `Closed` follows when
+    /// the person revokes it.
+    Grant {
+        id: u64,
+        app: String,
+        uid: u32,
+        device: Device,
+    },
     /// The app withdrew the request, or closed its session: the dialog goes down, or the
     /// cast stops. No answer follows.
     Cancel { id: u64 },
@@ -80,7 +97,10 @@ pub enum Response {
         /// Names this consent in a later `Cast { again }` by the same app.
         token: String,
     },
-    /// The cast ended: the person stopped it, or the screen went away.
+    /// The person allows the device, until `Closed`.
+    Granted { id: u64 },
+    /// The cast ended: the person stopped it, or the screen went away. Or the person
+    /// revoked the device.
     Closed { id: u64 },
     Cancelled { id: u64 },
     Failed { id: u64, reason: String },

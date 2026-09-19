@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::protocol::{Cursor, Source};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {
@@ -55,4 +55,7 @@ pub enum ToPortal {
     Started { cast: u64, node_id: u32, width: i32, height: i32 },
     /// The cast is gone, whoever ended it. Also the answer to a `Start` that failed.
     Stopped { cast: u64 },
+    /// The person's kill switch: every device they allowed is revoked (the casts get
+    /// `Stopped` each).
+    Revoke,
 }

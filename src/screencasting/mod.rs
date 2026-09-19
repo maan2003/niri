@@ -936,6 +936,7 @@ impl Niri {
         for id in ids {
             self.stop_cast(id);
         }
+        self.tell_portal(drv_portal::compositor::ToPortal::Revoke);
     }
 
     fn cast_session_ids(&self) -> HashSet<CastSessionId> {
