@@ -118,8 +118,13 @@ impl Fds {
 
     /// A listening unix stream socket.
     pub fn listener(&mut self, name: &str) -> io::Result<UnixListener> {
+        self.listener_of(name, Kind::Stream)
+    }
+
+    /// A listening unix socket of `kind`. `std` accepts on it whatever the kind is.
+    pub fn listener_of(&mut self, name: &str, kind: Kind) -> io::Result<UnixListener> {
         let fd = self.remove(name)?;
-        check_unix(&fd, name, Some(SocketType::STREAM), true)?;
+        check_unix(&fd, name, Some(kind.socket_type()), true)?;
         Ok(UnixListener::from(fd))
     }
 

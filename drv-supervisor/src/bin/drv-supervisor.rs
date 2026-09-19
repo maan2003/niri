@@ -246,7 +246,8 @@ fn supervise(args: Args) -> Result<(), String> {
     let apps = AppsCgroup::create(set.forker.uid, set.forker.gid)?;
 
     let listener = listen(&args.socket)?;
-    let bridge_listener = listen(&args.bridge_socket)?;
+    // Datagrams with fds: the shim and the server speak `drv_bridge::wire`, not a stream.
+    let bridge_listener = listen_seqpacket(&args.bridge_socket)?;
 
     loop {
         match start_set(&set, &listener, &bridge_listener, &args.docs) {
@@ -272,6 +273,23 @@ fn listen(path: &Path) -> Result<UnixListener, String> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o666))
         .map_err(|e| format!("chmod {}: {e}", path.display()))?;
     Ok(listener)
+}
+
+/// Like `listen`, a `SOCK_SEQPACKET` listener.
+fn listen_seqpacket(path: &Path) -> Result<UnixListener, String> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let _ = fs::remove_file(path);
+    let sock = rustix::net::socket_with(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)
+        .map_err(|e| format!("socket: {e}"))?;
+    let addr = SocketAddrUnix::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    rustix::net::bind(&sock, &addr).map_err(|e| format!("bind {}: {e}", path.display()))?;
+    rustix::net::listen(&sock, 64).map_err(|e| format!("listen on {}: {e}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o666))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    Ok(UnixListener::from(sock))
 }
 
 /// The documents mount, fresh for this set: a FUSE connection whose serving end goes to the
