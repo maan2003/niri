@@ -197,10 +197,13 @@ impl Forker {
                 CString::new(home.as_os_str().as_bytes())
                     .map_err(|_| format!("NUL in {}", home.display()))?,
             );
+            // Its /tmp outlives a launch (beside the runtime dirs, so gone with the boot): a
+            // second launch of the app finds the first one's single-instance socket there.
+            let tmp = self.owned_dir(&self.runtime_base.join("tmp"), uid, gid)?;
             let mut expose = self.expose.clone();
             expose.extend(extra_expose);
             expose.push(runtime);
-            sandbox = Some(Sandbox::plan(&expose, launch.network)?);
+            sandbox = Some(Sandbox::plan(&expose, launch.network, Some(&tmp))?);
         }
         let mut all_gids = vec![gid];
         all_gids.extend(gids);

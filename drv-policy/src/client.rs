@@ -86,6 +86,15 @@ impl PolicyClient {
         }
     }
 
+    /// Open `uri` with its manifest handler; only a launch channel answers.
+    pub fn open(&mut self, uri: String) -> io::Result<u32> {
+        match self.request(&Request::Open { uri })? {
+            Response::Launched { uid } => Ok(uid),
+            Response::Error(err) => Err(io::Error::other(err)),
+            other => Err(unexpected("open", other)),
+        }
+    }
+
     /// The names `launch` accepts; only a launch channel answers.
     pub fn apps(&mut self) -> io::Result<Vec<String>> {
         match self.request(&Request::Apps)? {

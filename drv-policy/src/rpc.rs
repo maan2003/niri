@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::AppPolicy;
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 /// Frames larger than this are refused, so a misbehaving peer cannot make us allocate freely.
 pub const MAX_FRAME: usize = 64 * 1024;
@@ -33,6 +33,31 @@ pub enum Request {
     },
     /// The names `Launch` accepts, for a menu. Only on a launch channel.
     Apps,
+    /// Start the app whose manifest declares the URI's scheme (`opens`), with the URI as its
+    /// one extra argument. Only on a launch channel (the bridge's, for the OpenURI portal).
+    /// The daemon refuses anything but a well-formed absolute URI it has a handler for.
+    Open {
+        uri: String,
+    },
+}
+
+/// The scheme of an absolute URI, lowercased, if `uri` is one we would pass along: ASCII
+/// printable only, no spaces, at most 8 KiB, `scheme:` as RFC 3986 spells it. Anything
+/// else is not a URI to us, whatever the app meant by it.
+pub fn uri_scheme(uri: &str) -> Option<String> {
+    if uri.len() > 8192 || !uri.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let (scheme, _) = uri.split_once(':')?;
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::protocol::{Cursor, Source};
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {
@@ -44,6 +44,9 @@ pub enum ToCompositor {
         cursor: Cursor,
     },
     Stop { cast: u64 },
+    /// Which apps hold the microphone and the camera right now, by manifest name, for the
+    /// on-screen indicator. Sent whenever the set changes; empty lists clear it.
+    Devices { mic: Vec<String>, camera: Vec<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -44,6 +44,18 @@ let
     </script>
   '';
   # Records the microphone into its home: the stream waits until the person allows it.
+  # Asks its private bus to open URIs, as a sandboxed app would. Two must be refused.
+  openTest = pkgs.writeShellScript "open-test" ''
+    open() {
+      ${pkgs.systemd}/bin/busctl --user -- call org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
+        org.freedesktop.portal.OpenURI OpenURI ssa{sv} "" "$1" 0 2>&1
+    }
+    {
+      echo "good: $(open 'https://example.com/?from=uid-100011')"
+      echo "bad scheme: $(open 'mailto:x@example.com')"
+      echo "not a uri: $(open '-https://example.com')"
+    } > "$HOME/open.txt"
+  '';
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/rec.wav"
   '';
@@ -153,6 +165,7 @@ in
         network = true;
         audio = true;
         groups = [ "render" ];
+        opens = [ "http" "https" ];
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
@@ -170,6 +183,7 @@ in
       };
       # Records: the person is asked at drv-portal; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; };
+      open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; };
     };
   };
 

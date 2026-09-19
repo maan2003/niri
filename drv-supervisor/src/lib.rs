@@ -156,7 +156,7 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
         return Err(format!("service {}: empty command", service.name));
     }
     let (fd_env, placed) = drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
-    let sandbox = Sandbox::plan(&service.expose, service.network)
+    let sandbox = Sandbox::plan(&service.expose, service.network, None)
         .map_err(|e| format!("{}: {e}", service.name))?;
     // Copies above the target numbers, so the dup2s in the child never clobber each other
     // and are never a same-fd no-op (which would keep close-on-exec set).

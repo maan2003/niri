@@ -323,6 +323,8 @@ struct Links {
     notifier_client: (OwnedFd, OwnedFd),
     compositor_portal: (OwnedFd, OwnedFd),
     bridge_portal: (OwnedFd, OwnedFd),
+    /// The bridge's launch channel: the OpenURI portal starts the URI's handler.
+    bridge_appd: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
 }
@@ -342,6 +344,7 @@ impl Links {
             menu_appd: stream()?,
             portal_client: stream()?,
             notifier_client: stream()?,
+            bridge_appd: stream()?,
             compositor_portal: seq()?,
             bridge_portal: seq()?,
             locker_auth: seq()?,
@@ -425,6 +428,7 @@ fn start_set(
                 ("channel", l.appd_forker.0.as_fd()),
                 ("compositor", l.compositor_appd.1.as_fd()),
                 ("menu", l.menu_appd.1.as_fd()),
+                ("bridge", l.bridge_appd.1.as_fd()),
             ],
         ),
         (
@@ -433,6 +437,7 @@ fn start_set(
             vec![
                 ("listener", bridge_listener.as_fd()),
                 ("portal", l.bridge_portal.0.as_fd()),
+                ("appd", l.bridge_appd.0.as_fd()),
             ],
         ),
     ];

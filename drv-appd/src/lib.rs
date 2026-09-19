@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use drv_policy::daemon::{self, Handler};
 use drv_policy::forker::{self, Launch};
+use drv_policy::rpc;
 use drv_policy::{AppPolicy, Global, Grant};
 use serde::{Deserialize, Serialize};
 
@@ -94,6 +95,10 @@ pub struct AppConfig {
     /// Listed by the menu. Off for daemons and probes that autostart.
     #[serde(default = "yes")]
     pub menu: bool,
+    /// URI schemes this app opens (`"https"`), lowercase. One handler per scheme: the
+    /// OpenURI portal starts it with the URI as its last argument.
+    #[serde(default)]
+    pub opens: Vec<String>,
 }
 
 impl AppConfig {
@@ -138,6 +143,7 @@ pub fn load_config(path: &Path) -> Result<Config, Error> {
 fn check_config(config: &Config) -> Result<(), String> {
     let mut names = HashSet::new();
     let mut uids = HashSet::new();
+    let mut schemes = HashSet::new();
     for app in &config.apps {
         if !names.insert(&app.name) {
             return Err(format!("app {:?} listed twice", app.name));
@@ -150,6 +156,17 @@ fn check_config(config: &Config) -> Result<(), String> {
         }
         if app.autostart && app.exec.is_none() {
             return Err(format!("app {:?} is autostart but has no exec", app.name));
+        }
+        for scheme in &app.opens {
+            if app.exec.is_none() {
+                return Err(format!("app {:?} opens {scheme:?} but has no exec", app.name));
+            }
+            if rpc::uri_scheme(&format!("{scheme}:")).as_deref() != Some(scheme.as_str()) {
+                return Err(format!("app {:?} opens {scheme:?}, which is not a lowercase scheme", app.name));
+            }
+            if !schemes.insert(scheme) {
+                return Err(format!("scheme {scheme:?} has more than one handler"));
+            }
         }
     }
     Ok(())
@@ -219,11 +236,20 @@ impl Appd {
         env
     }
 
-    fn start(self: &Arc<Self>, app: &AppConfig) -> Result<u32, String> {
-        let argv = app
+    /// Starts `app`; with `uri`, as the handler of its scheme, which the manifest must say
+    /// it is. The URI is the one argument that ever comes from outside the manifest.
+    fn start(self: &Arc<Self>, app: &AppConfig, uri: Option<&str>) -> Result<u32, String> {
+        let mut argv = app
             .exec
             .clone()
             .ok_or_else(|| format!("{:?} is a service, not a launchable app", app.name))?;
+        if let Some(uri) = uri {
+            let scheme = rpc::uri_scheme(uri).ok_or_else(|| "not a URI".to_owned())?;
+            if !app.opens.contains(&scheme) {
+                return Err(format!("{:?} does not open {scheme}: URIs", app.name));
+            }
+            argv.push(uri.to_owned());
+        }
         let launch = Launch {
             uid: app.uid,
             groups: app.groups.clone(),
@@ -259,7 +285,7 @@ impl Appd {
     pub fn autostart(self: &Arc<Self>) {
         self.autostarted.call_once(|| {
             for app in self.config.apps.iter().filter(|a| a.autostart) {
-                match self.start(app) {
+                match self.start(app, None) {
                     Ok(uid) => eprintln!("drv-appd: autostarted {:?} as uid {uid}", app.name),
                     Err(err) => eprintln!("drv-appd: autostart {:?}: {err}", app.name),
                 }
@@ -294,6 +320,12 @@ impl Handler for Appd {
             "uid {peer} asked for the app list on the public socket; only a launch channel may"
         ))
     }
+
+    fn open(&self, peer: u32, _uri: &str) -> Result<u32, String> {
+        Err(format!(
+            "uid {peer} asked to open a URI on the public socket; only a launch channel may"
+        ))
+    }
 }
 
 /// One launch channel's handler: launches for `who`, nothing else.
@@ -315,13 +347,27 @@ impl Handler for Launcher {
             .appd
             .app(name)
             .ok_or_else(|| format!("unknown app {name:?}; add it to appd.toml"))?;
-        let uid = self.appd.start(app)?;
+        let uid = self.appd.start(app, None)?;
         eprintln!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
         Ok(uid)
     }
 
     fn apps(&self, _peer: u32) -> Result<Vec<String>, String> {
         Ok(self.appd.launchable())
+    }
+
+    fn open(&self, _peer: u32, uri: &str) -> Result<u32, String> {
+        let scheme = rpc::uri_scheme(uri).ok_or_else(|| format!("{uri:?} is not a URI"))?;
+        let app = self
+            .appd
+            .config
+            .apps
+            .iter()
+            .find(|a| a.opens.contains(&scheme))
+            .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
+        let uid = self.appd.start(app, Some(uri))?;
+        eprintln!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {}", app.name, self.who);
+        Ok(uid)
     }
 
     fn hello(&self, _peer: u32) {
@@ -367,6 +413,7 @@ mod tests {
             groups = ["render"]
             env = { MOZ_ENABLE_WAYLAND = "1" }
             expose = ["/run/drv-session"]
+            opens = ["https"]
             "#,
         )
         .unwrap();
@@ -452,6 +499,31 @@ mod tests {
                 .contains("twice")
         );
         assert!(bad("[[app]]\nname = \"a\"\nuid = 12\nautostart = true\n").contains("autostart"));
+    }
+
+    #[test]
+    fn open_appends_the_uri_for_the_handler_only() {
+        let (id, recorder) = identity();
+        let launcher = launcher(&id);
+        assert_eq!(launcher.open(5, "HTTPS://example.com/a?b=c#d"), Ok(100042));
+        assert_eq!(recorder.0.lock().unwrap()[0].argv, vec!["firefox", "HTTPS://example.com/a?b=c#d"]);
+        for bad in ["http://example.com", "-https://x", "https://a b", "https", "https:\u{e9}", "mailto:x@y"] {
+            assert!(launcher.open(5, bad).is_err(), "{bad}");
+        }
+        assert!(id.open(5, "https://example.com").unwrap_err().contains("public socket"));
+        assert_eq!(recorder.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_handler_per_scheme() {
+        let config: Config = toml::from_str(
+            "wayland-socket = \"/x\"\n[[app]]\nname = \"a\"\nuid = 12\nexec = [\"a\"]\nopens = [\"https\"]\n[[app]]\nname = \"b\"\nuid = 13\nexec = [\"b\"]\nopens = [\"https\"]\n",
+        )
+        .unwrap();
+        assert!(check_config(&config).unwrap_err().contains("more than one handler"));
+        let config: Config =
+            toml::from_str("wayland-socket = \"/x\"\n[[app]]\nname = \"a\"\nuid = 12\nexec = [\"a\"]\nopens = [\"HTTPS\"]\n").unwrap();
+        assert!(check_config(&config).unwrap_err().contains("lowercase"));
     }
 
     #[test]

@@ -1,8 +1,9 @@
-//! "Screen is being shared" indicator.
+//! "Screen is being shared" / "Microphone: app" / "Camera: app" indicator.
 //!
 //! The compositor draws it above everything on every output while a screencast session is
-//! live, and never into the cast itself. Apps cannot draw or cover it, so the human at the
-//! screen always knows, and sees the key that stops the sharing.
+//! live or an app holds the microphone or the camera (drv-portal says which), and never into
+//! the cast itself. Apps cannot draw or cover it, so the human at the screen always knows,
+//! and sees the key that ends all of it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,6 +34,10 @@ const BORDER: i32 = 3;
 pub struct CastIndicator {
     /// Live screencast sessions; shown while there are any.
     sessions: usize,
+    /// Apps holding the microphone, by name; drv-portal's word.
+    mic: Vec<String>,
+    /// Apps holding the camera, by name.
+    camera: Vec<String>,
     config: Rc<RefCell<Config>>,
     mod_key: ModKey,
     buffers: RefCell<HashMap<NotNan<f64>, Option<TextureBuffer<RemoteTexture>>>>,
@@ -42,6 +47,8 @@ impl CastIndicator {
     pub fn new(config: Rc<RefCell<Config>>, mod_key: ModKey) -> Self {
         Self {
             sessions: 0,
+            mic: Vec::new(),
+            camera: Vec::new(),
             config,
             mod_key,
             buffers: RefCell::new(HashMap::new()),
@@ -58,15 +65,40 @@ impl CastIndicator {
         true
     }
 
+    /// Returns true when the indicator changed and outputs need a redraw.
+    pub fn set_devices(&mut self, mic: Vec<String>, camera: Vec<String>) -> bool {
+        if self.mic == mic && self.camera == camera {
+            return false;
+        }
+        self.mic = mic;
+        self.camera = camera;
+        self.buffers.borrow_mut().clear();
+        true
+    }
+
+    fn shown(&self) -> bool {
+        self.sessions > 0 || !self.mic.is_empty() || !self.camera.is_empty()
+    }
+
     pub fn on_hotkey_config_updated(&mut self, mod_key: ModKey) {
         self.mod_key = mod_key;
         self.buffers.borrow_mut().clear();
     }
 
     fn text(&self) -> String {
-        let mut text = String::from("Screen is being shared");
-        if self.sessions > 1 {
-            text.push_str(&format!(" ({} sessions)", self.sessions));
+        let mut lines = Vec::new();
+        if self.sessions > 0 {
+            let mut line = String::from("Screen is being shared");
+            if self.sessions > 1 {
+                line.push_str(&format!(" ({} sessions)", self.sessions));
+            }
+            lines.push(line);
+        }
+        if !self.mic.is_empty() {
+            lines.push(format!("Microphone: {}", self.mic.join(", ")));
+        }
+        if !self.camera.is_empty() {
+            lines.push(format!("Camera: {}", self.camera.join(", ")));
         }
 
         let config = self.config.borrow();
@@ -77,9 +109,13 @@ impl CastIndicator {
             .find(|bind| bind.action == Action::StopAllCasts);
         if let Some(bind) = stop {
             let key = key_name(false, self.mod_key, &bind.key);
-            text.push_str(&format!("    {key} to stop"));
+            if lines.len() == 1 {
+                lines[0].push_str(&format!("    {key} to stop"));
+            } else {
+                lines.push(format!("{key} to stop all"));
+            }
         }
-        text
+        lines.join("\n")
     }
 
     pub fn render<R: NiriRenderer>(
@@ -87,7 +123,7 @@ impl CastIndicator {
         renderer: &mut R,
         output: &Output,
     ) -> Option<PrimaryGpuTextureRenderElement> {
-        if self.sessions == 0 {
+        if !self.shown() {
             return None;
         }
 

@@ -19,6 +19,8 @@ pub trait Handler: Send + Sync {
     fn launch(&self, peer: u32, app: &str) -> Result<u32, String>;
     /// The names `launch` accepts (see [`Request::Apps`]).
     fn apps(&self, peer: u32) -> Result<Vec<String>, String>;
+    /// Open a URI with its manifest handler (see [`Request::Open`]); returns the handler's UID.
+    fn open(&self, peer: u32, uri: &str) -> Result<u32, String>;
     /// The peer's `Hello`, before the version goes back. A hook, not a decision.
     fn hello(&self, _peer: u32) {}
 }
@@ -34,6 +36,10 @@ impl Handler for PolicyStore {
     }
 
     fn launch(&self, _peer: u32, _app: &str) -> Result<u32, String> {
+        Err("this policy daemon does not launch apps".to_owned())
+    }
+
+    fn open(&self, _peer: u32, _uri: &str) -> Result<u32, String> {
         Err("this policy daemon does not launch apps".to_owned())
     }
 
@@ -85,6 +91,10 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
             },
             Request::Apps => match handler.apps(peer) {
                 Ok(apps) => Response::Apps(apps),
+                Err(err) => Response::Error(err),
+            },
+            Request::Open { uri } => match handler.open(peer, &uri) {
+                Ok(uid) => Response::Launched { uid },
                 Err(err) => Response::Error(err),
             },
         };

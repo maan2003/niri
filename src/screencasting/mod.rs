@@ -618,6 +618,11 @@ impl State {
                     portal_cast: cast,
                 });
             }
+            ToCompositor::Devices { mic, camera } => {
+                if self.niri.cast_indicator.set_devices(mic, camera) {
+                    self.niri.queue_redraw_all();
+                }
+            }
             ToCompositor::Stop { cast } => {
                 let session = self
                     .niri

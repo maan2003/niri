@@ -220,6 +220,7 @@ impl App {
             Request::Forget { app, uid } => {
                 self.consents.retain(|_, c| !(c.app == app && c.uid == uid));
                 self.devices.retain(|_, d| !(d.app == app && d.uid == uid));
+                self.show_devices();
             }
             Request::Cancel { id } => {
                 self.queue.retain(|p| p.id != id);
@@ -234,6 +235,7 @@ impl App {
                 }
                 if let Some(live) = self.devices.remove(&id) {
                     eprintln!("drv-portal: {} (uid {}) is done with the {}", live.app, live.uid, device_name(live.device));
+                    self.show_devices();
                 }
             }
         }
@@ -281,6 +283,7 @@ impl App {
                     eprintln!("drv-portal: {} (uid {}) loses the {}", live.app, live.uid, device_name(live.device));
                     self.send(Response::Closed { id });
                 }
+                self.show_devices();
             }
         }
     }
@@ -289,6 +292,18 @@ impl App {
         if let Err(err) = seq::send(&self.bridge, &resp, &[]) {
             eprintln!("drv-portal: to the bridge: {err}");
         }
+    }
+
+    /// The compositor's indicator follows `devices`: who holds the microphone, who the camera.
+    fn show_devices(&self) {
+        let holders = |device: Device| {
+            let mut names: Vec<String> =
+                self.devices.values().filter(|d| d.device == device).map(|d| d.app.clone()).collect();
+            names.sort();
+            names.dedup();
+            names
+        };
+        self.tell(ToCompositor::Devices { mic: holders(Device::Microphone), camera: holders(Device::Camera) });
     }
 
     fn tell(&self, msg: ToCompositor) {
@@ -424,6 +439,7 @@ impl App {
             let id = d.req.id;
             eprintln!("drv-portal: {} (uid {}) may use the {}", d.req.app, d.req.uid, device_name(device));
             self.devices.insert(id, LiveDevice { app: d.req.app.clone(), uid: d.req.uid, device });
+            self.show_devices();
             self.finish(qh, Response::Granted { id });
             return;
         }

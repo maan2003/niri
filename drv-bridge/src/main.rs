@@ -20,7 +20,7 @@ use drv_bridge::{
     PORTAL_PATH,
 };
 use drv_os::fds::Kind;
-use drv_policy::seq;
+use drv_policy::{rpc, seq};
 use drv_policy::{AppPolicy, PolicyClient};
 use drv_portal::protocol::{self, Device, Kind as ChooserKind};
 use zbus::blocking::Connection;
@@ -39,8 +39,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run as its own user under the supervisor: fd `listener` is the apps' socket, fd
-    /// `portal` the line to drv-portal. Each connection is keyed on the peer UID and
-    /// forwarded to the services' bus.
+    /// `portal` the line to drv-portal, fd `appd` a launch channel that only opens URIs.
+    /// Each connection is keyed on the peer UID and forwarded to the services' bus.
     Serve {
         #[arg(long, env = "DRV_APPD_SOCKET")]
         appd: PathBuf,
@@ -123,6 +123,9 @@ const SETTINGS: &str = "org.freedesktop.portal.Settings";
 const SETTINGS_VERSION: u32 = 2;
 const CAMERA: &str = "org.freedesktop.portal.Camera";
 const CAMERA_VERSION: u32 = 1;
+/// `OpenURI` only: version 1 has neither `OpenFile` nor `OpenDirectory`.
+const OPEN_URI: &str = "org.freedesktop.portal.OpenURI";
+const OPEN_URI_VERSION: u32 = 1;
 
 /// Every call an app makes, logged: for finding out what a portal client does.
 static TRACE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("DRV_BRIDGE_TRACE").is_some());
@@ -278,6 +281,10 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
     // Bound by the supervisor, any UID may connect; who they are is decided per connection.
     let listener = fds.listener("listener")?;
     let portal = Portal::start(fds.socket("portal", Kind::SeqPacket)?)?;
+    // drv-appd starts a URI's handler for us; the app names nothing but the URI.
+    let launcher = Arc::new(Mutex::new(
+        PolicyClient::from_stream(UnixStream::from(fds.socket("appd", Kind::Stream)?)).context("launch channel")?,
+    ));
     // For the remotes, and the microphone and camera consents.
     pipewire::init();
     // Fail at startup, not on the first app, if there is no session bus.
@@ -298,6 +305,7 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
         let policy = policy.clone();
         let portal = portal.clone();
         let access = access.clone();
+        let launcher = launcher.clone();
         std::thread::spawn(move || {
             let uid = match rustix::net::sockopt::socket_peercred(&stream) {
                 Ok(cred) => cred.uid.as_raw(),
@@ -318,7 +326,7 @@ fn serve(identity: PathBuf) -> anyhow::Result<()> {
                 }
             };
             eprintln!("bridge: {} (uid {uid}) connected", app.name);
-            if let Err(err) = AppLink::run(app, uid, stream, portal, access) {
+            if let Err(err) = AppLink::run(app, uid, stream, portal, access, launcher) {
                 eprintln!("bridge: {err:#}");
             }
         });
@@ -532,6 +540,8 @@ struct AppLink {
     uid: u32,
     portal: Arc<Portal>,
     access: Arc<Access>,
+    /// drv-appd's launch channel, shared by every app: `Open` only.
+    launcher: Arc<Mutex<PolicyClient>>,
     p2p: Connection,
     /// The human's session bus, for the notification daemon.
     bus: Connection,
@@ -548,7 +558,14 @@ struct LinkState {
 }
 
 impl AppLink {
-    fn run(app: Arc<AppPolicy>, uid: u32, stream: UnixStream, portal: Arc<Portal>, access: Arc<Access>) -> anyhow::Result<()> {
+    fn run(
+        app: Arc<AppPolicy>,
+        uid: u32,
+        stream: UnixStream,
+        portal: Arc<Portal>,
+        access: Arc<Access>,
+        launcher: Arc<Mutex<PolicyClient>>,
+    ) -> anyhow::Result<()> {
         // Who the peer is was settled by SO_PEERCRED, so no D-Bus authentication on top.
         #[allow(deprecated)] // the async-io variant needs an Async wrapper for nothing
         let p2p_iter = zbus::blocking::connection::Builder::unix_stream(stream)
@@ -565,6 +582,7 @@ impl AppLink {
             uid,
             portal,
             access,
+            launcher,
             p2p,
             bus,
             state: Mutex::new(LinkState::default()),
@@ -697,11 +715,15 @@ impl AppLink {
         if path == PORTAL_PATH && interface == CAMERA {
             return self.camera(msg, hdr, &member);
         }
+        if path == PORTAL_PATH && interface == OPEN_URI {
+            return self.open_uri(msg, hdr, &member);
+        }
         if path == PORTAL_PATH && interface == PROPERTIES {
             let props = |iface: &str| -> Option<Vec<(&'static str, Value<'static>)>> {
                 match iface {
                     FILE_CHOOSER => Some(vec![("version", Value::U32(FILE_CHOOSER_VERSION))]),
                     SETTINGS => Some(vec![("version", Value::U32(SETTINGS_VERSION))]),
+                    OPEN_URI => Some(vec![("version", Value::U32(OPEN_URI_VERSION))]),
                     CAMERA => Some(vec![
                         ("version", Value::U32(CAMERA_VERSION)),
                         ("IsCameraPresent", Value::Bool(!self.access.cameras().is_empty())),
@@ -1013,6 +1035,39 @@ impl AppLink {
             }
             other => bail!("no {other} on {CAMERA}"),
         }
+    }
+
+    /// `OpenURI`: drv-appd starts the scheme's handler from the manifest with the URI as its
+    /// last argument, no prompt. The URI is the only thing the app gets to say, and only a
+    /// well-formed one gets through; `writable`, `ask` and the parent window are ignored.
+    fn open_uri(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
+        if member != "OpenURI" {
+            bail!("no {member} on {OPEN_URI}");
+        }
+        let caller = caller_of(hdr)?;
+        let (_parent, uri, options): (String, String, HashMap<String, OwnedValue>) =
+            msg.body().deserialize().context("OpenURI arguments")?;
+        let handle = self.handle(msg, &caller, &options, "handle_token");
+        let code = match rpc::uri_scheme(&uri) {
+            None => {
+                eprintln!("bridge: {}: OpenURI of something that is not a URI ({} bytes)", self.app.name, uri.len());
+                2
+            }
+            Some(_) => match self.launcher.lock().unwrap().open(uri.clone()) {
+                Ok(uid) => {
+                    eprintln!("bridge: {}: {uri:?} opens as uid {uid}", self.app.name);
+                    0
+                }
+                Err(err) => {
+                    eprintln!("bridge: {}: OpenURI {uri:?}: {err}", self.app.name);
+                    2
+                }
+            },
+        };
+        // The reply first, then the signal: the spec's order.
+        self.p2p.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
+        self.respond(&handle, &caller, code, HashMap::new())?;
+        Ok(Ours::Done)
     }
 
     /// `OpenFile`/`SaveFile`: the handle goes back now, the `Response` signal when the

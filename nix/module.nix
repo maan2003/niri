@@ -33,7 +33,7 @@ let
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart menu;
+    inherit (app) uid groups gpu network globals grants autostart menu opens;
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
       PULSE_SERVER = "unix:${pulseDir name}/native";
@@ -203,6 +203,11 @@ in
             type = lib.types.bool;
             default = true;
             description = "Listed by the app menu.";
+          };
+          opens = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = "URI schemes this app handles for the OpenURI portal (one handler per scheme); the URI becomes its last argument.";
           };
         };
       }));
