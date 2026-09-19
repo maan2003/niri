@@ -6743,6 +6743,9 @@ impl Niri {
         }
         info!("locking session");
         self.lease_until = None;
+        // The person is gone: nothing keeps streaming the screen, the microphone or the
+        // camera on their behalf. Same switch as Super+Shift+Escape.
+        self.stop_all_casts();
         self.screenshot_ui.close();
         self.cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());

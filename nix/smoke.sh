@@ -70,8 +70,11 @@ echo "== microphone"
 mark; menu mic; sleep 3
 key ret; sleep 3        # allow
 expect "mic granted" 'drv-portal: mic-test \(uid 100010\) may use the microphone'
-key meta_l-shift-esc; sleep 3
-expect "mic revoked" 'drv-portal: mic-test \(uid 100010\) loses the microphone'
+key meta_l-alt-l; sleep 3   # lock-session: the lock is the other switch that revokes
+expect "locking revoked the mic" 'drv-portal: mic-test \(uid 100010\) loses the microphone'
+expect "session locked" 'locking session'
+key 1 2 3 4 ret; sleep 2
+expect "unlocked again" 'PIN accepted; unlocking'
 
 echo "== OpenURI"
 $SSH rm -f /var/lib/drv-apps/100011/open.txt
