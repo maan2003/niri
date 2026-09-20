@@ -2,7 +2,7 @@
 # apps, an ssh admin, the dev PIN and a test camera. Not a test: run it, drive it, read the
 # evidence. The machine around it is nix/dev-vm.nix (QEMU, x86_64) or nix/m2-vm.nix (crosvm
 # on an Apple M2 with the GPU passed through as a virtio-gpu native context).
-{ niri, camera ? true }:
+{ niri, camera ? true, xkbOptions ? null }:
 { config, pkgs, lib, ... }:
 let
   # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire,
@@ -108,7 +108,10 @@ in
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
     # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
-    config = builtins.replaceStrings [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" ] [ "skip-at-startup" "{ show-launcher; }" ] (builtins.readFile ../resources/default-config.kdl);
+    config = builtins.replaceStrings
+      [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\"" ]
+      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"") ]
+      (builtins.readFile ../resources/default-config.kdl);
     apps = {
       # Sends one notification from inside the sandbox over its private bus. Not autostarted:
       # launch it from the menu.

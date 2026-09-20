@@ -57,7 +57,9 @@ let
   '';
 in
 {
-  imports = [ (import ./dev-guest.nix { inherit niri; camera = false; }) ];
+  # crosvm's virtio keyboard declares no Super key, so the guest swaps Alt and Super: Alt in
+  # the noVNC page is Mod. nix/vm-lib.sh's M2 key map follows.
+  imports = [ (import ./dev-guest.nix { inherit niri; camera = false; xkbOptions = "altwin:swap_alt_win"; }) ];
 
   boot.kernelPackages = pkgs.linuxPackagesFor kernel;
 
