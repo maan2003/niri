@@ -82,6 +82,8 @@ in
     virtiofsd.extraArgs = [ "--sandbox" "none" ];
     crosvm.extraArgs = [
       "--disable-sandbox"
+      # The window's keyboard and mouse reach the guest as virtio-input devices.
+      "--display-window-keyboard" "--display-window-mouse"
       # A sound card whose input is silence, so audio capture and its grant can be exercised.
       "--virtio-snd" "capture=true,backend=null,num_input_devices=1"
       "--gpu" "backend=virglrenderer,context-types=drm:cross-domain,egl=true,vulkan=true,surfaceless=true,fixed-blob-mapping=true,displays=[[mode=windowed[1280,832]]]"
