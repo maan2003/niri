@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs a script in the M2 guest as root through the control share and prints its output:
+# `nix/m2-vm-exec 'journalctl -b | tail'`, or with the script on stdin. Exit status is the
+# guest's. Waits up to $M2VM_TIMEOUT s (default 60).
+set -uo pipefail
+M2VM=${M2VM:-$HOME/m2vm}
+S="$M2VM/share"
+n="$(date +%s%N)-$$"
+if [ $# -gt 0 ]; then printf '%s\n' "$*" > "$S/cmd/$n.tmp"; else cat > "$S/cmd/$n.tmp"; fi
+mv "$S/cmd/$n.tmp" "$S/cmd/$n.sh"
+deadline=$(( $(date +%s) + ${M2VM_TIMEOUT:-60} ))
+while [ ! -e "$S/done/$n" ]; do
+  [ "$(date +%s)" -lt "$deadline" ] || { echo "m2-vm-exec: no answer from the guest in ${M2VM_TIMEOUT:-60}s" >&2; rm -f "$S/cmd/$n.sh"; exit 124; }
+  sleep 0.2
+done
+cat "$S/out/$n"; rc=$(cat "$S/done/$n")
+rm -f "$S/out/$n" "$S/done/$n"
+exit "${rc:-1}"

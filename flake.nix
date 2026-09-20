@@ -3,11 +3,17 @@
   description = "Niri: A scrollable-tiling Wayland compositor.";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  # The M2 development VM only (nix/m2-vm.nix): a crosvm guest with the host GPU.
+  inputs.microvm = {
+    url = "github:astro/microvm.nix";
+    inputs.nixpkgs.follows = "nixpkgs";
+  };
 
   outputs =
     {
       self,
       nixpkgs,
+      microvm,
     }:
     let
       revision = self.shortRev or self.dirtyShortRev or "unknown";
@@ -303,6 +309,20 @@
               inherit system;
               modules = [ ./nix/resume-vm.nix ];
             }).config.system.build.vm;
+        }
+        // lib.optionalAttrs (system == "aarch64-linux") {
+          # The same guest as a crosvm machine on an Apple M2 with the real GPU as a virtio-gpu
+          # native context, its screen on a headless host compositor served over noVNC:
+          # `nix/m2-vm-run.sh` on the host, `nix/m2-vm-exec` to drive it. niri comes prebuilt
+          # from nix/m2-prebuilt (nix/cross-drv.sh on devbox), so the guest never compiles it.
+          m2-vm =
+            (lib.nixosSystem {
+              inherit system;
+              modules = [
+                microvm.nixosModules.microvm
+                (import ./nix/m2-vm.nix { niri = nixpkgsFor.${system}.callPackage ./nix/m2-prebuilt.nix { }; })
+              ];
+            }).config.microvm.declaredRunner;
         }
       );
 

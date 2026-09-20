@@ -3,8 +3,9 @@
 # done by hand after every build. Drives the desktop with QEMU's monitor (sendkey) and reads
 # the evidence over ssh: journal lines, the probe apps' result files, PipeWire state. Every
 # step prints PASS or FAIL with what it saw; the exit code is the number of failures.
-# Wants: the monitor at /tmp/niri-vm/monitor, /tmp/niri-vm/ssh, socat. Run once per boot: the
-# unlock step types the dev PIN, and the chooser walks the dialog from its start.
+# Wants: the monitor at /tmp/niri-vm/monitor, /tmp/niri-vm/ssh, socat; or VM_BACKEND=m2 with
+# the M2 guest up (nix/m2-vm-run.sh). Run once per boot: the unlock step types the dev PIN,
+# and the chooser walks the dialog from its start.
 set -uo pipefail
 . "$(dirname "$0")/vm-lib.sh"
 

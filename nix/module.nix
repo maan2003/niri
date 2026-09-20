@@ -152,6 +152,11 @@ in
       };
       description = "Environment every app gets.";
     };
+    gpuEnv = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      description = "Extra environment for the compositor's GPU process (Mesa knobs, say).";
+    };
     config = lib.mkOption {
       type = lib.types.lines;
       default = "";
@@ -489,7 +494,8 @@ in
           "MESA_GLSL_CACHE_DISABLE=true"
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
-        ] ++ map (e: "--compositor-env ${e}") [
+        ] ++ lib.mapAttrsToList (n: v: "--gpu-env ${n}=${v}") cfg.gpuEnv
+          ++ map (e: "--compositor-env ${e}") [
           "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
