@@ -6,9 +6,7 @@
 //! reachable only through it. Zygote on Android has the same shape.
 
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
@@ -16,12 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use clap::Parser;
-use drv_os::sandbox::{Root, RootSpec};
+use drv_os::approot::{AppRoot, Spec};
 use drv_os::{ensure_owned_dir, group_id, own_cgroup};
 use drv_policy::forker::{Launch, Request, Response};
 use drv_policy::seq;
-use rustix::fs::Mode;
-use rustix::thread::{CapabilitySet, CapabilitySets};
+use rustix::fs::{Gid, Mode, Uid};
+use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
 
 /// What forking an app takes when we are not root: the sandbox (SYS_ADMIN), the UID switch
 /// (SETUID, SETGID), the app's directories (CHOWN) and dropping our own bounding set in the
@@ -96,10 +94,6 @@ struct Args {
     /// The host's resolv.conf, bound over a networked app's own.
     #[arg(long, default_value = "/etc/resolv.conf")]
     resolv: PathBuf,
-    /// What is exec'd as the app, before the app: links its state, applies Landlock and
-    /// MDWE, execs the manifest's command. Default: beside this binary.
-    #[arg(long)]
-    trampoline: Option<PathBuf>,
 }
 
 struct Forker {
@@ -117,7 +111,6 @@ struct Forker {
     store: PathBuf,
     host_views: PathBuf,
     resolv: PathBuf,
-    trampoline: PathBuf,
     /// Live children, pid to uid.
     running: Arc<Mutex<HashMap<u32, u32>>>,
 }
@@ -191,14 +184,8 @@ impl Forker {
             None
         };
 
-        // Unprivileged tests run the command as themselves; apps go through the trampoline.
-        let mut command = if as_self {
-            let mut c = Command::new(&launch.argv[0]);
-            c.args(&launch.argv[1..]);
-            c
-        } else {
-            self.trampoline_command(launch)?
-        };
+        let mut command = Command::new(&launch.argv[0]);
+        command.args(&launch.argv[1..]);
         command.env_clear().envs(launch.env.iter().cloned());
         command.stdin(Stdio::null());
 
@@ -207,29 +194,32 @@ impl Forker {
         } else {
             uid
         };
-        let mut sandbox = None;
-        // chdir into the 0700 home only once we are the UID (std's current_dir would do it
-        // first, as us): in the child, below.
+        // The root and the Landlock ruleset are built here, in the parent, as fds; the child
+        // only enters them. chdir into the 0700 home only once we are the UID (std's
+        // current_dir would do it first, as us): in the child, below.
+        let mut root = None;
         let mut home_dir = None;
         if !as_self {
             let runtime = self.owned_dir(&self.runtime_base, uid, gid)?;
             let state = self.owned_dir(&self.home_base, uid, gid)?;
             let home = home_of(&launch.name)?;
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
-            home_dir = Some(
-                CString::new(home.as_os_str().as_bytes())
-                    .map_err(|_| format!("NUL in {}", home.display()))?,
-            );
+            home_dir = Some(home.clone());
             // Its /tmp outlives a launch (beside the runtime dirs, so gone with the boot): a
             // second launch of the app finds the first one's single-instance socket there.
             let tmp = self.owned_dir(&self.runtime_base.join("tmp"), uid, gid)?;
             let mut expose = self.expose.clone();
             expose.extend(extra_expose);
+            // Its runtime directory and the documents mount are written; the rest of /run read.
+            let mut writable = vec![runtime.clone()];
+            writable.extend(expose.iter().filter(|p| p.ends_with("drv-doc")).cloned());
             expose.push(runtime);
-            // The app's /etc must be a store path; the daemon says which, we check where.
-            let etc = launch.etc.as_ref().map(PathBuf::from);
+            // The app's /etc and closure list: the daemon says which, we check they are in
+            // the store (anything in the store is something any app could be given).
+            let etc = launch.etc.as_deref().map(|p| self.in_store(p)).transpose()?;
+            let closure = launch.closure.as_deref().map(|p| self.in_store(p)).transpose()?;
             let resolv = self.resolv.canonicalize().ok();
-            sandbox = Some(Root::plan(&RootSpec {
+            let prepared = AppRoot::prepare(&Spec {
                 store: &self.store,
                 etc: etc.as_deref(),
                 resolv: resolv.as_deref(),
@@ -237,22 +227,30 @@ impl Forker {
                 gpu: launch.gpu,
                 network: launch.network,
                 run_expose: &expose,
+                run_writable: &writable,
                 tmp: &tmp,
                 home: &home,
                 state: &state,
                 uid,
                 gid,
-            })?);
+                closure: closure.as_deref(),
+                jit: launch.jit,
+            })
+            .map_err(|e| format!("root: {e}"))?;
+            if prepared.missing > 0 {
+                drv_os::say!("drv-forker: {}: {} closure paths are not on this machine", launch.name, prepared.missing);
+            }
+            root = Some(prepared);
         }
-        let mut all_gids = vec![gid];
-        all_gids.extend(gids);
+        let mut all_gids = vec![Gid::from_raw(gid)];
+        all_gids.extend(gids.into_iter().map(Gid::from_raw));
         let switch_uid = privileged;
 
         // SAFETY: only async-signal-safe calls between fork and exec.
         unsafe {
             command.pre_exec(move || {
-                if let Some(sandbox) = &sandbox {
-                    sandbox.apply()?;
+                if let Some(root) = &root {
+                    root.enter()?;
                 }
                 if let Some(procs) = &cgroup_procs {
                     // "0" means the writing process itself.
@@ -264,27 +262,22 @@ impl Forker {
                     // Locked for good: no root, no setuid fixups, no ambient raise, and
                     // (where the kernel knows them) exec restricted to files, not scripts.
                     set_securebits()?;
-                    if libc::setgroups(all_gids.len(), all_gids.as_ptr()) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::setresgid(gid, gid, gid) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::setresuid(uid, uid, uid) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::getuid() != uid || libc::geteuid() != uid {
+                    rustix::thread::set_thread_groups(&all_gids)?;
+                    let g = Gid::from_raw(gid);
+                    rustix::thread::set_thread_res_gid(g, g, g)?;
+                    let u = Uid::from_raw(uid);
+                    rustix::thread::set_thread_res_uid(u, u, u)?;
+                    if rustix::process::getuid() != u || rustix::process::geteuid() != u {
                         return Err(io::Error::other("uid did not change"));
                     }
                 }
                 if let Some(home) = &home_dir {
-                    if libc::chdir(home.as_ptr()) != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+                    rustix::process::chdir(home)?;
                 }
                 drop_all_capabilities()?;
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                    return Err(io::Error::last_os_error());
+                rustix::thread::set_no_new_privs(true)?;
+                if let Some(root) = &root {
+                    root.restrict()?;
                 }
                 Ok(())
             });
@@ -295,7 +288,7 @@ impl Forker {
             .map_err(|err| format!("spawn {:?}: {err}", launch.argv[0]));
         let mut child = spawned?;
         let pid = child.id();
-        let name = launch.argv[0].clone();
+        let name = if launch.name.is_empty() { launch.argv[0].clone() } else { launch.name.clone() };
         self.running.lock().unwrap().insert(pid, uid);
         let running = Arc::clone(&self.running);
         // Reap it, or every launched app leaves a zombie under us.
@@ -309,50 +302,13 @@ impl Forker {
         Ok(pid)
     }
 
-    /// The trampoline's command line: what to link, what Landlock allows, then the app.
-    fn trampoline_command(&self, launch: &Launch) -> Result<Command, String> {
-        let home = home_of(&launch.name)?;
-        let mut c = Command::new(&self.trampoline);
-        c.arg("--home").arg(&home);
-        for entry in &launch.state {
-            let p = Path::new(entry);
-            if p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
-                return Err(format!("state {entry:?}: not a plain relative path"));
-            }
-            c.arg("--state").arg(entry);
+    /// `path`, resolved, if it is in the store.
+    fn in_store(&self, path: &str) -> Result<PathBuf, String> {
+        let real = Path::new(path).canonicalize().map_err(|e| format!("{path}: {e}"))?;
+        if !real.starts_with(&self.store) {
+            return Err(format!("{path}: not in the store"));
         }
-        for (flag, path) in [("--closure", &launch.closure), ("--files", &launch.files)] {
-            if let Some(path) = path {
-                let real = Path::new(path)
-                    .canonicalize()
-                    .map_err(|e| format!("{path}: {e}"))?;
-                if !real.starts_with(&self.store) {
-                    return Err(format!("{path}: not in the store"));
-                }
-                c.arg(flag).arg(real);
-            }
-        }
-        for read in ["/etc", "/sys", "/proc"] {
-            c.arg("--read").arg(read);
-        }
-        c.arg("--dev").arg("/dev");
-        for rw in ["/dev/shm", "/tmp"] {
-            c.arg("--rw").arg(rw);
-        }
-        // Its runtime directory and the documents mount are written; the rest of /run read.
-        let runtime = self.runtime_base.join(launch.uid.to_string());
-        c.arg("--rw").arg(&runtime);
-        let extra = launch.expose.iter().map(PathBuf::from).collect::<Vec<_>>();
-        for path in self.expose.iter().chain(extra.iter()) {
-            let flag = if path.ends_with("drv-doc") { "--rw" } else { "--read" };
-            c.arg(flag).arg(path);
-        }
-        if launch.jit {
-            c.arg("--jit");
-        }
-        c.arg("--");
-        c.args(&launch.argv);
-        Ok(c)
+        Ok(real)
     }
 
     /// `<base>/<uid>`, mode 0700, owned by the UID. Created on first launch.
@@ -382,24 +338,22 @@ fn home_of(name: &str) -> Result<PathBuf, String> {
 
 /// Between fork and exec, with CAP_SETPCAP still ours. Every bit locked.
 fn set_securebits() -> io::Result<()> {
-    const NOROOT: libc::c_ulong = 1 << 0;
-    const NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
-    const KEEP_CAPS_LOCKED: libc::c_ulong = 1 << 5;
-    const NO_CAP_AMBIENT_RAISE: libc::c_ulong = 1 << 6;
-    const EXEC_RESTRICT_FILE: libc::c_ulong = 1 << 8;
-    const EXEC_DENY_INTERACTIVE: libc::c_ulong = 1 << 10;
-    let locked = |bit: libc::c_ulong| bit | (bit << 1);
+    const NOROOT: u32 = 1 << 0;
+    const NO_SETUID_FIXUP: u32 = 1 << 2;
+    const KEEP_CAPS_LOCKED: u32 = 1 << 5;
+    const NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
+    const EXEC_RESTRICT_FILE: u32 = 1 << 8;
+    const EXEC_DENY_INTERACTIVE: u32 = 1 << 10;
+    let locked = |bit: u32| bit | (bit << 1);
     let base = locked(NOROOT) | locked(NO_SETUID_FIXUP) | KEEP_CAPS_LOCKED | locked(NO_CAP_AMBIENT_RAISE);
     let exec = locked(EXEC_RESTRICT_FILE) | locked(EXEC_DENY_INTERACTIVE);
-    // SAFETY: plain prctl.
-    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, base | exec, 0, 0, 0) } == 0 {
+    // rustix's flag set predates the exec bits (6.14): retain them past its check.
+    let set = |bits: u32| rustix::thread::set_capabilities_secure_bits(CapabilitiesSecureBits::from_bits_retain(bits));
+    if set(base | exec).is_ok() {
         return Ok(());
     }
     // A kernel before 6.14 does not know the exec bits.
-    // SAFETY: plain prctl.
-    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, base, 0, 0, 0) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    set(base)?;
     Ok(())
 }
 
@@ -450,12 +404,6 @@ fn run(args: Args) -> Result<(), String> {
         store: args.store,
         host_views: args.host_views,
         resolv: args.resolv,
-        trampoline: match args.trampoline {
-            Some(t) => t,
-            None => std::env::current_exe()
-                .map_err(|e| format!("current_exe: {e}"))?
-                .with_file_name("drv-trampoline"),
-        },
         running: Default::default(),
     };
     forker.serve(channel).map_err(|e| format!("channel: {e}"))
@@ -494,7 +442,6 @@ mod tests {
             store: PathBuf::from("/nix/store"),
             host_views: dir.join("views"),
             resolv: dir.join("none"),
-            trampoline: PathBuf::from("drv-trampoline"),
             running: Default::default(),
         };
         for view in ["dev", "sys"] {
@@ -515,8 +462,6 @@ mod tests {
             gpu: false,
             name: "test".into(),
             closure: None,
-            state: Vec::new(),
-            files: None,
             jit: false,
         };
 

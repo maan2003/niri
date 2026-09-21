@@ -105,12 +105,6 @@ pub struct AppConfig {
     /// The store paths it may open: a file listing them (closureInfo's store-paths).
     #[serde(default)]
     pub closure: Option<String>,
-    /// Paths under HOME that persist between runs.
-    #[serde(default)]
-    pub state: Vec<String>,
-    /// A store path: HOME defaults.
-    #[serde(default)]
-    pub files: Option<String>,
     /// A JIT inside: no MDWE.
     #[serde(default)]
     pub jit: bool,
@@ -276,8 +270,6 @@ impl Appd {
             gpu: app.gpu,
             name: app.name.clone(),
             closure: app.closure.clone(),
-            state: app.state.clone(),
-            files: app.files.clone(),
             jit: app.jit,
         };
         self.forker.launch(&launch)?;

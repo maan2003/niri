@@ -38,12 +38,6 @@ pub struct Launch {
     /// The store paths the app may open: a file listing them, one per line (closureInfo).
     #[serde(default)]
     pub closure: Option<String>,
-    /// Paths under HOME that persist between runs.
-    #[serde(default)]
-    pub state: Vec<String>,
-    /// A store path: a tree of HOME defaults, linked into HOME entry by entry.
-    #[serde(default)]
-    pub files: Option<String>,
     /// The app makes code at runtime (a JIT): no MDWE for it.
     #[serde(default)]
     pub jit: bool,

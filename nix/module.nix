@@ -42,15 +42,29 @@ let
   storeRoot = p: builtins.appendContext (builtins.head (builtins.match "(/nix/store/[^/]+).*" p)) (builtins.getContext p);
   # What an app may open in the store (DESIGN-app-namespace, "Store"): the closure of its
   # command, its /etc, the shared data profile, the graphics drivers, and the bus shim if it
-  # has one. The trampoline turns the list into Landlock rules.
+  # has one. The forker turns the list into Landlock rules.
   appClosure = name: app: pkgs.closureInfo {
     rootPaths = [ (appEtc name app) appShare config.hardware.graphics.package ]
       ++ config.hardware.graphics.extraPackages
-      ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") app.exec)
-      ++ lib.optionals app.bus [ pkgs.dbus cfg.package ]
+      ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
-  # HOME defaults: a tree the trampoline links into HOME entry by entry.
+  # The command, as launched. In front of the app's own: the state linker when it keeps
+  # anything (its state directories under $HOME/.state, linked from HOME, with the HOME
+  # defaults) and, for a private bus, the compat shim (the bridge on it forwards to the
+  # services' bus, which keys everything on the app's UID).
+  appExec = name: app: lib.optionals (app.state != [ ] || app.files != { }) (
+      [ "${cfg.package}/bin/drv-trampoline" ]
+      ++ lib.concatMap (s: [ "--state" s ]) app.state
+      ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ]
+      ++ [ "--" ])
+    ++ lib.optionals app.bus [
+      "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
+      # Its configuration from the store: the app's /etc has no dbus-1.
+      "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
+      "${cfg.package}/bin/drv-bridge" "app" "--"
+    ] ++ app.exec;
+  # HOME defaults: a tree the state linker links into HOME entry by entry.
   appFiles = name: app: pkgs.runCommand "drv-files-${name}" { } (''
     mkdir "$out"
   '' + lib.concatStrings (lib.mapAttrsToList (path: value: ''
@@ -101,22 +115,14 @@ hosts: files${lib.optionalString app.network " dns"}
     inherit (app) uid groups gpu network globals grants autostart menu opens;
     etc = "${appEtc name app}";
     closure = "${appClosure name app}/store-paths";
-    inherit (app) state jit;
+    inherit (app) jit;
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
       PULSE_SERVER = "unix:${pulseDir name}/native";
     };
     expose = app.expose ++ lib.optionals app.audio [ "/run/drv-audio" "/run/drv-pulse" ];
-    # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
-    # keys everything on the app's UID.
-    exec = lib.optionals app.bus [
-      "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
-      # Its configuration from the store: the app's /etc has no dbus-1.
-      "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
-      "${cfg.package}/bin/drv-bridge" "app" "--"
-    ] ++ app.exec;
-  } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }
-    // lib.optionalAttrs (app.files != { }) { files = "${appFiles name app}"; }) cfg.apps;
+    exec = appExec name app;
+  } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = toml.generate "appd.toml" {
     wayland-socket = "/run/drv-wayland/wayland";
     env = cfg.env;

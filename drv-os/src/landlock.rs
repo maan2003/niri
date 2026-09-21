@@ -1,4 +1,4 @@
-//! Landlock, raw: what the trampoline puts an app under. Rules are paths with access bits;
+//! Landlock, raw: what the forker puts an app under. Rules are paths with access bits;
 //! a rule on a directory covers everything beneath it, bind mounts included. Nothing here
 //! is permissive: a kernel without Landlock is an error, not a warning.
 
@@ -103,11 +103,23 @@ impl Ruleset {
     /// `access` at `path` and beneath. A file gets only what a file can have. A path that is
     /// not there is skipped: a closure entry not built on this machine is not a hole.
     pub fn allow(&self, path: &Path, access: u64) -> io::Result<bool> {
+        struct Cwd;
+        impl AsRawFd for Cwd {
+            fn as_raw_fd(&self) -> i32 {
+                libc::AT_FDCWD
+            }
+        }
+        self.allow_at(&Cwd, path, access)
+    }
+
+    /// The same, `path` relative to `dir` (a detached tree's fd, say): the rule is on the
+    /// inode, where the tree ends up mounted does not matter.
+    pub fn allow_at(&self, dir: &impl AsRawFd, path: &Path, access: u64) -> io::Result<bool> {
         let c = std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("NUL in {}", path.display())))?;
         // O_PATH: the inode, not an open file; std's OpenOptions wants read or write.
-        // SAFETY: valid C string.
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        // SAFETY: valid C string and fd.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::NotFound {
@@ -136,7 +148,7 @@ impl Ruleset {
     }
 
     /// From here on, this process and its descendants. Needs no_new_privs.
-    pub fn restrict_self(self) -> io::Result<()> {
+    pub fn restrict_self(&self) -> io::Result<()> {
         // SAFETY: plain syscall on our fd.
         if unsafe { libc::syscall(SYS_RESTRICT_SELF, self.fd.as_raw_fd(), 0u32) } != 0 {
             return Err(io::Error::last_os_error());
