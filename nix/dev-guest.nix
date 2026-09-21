@@ -76,6 +76,16 @@ let
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
     ${pkgs.coreutils}/bin/touch done
   '';
+  # The kernel's account of a task, for nix/kernel-state.sh: an out-of-tree module built
+  # against this VM's kernel. Dev only; a real install has no such thing.
+  kernel = config.boot.kernelPackages.kernel;
+  kdump = pkgs.stdenv.mkDerivation {
+    name = "drv-kdump-${kernel.version}";
+    src = ./kdump;
+    nativeBuildInputs = kernel.moduleBuildDependencies;
+    makeFlags = [ "KDIR=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build" ];
+    installPhase = "install -D drv_kdump.ko $out/lib/modules/${kernel.modDirVersion}/extra/drv_kdump.ko";
+  };
 in
 {
   imports = [ (import ./module.nix { inherit niri; }) ];
@@ -180,8 +190,11 @@ in
   # A camera for the portal: a loopback device fed a test pattern, which WirePlumber
   # picks up like any v4l2 camera (the spa videotestsrc node lacks node-level formats,
   # which browsers ask for).
-  boot.extraModulePackages = lib.optional camera config.boot.kernelPackages.v4l2loopback;
-  boot.kernelModules = lib.optional camera "v4l2loopback";
+  # The stock kernel, from the cache: the module above needs its build tree, and a patched
+  # kernel would be a kernel build. The resume patch has resume-vm to itself.
+  boot.kernelPatches = lib.mkForce [ ];
+  boot.extraModulePackages = lib.optional camera config.boot.kernelPackages.v4l2loopback ++ [ kdump ];
+  boot.kernelModules = lib.optional camera "v4l2loopback" ++ [ "drv_kdump" ];
   boot.extraModprobeConfig = lib.optionalString camera ''options v4l2loopback card_label="Test camera"'';
   systemd.services.test-camera = lib.mkIf camera {
     wantedBy = [ "multi-user.target" ];

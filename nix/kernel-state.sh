@@ -38,6 +38,19 @@ for n in mnt net pid user uts ipc cgroup time; do
   if [ "$(readlink /proc/$p/ns/$n)" = "$(readlink /proc/1/ns/$n)" ]; then echo "ns $n host"; else echo "ns $n own"; fi
 done
 sed "s/$uid/UID/" /proc/$p/cgroup
+# The kernel's own account, where the dev VM has the module (nix/kdump): what /proc does not
+# show. Store rules are the closure, one line per distinct access set instead of per path.
+if [ -e /sys/kernel/debug/drv/task ]; then
+  echo "$p" > /sys/kernel/debug/drv/task
+  # Store rules (paths inside the store's own filesystem, so no /nix/store prefix) collapse
+  # to one line per distinct access set; the tree is in pointer order, so rules are sorted.
+  sed -E "s/^task [0-9]+ /task /; s/\b$uid\b/UID/g; s/ ino [0-9]+//" /sys/kernel/debug/drv/task \
+    | awk '/^rule overlay:[^ ]* \/[a-z0-9]{32}-/ { sub(/ \/[a-z0-9]{32}-[^ ]*/, " store/*"); if (seen[$0]++) next }
+           /^rule / { rules[++n] = $0; next } { print }
+           END { cmd = "sort"; for (i = 1; i <= n; i++) print rules[i] | cmd; close(cmd) }'
+else
+  echo "kdump: no module"
+fi
 EOF
 )")
 if [ "${2:-}" = --update ]; then
