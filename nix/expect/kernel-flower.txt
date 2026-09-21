@@ -1,0 +1,35 @@
+parent drv-forker
+mount / ro,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=909,gid=909
+mount /dev ro,nosuid,noexec tmpfs root=/drv-host/dev rw,mode=755
+mount /dev/shm rw,nosuid,nodev tmpfs root=/ rw,uid=909,gid=909
+mount /etc rw,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=UID,gid=UID
+mount /home/app rw,nosuid,nodev,noexec tmpfs root=/ rw,mode=700,uid=UID,gid=UID
+mount /home/app/.state rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps/UID rw
+mount /nix/store ro,nosuid,nodev overlay root=/ host
+mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible
+mount /run/drv ro,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
+mount /run/drv-apps/UID rw,nosuid,nodev,noexec tmpfs root=/drv-apps/UID rw,mode=755
+mount /run/drv-bridge ro,nosuid,nodev,noexec tmpfs root=/drv-bridge rw,mode=755
+mount /run/drv-doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
+mount /run/drv-wayland ro,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
+mount /sys ro,nosuid,nodev,noexec tmpfs root=/drv-host/sys rw,mode=755
+mount /tmp rw,nosuid,nodev,noexec tmpfs root=/drv-apps/tmp/UID rw,mode=755
+Uid: UID UID UID UID
+Gid: UID UID UID UID
+Groups: UID
+CapInh: 0000000000000000
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+CapAmb: 0000000000000000
+NoNewPrivs: 1
+Seccomp: 0
+ns mnt own
+ns net own
+ns pid host
+ns user host
+ns uts host
+ns ipc host
+ns cgroup host
+ns time host
+0::/system.slice/drv-supervisor.service/apps/app-UID

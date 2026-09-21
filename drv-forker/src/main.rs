@@ -269,9 +269,9 @@ impl Forker {
             std::fs::File::create("/run/host/resolv.conf").map_err(|e| format!("resolv.conf: {e}"))?;
             attach(resolv, Path::new("/run/host/resolv.conf")).map_err(|e| format!("resolv.conf: {e}"))?;
         }
-        // Nothing new at the top level, ever.
+        // Nothing new at the top level, ever, and nothing runs from it.
         let root = open_path(Path::new("/"))?;
-        set_attrs(&root, ro, false).map_err(|e| format!("root read-only: {e}"))?;
+        set_attrs(&root, ro_noexec, false).map_err(|e| format!("root read-only: {e}"))?;
         drop(root);
         // One cgroup per app UID under the subtree the supervisor delegated to us.
         let name = format!("app-{uid}");
