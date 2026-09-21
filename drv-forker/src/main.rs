@@ -33,7 +33,12 @@ const NEEDED: CapabilitySet = CapabilitySet::SYS_ADMIN
 /// The layout of `/run` as the system configuration makes it. Every app: the appd socket,
 /// the apps' Wayland socket, the bridge, the driver link (a symlink into the store, remade
 /// as one), its own runtime directory, and the documents mount, which it writes.
-const RUN: &[&str] = &["/run/drv", "/run/drv-wayland", "/run/drv-bridge", "/run/opengl-driver"];
+const RUN: &[&str] = &[
+    "/run/drv",
+    "/run/drv-wayland",
+    "/run/drv-bridge",
+    "/run/opengl-driver",
+];
 const RUN_DOCS: &str = "/run/drv-doc";
 /// `audio`: PipeWire's apps socket and the per-app PulseAudio servers.
 const RUN_AUDIO: &[&str] = &["/run/drv-audio", "/run/drv-pulse"];
@@ -86,7 +91,11 @@ impl Forker {
         let mut children: Vec<(Pid, OwnedFd)> = Vec::new();
         loop {
             let mut fds = vec![PollFd::new(&channel, PollFlags::IN)];
-            fds.extend(children.iter().map(|(_, fd)| PollFd::new(fd, PollFlags::IN)));
+            fds.extend(
+                children
+                    .iter()
+                    .map(|(_, fd)| PollFd::new(fd, PollFlags::IN)),
+            );
             poll(&mut fds, None).map_err(|e| format!("poll: {e}"))?;
             let ready: Vec<bool> = fds.iter().map(|f| !f.revents().is_empty()).collect();
             let mut i = 0;
@@ -105,11 +114,25 @@ impl Forker {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return err("channel", e),
             };
+            // A fork with the child in PID, IPC and UTS namespaces of its own from the start:
+            // it is PID 1 there and stays, as the app's init (see `init`). Mount and net come
+            // in the child, which has handles to take first.
             // SAFETY: single-threaded; the child runs ordinary code and never returns.
-            let pid = unsafe { libc::fork() };
+            let pid = unsafe {
+                libc::syscall(
+                    libc::SYS_clone,
+                    (libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS) as libc::c_long
+                        | libc::SIGCHLD as libc::c_long,
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            } as libc::pid_t;
             if pid < 0 {
                 let e = io::Error::last_os_error();
-                seq::send(&channel, &Response::Error(format!("fork: {e}")), &[]).map_err(|e| format!("channel: {e}"))?;
+                seq::send(&channel, &Response::Error(format!("clone: {e}")), &[])
+                    .map_err(|e| format!("channel: {e}"))?;
                 continue;
             }
             if pid == 0 {
@@ -128,21 +151,27 @@ impl Forker {
         }
     }
 
-    /// The child, from fork to exec. Everything that needs no input first, then the request,
+    /// The child, from clone to exec. Everything that needs no input first, then the request,
     /// then what needs the UID, then the switch; argv, env and the closure are touched only
     /// once the process is the app. Returns only an error; success is exec.
     fn child(&self, channel: &OwnedFd, bytes: &[u8]) -> Result<std::convert::Infallible, String> {
         // 1. No input: handles on everything of the host's we will need, then privilege we
         // will never need again goes, then a mount namespace of our own, emptied.
-        let host_net = rustix::fs::open("/proc/self/ns/net", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .map_err(|e| format!("/proc/self/ns/net: {e}"))?;
+        let host_net = rustix::fs::open(
+            "/proc/self/ns/net",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| format!("/proc/self/ns/net: {e}"))?;
         let apps_cgroup = open_path(&drv_os::own_cgroup()?.join("apps"))?;
         let ro = Attr::MOUNT_ATTR_RDONLY | Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV;
         let ro_noexec = ro | Attr::MOUNT_ATTR_NOEXEC;
         let rw_noexec = Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV | Attr::MOUNT_ATTR_NOEXEC;
         // Device nodes live in the views, so no NODEV.
         let dev_attr = Attr::MOUNT_ATTR_RDONLY | Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC;
-        let clone = |path: &Path, attrs| clone_tree(CWD, path, attrs).map_err(|e| format!("{}: {e}", path.display()));
+        let clone = |path: &Path, attrs| {
+            clone_tree(CWD, path, attrs).map_err(|e| format!("{}: {e}", path.display()))
+        };
         let view = |name: &str, attrs| clone(&self.args.host_views.join(name), attrs);
         let store = clone(&self.args.store, ro)?;
         let dev = view("dev", dev_attr)?;
@@ -157,7 +186,11 @@ impl Forker {
                 let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{p}: {e}"))?;
                 // The driver link: a symlink into the store, remade as one.
                 let attrs = if writable { rw_noexec } else { ro_noexec };
-                let src = if meta.file_type().is_symlink() { Err(std::fs::read_link(path).map_err(|e| format!("{p}: {e}"))?) } else { Ok(clone(path, attrs)?) };
+                let src = if meta.file_type().is_symlink() {
+                    Err(std::fs::read_link(path).map_err(|e| format!("{p}: {e}"))?)
+                } else {
+                    Ok(clone(path, attrs)?)
+                };
                 run.push((p, src, writable));
             }
         }
@@ -166,10 +199,15 @@ impl Forker {
         drop_capability(CapabilitySet::SETPCAP)?;
         rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
         // SAFETY: single-threaded.
-        unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWNS | rustix::thread::UnshareFlags::NEWNET) }
-            .map_err(|e| format!("unshare: {e}"))?;
+        unsafe {
+            rustix::thread::unshare_unsafe(
+                rustix::thread::UnshareFlags::NEWNS | rustix::thread::UnshareFlags::NEWNET,
+            )
+        }
+        .map_err(|e| format!("unshare: {e}"))?;
         use rustix::mount::MountPropagationFlags as P;
-        rustix::mount::mount_change("/", P::PRIVATE | P::REC).map_err(|e| format!("make private: {e}"))?;
+        rustix::mount::mount_change("/", P::PRIVATE | P::REC)
+            .map_err(|e| format!("make private: {e}"))?;
         // The per-UID directories' parents, as plain handles into this namespace's copy of
         // the old root (a handle from before the unshare would point into the parent's
         // namespace, which nothing may be cloned from): the UID's subdirectory of each is
@@ -181,7 +219,12 @@ impl Forker {
         // runtime base for the moment it takes). The old root stays stacked beneath it,
         // reachable through the handles above and nothing else, until the UID's directories
         // are taken; then it is detached.
-        let root = new_fs("tmpfs", &[("mode", "0755")], Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV).map_err(|e| format!("root tmpfs: {e}"))?;
+        let root = new_fs(
+            "tmpfs",
+            &[("mode", "0755")],
+            Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV,
+        )
+        .map_err(|e| format!("root tmpfs: {e}"))?;
         attach(root, &self.args.runtime_base).map_err(|e| format!("attach root: {e}"))?;
         rustix::process::chdir(&self.args.runtime_base).map_err(|e| format!("chdir: {e}"))?;
         rustix::process::pivot_root(".", ".").map_err(|e| format!("pivot_root: {e}"))?;
@@ -193,9 +236,21 @@ impl Forker {
         };
         mount(store, &self.args.store.to_string_lossy())?;
         mount(dev, "/dev")?;
-        mount(new_fs("tmpfs", &[("mode", "1777")], Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV).map_err(|e| format!("shm: {e}"))?, "/dev/shm")?;
-        // The kernel's view of the app's own processes: its own instance, hidepid.
-        mount(new_fs("proc", &[("hidepid", "invisible")], rw_noexec).map_err(|e| format!("proc: {e}"))?, "/proc")?;
+        mount(
+            new_fs("tmpfs", &[("mode", "1777")], rw_noexec).map_err(|e| format!("shm: {e}"))?,
+            "/dev/shm",
+        )?;
+        // The app's own PID namespace seen through its own proc instance: the pid entries
+        // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
+        mount(
+            new_fs(
+                "proc",
+                &[("hidepid", "invisible"), ("subset", "pid")],
+                rw_noexec,
+            )
+            .map_err(|e| format!("proc: {e}"))?,
+            "/proc",
+        )?;
         let mut run_rules = Vec::new();
         let mut audio_mounts = Vec::new();
         for (p, src, writable) in run {
@@ -204,7 +259,8 @@ impl Forker {
                 Ok(fd) if !is_audio => mount(fd, p)?,
                 Ok(fd) => audio_mounts.push((p, fd)),
                 Err(target) => {
-                    std::fs::create_dir_all(Path::new(p).parent().unwrap()).map_err(|e| format!("{p}: {e}"))?;
+                    std::fs::create_dir_all(Path::new(p).parent().unwrap())
+                        .map_err(|e| format!("{p}: {e}"))?;
                     std::os::unix::fs::symlink(&target, p).map_err(|e| format!("{p}: {e}"))?;
                 }
             }
@@ -212,19 +268,26 @@ impl Forker {
         }
 
         // 2. The request. From here to the switch, only uid, network, gpu and audio are read.
-        let Request::Launch(launch): Request = seq::decode(bytes).map_err(|e| format!("request: {e}"))?;
+        let Request::Launch(launch): Request =
+            seq::decode(bytes).map_err(|e| format!("request: {e}"))?;
         let uid = launch.uid;
         if !self.covers(uid) {
             return Err(format!("uid {uid} is outside the app range"));
         }
         let uid_s = uid.to_string();
         if launch.network {
-            rustix::thread::move_into_link_name_space(host_net.as_fd(), Some(rustix::thread::LinkNameSpaceType::Network))
-                .map_err(|e| format!("rejoin the network: {e}"))?;
+            rustix::thread::move_into_link_name_space(
+                host_net.as_fd(),
+                Some(rustix::thread::LinkNameSpaceType::Network),
+            )
+            .map_err(|e| format!("rejoin the network: {e}"))?;
         }
         drop(host_net);
         if launch.gpu {
-            mount(dri.ok_or("no render node view (no GPU on this host?)")?, "/dev/dri")?;
+            mount(
+                dri.ok_or("no render node view (no GPU on this host?)")?,
+                "/dev/dri",
+            )?;
             mount(sys_gpu.ok_or("no sys-gpu view")?, "/sys")?;
             drop(sys);
         } else {
@@ -248,13 +311,16 @@ impl Forker {
         let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
         mount(owned("tmpfs", &[("mode", "0755")])?, "/etc")?;
         mount(owned("tmpfs", &[("mode", "0700"), ("size", "256m")])?, HOME)?;
-        let per_uid = |base: &OwnedFd, what: &str| clone_tree(base, Path::new(&uid_s), rw_noexec).map_err(|e| format!("{what}/{uid}: {e}"));
+        let per_uid = |base: &OwnedFd, what: &str| {
+            clone_tree(base, Path::new(&uid_s), rw_noexec).map_err(|e| format!("{what}/{uid}: {e}"))
+        };
         // The one mount inside something the app owns: paths through its 0700 HOME resolve
         // only for it, so this runs as the app's effective UID (the capabilities stay:
         // SECBIT_NO_SETUID_FIXUP); no override capability needed.
         let own = rustix::process::getuid();
         rustix::thread::set_thread_res_uid(own, u, own).map_err(|e| format!("euid {uid}: {e}"))?;
-        let state = per_uid(&state_base, "state").and_then(|fd| mount(fd, &format!("{HOME}/.state")));
+        let state =
+            per_uid(&state_base, "state").and_then(|fd| mount(fd, &format!("{HOME}/.state")));
         rustix::thread::set_thread_res_uid(own, own, own).map_err(|e| format!("euid back: {e}"))?;
         state?;
         mount(per_uid(&tmp_base, "tmp")?, "/tmp")?;
@@ -262,12 +328,15 @@ impl Forker {
         mount(per_uid(&run_base, "runtime")?, &runtime)?;
         // The old root, stacked beneath ours since the pivot: gone, with the handles into it.
         drop((run_base, tmp_base, state_base));
-        rustix::mount::unmount(".", rustix::mount::UnmountFlags::DETACH).map_err(|e| format!("detach old root: {e}"))?;
+        rustix::mount::unmount(".", rustix::mount::UnmountFlags::DETACH)
+            .map_err(|e| format!("detach old root: {e}"))?;
         if launch.network {
             let resolv = resolv.ok_or("no resolv.conf on the host")?;
             std::fs::create_dir_all("/run/host").map_err(|e| format!("/run/host: {e}"))?;
-            std::fs::File::create("/run/host/resolv.conf").map_err(|e| format!("resolv.conf: {e}"))?;
-            attach(resolv, Path::new("/run/host/resolv.conf")).map_err(|e| format!("resolv.conf: {e}"))?;
+            std::fs::File::create("/run/host/resolv.conf")
+                .map_err(|e| format!("resolv.conf: {e}"))?;
+            attach(resolv, Path::new("/run/host/resolv.conf"))
+                .map_err(|e| format!("resolv.conf: {e}"))?;
         }
         // Nothing new at the top level, ever, and nothing runs from it.
         let root = open_path(Path::new("/"))?;
@@ -279,10 +348,21 @@ impl Forker {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(e) => return err("cgroup", e),
         }
-        let procs = rustix::fs::openat(&apps_cgroup, format!("{name}/cgroup.procs"), OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty()).map_err(|e| format!("cgroup.procs: {e}"))?;
+        let procs = rustix::fs::openat(
+            &apps_cgroup,
+            format!("{name}/cgroup.procs"),
+            OFlags::WRONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|e| format!("cgroup.procs: {e}"))?;
         // "0" means the writing process itself.
         rustix::io::write(&procs, b"0").map_err(|e| format!("cgroup.procs: {e}"))?;
         drop((procs, apps_cgroup));
+        // Now that this is the app's cgroup, a cgroup namespace rooted here: /proc/self/cgroup
+        // says "/" and nothing about the host's tree.
+        // SAFETY: single-threaded.
+        unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWCGROUP) }
+            .map_err(|e| format!("cgroup namespace: {e}"))?;
 
         // 3. The switch. Its own group and nothing else (set explicitly: gid 0 would see
         // through hidepid). A non-root forker's capabilities survive setresuid, so they go
@@ -294,14 +374,25 @@ impl Forker {
             return Err("uid did not change".into());
         }
         rustix::thread::clear_ambient_capability_set().map_err(|e| format!("ambient: {e}"))?;
-        rustix::thread::set_capabilities(None, CapabilitySets { effective: CapabilitySet::empty(), permitted: CapabilitySet::empty(), inheritable: CapabilitySet::empty() })
-            .map_err(|e| format!("capset: {e}"))?;
+        rustix::thread::set_capabilities(
+            None,
+            CapabilitySets {
+                effective: CapabilitySet::empty(),
+                permitted: CapabilitySet::empty(),
+                inheritable: CapabilitySet::empty(),
+            },
+        )
+        .map_err(|e| format!("capset: {e}"))?;
         rustix::process::chdir(HOME).map_err(|e| format!("chdir {HOME}: {e}"))?;
 
         // 4. As the app, with nothing: what it may open, then its command.
         let rules = Ruleset::new().map_err(|e| format!("landlock: {e}"))?;
         let all = rules.all();
-        let allow = |path: &str, access: u64| rules.allow(Path::new(path), access).map_err(|e| format!("landlock {path}: {e}"));
+        let allow = |path: &str, access: u64| {
+            rules
+                .allow(Path::new(path), access)
+                .map_err(|e| format!("landlock {path}: {e}"))
+        };
         let mut missing = 0;
         for path in &launch.closure {
             if !allow(path, landlock::READ | landlock::EXECUTE)? {
@@ -311,8 +402,11 @@ impl Forker {
         if missing > 0 {
             drv_os::say!("drv-forker: uid {uid}: {missing} closure paths are not on this machine");
         }
-        allow("/dev", landlock::READ | landlock::WRITE_FILE | landlock::IOCTL_DEV)?;
-        allow("/dev/shm", all)?;
+        allow(
+            "/dev",
+            landlock::READ | landlock::WRITE_FILE | landlock::IOCTL_DEV,
+        )?;
+        allow("/dev/shm", all & !landlock::EXECUTE)?;
         allow("/sys", landlock::READ)?;
         allow("/proc", landlock::READ | landlock::WRITE_FILE)?;
         for path in ["/etc", HOME, "/tmp", &runtime] {
@@ -326,7 +420,10 @@ impl Forker {
                 allow(p, if writable { all } else { landlock::READ })?;
             }
         }
-        rules.restrict_self().map_err(|e| format!("landlock: {e}"))?;
+        rules
+            .restrict_self()
+            .map_err(|e| format!("landlock: {e}"))?;
+        refuse_syscalls(launch.userns)?;
         if !launch.jit {
             const PR_SET_MDWE: libc::c_int = 65;
             const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
@@ -341,19 +438,184 @@ impl Forker {
         let mut env: Vec<(String, String)> = launch.env.clone();
         env.push(("HOME".into(), HOME.into()));
         env.push(("XDG_RUNTIME_DIR".into(), runtime.clone()));
-        let path = env.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone()).unwrap_or_default();
-        let exe = which(&launch.argv[0], &path).ok_or_else(|| format!("{}: not found in PATH", launch.argv[0]))?;
-        let c_argv: Vec<CString> = launch.argv.iter().map(|a| CString::new(a.as_bytes())).collect::<Result<_, _>>().map_err(|_| "NUL in argv")?;
-        let c_env: Vec<CString> = env.iter().map(|(k, v)| CString::new(format!("{k}={v}"))).collect::<Result<_, _>>().map_err(|_| "NUL in env")?;
-        seq::send(channel, &Response::Forked { pid: std::process::id() }, &[]).map_err(|e| format!("channel: {e}"))?;
-        let mut argv_p: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
-        argv_p.push(std::ptr::null());
-        let mut env_p: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
-        env_p.push(std::ptr::null());
-        // SAFETY: NUL-terminated arrays of NUL-terminated strings.
-        unsafe { libc::execve(exe.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
-        Err(format!("exec {}: {}", launch.argv[0], io::Error::last_os_error()))
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let exe = which(&launch.argv[0], &path)
+            .ok_or_else(|| format!("{}: not found in PATH", launch.argv[0]))?;
+        let c_argv: Vec<CString> = launch
+            .argv
+            .iter()
+            .map(|a| CString::new(a.as_bytes()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "NUL in argv")?;
+        let c_env: Vec<CString> = env
+            .iter()
+            .map(|(k, v)| CString::new(format!("{k}={v}")))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "NUL in env")?;
+        // 5. This process is PID 1 of the app's namespace and stays as its init; the app is
+        // its child. A pipe tells init whether the exec happened (closed on exec) or not.
+        let (exec_r, exec_w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+            .map_err(|e| format!("pipe: {e}"))?;
+        // SAFETY: single-threaded; the child only execs or reports and exits.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return err("fork", io::Error::last_os_error());
+        }
+        if pid == 0 {
+            drop(exec_r);
+            let mut argv_p: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
+            argv_p.push(std::ptr::null());
+            let mut env_p: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
+            env_p.push(std::ptr::null());
+            // SAFETY: NUL-terminated arrays of NUL-terminated strings.
+            unsafe { libc::execve(exe.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
+            let _ = rustix::io::write(
+                &exec_w,
+                format!("exec {}: {}", launch.argv[0], io::Error::last_os_error()).as_bytes(),
+            );
+            std::process::exit(127);
+        }
+        drop(exec_w);
+        let mut failure = Vec::new();
+        let mut buf = [0u8; 512];
+        while let Ok(n) = rustix::io::read(&exec_r, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            failure.extend_from_slice(&buf[..n]);
+        }
+        drop(exec_r);
+        if !failure.is_empty() {
+            return Err(String::from_utf8_lossy(&failure).into_owned());
+        }
+        seq::send(channel, &Response::Forked, &[]).map_err(|e| format!("channel: {e}"))?;
+        init(Pid::from_raw(pid).unwrap())
     }
+}
+
+/// The app's init: PID 1 of its namespace, the app's own UID with nothing, under the same
+/// Landlock, seccomp and MDWE as the app. Reaps whatever gets orphaned, passes the signals
+/// it is sent on to the app, and ends when the app does, with its status. A PID 1 cannot
+/// be killed by a signal from inside its namespace, its own included, so a signal death of
+/// the app becomes exit status 128 + signal here.
+fn init(app: Pid) -> ! {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static APP: AtomicI32 = AtomicI32::new(0);
+    extern "C" fn forward(sig: libc::c_int) {
+        let pid = APP.load(Ordering::Relaxed);
+        if pid > 0 {
+            // SAFETY: async-signal-safe.
+            unsafe { libc::kill(pid, sig) };
+        }
+    }
+    APP.store(app.as_raw_nonzero().get(), Ordering::Relaxed);
+    // SAFETY: plain prctl with a NUL-terminated name.
+    unsafe { libc::prctl(libc::PR_SET_NAME, c"drv-init".as_ptr()) };
+    for sig in [
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGHUP,
+        libc::SIGQUIT,
+        libc::SIGUSR1,
+        libc::SIGUSR2,
+    ] {
+        // SAFETY: a zeroed sigaction with a handler is a valid one; forward is signal-safe.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = forward as *const () as usize;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+    loop {
+        match rustix::process::waitpid(None, rustix::process::WaitOptions::empty()) {
+            Ok(Some((pid, status))) if pid == app => {
+                let code = match (status.exit_status(), status.terminating_signal()) {
+                    (Some(code), _) => code as i32,
+                    (_, Some(sig)) => 128 + sig,
+                    _ => 1,
+                };
+                std::process::exit(code);
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => {}
+            Err(_) => std::process::exit(0),
+        }
+    }
+}
+
+/// What no app gets, whatever its manifest: an executable memfd (so, with the noexec mounts
+/// and `vm.memfd_noexec`, only the store runs code) and io_uring. Without `userns`, no user
+/// namespace either: `unshare`, `clone` and `setns` refuse CLONE_NEWUSER and `clone3`, whose
+/// flags are behind a pointer, is not there (ENOSYS, which libc falls back from). Everything
+/// else passes: this is a denylist for a few doors, not the sandbox.
+fn refuse_syscalls(userns: bool) -> Result<(), String> {
+    use std::collections::BTreeMap;
+
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as Cond,
+        SeccompFilter, SeccompRule,
+    };
+    const MFD_EXEC: u64 = 0x0010;
+    let arch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| "seccomp: unknown arch")?;
+    let rule = |arg: u8, op: Op, value: u64| {
+        SeccompRule::new(vec![
+            Cond::new(arg, Len::Dword, op, value).map_err(|e| format!("seccomp: {e}"))?
+        ])
+        .map_err(|e| format!("seccomp: {e}"))
+    };
+    let newuser = libc::CLONE_NEWUSER as u64;
+    let mut eperm: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    eperm.insert(
+        libc::SYS_memfd_create,
+        vec![rule(1, Op::MaskedEq(MFD_EXEC), MFD_EXEC)?],
+    );
+    for nr in [
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+    ] {
+        eperm.insert(nr, vec![]);
+    }
+    if !userns {
+        eperm.insert(
+            libc::SYS_unshare,
+            vec![rule(0, Op::MaskedEq(newuser), newuser)?],
+        );
+        eperm.insert(
+            libc::SYS_clone,
+            vec![rule(0, Op::MaskedEq(newuser), newuser)?],
+        );
+        // setns: to a user namespace by type, or by any type (0) which a userns fd satisfies.
+        eperm.insert(
+            libc::SYS_setns,
+            vec![
+                rule(1, Op::MaskedEq(newuser), newuser)?,
+                rule(1, Op::Eq, 0)?,
+            ],
+        );
+    }
+    let apply =
+        |rules: BTreeMap<i64, Vec<SeccompRule>>, action: SeccompAction| -> Result<(), String> {
+            let filter = SeccompFilter::new(rules, SeccompAction::Allow, action, arch)
+                .map_err(|e| format!("seccomp: {e}"))?;
+            let bpf: seccompiler::BpfProgram =
+                filter.try_into().map_err(|e| format!("seccomp: {e}"))?;
+            seccompiler::apply_filter(&bpf).map_err(|e| format!("seccomp: {e}"))
+        };
+    apply(eperm, SeccompAction::Errno(libc::EPERM as u32))?;
+    if !userns {
+        let mut enosys = BTreeMap::new();
+        enosys.insert(libc::SYS_clone3, vec![]);
+        apply(enosys, SeccompAction::Errno(libc::ENOSYS as u32))?;
+    }
+    Ok(())
 }
 
 /// `argv[0]` as a path: itself if it has a slash, else the first hit in `path`.
@@ -361,7 +623,10 @@ fn which(name: &str, path: &str) -> Option<CString> {
     let candidates: Vec<PathBuf> = if name.contains('/') {
         vec![PathBuf::from(name)]
     } else {
-        path.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join(name)).collect()
+        path.split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| Path::new(d).join(name))
+            .collect()
     };
     candidates
         .into_iter()
@@ -370,7 +635,12 @@ fn which(name: &str, path: &str) -> Option<CString> {
 }
 
 fn open_path(path: &Path) -> Result<OwnedFd, String> {
-    rustix::fs::open(path, OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty()).map_err(|e| format!("{}: {e}", path.display()))
+    rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A child of ours ended: reap it and log which UID it ran as. The UID comes with the
@@ -381,13 +651,26 @@ fn reap(pid: Pid) {
     // successful waitid, which filled it for a child that exited or was killed.
     let (code, status, uid) = unsafe {
         let mut info: libc::siginfo_t = std::mem::zeroed();
-        if libc::waitid(libc::P_PID, pid.as_raw_nonzero().get() as libc::id_t, &mut info, libc::WEXITED) != 0 {
+        if libc::waitid(
+            libc::P_PID,
+            pid.as_raw_nonzero().get() as libc::id_t,
+            &mut info,
+            libc::WEXITED,
+        ) != 0
+        {
             return;
         }
         (info.si_code, info.si_status(), info.si_uid())
     };
-    let how = if code == libc::CLD_EXITED { format!("exit status: {status}") } else { format!("signal: {status}") };
-    drv_os::say!("drv-forker: pid {} (uid {uid}) exited: {how}", pid.as_raw_nonzero());
+    let how = if code == libc::CLD_EXITED {
+        format!("exit status: {status}")
+    } else {
+        format!("signal: {status}")
+    };
+    drv_os::say!(
+        "drv-forker: pid {} (uid {uid}) exited: {how}",
+        pid.as_raw_nonzero()
+    );
 }
 
 /// Every bit locked, before anything else: no root, no setuid fixups, no ambient raise, and
@@ -400,10 +683,13 @@ fn set_securebits() -> Result<(), String> {
     const EXEC_RESTRICT_FILE: u32 = 1 << 8;
     const EXEC_DENY_INTERACTIVE: u32 = 1 << 10;
     let locked = |bit: u32| bit | (bit << 1);
-    let base = locked(NOROOT) | locked(NO_SETUID_FIXUP) | KEEP_CAPS_LOCKED | locked(NO_CAP_AMBIENT_RAISE);
+    let base =
+        locked(NOROOT) | locked(NO_SETUID_FIXUP) | KEEP_CAPS_LOCKED | locked(NO_CAP_AMBIENT_RAISE);
     let exec = locked(EXEC_RESTRICT_FILE) | locked(EXEC_DENY_INTERACTIVE);
     // rustix's flag set predates the exec bits: retain them past its check.
-    let set = |bits: u32| rustix::thread::set_capabilities_secure_bits(CapabilitiesSecureBits::from_bits_retain(bits));
+    let set = |bits: u32| {
+        rustix::thread::set_capabilities_secure_bits(CapabilitiesSecureBits::from_bits_retain(bits))
+    };
     if set(base | exec).is_ok() {
         return Ok(());
     }
@@ -413,8 +699,11 @@ fn set_securebits() -> Result<(), String> {
 /// Nothing exec'd from here on can gain a capability, whatever its file says.
 fn empty_bounding_set() -> Result<(), String> {
     for cap in CapabilitySet::all().iter() {
-        if cap.bits().count_ones() == 1 && rustix::thread::capability_is_in_bounding_set(cap).map_err(|e| e.to_string())? {
-            rustix::thread::remove_capability_from_bounding_set(cap).map_err(|e| format!("bounding set: {e}"))?;
+        if cap.bits().count_ones() == 1
+            && rustix::thread::capability_is_in_bounding_set(cap).map_err(|e| e.to_string())?
+        {
+            rustix::thread::remove_capability_from_bounding_set(cap)
+                .map_err(|e| format!("bounding set: {e}"))?;
         }
     }
     Ok(())

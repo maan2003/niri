@@ -71,7 +71,10 @@ let
     # The store beyond the closure: not even listable.
     ${pkgs.coreutils}/bin/ls /nix/store > store.txt 2>&1 || echo "denied: $?" >> store.txt
     ${pkgs.procps}/bin/ps -eo user,pid,cmd > ps.txt 2>&1
-    ${pkgs.coreutils}/bin/cat /proc/net/dev > net.txt 2>&1
+    # The sandbox's doors: no user namespace, no /proc beyond the pid entries.
+    ${pkgs.util-linux}/bin/unshare -U ${pkgs.coreutils}/bin/true > userns.txt 2>&1 || echo "denied: $?" >> userns.txt
+    ${pkgs.coreutils}/bin/ls /proc > proc.txt 2>&1
+    ${pkgs.coreutils}/bin/cat /proc/self/net/dev > net.txt 2>&1
     ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
     ${pkgs.coreutils}/bin/touch done
@@ -160,6 +163,7 @@ in
         opens = [ "http" "https" ];
         state = [ ".config/chromium" ".cache/chromium" ];
         jit = true;
+        userns = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.

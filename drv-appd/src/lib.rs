@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 use drv_policy::daemon::{self, Handler};
 use drv_policy::forker::{self, Launch};
-use drv_policy::rpc;
-use drv_policy::{AppPolicy, Global, Grant};
+use drv_policy::{rpc, AppPolicy, Global, Grant};
 use serde::{Deserialize, Serialize};
 
 /// `appd.json`.
@@ -94,6 +93,9 @@ pub struct AppConfig {
     /// A JIT inside: no MDWE.
     #[serde(default)]
     pub jit: bool,
+    /// May make user namespaces (a browser's own sandbox).
+    #[serde(default)]
+    pub userns: bool,
 }
 
 impl AppConfig {
@@ -129,13 +131,19 @@ impl std::error::Error for Error {}
 
 pub fn load_config(path: &Path) -> Result<Config, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.to_owned(), e))?;
-    let mut config: Config = serde_json::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
+    let mut config: Config =
+        serde_json::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
     check_config(&config).map_err(Error::Config)?;
     // The closure lists are read now, before the syscall filter: at launch nothing is opened.
     for app in &mut config.apps {
         if let Some(list) = &app.closure {
-            let text = std::fs::read_to_string(list).map_err(|e| Error::Io(Path::new(list).to_owned(), e))?;
-            app.closure_paths = text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+            let text = std::fs::read_to_string(list)
+                .map_err(|e| Error::Io(Path::new(list).to_owned(), e))?;
+            app.closure_paths = text
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
     }
     Ok(config)
@@ -161,10 +169,16 @@ fn check_config(config: &Config) -> Result<(), String> {
         }
         for scheme in &app.opens {
             if app.exec.is_none() {
-                return Err(format!("app {:?} opens {scheme:?} but has no exec", app.name));
+                return Err(format!(
+                    "app {:?} opens {scheme:?} but has no exec",
+                    app.name
+                ));
             }
             if rpc::uri_scheme(&format!("{scheme}:")).as_deref() != Some(scheme.as_str()) {
-                return Err(format!("app {:?} opens {scheme:?}, which is not a lowercase scheme", app.name));
+                return Err(format!(
+                    "app {:?} opens {scheme:?}, which is not a lowercase scheme",
+                    app.name
+                ));
             }
             if !schemes.insert(scheme) {
                 return Err(format!("scheme {scheme:?} has more than one handler"));
@@ -260,6 +274,7 @@ impl Appd {
             gpu: app.gpu,
             audio: app.audio,
             jit: app.jit,
+            userns: app.userns,
             // Inline: the forker mounts and rules, it does not read files.
             closure: app.closure_paths.clone(),
         };
@@ -371,7 +386,11 @@ impl Handler for Launcher {
             .find(|a| a.opens.contains(&scheme))
             .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
         let uid = self.appd.start(app, Some(uri))?;
-        drv_os::say!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {}", app.name, self.who);
+        drv_os::say!(
+            "drv-appd: {:?} (uid {uid}) opens {uri:?} for {}",
+            app.name,
+            self.who
+        );
         Ok(uid)
     }
 
@@ -479,7 +498,8 @@ mod tests {
     fn rejects_duplicate_uids_and_names_and_bad_autostart() {
         let bad = |apps: &str| {
             let config: Config =
-                serde_json::from_str(&format!(r#"{{"wayland-socket": "/x", "app": [{apps}]}}"#)).unwrap();
+                serde_json::from_str(&format!(r#"{{"wayland-socket": "/x", "app": [{apps}]}}"#))
+                    .unwrap();
             check_config(&config).unwrap_err()
         };
         assert!(bad(r#"{"name": "a", "uid": 12}, {"name": "b", "uid": 12}"#).contains("uid 12"));
@@ -492,11 +512,24 @@ mod tests {
         let (id, recorder) = identity();
         let launcher = launcher(&id);
         assert_eq!(launcher.open(5, "HTTPS://example.com/a?b=c#d"), Ok(100042));
-        assert_eq!(recorder.0.lock().unwrap()[0].argv, vec!["firefox", "HTTPS://example.com/a?b=c#d"]);
-        for bad in ["http://example.com", "-https://x", "https://a b", "https", "https:\u{e9}", "mailto:x@y"] {
+        assert_eq!(
+            recorder.0.lock().unwrap()[0].argv,
+            vec!["firefox", "HTTPS://example.com/a?b=c#d"]
+        );
+        for bad in [
+            "http://example.com",
+            "-https://x",
+            "https://a b",
+            "https",
+            "https:\u{e9}",
+            "mailto:x@y",
+        ] {
             assert!(launcher.open(5, bad).is_err(), "{bad}");
         }
-        assert!(id.open(5, "https://example.com").unwrap_err().contains("public socket"));
+        assert!(id
+            .open(5, "https://example.com")
+            .unwrap_err()
+            .contains("public socket"));
         assert_eq!(recorder.0.lock().unwrap().len(), 1);
     }
 
@@ -508,7 +541,9 @@ mod tests {
                 {"name": "b", "uid": 13, "exec": ["b"], "opens": ["https"]}]}"#,
         )
         .unwrap();
-        assert!(check_config(&config).unwrap_err().contains("more than one handler"));
+        assert!(check_config(&config)
+            .unwrap_err()
+            .contains("more than one handler"));
         let config: Config = serde_json::from_str(
             r#"{"wayland-socket": "/x", "app": [{"name": "a", "uid": 12, "exec": ["a"], "opens": ["HTTPS"]}]}"#,
         )

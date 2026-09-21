@@ -1,7 +1,7 @@
 //! drv-appd's process. Its fds come from the supervisor by name: `listener` (the public
 //! socket, lookups only), `channel` (to drv-forker), `compositor`, `menu` and `bridge` (the
-//! launch channels of the three launchers; the bridge's only opens URIs). Nothing here is found; all of it was put in place before
-//! we ran.
+//! launch channels of the three launchers; the bridge's only opens URIs). Nothing here is found;
+//! all of it was put in place before we ran.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,10 +23,18 @@ struct Args {
 fn run(args: Args) -> Result<(), String> {
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the supervisor: {e}"))?;
     let listener = fds.listener("listener").map_err(|e| e.to_string())?;
-    let channel = fds.socket("channel", Kind::SeqPacket).map_err(|e| e.to_string())?;
-    let compositor = fds.socket("compositor", Kind::Stream).map_err(|e| e.to_string())?;
-    let menu = fds.socket("menu", Kind::Stream).map_err(|e| e.to_string())?;
-    let bridge = fds.socket("bridge", Kind::Stream).map_err(|e| e.to_string())?;
+    let channel = fds
+        .socket("channel", Kind::SeqPacket)
+        .map_err(|e| e.to_string())?;
+    let compositor = fds
+        .socket("compositor", Kind::Stream)
+        .map_err(|e| e.to_string())?;
+    let menu = fds
+        .socket("menu", Kind::Stream)
+        .map_err(|e| e.to_string())?;
+    let bridge = fds
+        .socket("bridge", Kind::Stream)
+        .map_err(|e| e.to_string())?;
     let config = load_config(&args.config).map_err(|e| e.to_string())?;
     let base_env: Vec<(String, String)> = std::env::var("PATH")
         .map(|path| vec![("PATH".to_owned(), path)])

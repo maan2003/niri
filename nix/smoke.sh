@@ -27,6 +27,8 @@ file_has "own uid" $H/id.txt '^uid=100001\(app-hello\) gid=100001\(app-hello\) g
 file_has "only loopback" $H/net.txt '^ *lo:'
 count_ifaces=$($SSH cat $H/net.txt | grep -c ':'); [ "$count_ifaces" = 1 ] && echo "PASS no other interface" || fail "other interfaces: $count_ifaces"
 others=$($SSH cat $H/ps.txt | tail -n +2 | grep -v '^app-hel'); [ -z "$others" ] && echo "PASS sees only its own processes" || fail "sees other processes: $others"
+file_has "no user namespace" $H/userns.txt 'Operation not permitted'
+$SSH grep -q cpuinfo $H/proc.txt && fail "proc beyond the pid entries" || echo "PASS proc is the pid entries only"
 file_has "no PipeWire without audio" $H/pipewire.txt 'failed to connect|Host is down'
 hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_capture_source|output_management|output_power|foreign_toplevel|virtual_pointer|virtual_keyboard|security_context|gamma_control|input_method|ext_transient_seat|zwlr_data_control|ext_data_control'
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")

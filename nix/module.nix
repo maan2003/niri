@@ -104,7 +104,7 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio jit globals grants autostart menu opens;
+    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens;
     closure = "${appClosure name app}/store-paths";
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
@@ -272,6 +272,11 @@ in
             type = lib.types.bool;
             default = false;
             description = "The app makes code at runtime (a browser's JIT): it is not held to W^X memory.";
+          };
+          userns = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "The app may make user namespaces (a browser's own sandbox). Every other app is refused them: they are the usual way to a kernel bug.";
           };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           grants = lib.mkOption {
@@ -445,6 +450,9 @@ in
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
     boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
+    # memfds are not executable unless asked for (MFD_EXEC), and the forker's seccomp filter
+    # refuses apps the asking: with the noexec mounts, the store is the only place code runs from.
+    boot.kernel.sysctl."vm.memfd_noexec" = 1;
     boot.kernelParams = [ "drm_kms_helper.blank_on_resume=1" ];
 
     environment.etc."drv/config.kdl".text = cfg.config;

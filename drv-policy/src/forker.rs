@@ -33,6 +33,10 @@ pub struct Launch {
     /// The app makes code at runtime (a JIT): no MDWE for it.
     #[serde(default)]
     pub jit: bool,
+    /// The app may make user namespaces (a browser's own sandbox). Otherwise `unshare`,
+    /// `clone` and `setns` with CLONE_NEWUSER fail and `clone3` is not there.
+    #[serde(default)]
+    pub userns: bool,
     /// The store paths the app may open (its closure, from closureInfo).
     #[serde(default)]
     pub closure: Vec<String>,
@@ -45,7 +49,7 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
-    Forked { pid: u32 },
+    Forked,
     Error(String),
 }
 
@@ -64,9 +68,9 @@ impl Channel {
         Ok(response)
     }
 
-    pub fn launch(&self, launch: &Launch) -> io::Result<u32> {
+    pub fn launch(&self, launch: &Launch) -> io::Result<()> {
         match self.call(&Request::Launch(launch.clone()))? {
-            Response::Forked { pid } => Ok(pid),
+            Response::Forked => Ok(()),
             Response::Error(err) => Err(io::Error::other(err)),
         }
     }

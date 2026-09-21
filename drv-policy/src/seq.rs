@@ -48,7 +48,8 @@ pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>
 
 /// A datagram's bytes, undecoded.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-    postcard::from_bytes(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    postcard::from_bytes(bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// One datagram as it came: for a receiver that must not decode it itself (the forker's

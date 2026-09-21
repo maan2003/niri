@@ -269,8 +269,8 @@ impl PolicyStore {
 
 pub mod client;
 pub mod daemon;
-pub mod rpc;
 pub mod forker;
+pub mod rpc;
 pub mod seq;
 
 /// Environment names the pieces agree on.
@@ -343,6 +343,8 @@ mod tests {
 
     #[test]
     fn unknown_field_is_an_error() {
-        assert!(serde_json::from_str::<PolicyFile>(r#"{"default": {"name": "x"}, "foo": 1}"#).is_err());
+        assert!(
+            serde_json::from_str::<PolicyFile>(r#"{"default": {"name": "x"}, "foo": 1}"#).is_err()
+        );
     }
 }
