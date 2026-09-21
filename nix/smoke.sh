@@ -30,7 +30,7 @@ hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_ca
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")
 [ -z "$leaked" ] && echo "PASS no privileged globals" || fail "privileged globals: $leaked"
 file_has "but the ordinary ones" $H/globals.txt "interface: 'xdg_wm_base'"
-file_has "state linked into HOME" $H/home.txt 'out -> /home/hello/.state/out'
+file_has "state linked into HOME" $H/home.txt 'out -> /home/app/.state/out'
 file_has "defaults linked from the store" $H/home.txt '^/nix/store/.*-drv-files-hello/.config/hello/greeting$'
 file_has "and readable through the closure" $H/home.txt '^hello from the store$'
 file_has "store not listable beyond the closure" $H/store.txt 'Permission denied'

@@ -1,9 +1,9 @@
 //! Users, groups, fds and owned directories: the handful of libc calls every privileged piece
 //! needs, in one place.
 
-pub mod approot;
 pub mod fds;
 pub mod landlock;
+pub mod mounts;
 pub mod sandbox;
 pub mod seccomp;
 

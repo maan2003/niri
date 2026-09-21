@@ -26,7 +26,7 @@ let
     "${cfg.package}/bin/drv-forker"
     "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
     "--runtime-base /run/drv-apps"
-    "--home-base /var/lib/drv-apps"
+    "--state-base /var/lib/drv-apps"
     "--host-views ${hostViews}"
   ]);
   hostViews = "/run/drv-host";
@@ -79,7 +79,7 @@ let
   in pkgs.runCommand "drv-etc-${name}" { } ''
     mkdir "$out"
     cd "$out"
-    echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:/var/lib/drv-apps/${toString app.uid}:${pkgs.shadow}/bin/nologin" > passwd
+    echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:/home/app:${pkgs.shadow}/bin/nologin" > passwd
     echo "app-${name}:x:${toString app.uid}:" > group
     printf 'passwd: files
 group: files
@@ -104,7 +104,7 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio bus jit globals grants autostart menu opens;
+    inherit (app) uid gpu network audio jit globals grants autostart menu opens;
     closure = "${appClosure name app}/store-paths";
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
@@ -362,8 +362,8 @@ in
       drv-seat = { uid = cfg.ids.seat; group = "drv-seat"; isSystemUser = true; extraGroups = [ "video" "input" "tty" ]; };
       # The lock screen: no devices, no sockets; everything it talks to comes down its wire.
       drv-lock = { uid = cfg.ids.lock; group = "drv-lock"; isSystemUser = true; };
-      # The forker: not root. The supervisor leaves it setuid, setgid, setpcap, sys_admin and
-      # chown, and hands it the supervisor's cgroup subtree and the apps' directories.
+      # The forker: not root. The supervisor leaves it setuid, setgid, setpcap and sys_admin,
+      # and hands it the supervisor's cgroup subtree.
       drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
       # The supervisor: the capabilities its unit grants it (below), nothing else.
       drv-supervisor = { uid = cfg.ids.supervisor; group = "drv-supervisor"; isSystemUser = true; };
@@ -554,14 +554,15 @@ in
           "--socket ${appdSocket}"
           "--appd-user drv-appd"
           "--appd-exec '${cfg.package}/bin/drv-appd --config /etc/drv/appd.json'"
-          # drv-appd's privileged helper: forks one sandboxed app per request over the channel
-          # the supervisor made for the two of them, checks UIDs, groups and /run entries
-          # against these lists, and nothing else.
+          # drv-appd's privileged helper: forks once per request over the channel the
+          # supervisor made for the two of them, before reading it; the child builds the
+          # app's root and becomes the UID. Every directory it binds already exists
+          # (tmpfiles, below): it makes and chowns nothing.
           "--forker-user drv-forker"
           "--forker-exec '${forkerExec}'"
           "--forker-dir /run/drv-apps:0711"
           "--forker-dir /var/lib/drv-apps:0711"
-        ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ]
+        ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" ]
           # Every member of the set gets the apps' sandbox (drv_os::sandbox): its /run holds
           # only what is listed for it. The forker's must hold what it binds for the apps.
           ++ map (p: "--forker-expose ${p}") appRun
@@ -662,13 +663,20 @@ in
       };
     };
 
+    # The apps' directories, one set per UID, made here so the forker never makes or chowns
+    # anything: the runtime directory, /tmp and what persists (HOME/.state).
     systemd.tmpfiles.rules = [
       "d /run/drv-apps 0711 drv-forker drv-forker -"
+      "d /run/drv-apps/tmp 0711 drv-forker drv-forker -"
       "d /run/drv-audio 0755 pipewire pipewire -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
       "d ${cfg.files} 0700 drv-portal drv-portal -"
-    ];
+    ] ++ lib.concatMap (app: let u = toString app.uid; in [
+      "d /run/drv-apps/${u} 0700 ${u} ${u} -"
+      "d /run/drv-apps/tmp/${u} 0700 ${u} ${u} -"
+      "d /var/lib/drv-apps/${u} 0700 ${u} ${u} -"
+    ]) (lib.attrValues cfg.apps);
 
   } ]);
 }

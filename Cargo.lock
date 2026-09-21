@@ -1011,7 +1011,7 @@ dependencies = [
  "libc",
  "rustix 1.1.4",
  "serde",
- "toml",
+ "serde_json",
 ]
 
 [[package]]
@@ -1091,7 +1091,7 @@ dependencies = [
  "postcard",
  "rustix 1.1.4",
  "serde",
- "toml",
+ "serde_json",
 ]
 
 [[package]]

@@ -12,13 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::seq;
 
 /// An app, as the manifest describes it. Booleans say what the app is; the forker owns what
-/// each one means on this host (which `/run` entries, which device nodes). Nothing here is a
-/// path the forker has to judge: the store paths are typed by syntax, and any store path is
-/// content an app may be given.
+/// each one means on this host. The only path-shaped field is the closure, and any store
+/// path is content an app may be given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
-    /// A plain identifier: its HOME is `/home/<name>`.
-    pub name: String,
     pub uid: u32,
     /// `argv[0]` is looked up in `PATH` from `env`.
     pub argv: Vec<String>,
@@ -27,15 +24,12 @@ pub struct Launch {
     /// Keep the host network. Otherwise the child gets a new, empty network namespace.
     #[serde(default)]
     pub network: bool,
-    /// The render node, the host's view of it, the driver link.
+    /// The render node and the host's view of it.
     #[serde(default)]
     pub gpu: bool,
     /// The PipeWire and PulseAudio sockets.
     #[serde(default)]
     pub audio: bool,
-    /// A private session bus with the bridge on it: the bridge's socket.
-    #[serde(default)]
-    pub bus: bool,
     /// The app makes code at runtime (a JIT): no MDWE for it.
     #[serde(default)]
     pub jit: bool,

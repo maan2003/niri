@@ -1,4 +1,4 @@
-//! Landlock, raw: what the forker puts an app under. Rules are paths with access bits;
+//! Landlock, raw: what the forker's child puts itself under before it becomes the app. Rules are paths with access bits;
 //! a rule on a directory covers everything beneath it, bind mounts included. Nothing here
 //! is permissive: a kernel without Landlock is an error, not a warning.
 

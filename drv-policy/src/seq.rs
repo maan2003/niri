@@ -42,6 +42,18 @@ pub fn send<T: Serialize>(sock: impl AsFd, msg: &T, fds: &[BorrowedFd<'_>]) -> i
 
 /// One datagram and the fds that came with it.
 pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>)> {
+    let (bytes, fds) = recv_bytes(sock)?;
+    Ok((decode(&bytes)?, fds))
+}
+
+/// A datagram's bytes, undecoded.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+    postcard::from_bytes(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// One datagram as it came: for a receiver that must not decode it itself (the forker's
+/// parent hands the bytes to the child).
+pub fn recv_bytes(sock: impl AsFd) -> io::Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut buf = vec![0u8; MAX_MSG];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_FDS))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -63,9 +75,8 @@ pub fn recv<T: DeserializeOwned>(sock: impl AsFd) -> io::Result<(T, Vec<OwnedFd>
     if msg.flags.contains(rustix::net::ReturnFlags::TRUNC) {
         return Err(io::Error::other("message too large"));
     }
-    let value = postcard::from_bytes(&buf[..msg.bytes])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    Ok((value, fds))
+    buf.truncate(msg.bytes);
+    Ok((buf, fds))
 }
 
 /// A connected pair, close-on-exec.

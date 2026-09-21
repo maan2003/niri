@@ -63,9 +63,6 @@ pub struct AppConfig {
     /// PipeWire and a PulseAudio server of its own.
     #[serde(default)]
     pub audio: bool,
-    /// A private session bus, bridged to the desktop.
-    #[serde(default)]
-    pub bus: bool,
     /// Keep the host network; off means an empty network namespace.
     #[serde(default)]
     pub network: bool,
@@ -256,14 +253,12 @@ impl Appd {
             argv.push(uri.to_owned());
         }
         let launch = Launch {
-            name: app.name.clone(),
             uid: app.uid,
             argv,
             env: self.env_for(app),
             network: app.network,
             gpu: app.gpu,
             audio: app.audio,
-            bus: app.bus,
             jit: app.jit,
             // Inline: the forker mounts and rules, it does not read files.
             closure: app.closure_paths.clone(),
