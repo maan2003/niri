@@ -14,8 +14,10 @@ cargo build --release --locked --target aarch64-unknown-linux-gnu --no-default-f
   -p drv-lock -p drv-menu -p drv-portal 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Checking)'
 out=${OUT:-$state/drv-out}
 rm -rf "$out"; mkdir -p "$out/bin"
+# Debug info stays here (target/); the copies that travel to the M2 keep their symbol table
+# (names in backtraces) but not the line tables: niri alone is 130 MB with them.
 for b in target/aarch64-unknown-linux-gnu/release/*; do
-  [ -f "$b" ] && [ -x "$b" ] && case "$b" in *.d) ;; *) install -m 0755 "$b" "$out/bin/";; esac
+  [ -f "$b" ] && [ -x "$b" ] && case "$b" in *.d) ;; *) llvm-objcopy --strip-debug "$b" "$out/bin/$(basename "$b")" && chmod 0755 "$out/bin/$(basename "$b")";; esac
 done
 cp -r resources "$out/resources"
 ls -la "$out/bin"
