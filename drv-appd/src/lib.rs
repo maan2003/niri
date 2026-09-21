@@ -99,6 +99,9 @@ pub struct AppConfig {
     /// OpenURI portal starts it with the URI as its last argument.
     #[serde(default)]
     pub opens: Vec<String>,
+    /// The app's `/etc`, a store path the system configuration built for it.
+    #[serde(default)]
+    pub etc: Option<String>,
 }
 
 impl AppConfig {
@@ -257,6 +260,8 @@ impl Appd {
             env: self.env_for(app),
             network: app.network,
             expose: app.expose.clone(),
+            etc: app.etc.clone(),
+            gpu: app.gpu,
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)

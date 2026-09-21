@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use clap::Parser;
-use drv_os::sandbox::Sandbox;
+use drv_os::sandbox::{Root, RootSpec};
 use drv_os::{ensure_owned_dir, group_id, own_cgroup};
 use drv_policy::forker::{Launch, Request, Response};
 use drv_policy::seq;
@@ -86,6 +86,16 @@ struct Args {
     /// An entry of `/run` an app may ask for. Repeatable.
     #[arg(long = "expose-optional")]
     optional_expose: Vec<PathBuf>,
+    /// The store: the only executable thing in an app's root.
+    #[arg(long, default_value = "/nix/store")]
+    store: PathBuf,
+    /// The host's generated views of itself (`dev`, `dev-gpu`, `sys`, `sys-gpu`), written
+    /// at boot. Bound into every app's root.
+    #[arg(long, default_value = "/run/drv-host")]
+    host_views: PathBuf,
+    /// The host's resolv.conf, bound over a networked app's own.
+    #[arg(long, default_value = "/etc/resolv.conf")]
+    resolv: PathBuf,
 }
 
 struct Forker {
@@ -100,6 +110,9 @@ struct Forker {
     expose: Vec<PathBuf>,
     /// Entries a request may ask for on top. Anything else asked for is refused.
     optional_expose: Vec<PathBuf>,
+    store: PathBuf,
+    host_views: PathBuf,
+    resolv: PathBuf,
     /// Live children, pid to uid.
     running: Arc<Mutex<HashMap<u32, u32>>>,
 }
@@ -203,7 +216,20 @@ impl Forker {
             let mut expose = self.expose.clone();
             expose.extend(extra_expose);
             expose.push(runtime);
-            sandbox = Some(Sandbox::plan(&expose, launch.network, Some(&tmp))?);
+            // The app's /etc must be a store path; the daemon says which, we check where.
+            let etc = launch.etc.as_ref().map(PathBuf::from);
+            let resolv = self.resolv.canonicalize().ok();
+            sandbox = Some(Root::plan(&RootSpec {
+                store: &self.store,
+                etc: etc.as_deref(),
+                resolv: resolv.as_deref(),
+                views: &self.host_views,
+                gpu: launch.gpu,
+                network: launch.network,
+                run_expose: &expose,
+                tmp: &tmp,
+                home: &home,
+            })?);
         }
         let mut all_gids = vec![gid];
         all_gids.extend(gids);
@@ -325,6 +351,9 @@ fn run(args: Args) -> Result<(), String> {
         home_base: args.home_base,
         expose: args.expose,
         optional_expose: args.optional_expose,
+        store: args.store,
+        host_views: args.host_views,
+        resolv: args.resolv,
         running: Default::default(),
     };
     forker.serve(channel).map_err(|e| format!("channel: {e}"))
@@ -360,8 +389,14 @@ mod tests {
             home_base: dir.join("home"),
             expose: Vec::new(),
             optional_expose: vec![PathBuf::from("/run/allowed")],
+            store: PathBuf::from("/nix/store"),
+            host_views: dir.join("views"),
+            resolv: dir.join("none"),
             running: Default::default(),
         };
+        for view in ["dev", "sys"] {
+            std::fs::create_dir_all(forker.host_views.join(view)).unwrap();
+        }
         let (ours, theirs) = seq::pair().unwrap();
         let _forker = thread::spawn(move || forker.serve(theirs));
         let channel = Channel::new(ours);
@@ -373,6 +408,8 @@ mod tests {
             env: vec![("PATH".into(), path.clone())],
             network: false,
             expose: Vec::new(),
+            etc: None,
+            gpu: false,
         };
 
         let pid = channel

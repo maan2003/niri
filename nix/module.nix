@@ -27,13 +27,60 @@ let
     "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
     "--runtime-base /run/drv-apps"
     "--home-base /var/lib/drv-apps"
+    "--host-views ${hostViews}"
   ] ++ map (g: "--group ${g}") cfg.groups ++ map (p: "--expose ${p}") cfg.expose
     ++ map (p: "--expose-optional ${p}") optionalExpose);
+  hostViews = "/run/drv-host";
+  # What XDG_DATA_DIRS points at: the MIME database and the icon theme's index, from the
+  # store, in place of the whole system profile.
+  appShare = pkgs.buildEnv {
+    name = "drv-app-share";
+    paths = [ pkgs.shared-mime-info pkgs.hicolor-icon-theme ];
+    pathsToLink = [ "/share" ];
+  };
+  # An app's /etc (DESIGN-app-namespace): what glibc, TLS and the toolkits look up, every
+  # entry a store path or a fact about this app. The host's /etc is not there.
+  appEtc = name: app: let
+    gid = g: config.users.groups.${g}.gid or null;
+    groups = lib.filter (g: gid g != null) app.groups;
+    fromHost = n: lib.optionalString (config.environment.etc ? ${n} && config.environment.etc.${n}.enable) ''
+      mkdir -p "$out/$(dirname ${n})"
+      ln -s ${config.environment.etc.${n}.source} "$out/${n}"
+    '';
+  in pkgs.runCommand "drv-etc-${name}" { } ''
+    mkdir "$out"
+    cd "$out"
+    echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:/var/lib/drv-apps/${toString app.uid}:${pkgs.shadow}/bin/nologin" > passwd
+    {
+      echo "app-${name}:x:${toString app.uid}:"
+      ${lib.concatMapStrings (g: ''echo "${g}:x:${toString (gid g)}:app-${name}"
+      '') groups}
+    } > group
+    printf 'passwd: files
+group: files
+hosts: files${lib.optionalString app.network " dns"}
+' > nsswitch.conf
+    printf '127.0.0.1 localhost
+::1 localhost
+' > hosts
+    echo ${builtins.hashString "md5" "drv-app-${name}"} > machine-id
+    ln -s ${pkgs.tzdata}/share/zoneinfo zoneinfo
+    ln -s zoneinfo/${if config.time.timeZone != null then config.time.timeZone else "UTC"} localtime
+    ${lib.optionalString app.network ''
+      # Bound over with the host's at launch.
+      : > resolv.conf
+      mkdir -p ssl/certs
+      ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-bundle.crt
+      ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-certificates.crt
+    ''}
+    ${lib.concatMapStrings fromHost (cfg.etc ++ app.etc)}
+  '';
   rangeEnd = cfg.uidRange.start + cfg.uidRange.count;
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
     inherit (app) uid groups gpu network globals grants autostart menu opens;
+    etc = "${appEtc name app}";
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
       PULSE_SERVER = "unix:${pulseDir name}/native";
@@ -42,7 +89,9 @@ let
     # A private bus is a compat shim: the bridge on it forwards to the services' bus, which
     # keys everything on the app's UID.
     exec = lib.optionals app.bus [
-      "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon" "--"
+      "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
+      # Its configuration from the store: the app's /etc has no dbus-1.
+      "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
       "${cfg.package}/bin/drv-bridge" "app" "--"
     ] ++ app.exec;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
@@ -132,8 +181,13 @@ in
     };
     expose = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" "/run/current-system" ];
+      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" ];
       description = "Entries of /run apps may see; the rest of /run is hidden.";
+    };
+    etc = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "fonts" "os-release" ];
+      description = "Entries of the host's /etc (environment.etc names) copied into every app's /etc, which is otherwise generated per app.";
     };
     files = lib.mkOption {
       type = lib.types.str;
@@ -146,7 +200,7 @@ in
         DRV_BRIDGE_SOCKET = bridgeSocket;
         DRV_APPD_SOCKET = appdSocket;
         XDG_SESSION_TYPE = "wayland";
-        XDG_DATA_DIRS = "/run/current-system/sw/share";
+        XDG_DATA_DIRS = "${appShare}/share";
         # GTK asks the portal for files instead of browsing a home that holds nothing.
         GTK_USE_PORTAL = "1";
       };
@@ -189,6 +243,11 @@ in
             type = lib.types.bool;
             default = false;
             description = "PipeWire and a PulseAudio server of its own: playback freely, capture when the person allows it.";
+          };
+          etc = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = "Further entries of the host's /etc for this app.";
           };
           expose = lib.mkOption {
             type = lib.types.listOf lib.types.str;
@@ -389,10 +448,78 @@ in
     # restarts what dies; their logs land here. The compositor's environment is exactly what
     # is listed. Not root: it holds the union of what its children keep plus what switching
     # them takes, and nothing outside that bounding set.
+    # The host's views of itself for the apps' roots (DESIGN-app-namespace): a /dev of the
+    # basic nodes, a /dev/dri of the render nodes, and a /sys of what Mesa and libdrm read
+    # (the render node's device and its bus, the CPU topology), copied out of the real ones
+    # once. The forker binds them; the real /dev and /sys never enter an app.
+    systemd.services.drv-host-views = {
+      wantedBy = [ "multi-user.target" ];
+      after = [ "systemd-udevd.service" "local-fs.target" ];
+      before = [ "drv-supervisor.service" ];
+      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+      path = [ pkgs.coreutils ];
+      script = ''
+        set -eu
+        T=$(mktemp -d ${hostViews}.XXXXXX)
+        chmod 755 "$T"
+        mkdir -p "$T"/dev/shm "$T"/dev/dri "$T"/dev-gpu/dri "$T"/sys "$T"/sys-gpu
+        for n in null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9; do
+          IFS=: read -r name maj min <<< "$n"
+          mknod -m 666 "$T/dev/$name" c "$maj" "$min"
+        done
+        ln -s /proc/self/fd "$T"/dev/fd
+        for i in 0:stdin 1:stdout 2:stderr; do ln -s "/proc/self/fd/''${i%%:*}" "$T/dev/''${i##*:}"; done
+        # One entry of the real /sys, at the same place: links as links, files by content.
+        take() {
+          local dst="$1''${2#/sys}"
+          if [ -L "$2" ]; then mkdir -p "$(dirname "$dst")"; cp -P "$2" "$dst"
+          elif [ -d "$2" ]; then mkdir -p "$dst"
+          elif [ -f "$2" ]; then mkdir -p "$(dirname "$dst")"; cp "$2" "$dst" 2>/dev/null || true
+          fi
+        }
+        # The CPU topology: counts, capacities, caches (Mesa and the toolkits size their
+        # thread pools from them). Once, then the same tree for both views.
+        cpu=/sys/devices/system/cpu
+        for f in possible online present kernel_max; do take "$T"/sys $cpu/$f; done
+        for c in $cpu/cpu[0-9]*; do
+          take "$T"/sys "$c"/cpu_capacity
+          for d in topology cache; do
+            [ -d "$c/$d" ] || continue
+            mkdir -p "$T/sys''${c#/sys}/$d"
+            cp -rP --no-preserve=all "$c/$d"/. "$T/sys''${c#/sys}/$d/" 2>/dev/null || true
+          done
+        done
+        cp -rP --no-preserve=all "$T"/sys/. "$T"/sys-gpu/
+        for r in /dev/dri/renderD*; do
+          [ -e "$r" ] || continue
+          cp -a "$r" "$T"/dev-gpu/dri/
+          link=/sys/dev/char/$(printf '%d:%d' "0x$(stat -c %t "$r")" "0x$(stat -c %T "$r")")
+          take "$T"/sys-gpu "$link"
+          node=$(readlink -f "$link")
+          for f in "$node"/dev "$node"/uevent "$node"/device "$node"/subsystem; do take "$T"/sys-gpu "$f"; done
+          dev=$(readlink -f "$node"/device)
+          while [ "$dev" != /sys/devices ] && [ "$dev" != /sys ] && [ "$dev" != / ]; do
+            for f in uevent subsystem driver vendor device subsystem_vendor subsystem_device revision class modalias; do
+              [ -e "$dev/$f" ] && take "$T"/sys-gpu "$dev/$f"
+            done
+            if [ -e "$dev"/of_node/compatible ]; then
+              mkdir -p "$T/sys-gpu''${dev#/sys}/of_node"
+              cp "$dev"/of_node/compatible "$T/sys-gpu''${dev#/sys}/of_node/"
+            fi
+            dev=$(dirname "$dev")
+          done
+        done
+        rm -rf ${hostViews}.old
+        [ -e ${hostViews} ] && mv ${hostViews} ${hostViews}.old
+        mv "$T" ${hostViews}
+        rm -rf ${hostViews}.old
+      '';
+    };
+
     systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-session-bus.service" ];
-      requires = [ "drv-session-bus.service" ];
+      after = [ "drv-session-bus.service" "drv-host-views.service" ];
+      requires = [ "drv-session-bus.service" "drv-host-views.service" ];
       serviceConfig = {
         User = "drv-supervisor";
         # setuid/setgid/setpcap: become each child's user with its own bounding set; chown:
@@ -417,7 +544,7 @@ in
         ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ]
           # Every member of the set gets the apps' sandbox (drv_os::sandbox): its /run holds
           # only what is listed for it. The forker's must hold what it binds for the apps.
-          ++ map (p: "--forker-expose ${p}") (lib.unique ([ "/run/drv-apps" ] ++ cfg.expose ++ optionalExpose))
+          ++ map (p: "--forker-expose ${p}") (lib.unique ([ "/run/drv-apps" hostViews ] ++ cfg.expose ++ optionalExpose))
           ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
           # udev: libinput initialises the evdev devices seatd hands over from udev's database.
           ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/drv-session" "/run/pipewire" ]

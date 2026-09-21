@@ -26,6 +26,12 @@ pub struct Launch {
     /// must be on the forker's optional list.
     #[serde(default)]
     pub expose: Vec<String>,
+    /// The app's `/etc`: a store path built from its manifest entry, bound read-only.
+    #[serde(default)]
+    pub etc: Option<String>,
+    /// The render node and the host's view of it.
+    #[serde(default)]
+    pub gpu: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
