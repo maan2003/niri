@@ -28,8 +28,7 @@ let
     "--runtime-base /run/drv-apps"
     "--home-base /var/lib/drv-apps"
     "--host-views ${hostViews}"
-  ] ++ map (g: "--group ${g}") cfg.groups ++ map (p: "--expose ${p}") cfg.expose
-    ++ map (p: "--expose-optional ${p}") optionalExpose);
+  ]);
   hostViews = "/run/drv-host";
   # What XDG_DATA_DIRS points at: the MIME database and the icon theme's index, from the
   # store, in place of the whole system profile.
@@ -49,15 +48,14 @@ let
       ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
-  # The command, as launched. In front of the app's own: the state linker when it keeps
-  # anything (its state directories under $HOME/.state, linked from HOME, with the HOME
-  # defaults) and, for a private bus, the compat shim (the bridge on it forwards to the
+  # The command, as launched. In front of the app's own: the linker (its /etc from the store,
+  # its state directories under $HOME/.state linked from HOME, the HOME defaults) and, for a
+  # private bus, the compat shim (the bridge on it forwards to the
   # services' bus, which keys everything on the app's UID).
-  appExec = name: app: lib.optionals (app.state != [ ] || app.files != { }) (
-      [ "${cfg.package}/bin/drv-trampoline" ]
+  appExec = name: app: [ "${cfg.package}/bin/drv-trampoline" "--etc" "${appEtc name app}" ]
       ++ lib.concatMap (s: [ "--state" s ]) app.state
       ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ]
-      ++ [ "--" ])
+      ++ [ "--" ]
     ++ lib.optionals app.bus [
       "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
       # Its configuration from the store: the app's /etc has no dbus-1.
@@ -74,8 +72,6 @@ let
   # An app's /etc (DESIGN-app-namespace): what glibc, TLS and the toolkits look up, every
   # entry a store path or a fact about this app. The host's /etc is not there.
   appEtc = name: app: let
-    gid = g: config.users.groups.${g}.gid or null;
-    groups = lib.filter (g: gid g != null) app.groups;
     fromHost = n: lib.optionalString (config.environment.etc ? ${n} && config.environment.etc.${n}.enable) ''
       mkdir -p "$out/$(dirname ${n})"
       ln -s ${config.environment.etc.${n}.source} "$out/${n}"
@@ -84,11 +80,7 @@ let
     mkdir "$out"
     cd "$out"
     echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:/var/lib/drv-apps/${toString app.uid}:${pkgs.shadow}/bin/nologin" > passwd
-    {
-      echo "app-${name}:x:${toString app.uid}:"
-      ${lib.concatMapStrings (g: ''echo "${g}:x:${toString (gid g)}:app-${name}"
-      '') groups}
-    } > group
+    echo "app-${name}:x:${toString app.uid}:" > group
     printf 'passwd: files
 group: files
 hosts: files${lib.optionalString app.network " dns"}
@@ -100,8 +92,8 @@ hosts: files${lib.optionalString app.network " dns"}
     ln -s ${pkgs.tzdata}/share/zoneinfo zoneinfo
     ln -s zoneinfo/${if config.time.timeZone != null then config.time.timeZone else "UTC"} localtime
     ${lib.optionalString app.network ''
-      # Bound over with the host's at launch.
-      : > resolv.conf
+      # The forker puts the host's live one there for a networked app.
+      ln -s /run/host/resolv.conf resolv.conf
       mkdir -p ssl/certs
       ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-bundle.crt
       ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-certificates.crt
@@ -112,15 +104,12 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid groups gpu network globals grants autostart menu opens;
-    etc = "${appEtc name app}";
+    inherit (app) uid gpu network audio bus jit globals grants autostart menu opens;
     closure = "${appClosure name app}/store-paths";
-    inherit (app) jit;
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
       PULSE_SERVER = "unix:${pulseDir name}/native";
     };
-    expose = app.expose ++ lib.optionals app.audio [ "/run/drv-audio" "/run/drv-pulse" ];
     exec = appExec name app;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = toml.generate "appd.toml" {
@@ -132,8 +121,10 @@ hosts: files${lib.optionalString app.network " dns"}
       { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
-  # Everything any app may ask to see; the spawner refuses anything else.
-  optionalExpose = lib.unique (lib.concatMap (a: a.expose ++ lib.optionals a.audio [ "/run/drv-audio" "/run/drv-pulse" ]) (lib.attrValues cfg.apps));
+  # What the forker binds into apps' roots (its own view has to hold them): the layout its
+  # feature table names, plus the audio sockets when any app has audio.
+  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" ]
+    ++ lib.optionals (lib.any (a: a.audio) (lib.attrValues cfg.apps)) [ "/run/drv-audio" "/run/drv-pulse" ];
   # The services' bus: distinct UIDs, so the bus itself says who may own what: the
   # notification daemon its name, nobody else anything.
   sessionBusConfig = pkgs.writeText "drv-session-bus.conf" ''
@@ -202,16 +193,6 @@ in
       start = lib.mkOption { type = lib.types.int; default = 100000; };
       count = lib.mkOption { type = lib.types.int; default = 1000; };
     };
-    groups = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ "render" ];
-      description = "Supplementary groups the spawner may hand out to apps.";
-    };
-    expose = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" ];
-      description = "Entries of /run apps may see; the rest of /run is hidden.";
-    };
     etc = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ "fonts" "os-release" ];
@@ -255,7 +236,6 @@ in
             default = [ name ];
             description = "Program and arguments; the only arguments the app ever gets.";
           };
-          groups = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           gpu = lib.mkOption { type = lib.types.bool; default = false; };
           network = lib.mkOption {
             type = lib.types.bool;
@@ -292,11 +272,6 @@ in
             type = lib.types.bool;
             default = false;
             description = "The app makes code at runtime (a browser's JIT): it is not held to W^X memory.";
-          };
-          expose = lib.mkOption {
-            type = lib.types.listOf lib.types.str;
-            default = [ ];
-            description = "Extra entries of /run this app sees.";
           };
           globals = lib.mkOption { type = lib.types.listOf lib.types.str; default = [ ]; };
           grants = lib.mkOption {
@@ -536,7 +511,8 @@ in
         cp -rP --no-preserve=all "$T"/sys/. "$T"/sys-gpu/
         for r in /dev/dri/renderD*; do
           [ -e "$r" ] || continue
-          cp -a "$r" "$T"/dev-gpu/dri/
+          # A render node is safe for anyone (that is what render nodes are for): no group.
+          cp -a "$r" "$T"/dev-gpu/dri/ && chmod 666 "$T"/dev-gpu/dri/"$(basename "$r")"
           link=/sys/dev/char/$(printf '%d:%d' "0x$(stat -c %t "$r")" "0x$(stat -c %T "$r")")
           take "$T"/sys-gpu "$link"
           node=$(readlink -f "$link")
@@ -588,7 +564,7 @@ in
         ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" "chown" ]
           # Every member of the set gets the apps' sandbox (drv_os::sandbox): its /run holds
           # only what is listed for it. The forker's must hold what it binds for the apps.
-          ++ map (p: "--forker-expose ${p}") (lib.unique ([ "/run/drv-apps" hostViews ] ++ cfg.expose ++ optionalExpose))
+          ++ map (p: "--forker-expose ${p}") appRun
           ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
           # udev: libinput initialises the evdev devices seatd hands over from udev's database.
           ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/drv-session" "/run/pipewire" ]

@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
 use clap::Parser;
-use drv_os::approot::{AppRoot, Spec};
-use drv_os::{ensure_owned_dir, group_id, own_cgroup};
+use drv_os::approot::{AppRoot, RunEntry, Spec};
+use drv_os::{ensure_owned_dir, own_cgroup};
 use drv_policy::forker::{Launch, Request, Response};
 use drv_policy::seq;
 use rustix::fs::{Gid, Mode, Uid};
@@ -68,22 +68,12 @@ struct Args {
     /// `start:count`: the UIDs apps may run as.
     #[arg(long)]
     range: String,
-    /// A supplementary group an app may be given. Repeatable.
-    #[arg(long = "group")]
-    groups: Vec<String>,
     /// Per-UID `XDG_RUNTIME_DIR` parent.
     #[arg(long, default_value = "/run/drv-apps")]
     runtime_base: PathBuf,
     /// Per-UID `HOME` parent.
     #[arg(long, default_value = "/var/lib/drv-apps")]
     home_base: PathBuf,
-    /// An entry of `/run` apps may see (a directory to bind mount or a symlink to recreate).
-    /// Repeatable. Apps get a fresh `/run` with only these plus their own runtime directory.
-    #[arg(long = "expose")]
-    expose: Vec<PathBuf>,
-    /// An entry of `/run` an app may ask for. Repeatable.
-    #[arg(long = "expose-optional")]
-    optional_expose: Vec<PathBuf>,
     /// The store: the only executable thing in an app's root.
     #[arg(long, default_value = "/nix/store")]
     store: PathBuf,
@@ -91,23 +81,29 @@ struct Args {
     /// at boot. Bound into every app's root.
     #[arg(long, default_value = "/run/drv-host")]
     host_views: PathBuf,
-    /// The host's resolv.conf, bound over a networked app's own.
+    /// The host's resolv.conf, at `/run/host/resolv.conf` for a networked app.
     #[arg(long, default_value = "/etc/resolv.conf")]
     resolv: PathBuf,
 }
+
+/// The layout of `/run` as the system configuration makes it: what each feature of an app
+/// means, in one place. Every app: the appd socket and the apps' Wayland socket, its own
+/// runtime directory, the documents mount (writable: what it saves goes there).
+const RUN_ALWAYS: &[&str] = &["/run/drv", "/run/drv-wayland"];
+const RUN_DOCS: &str = "/run/drv-doc";
+/// `bus`: the bridge's socket, which its private bus forwards to.
+const RUN_BUS: &[&str] = &["/run/drv-bridge"];
+/// `gpu`: the driver link into the store.
+const RUN_GPU: &[&str] = &["/run/opengl-driver"];
+/// `audio`: PipeWire's apps socket and the per-app PulseAudio servers.
+const RUN_AUDIO: &[&str] = &["/run/drv-audio", "/run/drv-pulse"];
 
 struct Forker {
     /// UIDs a request may name: `[start, start + count)`. Never root, never a service.
     start: u32,
     count: u32,
-    /// Group names resolved at startup, so a request can only name what is listed here.
-    groups: Vec<(String, u32)>,
     runtime_base: PathBuf,
     home_base: PathBuf,
-    /// Entries of `/run` every app may see. Everything else under `/run` is hidden.
-    expose: Vec<PathBuf>,
-    /// Entries a request may ask for on top. Anything else asked for is refused.
-    optional_expose: Vec<PathBuf>,
     store: PathBuf,
     host_views: PathBuf,
     resolv: PathBuf,
@@ -146,6 +142,9 @@ impl Forker {
         if launch.argv.is_empty() {
             return Err("empty argv".to_owned());
         }
+        // The typed fields: the name is an identifier, the UID is ours to give, the closure
+        // is store paths. After these, construction cannot fail for a security reason.
+        let home = home_of(&launch.name)?;
         let uid = launch.uid;
         let privileged = privileged();
         // Unprivileged (tests): can only fork as ourselves, with no sandbox and no cgroup.
@@ -156,25 +155,10 @@ impl Forker {
         if !as_self && !privileged {
             return Err("forker is unprivileged, can only fork as itself".to_owned());
         }
-        let mut extra_expose = Vec::new();
-        for path in &launch.expose {
-            let path = PathBuf::from(path);
-            if !self.optional_expose.contains(&path) {
-                return Err(format!(
-                    "{} is not on the forker's optional expose list",
-                    path.display()
-                ));
-            }
-            extra_expose.push(path);
-        }
-        let mut gids = Vec::new();
-        for name in &launch.groups {
-            let (_, gid) = self
-                .groups
-                .iter()
-                .find(|(n, _)| n == name)
-                .ok_or_else(|| format!("group {name:?} is not on the forker's list"))?;
-            gids.push(*gid);
+        // The one field that is a path: typed by syntax. Any store path is content an app
+        // may be given; nothing outside the store is.
+        for path in &launch.closure {
+            self.store_path(path)?;
         }
         // One cgroup per app UID under our own delegated subtree, so killing an app is killing
         // a cgroup. Unprivileged (tests) has no subtree to write.
@@ -202,38 +186,32 @@ impl Forker {
         if !as_self {
             let runtime = self.owned_dir(&self.runtime_base, uid, gid)?;
             let state = self.owned_dir(&self.home_base, uid, gid)?;
-            let home = home_of(&launch.name)?;
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
             home_dir = Some(home.clone());
             // Its /tmp outlives a launch (beside the runtime dirs, so gone with the boot): a
             // second launch of the app finds the first one's single-instance socket there.
             let tmp = self.owned_dir(&self.runtime_base.join("tmp"), uid, gid)?;
-            let mut expose = self.expose.clone();
-            expose.extend(extra_expose);
-            // Its runtime directory and the documents mount are written; the rest of /run read.
-            let mut writable = vec![runtime.clone()];
-            writable.extend(expose.iter().filter(|p| p.ends_with("drv-doc")).cloned());
-            expose.push(runtime);
-            // The app's /etc and closure list: the daemon says which, we check they are in
-            // the store (anything in the store is something any app could be given).
-            let etc = launch.etc.as_deref().map(|p| self.in_store(p)).transpose()?;
-            let closure = launch.closure.as_deref().map(|p| self.in_store(p)).transpose()?;
-            let resolv = self.resolv.canonicalize().ok();
+            // What its features mean under /run.
+            let mut run = vec![RunEntry { path: &runtime, writable: true }, RunEntry { path: Path::new(RUN_DOCS), writable: true }];
+            let features = [(true, RUN_ALWAYS), (launch.bus, RUN_BUS), (launch.gpu, RUN_GPU), (launch.audio, RUN_AUDIO)];
+            for (on, paths) in features {
+                if on {
+                    run.extend(paths.iter().map(|p| RunEntry { path: Path::new(p), writable: false }));
+                }
+            }
             let prepared = AppRoot::prepare(&Spec {
                 store: &self.store,
-                etc: etc.as_deref(),
-                resolv: resolv.as_deref(),
+                resolv: &self.resolv,
                 views: &self.host_views,
                 gpu: launch.gpu,
                 network: launch.network,
-                run_expose: &expose,
-                run_writable: &writable,
+                run: &run,
                 tmp: &tmp,
                 home: &home,
                 state: &state,
                 uid,
                 gid,
-                closure: closure.as_deref(),
+                closure: &launch.closure,
                 jit: launch.jit,
             })
             .map_err(|e| format!("root: {e}"))?;
@@ -242,8 +220,8 @@ impl Forker {
             }
             root = Some(prepared);
         }
-        let mut all_gids = vec![Gid::from_raw(gid)];
-        all_gids.extend(gids.into_iter().map(Gid::from_raw));
+        // Its own group and nothing else (set explicitly: gid 0 would see through hidepid).
+        let all_gids = vec![Gid::from_raw(gid)];
         let switch_uid = privileged;
 
         // SAFETY: only async-signal-safe calls between fork and exec.
@@ -302,13 +280,18 @@ impl Forker {
         Ok(pid)
     }
 
-    /// `path`, resolved, if it is in the store.
-    fn in_store(&self, path: &str) -> Result<PathBuf, String> {
-        let real = Path::new(path).canonicalize().map_err(|e| format!("{path}: {e}"))?;
-        if !real.starts_with(&self.store) {
-            return Err(format!("{path}: not in the store"));
+    /// `path` is `<store>/<one entry>`: a type check, no lookup.
+    fn store_path(&self, path: &str) -> Result<(), String> {
+        let ok = Path::new(path)
+            .strip_prefix(&self.store)
+            .ok()
+            .and_then(|rest| rest.to_str())
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/') && !rest.starts_with('.'));
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("{path:?}: not a store path"))
         }
-        Ok(real)
     }
 
     /// `<base>/<uid>`, mode 0700, owned by the UID. Created on first launch.
@@ -388,19 +371,11 @@ fn run(args: Args) -> Result<(), String> {
         .and_then(|mut fds| fds.socket("channel", drv_os::fds::Kind::SeqPacket))
         .map_err(|e| format!("the channel from the supervisor: {e}"))?;
     let (start, count) = parse_range(&args.range)?;
-    let groups = args
-        .groups
-        .iter()
-        .map(|name| Ok((name.clone(), group_id(name)?)))
-        .collect::<Result<Vec<_>, String>>()?;
     let forker = Forker {
         start,
         count,
-        groups,
         runtime_base: args.runtime_base,
         home_base: args.home_base,
-        expose: args.expose,
-        optional_expose: args.optional_expose,
         store: args.store,
         host_views: args.host_views,
         resolv: args.resolv,
@@ -434,11 +409,8 @@ mod tests {
         let forker = Forker {
             start: 0,
             count: 0,
-            groups: Vec::new(),
             runtime_base: dir.join("run"),
             home_base: dir.join("home"),
-            expose: Vec::new(),
-            optional_expose: vec![PathBuf::from("/run/allowed")],
             store: PathBuf::from("/nix/store"),
             host_views: dir.join("views"),
             resolv: dir.join("none"),
@@ -451,47 +423,36 @@ mod tests {
         let _forker = thread::spawn(move || forker.serve(theirs));
         let channel = Channel::new(ours);
         let path = std::env::var("PATH").unwrap();
-        let launch = |uid, groups: Vec<&str>, argv: Vec<&str>| Launch {
+        let launch = |uid, argv: Vec<&str>| Launch {
+            name: "test".into(),
             uid,
-            groups: groups.into_iter().map(String::from).collect(),
             argv: argv.into_iter().map(String::from).collect(),
             env: vec![("PATH".into(), path.clone())],
             network: false,
-            expose: Vec::new(),
-            etc: None,
             gpu: false,
-            name: "test".into(),
-            closure: None,
+            audio: false,
+            bus: false,
             jit: false,
+            closure: vec!["/nix/store/00000000000000000000000000000000-fine".into()],
         };
 
-        let pid = channel
-            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]))
-            .unwrap();
+        let pid = channel.launch(&launch(uid, vec!["sh", "-c", "exit 0"])).unwrap();
         assert!(pid > 0);
 
-        let err = channel
-            .launch(&launch(uid, vec!["render"], vec!["sh"]))
-            .unwrap_err();
-        assert!(err.to_string().contains("forker's list"), "{err}");
-
-        let err = channel
-            .launch(&launch(uid.wrapping_add(1), vec![], vec!["sh"]))
-            .unwrap_err();
+        let err = channel.launch(&launch(uid.wrapping_add(1), vec!["sh"])).unwrap_err();
         assert!(err.to_string().contains("outside"), "{err}");
 
-        let err = channel
-            .launch(&Launch {
-                expose: vec!["/run/secret".into()],
-                ..launch(uid, vec![], vec!["sh"])
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("optional expose"), "{err}");
+        for bad in ["/var/lib/drv-apps/100005", "/nix/store", "/nix/store/x/../../etc", "/nix/store/.hidden"] {
+            let err = channel
+                .launch(&Launch { closure: vec![bad.into()], ..launch(uid, vec!["sh"]) })
+                .unwrap_err();
+            assert!(err.to_string().contains("not a store path"), "{bad}: {err}");
+        }
+        let err = channel.launch(&Launch { name: "../x".into(), ..launch(uid, vec!["sh"]) }).unwrap_err();
+        assert!(err.to_string().contains("app name"), "{err}");
 
         // The channel survives refusals: still answering.
-        channel
-            .launch(&launch(uid, vec![], vec!["sh", "-c", "exit 0"]))
-            .unwrap();
+        channel.launch(&launch(uid, vec!["sh", "-c", "exit 0"])).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

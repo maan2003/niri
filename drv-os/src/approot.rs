@@ -10,7 +10,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{chownat, mkdirat, symlinkat, AtFlags, Gid, Mode, Uid};
+use rustix::fs::{chownat, mkdirat, symlinkat, AtFlags, Gid, Mode, OFlags, Uid};
 use rustix::mount::{
     fsconfig_create, fsconfig_set_string, fsmount, fsopen, mount_change, move_mount, open_tree,
     unmount, FsMountFlags, FsOpenFlags, MountAttrFlags, MountPropagationFlags, MoveMountFlags,
@@ -99,22 +99,24 @@ fn mkdir_p(dir: &OwnedFd, rel: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// An entry of the host's `/run` an app sees.
+pub struct RunEntry<'a> {
+    pub path: &'a Path,
+    pub writable: bool,
+}
+
 /// What the forker knows about the app; everything else is fixed here.
 pub struct Spec<'a> {
     /// `/nix/store`.
     pub store: &'a Path,
-    /// The app's `/etc`, a store path.
-    pub etc: Option<&'a Path>,
-    /// The host's resolv.conf (its final target), bound over the app's when it has the network.
-    pub resolv: Option<&'a Path>,
+    /// The host's resolv.conf, at `/run/host/resolv.conf` inside when the app has the network.
+    pub resolv: &'a Path,
     /// `/run/drv-host`: `dev`, `dev-gpu`, `sys`, `sys-gpu`, written by the host at boot.
     pub views: &'a Path,
     pub gpu: bool,
     pub network: bool,
-    /// Entries under `/run` to keep, the app's own runtime directory among them.
-    pub run_expose: &'a [PathBuf],
-    /// Entries of `run_expose` the app writes (its runtime directory, the documents mount).
-    pub run_writable: &'a [PathBuf],
+    /// Entries under `/run` to keep (the app's own runtime directory among them).
+    pub run: &'a [RunEntry<'a>],
     /// The app's `/tmp`, kept for the boot.
     pub tmp: &'a Path,
     /// HOME: `/home/<name>`, a fresh size-capped tmpfs owned by the UID.
@@ -123,8 +125,8 @@ pub struct Spec<'a> {
     pub state: &'a Path,
     pub uid: libc::uid_t,
     pub gid: libc::gid_t,
-    /// The store paths the app may open: a file listing them, one per line.
-    pub closure: Option<&'a Path>,
+    /// The store paths the app may open. Already checked to be store paths.
+    pub closure: &'a [String],
     /// A JIT inside: no MDWE.
     pub jit: bool,
 }
@@ -148,6 +150,9 @@ impl AppRoot {
         // Device nodes live here, so no NODEV.
         let dev = A::MOUNT_ATTR_RDONLY | A::MOUNT_ATTR_NOSUID | A::MOUNT_ATTR_NOEXEC;
         let rel = |p: &Path| p.strip_prefix("/").unwrap_or(p).to_path_buf();
+        let own = |fd: &OwnedFd| -> io::Result<()> {
+            Ok(chownat(fd, "", Some(Uid::from_raw(spec.uid)), Some(Gid::from_raw(spec.gid)), AtFlags::EMPTY_PATH)?)
+        };
 
         let root = ctx(new_fs("tmpfs", &[("mode", "0755")], A::MOUNT_ATTR_NOSUID | A::MOUNT_ATTR_NODEV), || "root tmpfs".into())?;
         let rules = Ruleset::new()?;
@@ -158,93 +163,79 @@ impl AppRoot {
         mkdir_p(&root, &store)?;
         attach(ctx(clone_tree(spec.store, ro), || "store".into())?, &root, &store)?;
         let mut missing = 0;
-        if let Some(closure) = spec.closure {
-            let list = ctx(std::fs::read_to_string(closure), || format!("closure {}", closure.display()))?;
-            for line in list.lines().filter(|l| !l.is_empty()) {
-                if !rules.allow(Path::new(line), landlock::READ | landlock::EXECUTE)? {
-                    missing += 1;
-                }
+        for path in spec.closure {
+            if !rules.allow(Path::new(path), landlock::READ | landlock::EXECUTE)? {
+                missing += 1;
             }
         }
 
-        // 2. Host views: /etc from the store, /dev and /sys from the boot-time generator.
-        if let Some(etc) = spec.etc {
-            mkdir_p(&root, Path::new("etc"))?;
-            attach(ctx(clone_tree(etc, ro_noexec), || "etc".into())?, &root, Path::new("etc"))?;
-            if spec.network {
-                if let Some(resolv) = spec.resolv {
-                    if etc.join("resolv.conf").exists() {
-                        attach(ctx(clone_tree(resolv, ro_noexec), || "resolv.conf".into())?, &root, Path::new("etc/resolv.conf"))?;
-                    }
-                }
-            }
-            rules.allow_at(&root, Path::new("etc"), landlock::READ)?;
-        }
-        let view = |name: &str| -> io::Result<PathBuf> {
-            let p = spec.views.join(name);
-            if !p.is_dir() {
-                return Err(io::Error::new(io::ErrorKind::NotFound, format!("host view {} is missing (drv-host-views not run?)", p.display())));
-            }
-            Ok(p)
+        // 2. Host views: /dev and /sys from the boot-time generator, the live resolv.conf.
+        let view = |name: &str, attrs| {
+            ctx(clone_tree(&spec.views.join(name), attrs), || format!("host view {name} (drv-host-views not run?)"))
         };
         mkdir_p(&root, Path::new("dev"))?;
-        attach(clone_tree(&view("dev")?, dev)?, &root, Path::new("dev"))?;
+        attach(view("dev", dev)?, &root, Path::new("dev"))?;
         if spec.gpu {
-            attach(clone_tree(&view("dev-gpu")?.join("dri"), dev)?, &root, Path::new("dev/dri"))?;
+            attach(view("dev-gpu/dri", dev)?, &root, Path::new("dev/dri"))?;
         }
         attach(new_fs("tmpfs", &[("mode", "1777")], A::MOUNT_ATTR_NOSUID | A::MOUNT_ATTR_NODEV)?, &root, Path::new("dev/shm"))?;
         rules.allow_at(&root, Path::new("dev"), landlock::READ | landlock::WRITE_FILE | landlock::IOCTL_DEV)?;
         rules.allow_at(&root, Path::new("dev/shm"), all)?;
         mkdir_p(&root, Path::new("sys"))?;
-        attach(clone_tree(&view(if spec.gpu { "sys-gpu" } else { "sys" })?, ro_noexec)?, &root, Path::new("sys"))?;
+        attach(view(if spec.gpu { "sys-gpu" } else { "sys" }, ro_noexec)?, &root, Path::new("sys"))?;
         rules.allow_at(&root, Path::new("sys"), landlock::READ)?;
         // The kernel's view of the app's own processes. Its own instance (each proc mount is
         // one since 5.8), so the rule must come from this one.
         mkdir_p(&root, Path::new("proc"))?;
         attach(ctx(new_fs("proc", &[("hidepid", "invisible")], rw_noexec), || "proc".into())?, &root, Path::new("proc"))?;
         rules.allow_at(&root, Path::new("proc"), landlock::READ | landlock::WRITE_FILE)?;
+        mkdir_p(&root, Path::new("run"))?;
+        if spec.network {
+            mkdir_p(&root, Path::new("run/host"))?;
+            let f = rustix::fs::openat(&root, "run/host/resolv.conf", OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC, Mode::from_raw_mode(0o644))?;
+            drop(f);
+            attach(ctx(clone_tree(spec.resolv, ro_noexec), || "resolv.conf".into())?, &root, Path::new("run/host/resolv.conf"))?;
+            rules.allow_at(&root, Path::new("run/host"), landlock::READ)?;
+        }
 
-        // 3. State: HOME is a tmpfs of the app's own; what persists sits at .state inside
-        // it. The tmpfs is ours until the state directory is made, then the app's.
+        // 3. The app's own: /etc (filled by the linker from the store), HOME (a tmpfs with
+        // what persists at .state inside), /tmp. The rules before the chowns: once a
+        // directory is the app's 0700, we cannot look inside.
+        let etc = ctx(new_fs("tmpfs", &[("mode", "0755")], rw_noexec), || "etc tmpfs".into())?;
+        rules.allow_at(&etc, Path::new("."), all)?;
+        own(&etc)?;
+        mkdir_p(&root, Path::new("etc"))?;
+        attach(etc, &root, Path::new("etc"))?;
         let home = ctx(new_fs("tmpfs", &[("mode", "0700"), ("size", "256m")], rw_noexec), || "home tmpfs".into())?;
         mkdir_p(&home, Path::new(".state"))?;
         attach(ctx(clone_tree(spec.state, rw_noexec), || "state".into())?, &home, Path::new(".state"))?;
-        // The rule before the chown: once it is the app's 0700, we cannot look inside.
         rules.allow_at(&home, Path::new("."), all)?;
-        ctx(
-            chownat(&home, "", Some(Uid::from_raw(spec.uid)), Some(Gid::from_raw(spec.gid)), AtFlags::EMPTY_PATH).map_err(Into::into),
-            || "chown home".into(),
-        )?;
+        own(&home)?;
         let home_rel = rel(spec.home);
         mkdir_p(&root, &home_rel)?;
         attach(home, &root, &home_rel)?;
-
-        // 4. Runtime: /tmp, and /run holding only the exposed entries.
         mkdir_p(&root, Path::new("tmp"))?;
         attach(ctx(clone_tree(spec.tmp, rw_noexec), || "tmp".into())?, &root, Path::new("tmp"))?;
         rules.allow_at(&root, Path::new("tmp"), all)?;
-        mkdir_p(&root, Path::new("run"))?;
-        for path in spec.run_expose {
+
+        // 4. /run: exactly the entries the app's features call for.
+        for entry in spec.run {
+            let path = entry.path;
             let r = path
                 .strip_prefix("/run")
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("expose {}: not under /run", path.display())))?;
-            if r.as_os_str().is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "expose /run: exposing everything defeats the sandbox"));
-            }
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not under /run", path.display())))?;
             let dst = Path::new("run").join(r);
-            let meta = ctx(std::fs::symlink_metadata(path), || format!("expose {}", path.display()))?;
+            let meta = ctx(std::fs::symlink_metadata(path), || format!("run entry {}", path.display()))?;
             if meta.file_type().is_symlink() {
+                // The driver link: a symlink into the store, remade as one.
                 let target = std::fs::read_link(path)?;
                 mkdir_p(&root, dst.parent().unwrap())?;
                 symlinkat(&target, &root, &dst)?;
-            } else if meta.is_dir() {
-                mkdir_p(&root, &dst)?;
-                attach(ctx(clone_tree(path, rw_noexec), || format!("expose {}", path.display()))?, &root, &dst)?;
             } else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("expose {}: only directories and symlinks", path.display())));
+                mkdir_p(&root, &dst)?;
+                attach(ctx(clone_tree(path, rw_noexec), || format!("run entry {}", path.display()))?, &root, &dst)?;
             }
-            let access = if spec.run_writable.contains(path) { all } else { landlock::READ };
-            rules.allow_at(&root, &dst, access)?;
+            rules.allow_at(&root, &dst, if entry.writable { all } else { landlock::READ })?;
         }
         // Nothing new at the top level.
         set_attrs(&root, ro, false)?;

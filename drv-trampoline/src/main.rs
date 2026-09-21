@@ -1,8 +1,8 @@
 //! The first thing that runs as an app, inside its finished root, with no privilege
-//! (DESIGN-app-namespace, "State"): it makes the app's declared state directories under
-//! `$HOME/.state`, links them from HOME, links the HOME defaults from the store, and execs the
-//! command. The system configuration puts it in front of an app's command; the forker knows
-//! nothing of it. A bug here is worth exactly one app.
+//! (DESIGN-app-namespace, "Who does what"): it fills the app's `/etc` from the store, makes
+//! the declared state directories under `$HOME/.state`, links them from HOME, links the HOME
+//! defaults from the store, and execs the command. The system configuration puts it in front
+//! of every app's command; the forker knows nothing of it. A bug here is worth exactly one app.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -12,8 +12,11 @@ use std::process::{Command, ExitCode};
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "drv-trampoline", about = "Link an app's state into HOME, then exec it")]
+#[command(name = "drv-trampoline", about = "Link an app's /etc and state, then exec it")]
 struct Args {
+    /// A store path: the app's `/etc`, linked entry by entry into the empty `/etc` it was given.
+    #[arg(long)]
+    etc: Option<PathBuf>,
     /// A path under HOME that persists: made under `$HOME/.state`, linked from HOME. Repeatable.
     #[arg(long = "state")]
     state: Vec<PathBuf>,
@@ -42,6 +45,12 @@ fn main() -> ExitCode {
 
 /// Returns only if the exec failed.
 fn run(args: Args) -> Result<io::Error, String> {
+    if let Some(etc) = &args.etc {
+        for entry in std::fs::read_dir(etc).map_err(|e| format!("{}: {e}", etc.display()))? {
+            let entry = entry.map_err(|e| format!("{}: {e}", etc.display()))?;
+            link(&entry.path(), &Path::new("/etc").join(entry.file_name()))?;
+        }
+    }
     let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?);
     let state_root = home.join(".state");
     for entry in &args.state {

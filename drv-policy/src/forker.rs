@@ -11,36 +11,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::seq;
 
+/// An app, as the manifest describes it. Booleans say what the app is; the forker owns what
+/// each one means on this host (which `/run` entries, which device nodes). Nothing here is a
+/// path the forker has to judge: the store paths are typed by syntax, and any store path is
+/// content an app may be given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
+    /// A plain identifier: its HOME is `/home/<name>`.
+    pub name: String,
     pub uid: u32,
-    /// Supplementary group names (`render` for the GPU). Each must be on the forker's list.
-    pub groups: Vec<String>,
     /// `argv[0]` is looked up in `PATH` from `env`.
     pub argv: Vec<String>,
     /// The child's whole environment, plus `HOME` and `XDG_RUNTIME_DIR` which the forker sets.
     pub env: Vec<(String, String)>,
     /// Keep the host network. Otherwise the child gets a new, empty network namespace.
+    #[serde(default)]
     pub network: bool,
-    /// Extra `/run` entries for this app (the services' bus for a notification daemon). Each
-    /// must be on the forker's optional list.
-    #[serde(default)]
-    pub expose: Vec<String>,
-    /// The app's `/etc`: a store path built from its manifest entry, bound read-only.
-    #[serde(default)]
-    pub etc: Option<String>,
-    /// The render node and the host's view of it.
+    /// The render node, the host's view of it, the driver link.
     #[serde(default)]
     pub gpu: bool,
-    /// The app's name: its HOME is `/home/<name>`.
+    /// The PipeWire and PulseAudio sockets.
     #[serde(default)]
-    pub name: String,
-    /// The store paths the app may open: a file listing them, one per line (closureInfo).
+    pub audio: bool,
+    /// A private session bus with the bridge on it: the bridge's socket.
     #[serde(default)]
-    pub closure: Option<String>,
+    pub bus: bool,
     /// The app makes code at runtime (a JIT): no MDWE for it.
     #[serde(default)]
     pub jit: bool,
+    /// The store paths the app may open (its closure, from closureInfo).
+    #[serde(default)]
+    pub closure: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

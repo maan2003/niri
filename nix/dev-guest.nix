@@ -130,10 +130,8 @@ in
         state = [ "out" ];
         files = { ".config/hello/greeting" = "hello from the store"; };
       };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; menu = false; state = [ "out" ]; };
+      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; autostart = true; menu = false; state = [ "out" ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
-      # Asks for a group the spawner was not told to hand out: must be refused.
-      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; menu = false; state = [ "out" ]; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {
@@ -149,7 +147,6 @@ in
         gpu = true;
         network = true;
         audio = true;
-        groups = [ "render" ];
         opens = [ "http" "https" ];
         state = [ ".config/chromium" ".cache/chromium" ];
         jit = true;

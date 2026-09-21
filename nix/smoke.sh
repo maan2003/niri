@@ -17,7 +17,6 @@ for m in compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-porta
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
-expect "sneaky refused" 'autostart "sneaky": forker: group "wheel" is not on the forker'"'"'s list'
 
 echo "== an app's view (the hello probe)"
 H=/var/lib/drv-apps/100001/out

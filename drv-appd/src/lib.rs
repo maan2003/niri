@@ -38,7 +38,6 @@ use serde::{Deserialize, Serialize};
 /// exec = ["firefox"]    # the only arguments the app ever gets
 /// gpu = true
 /// network = true
-/// groups = ["render"]
 /// autostart = true
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,12 +67,14 @@ pub struct AppConfig {
     /// Program and its arguments. Absent means a service that is identified but not launched.
     #[serde(default)]
     pub exec: Option<Vec<String>>,
-    /// Supplementary groups, e.g. `render` for the GPU. The spawner checks them against its
-    /// list.
-    #[serde(default)]
-    pub groups: Vec<String>,
     #[serde(default)]
     pub gpu: bool,
+    /// PipeWire and a PulseAudio server of its own.
+    #[serde(default)]
+    pub audio: bool,
+    /// A private session bus, bridged to the desktop.
+    #[serde(default)]
+    pub bus: bool,
     /// Keep the host network; off means an empty network namespace.
     #[serde(default)]
     pub network: bool,
@@ -86,9 +87,6 @@ pub struct AppConfig {
     /// Extra environment for this app only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Extra `/run` entries this app may see, on top of the spawner's default list.
-    #[serde(default)]
-    pub expose: Vec<String>,
     /// Started by the daemon once the compositor's socket exists, in manifest order.
     #[serde(default)]
     pub autostart: bool,
@@ -99,12 +97,12 @@ pub struct AppConfig {
     /// OpenURI portal starts it with the URI as its last argument.
     #[serde(default)]
     pub opens: Vec<String>,
-    /// The app's `/etc`, a store path the system configuration built for it.
-    #[serde(default)]
-    pub etc: Option<String>,
-    /// The store paths it may open: a file listing them (closureInfo's store-paths).
+    /// The store paths it may open: a file listing them (closureInfo's store-paths), read
+    /// once at load into `closure_paths`.
     #[serde(default)]
     pub closure: Option<String>,
+    #[serde(skip)]
+    pub closure_paths: Vec<String>,
     /// A JIT inside: no MDWE.
     #[serde(default)]
     pub jit: bool,
@@ -143,8 +141,15 @@ impl std::error::Error for Error {}
 
 pub fn load_config(path: &Path) -> Result<Config, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.to_owned(), e))?;
-    let config: Config = toml::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
+    let mut config: Config = toml::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
     check_config(&config).map_err(Error::Config)?;
+    // The closure lists are read now, before the syscall filter: at launch nothing is opened.
+    for app in &mut config.apps {
+        if let Some(list) = &app.closure {
+            let text = std::fs::read_to_string(list).map_err(|e| Error::Io(Path::new(list).to_owned(), e))?;
+            app.closure_paths = text.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        }
+    }
     Ok(config)
 }
 
@@ -260,17 +265,17 @@ impl Appd {
             argv.push(uri.to_owned());
         }
         let launch = Launch {
+            name: app.name.clone(),
             uid: app.uid,
-            groups: app.groups.clone(),
             argv,
             env: self.env_for(app),
             network: app.network,
-            expose: app.expose.clone(),
-            etc: app.etc.clone(),
             gpu: app.gpu,
-            name: app.name.clone(),
-            closure: app.closure.clone(),
+            audio: app.audio,
+            bus: app.bus,
             jit: app.jit,
+            // Inline: the forker mounts and rules, it does not read files.
+            closure: app.closure_paths.clone(),
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)
@@ -424,9 +429,7 @@ mod tests {
             uid = 100042
             exec = ["firefox"]
             gpu = true
-            groups = ["render"]
             env = { MOZ_ENABLE_WAYLAND = "1" }
-            expose = ["/run/drv-session"]
             opens = ["https"]
             "#,
         )
@@ -456,8 +459,7 @@ mod tests {
         let requests = recorder.0.lock().unwrap();
         let req = &requests[0];
         assert_eq!(req.argv, vec!["firefox"]);
-        assert_eq!(req.groups, vec!["render"]);
-        assert_eq!(req.expose, vec!["/run/drv-session"]);
+        assert!(req.gpu && !req.audio && !req.network);
         let get = |k: &str| {
             req.env
                 .iter()
