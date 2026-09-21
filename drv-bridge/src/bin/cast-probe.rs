@@ -88,7 +88,7 @@ fn globals(fd: OwnedFd) -> anyhow::Result<Vec<(u32, String)>> {
 
 fn main() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    let result = format!("{home}/cast.txt");
+    let result = format!("{home}/out/cast.txt");
     let mut out = String::new();
     if let Err(err) = run(&result, &mut out) {
         out += &format!("error: {err:#}\n");

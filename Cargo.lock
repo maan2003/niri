@@ -1134,6 +1134,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-trampoline"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
+ "libc",
+]
+
+[[package]]
 name = "drv-ui"
 version = "26.4.0"
 dependencies = [

@@ -1,0 +1,17 @@
+[package]
+name = "drv-trampoline"
+version.workspace = true
+description = "Exec'd as the app before the app: links its state, applies Landlock and MDWE, execs it"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+drv-os = { version = "26.4.0", path = "../drv-os" }
+libc = "0.2"
+
+[[bin]]
+name = "drv-trampoline"
+path = "src/main.rs"

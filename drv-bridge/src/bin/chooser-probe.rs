@@ -69,7 +69,7 @@ fn path_of(uri: &str) -> String {
 
 fn main() -> anyhow::Result<()> {
     let home = std::env::var("HOME")?;
-    let result = format!("{home}/result.txt");
+    let result = format!("{home}/out/result.txt");
     let conn = Connection::session()?;
     let mut out = String::new();
     let version: u32 = Proxy::new(&conn, PORTAL_NAME, PORTAL_PATH, FILE_CHOOSER)?.get_property("version")?;

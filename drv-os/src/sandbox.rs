@@ -236,8 +236,9 @@ enum Step {
     /// `src` bound at `dst`, then remounted with `flags` (read-only, nosuid, ...).
     Bind { src: CString, dst: CString, flags: libc::c_ulong },
     Symlink { target: CString, link: CString },
-    Tmpfs { dst: CString, data: CString },
+    Tmpfs { dst: CString, data: CString, flags: libc::c_ulong },
     Proc(CString),
+    Chown { path: CString, uid: libc::uid_t, gid: libc::gid_t },
 }
 
 /// What the forker knows about the app; everything else is fixed here.
@@ -256,8 +257,13 @@ pub struct RootSpec<'a> {
     pub run_expose: &'a [PathBuf],
     /// The app's `/tmp`, kept for the boot.
     pub tmp: &'a Path,
-    /// The app's home, bound at its own path.
+    /// HOME: `/home/<name>`, a fresh size-capped tmpfs owned by the UID.
     pub home: &'a Path,
+    /// What the app keeps between runs (`/var/lib/drv-apps/<uid>`), bound at `<home>/.state`
+    /// for the trampoline to link the declared entries from.
+    pub state: &'a Path,
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
 }
 
 const NEW: &str = "/dev/shm/.root";
@@ -337,14 +343,21 @@ impl Root {
         }
         let shm = staged(Path::new("/dev/shm"));
         plan.dir(&shm)?;
-        plan.steps.push(Step::Tmpfs { dst: cstr(&shm)?, data: c"mode=1777".into() });
+        plan.steps.push(Step::Tmpfs { dst: cstr(&shm)?, data: c"mode=1777".into(), flags: libc::MS_NOSUID | libc::MS_NODEV });
         plan.bind(&view(if spec.gpu { "sys-gpu" } else { "sys" })?, &staged(Path::new("/sys")), ro_noexec)?;
         // The kernel's view of the app's own processes.
         let proc_ = staged(Path::new("/proc"));
         plan.dir(&proc_)?;
         plan.steps.push(Step::Proc(cstr(&proc_)?));
-        // 3. State: the home, at its own path, nothing else under /var.
-        plan.bind(spec.home, &staged(spec.home), rw_noexec)?;
+        // 3. State: HOME is a tmpfs of the app's own; what persists sits at .state inside
+        // it. The tmpfs is ours until the state directory is made, then the app's.
+        let home = staged(spec.home);
+        plan.dir(&home)?;
+        plan.steps.push(Step::Tmpfs { dst: cstr(&home)?, data: c"mode=0700,size=256m".into(), flags: rw_noexec });
+        let state = home.join(".state");
+        plan.steps.push(Step::Dir(cstr(&state)?));
+        plan.steps.push(Step::Bind { src: cstr(spec.state)?, dst: cstr(&state)?, flags: rw_noexec });
+        plan.steps.push(Step::Chown { path: cstr(&home)?, uid: spec.uid, gid: spec.gid });
         // 4. Runtime: /tmp, and /run holding only the exposed entries.
         plan.bind(spec.tmp, &staged(Path::new("/tmp")), rw_noexec)?;
         let run = staged(Path::new("/run"));
@@ -454,14 +467,20 @@ impl Root {
                         return fail("remount bind");
                     }
                 }
-                Step::Tmpfs { dst, data } => {
-                    if mnt(tmpfs.as_ptr(), dst, tmpfs.as_ptr(), nodev, data.as_ptr()) != 0 {
+                Step::Tmpfs { dst, data, flags } => {
+                    if mnt(tmpfs.as_ptr(), dst, tmpfs.as_ptr(), *flags, data.as_ptr()) != 0 {
                         return fail("tmpfs");
                     }
                 }
                 Step::Proc(dst) => {
                     if mnt(c"proc".as_ptr(), dst, c"proc".as_ptr(), nodev | libc::MS_NOEXEC, c"hidepid=invisible".as_ptr()) != 0 {
                         return fail("proc");
+                    }
+                }
+                Step::Chown { path, uid, gid } => {
+                    // SAFETY: valid C string.
+                    if unsafe { libc::lchown(path.as_ptr(), *uid, *gid) } != 0 {
+                        return fail("chown");
                     }
                 }
             }

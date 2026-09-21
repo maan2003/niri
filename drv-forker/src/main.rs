@@ -96,6 +96,10 @@ struct Args {
     /// The host's resolv.conf, bound over a networked app's own.
     #[arg(long, default_value = "/etc/resolv.conf")]
     resolv: PathBuf,
+    /// What is exec'd as the app, before the app: links its state, applies Landlock and
+    /// MDWE, execs the manifest's command. Default: beside this binary.
+    #[arg(long)]
+    trampoline: Option<PathBuf>,
 }
 
 struct Forker {
@@ -113,6 +117,7 @@ struct Forker {
     store: PathBuf,
     host_views: PathBuf,
     resolv: PathBuf,
+    trampoline: PathBuf,
     /// Live children, pid to uid.
     running: Arc<Mutex<HashMap<u32, u32>>>,
 }
@@ -186,11 +191,15 @@ impl Forker {
             None
         };
 
-        let mut command = Command::new(&launch.argv[0]);
-        command
-            .args(&launch.argv[1..])
-            .env_clear()
-            .envs(launch.env.iter().cloned());
+        // Unprivileged tests run the command as themselves; apps go through the trampoline.
+        let mut command = if as_self {
+            let mut c = Command::new(&launch.argv[0]);
+            c.args(&launch.argv[1..]);
+            c
+        } else {
+            self.trampoline_command(launch)?
+        };
+        command.env_clear().envs(launch.env.iter().cloned());
         command.stdin(Stdio::null());
 
         let gid = if as_self {
@@ -204,7 +213,8 @@ impl Forker {
         let mut home_dir = None;
         if !as_self {
             let runtime = self.owned_dir(&self.runtime_base, uid, gid)?;
-            let home = self.owned_dir(&self.home_base, uid, gid)?;
+            let state = self.owned_dir(&self.home_base, uid, gid)?;
+            let home = home_of(&launch.name)?;
             command.env("XDG_RUNTIME_DIR", &runtime).env("HOME", &home);
             home_dir = Some(
                 CString::new(home.as_os_str().as_bytes())
@@ -229,6 +239,9 @@ impl Forker {
                 run_expose: &expose,
                 tmp: &tmp,
                 home: &home,
+                state: &state,
+                uid,
+                gid,
             })?);
         }
         let mut all_gids = vec![gid];
@@ -248,6 +261,9 @@ impl Forker {
                     procs.write_all(b"0")?;
                 }
                 if switch_uid {
+                    // Locked for good: no root, no setuid fixups, no ambient raise, and
+                    // (where the kernel knows them) exec restricted to files, not scripts.
+                    set_securebits()?;
                     if libc::setgroups(all_gids.len(), all_gids.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -293,6 +309,52 @@ impl Forker {
         Ok(pid)
     }
 
+    /// The trampoline's command line: what to link, what Landlock allows, then the app.
+    fn trampoline_command(&self, launch: &Launch) -> Result<Command, String> {
+        let home = home_of(&launch.name)?;
+        let mut c = Command::new(&self.trampoline);
+        c.arg("--home").arg(&home);
+        for entry in &launch.state {
+            let p = Path::new(entry);
+            if p.is_absolute() || p.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                return Err(format!("state {entry:?}: not a plain relative path"));
+            }
+            c.arg("--state").arg(entry);
+        }
+        for (flag, path) in [("--closure", &launch.closure), ("--files", &launch.files)] {
+            if let Some(path) = path {
+                let real = Path::new(path)
+                    .canonicalize()
+                    .map_err(|e| format!("{path}: {e}"))?;
+                if !real.starts_with(&self.store) {
+                    return Err(format!("{path}: not in the store"));
+                }
+                c.arg(flag).arg(real);
+            }
+        }
+        for read in ["/etc", "/sys", "/proc"] {
+            c.arg("--read").arg(read);
+        }
+        c.arg("--dev").arg("/dev");
+        for rw in ["/dev/shm", "/tmp"] {
+            c.arg("--rw").arg(rw);
+        }
+        // Its runtime directory and the documents mount are written; the rest of /run read.
+        let runtime = self.runtime_base.join(launch.uid.to_string());
+        c.arg("--rw").arg(&runtime);
+        let extra = launch.expose.iter().map(PathBuf::from).collect::<Vec<_>>();
+        for path in self.expose.iter().chain(extra.iter()) {
+            let flag = if path.ends_with("drv-doc") { "--rw" } else { "--read" };
+            c.arg(flag).arg(path);
+        }
+        if launch.jit {
+            c.arg("--jit");
+        }
+        c.arg("--");
+        c.args(&launch.argv);
+        Ok(c)
+    }
+
     /// `<base>/<uid>`, mode 0700, owned by the UID. Created on first launch.
     fn owned_dir(&self, base: &Path, uid: u32, gid: u32) -> Result<PathBuf, String> {
         let dir = base.join(uid.to_string());
@@ -307,6 +369,40 @@ impl Forker {
 
 /// `cgroup.procs` of `<our cgroup>/apps/app-<uid>`, created if needed. The supervisor made
 /// `apps` ours (and keeps its `cgroup.kill`, which ends every app when the set restarts).
+/// `/home/<name>`; the name is checked, not trusted.
+fn home_of(name: &str) -> Result<PathBuf, String> {
+    let ok = !name.is_empty()
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !ok {
+        return Err(format!("app name {name:?}: letters, digits, '-', '_', '.' only"));
+    }
+    Ok(Path::new("/home").join(name))
+}
+
+/// Between fork and exec, with CAP_SETPCAP still ours. Every bit locked.
+fn set_securebits() -> io::Result<()> {
+    const NOROOT: libc::c_ulong = 1 << 0;
+    const NO_SETUID_FIXUP: libc::c_ulong = 1 << 2;
+    const KEEP_CAPS_LOCKED: libc::c_ulong = 1 << 5;
+    const NO_CAP_AMBIENT_RAISE: libc::c_ulong = 1 << 6;
+    const EXEC_RESTRICT_FILE: libc::c_ulong = 1 << 8;
+    const EXEC_DENY_INTERACTIVE: libc::c_ulong = 1 << 10;
+    let locked = |bit: libc::c_ulong| bit | (bit << 1);
+    let base = locked(NOROOT) | locked(NO_SETUID_FIXUP) | KEEP_CAPS_LOCKED | locked(NO_CAP_AMBIENT_RAISE);
+    let exec = locked(EXEC_RESTRICT_FILE) | locked(EXEC_DENY_INTERACTIVE);
+    // SAFETY: plain prctl.
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, base | exec, 0, 0, 0) } == 0 {
+        return Ok(());
+    }
+    // A kernel before 6.14 does not know the exec bits.
+    // SAFETY: plain prctl.
+    if unsafe { libc::prctl(libc::PR_SET_SECUREBITS, base, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn app_cgroup_procs(uid: u32) -> Result<std::fs::File, String> {
     let dir = own_cgroup()?.join("apps").join(format!("app-{uid}"));
     match std::fs::create_dir(&dir) {
@@ -354,6 +450,12 @@ fn run(args: Args) -> Result<(), String> {
         store: args.store,
         host_views: args.host_views,
         resolv: args.resolv,
+        trampoline: match args.trampoline {
+            Some(t) => t,
+            None => std::env::current_exe()
+                .map_err(|e| format!("current_exe: {e}"))?
+                .with_file_name("drv-trampoline"),
+        },
         running: Default::default(),
     };
     forker.serve(channel).map_err(|e| format!("channel: {e}"))
@@ -392,6 +494,7 @@ mod tests {
             store: PathBuf::from("/nix/store"),
             host_views: dir.join("views"),
             resolv: dir.join("none"),
+            trampoline: PathBuf::from("drv-trampoline"),
             running: Default::default(),
         };
         for view in ["dev", "sys"] {
@@ -410,6 +513,11 @@ mod tests {
             expose: Vec::new(),
             etc: None,
             gpu: false,
+            name: "test".into(),
+            closure: None,
+            state: Vec::new(),
+            files: None,
+            jit: false,
         };
 
         let pid = channel

@@ -38,6 +38,25 @@ let
     paths = [ pkgs.shared-mime-info pkgs.hicolor-icon-theme ];
     pathsToLink = [ "/share" ];
   };
+  # The store path a string under the store belongs to, context kept: `${pkg}/bin/x` -> pkg.
+  storeRoot = p: builtins.appendContext (builtins.head (builtins.match "(/nix/store/[^/]+).*" p)) (builtins.getContext p);
+  # What an app may open in the store (DESIGN-app-namespace, "Store"): the closure of its
+  # command, its /etc, the shared data profile, the graphics drivers, and the bus shim if it
+  # has one. The trampoline turns the list into Landlock rules.
+  appClosure = name: app: pkgs.closureInfo {
+    rootPaths = [ (appEtc name app) appShare config.hardware.graphics.package ]
+      ++ config.hardware.graphics.extraPackages
+      ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") app.exec)
+      ++ lib.optionals app.bus [ pkgs.dbus cfg.package ]
+      ++ lib.optional (app.files != { }) (appFiles name app);
+  };
+  # HOME defaults: a tree the trampoline links into HOME entry by entry.
+  appFiles = name: app: pkgs.runCommand "drv-files-${name}" { } (''
+    mkdir "$out"
+  '' + lib.concatStrings (lib.mapAttrsToList (path: value: ''
+    mkdir -p "$out/$(dirname ${lib.escapeShellArg path})"
+    ln -s ${if builtins.isString value then pkgs.writeText (baseNameOf path) value else value} "$out/"${lib.escapeShellArg path}
+  '') app.files));
   # An app's /etc (DESIGN-app-namespace): what glibc, TLS and the toolkits look up, every
   # entry a store path or a fact about this app. The host's /etc is not there.
   appEtc = name: app: let
@@ -81,6 +100,8 @@ hosts: files${lib.optionalString app.network " dns"}
     inherit name;
     inherit (app) uid groups gpu network globals grants autostart menu opens;
     etc = "${appEtc name app}";
+    closure = "${appClosure name app}/store-paths";
+    inherit (app) state jit;
     env = app.env // lib.optionalAttrs app.audio {
       PIPEWIRE_REMOTE = appsSocket;
       PULSE_SERVER = "unix:${pulseDir name}/native";
@@ -94,7 +115,8 @@ hosts: files${lib.optionalString app.network " dns"}
       "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
       "${cfg.package}/bin/drv-bridge" "app" "--"
     ] ++ app.exec;
-  } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
+  } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }
+    // lib.optionalAttrs (app.files != { }) { files = "${appFiles name app}"; }) cfg.apps;
   appdFile = toml.generate "appd.toml" {
     wayland-socket = "/run/drv-wayland/wayland";
     env = cfg.env;
@@ -248,6 +270,22 @@ in
             type = lib.types.listOf lib.types.str;
             default = [ ];
             description = "Further entries of the host's /etc for this app.";
+          };
+          state = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [ ".config/chromium" ".cache/chromium" ];
+            description = "Paths under HOME that persist between runs (under /var/lib/drv-apps/<uid>). Everything else in HOME is gone with the run.";
+          };
+          files = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.path);
+            default = { };
+            description = "HOME defaults: path under HOME to its content (text or a path), linked from the store, read-only.";
+          };
+          jit = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "The app makes code at runtime (a browser's JIT): it is not held to W^X memory.";
           };
           expose = lib.mkOption {
             type = lib.types.listOf lib.types.str;

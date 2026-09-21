@@ -55,21 +55,26 @@ let
       echo "good: $(open 'https://example.com/?from=uid-100011')"
       echo "bad scheme: $(open 'mailto:x@example.com')"
       echo "not a uri: $(open '-https://example.com')"
-    } > "$HOME/open.txt"
+    } > "$HOME/out/open.txt"
   '';
   micTest = pkgs.writeShellScript "mic-test" ''
-    exec ${pkgs.pipewire}/bin/pw-record "$HOME/rec.wav"
+    exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"
   '';
+  # Results go to $HOME/out, the one directory the probe apps declare as state.
   probe = pkgs.writeShellScript "probe" ''
-    ${pkgs.coreutils}/bin/id > "$HOME/id.txt"
-    ${pkgs.coreutils}/bin/cat /proc/self/cgroup > "$HOME/cgroup.txt"
-    ${pkgs.coreutils}/bin/env > "$HOME/env.txt"
-    ${pkgs.coreutils}/bin/ls -la /run /tmp /dev/shm > "$HOME/run.txt" 2>&1
-    ${pkgs.procps}/bin/ps -eo user,pid,cmd > "$HOME/ps.txt" 2>&1
-    ${pkgs.coreutils}/bin/cat /proc/net/dev > "$HOME/net.txt" 2>&1
-    ${pkgs.pipewire}/bin/pw-cli info 0 > "$HOME/pipewire.txt" 2>&1 || echo "pw-cli failed: $?" >> "$HOME/pipewire.txt"
-    ${pkgs.wayland-utils}/bin/wayland-info > "$HOME/globals.txt" 2> "$HOME/wayland-info.err"
-    ${pkgs.coreutils}/bin/touch "$HOME/done"
+    cd "$HOME/out"
+    ${pkgs.coreutils}/bin/id > id.txt
+    ${pkgs.coreutils}/bin/cat /proc/self/cgroup > cgroup.txt
+    ${pkgs.coreutils}/bin/env > env.txt
+    ${pkgs.coreutils}/bin/ls -la / /run /tmp /dev /dev/shm /etc > run.txt 2>&1
+    { ${pkgs.coreutils}/bin/ls -la "$HOME"; ${pkgs.coreutils}/bin/readlink "$HOME/.config/hello/greeting"; ${pkgs.coreutils}/bin/cat "$HOME/.config/hello/greeting"; } > home.txt 2>&1
+    # The store beyond the closure: not even listable.
+    ${pkgs.coreutils}/bin/ls /nix/store > store.txt 2>&1 || echo "denied: $?" >> store.txt
+    ${pkgs.procps}/bin/ps -eo user,pid,cmd > ps.txt 2>&1
+    ${pkgs.coreutils}/bin/cat /proc/net/dev > net.txt 2>&1
+    ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
+    ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
+    ${pkgs.coreutils}/bin/touch done
   '';
 in
 {
@@ -120,11 +125,15 @@ in
         bus = true;
         exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
       };
-      hello = { uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false; };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; menu = false; };
+      hello = {
+        uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false;
+        state = [ "out" ];
+        files = { ".config/hello/greeting" = "hello from the store"; };
+      };
+      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; groups = [ "render" ]; autostart = true; menu = false; state = [ "out" ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
       # Asks for a group the spawner was not told to hand out: must be refused.
-      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; menu = false; };
+      sneaky = { uid = 100004; exec = [ "${probe}" ]; groups = [ "wheel" ]; autostart = true; menu = false; state = [ "out" ]; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {
@@ -142,15 +151,17 @@ in
         audio = true;
         groups = [ "render" ];
         opens = [ "http" "https" ];
+        state = [ ".config/chromium" ".cache/chromium" ];
+        jit = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
       # Then it saves a copy the same way. Results in its home, result.txt.
-      chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; };
+      chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; state = [ "out" ]; };
       # A client of screen sharing, as a browser would use it: session, Start (the person
       # picks a screen at drv-portal), the PipeWire remote, and what that remote can see.
       # Holds the cast 20 s, then closes. Results in its home, cast.txt.
-      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; audio = true; };
+      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; audio = true; state = [ "out" ]; };
       # Plays a sound: playback is free for an audio app.
       beep = {
         uid = 100006;
@@ -158,8 +169,8 @@ in
         audio = true;
       };
       # Records: the person is asked at drv-portal; Mod+Shift+Esc ends it.
-      mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; };
-      open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; };
+      mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
+      open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
     };
   };
 

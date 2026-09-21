@@ -53,6 +53,7 @@
               ./drv-supervisor
               ./drv-appd
               ./drv-forker
+              ./drv-trampoline
               ./drv-os
               ./niri-ipc
               ./drv-policy
@@ -99,6 +100,8 @@
             "drv-appd"
             "-p"
             "drv-forker"
+            "-p"
+            "drv-trampoline"
             "-p"
             "drv-bridge"
             "-p"

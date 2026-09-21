@@ -12,6 +12,7 @@ members = [
     "drv-supervisor",
     "drv-appd",
     "drv-forker",
+    "drv-trampoline",
     "drv-os",
     "drv-bridge",
     "niri-visual-tests",

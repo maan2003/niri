@@ -20,7 +20,7 @@ count "set started once" "drv-supervisor: compositor running as uid" 1
 expect "sneaky refused" 'autostart "sneaky": forker: group "wheel" is not on the forker'"'"'s list'
 
 echo "== an app's view (the hello probe)"
-H=/var/lib/drv-apps/100001
+H=/var/lib/drv-apps/100001/out
 for _ in $(seq 1 30); do $SSH test -e $H/done && break; sleep 1; done
 file_has "own uid" $H/id.txt '^uid=100001\(app-hello\) gid=100001\(app-hello\) groups=100001\(app-hello\)$'
 file_has "only loopback" $H/net.txt '^ *lo:'
@@ -31,6 +31,10 @@ hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_ca
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")
 [ -z "$leaked" ] && echo "PASS no privileged globals" || fail "privileged globals: $leaked"
 file_has "but the ordinary ones" $H/globals.txt "interface: 'xdg_wm_base'"
+file_has "state linked into HOME" $H/home.txt 'out -> /home/hello/.state/out'
+file_has "defaults linked from the store" $H/home.txt '^/nix/store/.*-drv-files-hello/.config/hello/greeting$'
+file_has "and readable through the closure" $H/home.txt '^hello from the store$'
+file_has "store not listable beyond the closure" $H/store.txt 'Permission denied'
 
 echo "== unlock"
 mark; key 1 2 3 4 ret; sleep 2
@@ -43,23 +47,23 @@ expect "reached the server as Notify" 'notify-test: Notify \{'
 expect "notify-test exited 0" 'uid 100007\) exited: exit status: 0'
 
 echo "== file chooser"
-$SSH rm -f /var/lib/drv-apps/100008/result.txt
+$SSH rm -f /var/lib/drv-apps/100008/out/result.txt
 mark; menu choo; sleep 3
 key ret; sleep 1.2      # into notes/
 key ret; sleep 2.5      # todo.txt
 key ret; sleep 3        # save under the offered name
-R=/var/lib/drv-apps/100008/result.txt
+R=/var/lib/drv-apps/100008/out/result.txt
 file_has "read the picked file" $R 'read /run/drv-doc/[0-9]+/todo.txt: Ok\("build the portal\\n"\)'
 file_has "read-only pick" $R 'open it for writing: Err'
 file_has "saved a copy" $R 'wrote /run/drv-doc/[0-9]+/result copy.txt, length now Ok\('
 expect "portal granted it" 'drv-portal: chooser-test \(uid 100008\) gets /var/lib/drv-files/notes/todo.txt'
 
 echo "== screen cast"
-$SSH rm -f /var/lib/drv-apps/100009/cast.txt
+$SSH rm -f /var/lib/drv-apps/100009/out/cast.txt
 mark; menu cast; sleep 3
 key ret; sleep 5        # consent
 expect "portal started the cast" 'drv-portal: cast-test \(uid 100009\) shares Virtual-1 on PipeWire node [0-9]+'
-C=/var/lib/drv-apps/100009/cast.txt
+C=/var/lib/drv-apps/100009/out/cast.txt
 file_has "Start answered with a stream" $C 'Start: response 0, streams Some'
 file_has "remote sees its node only" $C 'the remote sees: \[\(0, "Core"\), \([0-9]+, "Factory"\), \([0-9]+, "Node"\)\]$'
 key meta_l-shift-esc; sleep 3
@@ -78,9 +82,9 @@ key 1 2 3 4 ret; sleep 2
 expect "unlocked again" 'PIN accepted; unlocking'
 
 echo "== OpenURI"
-$SSH rm -f /var/lib/drv-apps/100011/open.txt
+$SSH rm -f /var/lib/drv-apps/100011/out/open.txt
 mark; menu open; sleep 6
-O=/var/lib/drv-apps/100011/open.txt
+O=/var/lib/drv-apps/100011/out/open.txt
 file_has "three calls answered" $O '^not a uri: o "/org/freedesktop/portal/desktop/request/'
 expect "https went to chromium" '"chromium" \(uid 100005\) opens "https://example.com/\?from=uid-100011" for the bridge'
 expect "mailto refused" 'no app opens mailto: URIs'
