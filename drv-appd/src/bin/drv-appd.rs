@@ -16,7 +16,7 @@ use drv_policy::forker::Channel;
 #[command(name = "drv-appd", about = "The app daemon; runs under drv-supervisor")]
 struct Args {
     /// The manifest.
-    #[arg(long, default_value = "/etc/drv/appd.toml")]
+    #[arg(long, default_value = "/etc/drv/appd.json")]
     config: PathBuf,
 }
 

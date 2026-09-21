@@ -7,7 +7,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.drv;
-  toml = pkgs.formats.toml { };
+  json = pkgs.formats.json { };
   bridgeSocket = "/run/drv-bridge/bridge.sock";
   sessionBus = "unix:path=/run/drv-session/bus";
   appdSocket = "/run/drv/appd.sock";
@@ -112,7 +112,7 @@ hosts: files${lib.optionalString app.network " dns"}
     };
     exec = appExec name app;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
-  appdFile = toml.generate "appd.toml" {
+  appdFile = json.generate "appd.json" {
     wayland-socket = "/run/drv-wayland/wayland";
     env = cfg.env;
     app = [
@@ -441,7 +441,7 @@ in
         ];
       };
     };
-    environment.etc."drv/appd.toml".source = appdFile;
+    environment.etc."drv/appd.json".source = appdFile;
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
     boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
@@ -553,7 +553,7 @@ in
           "${cfg.package}/bin/drv-supervisor"
           "--socket ${appdSocket}"
           "--appd-user drv-appd"
-          "--appd-exec '${cfg.package}/bin/drv-appd --config /etc/drv/appd.toml'"
+          "--appd-exec '${cfg.package}/bin/drv-appd --config /etc/drv/appd.json'"
           # drv-appd's privileged helper: forks one sandboxed app per request over the channel
           # the supervisor made for the two of them, checks UIDs, groups and /run entries
           # against these lists, and nothing else.

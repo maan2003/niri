@@ -14,7 +14,7 @@ drv-os = { version = "26.4.0", path = "../drv-os" }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
 rustix = { version = "1.1.4", features = ["process"] }
 serde.workspace = true
-toml = "1"
+serde_json.workspace = true
 
 [[bin]]
 name = "drv"

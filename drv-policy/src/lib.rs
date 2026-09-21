@@ -157,22 +157,16 @@ impl AppEntry {
     }
 }
 
-/// The static policy file (`policy.toml`).
+/// The static policy file (`policy.json`).
 ///
-/// ```toml
-/// [default]
-/// name = "unknown"
-///
-/// [[app]]
-/// uid = 901
-/// name = "compositor"
-/// grants = ["lookup"]
-///
-/// [[app]]
-/// uid = 100000
-/// uid-end = 199999
-/// name = "sandboxed"
-/// gpu = true
+/// ```json
+/// {
+///   "default": { "name": "unknown" },
+///   "app": [
+///     { "uid": 901, "name": "compositor", "grants": ["lookup"] },
+///     { "uid": 100000, "uid-end": 199999, "name": "sandboxed", "gpu": true }
+///   ]
+/// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -196,7 +190,7 @@ impl Default for PolicyFile {
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    Parse(toml::de::Error),
+    Parse(serde_json::Error),
     /// Two entries claim the same UID.
     Overlap(u32),
 }
@@ -249,7 +243,7 @@ impl PolicyStore {
 
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(Error::Io)?;
-        let file: PolicyFile = toml::from_str(&text).map_err(Error::Parse)?;
+        let file: PolicyFile = serde_json::from_str(&text).map_err(Error::Parse)?;
         Self::new(file)
     }
 
@@ -293,24 +287,14 @@ mod tests {
 
     #[test]
     fn parses_file() {
-        let file: PolicyFile = toml::from_str(
-            r#"
-            [default]
-            name = "unknown"
-
-            [[app]]
-            uid = 1000
-            name = "me"
-            globals = ["screencopy"]
-            grants = ["lookup"]
-
-            [[app]]
-            uid = 100000
-            uid-end = 199999
-            name = "sandboxed"
-            gpu = true
-            globals = ["layer-shell"]
-            "#,
+        let file: PolicyFile = serde_json::from_str(
+            r#"{
+              "default": { "name": "unknown" },
+              "app": [
+                { "uid": 1000, "name": "me", "globals": ["screencopy"], "grants": ["lookup"] },
+                { "uid": 100000, "uid-end": 199999, "name": "sandboxed", "gpu": true, "globals": ["layer-shell"] }
+              ]
+            }"#,
         )
         .unwrap();
         let store = PolicyStore::new(file).unwrap();
@@ -329,8 +313,8 @@ mod tests {
 
     #[test]
     fn client_and_daemon_roundtrip() {
-        let file: PolicyFile = toml::from_str(
-            "[[app]]\nuid = 7\nname = \"seven\"\ngpu = true\ngrants = [\"lookup\"]\n",
+        let file: PolicyFile = serde_json::from_str(
+            r#"{"app": [{"uid": 7, "name": "seven", "gpu": true, "grants": ["lookup"]}]}"#,
         )
         .unwrap();
         let store = PolicyStore::new(file).unwrap();
@@ -350,17 +334,8 @@ mod tests {
 
     #[test]
     fn rejects_overlap() {
-        let file: PolicyFile = toml::from_str(
-            r#"
-            [[app]]
-            uid = 10
-            uid-end = 20
-            name = "a"
-
-            [[app]]
-            uid = 20
-            name = "b"
-            "#,
+        let file: PolicyFile = serde_json::from_str(
+            r#"{"app": [{"uid": 10, "uid-end": 20, "name": "a"}, {"uid": 20, "name": "b"}]}"#,
         )
         .unwrap();
         assert!(matches!(PolicyStore::new(file), Err(Error::Overlap(20))));
@@ -368,6 +343,6 @@ mod tests {
 
     #[test]
     fn unknown_field_is_an_error() {
-        assert!(toml::from_str::<PolicyFile>("[default]\nname = \"x\"\nfoo = 1\n").is_err());
+        assert!(serde_json::from_str::<PolicyFile>(r#"{"default": {"name": "x"}, "foo": 1}"#).is_err());
     }
 }

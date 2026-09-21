@@ -19,26 +19,17 @@ use drv_policy::rpc;
 use drv_policy::{AppPolicy, Global, Grant};
 use serde::{Deserialize, Serialize};
 
-/// `identity.toml`.
+/// `appd.json`.
 ///
-/// ```toml
-/// wayland-socket = "/run/drv-wayland/wayland"
-///
-/// [env]
-/// PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
-///
-/// [[app]]
-/// name = "compositor"   # a service: identified, never launched
-/// uid = 901
-/// grants = ["lookup"]
-///
-/// [[app]]
-/// name = "firefox"
-/// uid = 100042
-/// exec = ["firefox"]    # the only arguments the app ever gets
-/// gpu = true
-/// network = true
-/// autostart = true
+/// ```json
+/// {
+///   "wayland-socket": "/run/drv-wayland/wayland",
+///   "env": { "PIPEWIRE_RUNTIME_DIR": "/run/pipewire" },
+///   "app": [
+///     { "name": "compositor", "uid": 901, "grants": ["lookup"] },
+///     { "name": "firefox", "uid": 100042, "exec": ["firefox"], "gpu": true, "network": true, "autostart": true }
+///   ]
+/// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -123,7 +114,7 @@ impl AppConfig {
 #[derive(Debug)]
 pub enum Error {
     Io(PathBuf, std::io::Error),
-    Parse(PathBuf, toml::de::Error),
+    Parse(PathBuf, serde_json::Error),
     Config(String),
 }
 
@@ -141,7 +132,7 @@ impl std::error::Error for Error {}
 
 pub fn load_config(path: &Path) -> Result<Config, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.to_owned(), e))?;
-    let mut config: Config = toml::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
+    let mut config: Config = serde_json::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
     check_config(&config).map_err(Error::Config)?;
     // The closure lists are read now, before the syscall filter: at launch nothing is opened.
     for app in &mut config.apps {
@@ -365,7 +356,7 @@ impl Handler for Launcher {
         let app = self
             .appd
             .app(name)
-            .ok_or_else(|| format!("unknown app {name:?}; add it to appd.toml"))?;
+            .ok_or_else(|| format!("unknown app {name:?}; add it to appd.json"))?;
         let uid = self.appd.start(app, None)?;
         drv_os::say!("drv-appd: launched {name:?} as uid {uid} for {}", self.who);
         Ok(uid)
@@ -412,26 +403,16 @@ mod tests {
     }
 
     fn identity() -> (Arc<Appd>, Arc<Recorder>) {
-        let config: Config = toml::from_str(
-            r#"
-            wayland-socket = "/run/drv-wayland/wayland"
-
-            [env]
-            PIPEWIRE_RUNTIME_DIR = "/run/pipewire"
-
-            [[app]]
-            name = "compositor"
-            uid = 901
-            grants = ["lookup"]
-
-            [[app]]
-            name = "firefox"
-            uid = 100042
-            exec = ["firefox"]
-            gpu = true
-            env = { MOZ_ENABLE_WAYLAND = "1" }
-            opens = ["https"]
-            "#,
+        let config: Config = serde_json::from_str(
+            r#"{
+              "wayland-socket": "/run/drv-wayland/wayland",
+              "env": { "PIPEWIRE_RUNTIME_DIR": "/run/pipewire" },
+              "app": [
+                { "name": "compositor", "uid": 901, "grants": ["lookup"] },
+                { "name": "firefox", "uid": 100042, "exec": ["firefox"], "gpu": true,
+                  "env": { "MOZ_ENABLE_WAYLAND": "1" }, "opens": ["https"] }
+              ]
+            }"#,
         )
         .unwrap();
         check_config(&config).unwrap();
@@ -503,18 +484,12 @@ mod tests {
     fn rejects_duplicate_uids_and_names_and_bad_autostart() {
         let bad = |apps: &str| {
             let config: Config =
-                toml::from_str(&format!("wayland-socket = \"/x\"\n{apps}")).unwrap();
+                serde_json::from_str(&format!(r#"{{"wayland-socket": "/x", "app": [{apps}]}}"#)).unwrap();
             check_config(&config).unwrap_err()
         };
-        assert!(
-            bad("[[app]]\nname = \"a\"\nuid = 12\n[[app]]\nname = \"b\"\nuid = 12\n")
-                .contains("uid 12")
-        );
-        assert!(
-            bad("[[app]]\nname = \"a\"\nuid = 12\n[[app]]\nname = \"a\"\nuid = 13\n")
-                .contains("twice")
-        );
-        assert!(bad("[[app]]\nname = \"a\"\nuid = 12\nautostart = true\n").contains("autostart"));
+        assert!(bad(r#"{"name": "a", "uid": 12}, {"name": "b", "uid": 12}"#).contains("uid 12"));
+        assert!(bad(r#"{"name": "a", "uid": 12}, {"name": "a", "uid": 13}"#).contains("twice"));
+        assert!(bad(r#"{"name": "a", "uid": 12, "autostart": true}"#).contains("autostart"));
     }
 
     #[test]
@@ -532,13 +507,17 @@ mod tests {
 
     #[test]
     fn one_handler_per_scheme() {
-        let config: Config = toml::from_str(
-            "wayland-socket = \"/x\"\n[[app]]\nname = \"a\"\nuid = 12\nexec = [\"a\"]\nopens = [\"https\"]\n[[app]]\nname = \"b\"\nuid = 13\nexec = [\"b\"]\nopens = [\"https\"]\n",
+        let config: Config = serde_json::from_str(
+            r#"{"wayland-socket": "/x", "app": [
+                {"name": "a", "uid": 12, "exec": ["a"], "opens": ["https"]},
+                {"name": "b", "uid": 13, "exec": ["b"], "opens": ["https"]}]}"#,
         )
         .unwrap();
         assert!(check_config(&config).unwrap_err().contains("more than one handler"));
-        let config: Config =
-            toml::from_str("wayland-socket = \"/x\"\n[[app]]\nname = \"a\"\nuid = 12\nexec = [\"a\"]\nopens = [\"HTTPS\"]\n").unwrap();
+        let config: Config = serde_json::from_str(
+            r#"{"wayland-socket": "/x", "app": [{"name": "a", "uid": 12, "exec": ["a"], "opens": ["HTTPS"]}]}"#,
+        )
+        .unwrap();
         assert!(check_config(&config).unwrap_err().contains("lowercase"));
     }
 
@@ -551,6 +530,6 @@ mod tests {
 
     #[test]
     fn unknown_field_is_an_error() {
-        assert!(toml::from_str::<Config>("wayland-socket = \"/x\"\nfoo = 1\n").is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"wayland-socket": "/x", "foo": 1}"#).is_err());
     }
 }
