@@ -6,18 +6,22 @@
 
 use std::fs::File;
 use std::io::{self, Write as _};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use drv_os::sandbox::Sandbox;
+use drv_os::mounts::{clone_tree, new_fs, Attr};
+use drv_os::root::Root;
 use drv_os::{dup_high, ensure_owned_dir};
-use rustix::thread::{CapabilitySet, CapabilitySets};
+use rustix::fs::CWD;
+use rustix::thread::{CapabilitySet, Gid, Uid};
 
-/// A service the supervisor forks and keeps running: its own user, the same sandbox an app
-/// gets (`drv_os::sandbox`: private `/tmp`, `/dev/shm` and `/proc`, a `/run` holding only
-/// `expose`, no network unless `network`), its environment exactly as listed.
+/// A service the supervisor forks and keeps running: its own user, a root of its own built
+/// the way an app's is (`drv_os::root`: the store, the real `/dev` and `/sys`, the host's
+/// `/etc` read-only, fresh `/tmp`, `/dev/shm` and `/proc`, under `/run` only `expose`, its
+/// `dirs`, nothing else of the host's; no network unless `network`), its environment exactly
+/// as listed.
 pub struct Service {
     pub name: String,
     pub uid: u32,
@@ -35,6 +39,71 @@ pub struct Service {
     pub expose: Vec<PathBuf>,
     /// Keeps the host's network namespace (the forker: apps with `network` get it from there).
     pub network: bool,
+    /// Sees the cgroup tree writable (the forker: one cgroup per app under its subtree).
+    pub cgroups: bool,
+}
+
+/// A member's root, planned before the fork: what every member gets, plus its `expose`
+/// entries under `/run` (a symlink into the store remade as one) and its `dirs`.
+fn member_root(service: &Service) -> Result<Root, String> {
+    let ro = Attr::MOUNT_ATTR_RDONLY | Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV;
+    let ro_noexec = ro | Attr::MOUNT_ATTR_NOEXEC;
+    let rw_noexec = Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV | Attr::MOUNT_ATTR_NOEXEC;
+    let clone = |path: &Path, attrs| {
+        clone_tree(CWD, path, attrs).map_err(|e| format!("{}: {e}", path.display()))
+    };
+    let fresh = |fs: &str, opts: &[(&str, &str)]| {
+        new_fs(fs, opts, rw_noexec).map_err(|e| format!("{fs}: {e}"))
+    };
+    let mut root = Root::new(Path::new("/tmp"), !service.network)?;
+    let mut fixed: Vec<(&str, OwnedFd)> = vec![
+        ("/nix/store", clone(Path::new("/nix/store"), ro)?),
+        // Device nodes, so no NODEV; the real ones: seatd and the compositor open them.
+        (
+            "/dev",
+            clone(
+                Path::new("/dev"),
+                Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC,
+            )?,
+        ),
+        ("/dev/shm", fresh("tmpfs", &[("mode", "1777")])?),
+        ("/proc", fresh("proc", &[("hidepid", "invisible")])?),
+        ("/sys", clone(Path::new("/sys"), ro_noexec)?),
+        ("/etc", clone(Path::new("/etc"), ro_noexec)?),
+        ("/tmp", fresh("tmpfs", &[("mode", "1777")])?),
+    ];
+    if service.cgroups {
+        fixed.push((
+            "/sys/fs/cgroup",
+            clone(Path::new("/sys/fs/cgroup"), rw_noexec)?,
+        ));
+    }
+    for (path, fd) in fixed {
+        root.mount(fd, Path::new(path))?;
+    }
+    for path in &service.expose {
+        let rel = path
+            .strip_prefix("/run")
+            .map_err(|_| format!("expose {}: not under /run", path.display()))?;
+        if rel.as_os_str().is_empty() {
+            return Err("expose /run: exposing everything defeats the sandbox".to_owned());
+        }
+        let meta =
+            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            let target =
+                std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            root.symlink(&target, path)?;
+        } else {
+            root.mount(clone(path, rw_noexec)?, path)?;
+        }
+    }
+    for (dir, _) in &service.dirs {
+        if !service.expose.contains(dir) {
+            root.mount(clone(dir, rw_noexec)?, dir)?;
+        }
+    }
+    Ok(root)
 }
 
 /// A capability by its kernel name without the `CAP_` prefix (`sys_tty_config`).
@@ -56,46 +125,6 @@ pub fn capability(name: &str) -> Result<CapabilitySet, String> {
         "mknod" => CapabilitySet::MKNOD,
         other => return Err(format!("unknown capability {other:?}")),
     })
-}
-
-/// Between fork and exec: become `uid`/`gid`/`groups` keeping exactly `caps`, and make `caps`
-/// the bounding set. Works for a root supervisor and for one that holds `caps` itself plus
-/// SETUID, SETGID and SETPCAP. Everything here is async-signal-safe (raw syscalls).
-fn become_user(uid: u32, gid: u32, groups: &[u32], caps: CapabilitySet) -> io::Result<()> {
-    // The bounding set first, while CAP_SETPCAP is still effective.
-    for cap in CapabilitySet::all().iter() {
-        if cap.bits().count_ones() == 1
-            && !caps.contains(cap)
-            && rustix::thread::capability_is_in_bounding_set(cap).unwrap_or(false)
-        {
-            rustix::thread::remove_capability_from_bounding_set(cap)?;
-        }
-    }
-    // Keep the permitted set across the uid change; it is narrowed to `caps` right after.
-    rustix::thread::set_keep_capabilities(true)?;
-    // SAFETY: plain syscalls on our own credentials.
-    if unsafe { libc::setgroups(groups.len(), groups.as_ptr()) } != 0
-        || unsafe { libc::setresgid(gid, gid, gid) } != 0
-        || unsafe { libc::setresuid(uid, uid, uid) } != 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    rustix::thread::set_capabilities(
-        None,
-        CapabilitySets {
-            effective: caps,
-            permitted: caps,
-            inheritable: caps,
-        },
-    )?;
-    // Ambient, so they survive the exec.
-    for cap in caps.iter() {
-        if cap.bits().count_ones() == 1 {
-            rustix::thread::configure_capability_in_ambient_set(cap, true)?;
-        }
-    }
-    rustix::thread::set_keep_capabilities(false)?;
-    Ok(())
 }
 
 /// The apps' cgroup: `<ours>/apps`, made once. drv-forker owns the directory (it makes
@@ -155,9 +184,9 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
     if service.argv.is_empty() {
         return Err(format!("service {}: empty command", service.name));
     }
-    let (fd_env, placed) = drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
-    let sandbox = Sandbox::plan(&service.expose, service.network, None)
-        .map_err(|e| format!("{}: {e}", service.name))?;
+    let (fd_env, placed) =
+        drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
+    let root = member_root(service).map_err(|e| format!("{}: {e}", service.name))?;
     // Copies above the target numbers, so the dup2s in the child never clobber each other
     // and are never a same-fd no-op (which would keep close-on-exec set).
     let mut dups = Vec::new();
@@ -171,10 +200,19 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
         .envs(service.env.iter().cloned())
         .envs(fd_env)
         .stdin(Stdio::null());
-    let (uid, gid, caps) = (service.uid, service.gid, service.caps);
-    let groups = service.groups.clone();
+    let (uid, gid, caps) = (
+        Uid::from_raw(service.uid),
+        Gid::from_raw(service.gid),
+        service.caps,
+    );
+    let groups: Vec<Gid> = service.groups.iter().map(|g| Gid::from_raw(*g)).collect();
     let child_dups = dups.clone();
-    // SAFETY: only dup2, mount, credential and capability syscalls between fork and exec.
+    let ro_noexec = Attr::MOUNT_ATTR_RDONLY
+        | Attr::MOUNT_ATTR_NOSUID
+        | Attr::MOUNT_ATTR_NODEV
+        | Attr::MOUNT_ATTR_NOEXEC;
+    // SAFETY: only dup2, mount, credential and capability syscalls between fork and exec,
+    // on strings and handles made before it; the child is single-threaded.
     unsafe {
         command.pre_exec(move || {
             for (high, target) in &child_dups {
@@ -183,13 +221,11 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
                 }
             }
             // While CAP_SYS_ADMIN is still ours.
-            sandbox.apply()?;
-            if uid != 0 {
-                become_user(uid, gid, &groups, caps)?;
-            }
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            root.unshare()?;
+            root.build()?;
+            drv_os::root::finish(ro_noexec)?;
+            drv_os::creds::switch_to(uid, gid, &groups, caps).map_err(io::Error::other)?;
+            rustix::thread::set_no_new_privs(true)?;
             Ok(())
         });
     }

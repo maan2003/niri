@@ -210,7 +210,8 @@ impl Allowlist {
             Some(rules) if rules.is_empty() => {}
             Some(rules) => rules.push(SeccompRule::new(conds).map_err(err)?),
             None => {
-                self.map.insert(nr, vec![SeccompRule::new(conds).map_err(err)?]);
+                self.map
+                    .insert(nr, vec![SeccompRule::new(conds).map_err(err)?]);
             }
         }
         Ok(self)
@@ -238,7 +239,10 @@ impl Allowlist {
         const IOC_TYPE_MASK: u64 = 0xff00;
         self.allow_when(
             SYS_ioctl,
-            vec![Cond::new(1, Len::Dword, Op::MaskedEq(IOC_TYPE_MASK), (ty as u64) << 8).map_err(err)?],
+            vec![
+                Cond::new(1, Len::Dword, Op::MaskedEq(IOC_TYPE_MASK), (ty as u64) << 8)
+                    .map_err(err)?,
+            ],
         )
     }
 
@@ -303,7 +307,10 @@ impl Allowlist {
         const O_TMPFILE_BIT: u64 = 0o20000000;
         self.allow_when(
             SYS_openat,
-            vec![Cond::new(2, Len::Dword, Op::MaskedEq(O_TMPFILE_BIT), O_TMPFILE_BIT).map_err(err)?],
+            vec![
+                Cond::new(2, Len::Dword, Op::MaskedEq(O_TMPFILE_BIT), O_TMPFILE_BIT)
+                    .map_err(err)?,
+            ],
         )
     }
 
@@ -390,7 +397,9 @@ impl Allowlist {
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn apply(self, _tag: &'static str) -> io::Result<()> {
-        Err(io::Error::other("seccomp sandbox is only implemented for x86_64 and aarch64"))
+        Err(io::Error::other(
+            "seccomp sandbox is only implemented for x86_64 and aarch64",
+        ))
     }
 }
 
@@ -460,7 +469,11 @@ extern "C" fn on_sigsys(_signal: c_int, info: *mut siginfo_t, ctx: *mut c_void) 
         #[cfg(target_arch = "x86_64")]
         {
             let g = &ctx.uc_mcontext.gregs;
-            [g[REG_RDI as usize] as u64, g[REG_RSI as usize] as u64, g[REG_RDX as usize] as u64]
+            [
+                g[REG_RDI as usize] as u64,
+                g[REG_RSI as usize] as u64,
+                g[REG_RDX as usize] as u64,
+            ]
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -480,8 +493,16 @@ fn path_arg(nr: c_int) -> Option<(usize, Option<usize>)> {
         return Some((0, Some(1)));
     }
     #[cfg(target_arch = "x86_64")]
-    if [SYS_stat, SYS_lstat, SYS_access, SYS_readlink, SYS_unlink, SYS_mkdir, SYS_chmod]
-        .contains(&nr)
+    if [
+        SYS_stat,
+        SYS_lstat,
+        SYS_access,
+        SYS_readlink,
+        SYS_unlink,
+        SYS_mkdir,
+        SYS_chmod,
+    ]
+    .contains(&nr)
     {
         return Some((0, None));
     }

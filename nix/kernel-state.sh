@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# The kernel's account of one running app against ours: mounts and their flags, credentials,
+# The kernel's account of one running app, or member of the set, against ours: mounts and their flags, credentials,
 # namespaces, cgroup, parent, normalized and diffed with nix/expect/kernel-<app>.txt. The
 # forker is written from a model of what each syscall does to kernel state; this is where the
 # model meets what the kernel says it did, so any divergence is a diff, not a surprise later.
 # One ssh round trip. Not visible from outside a process, so not here: securebits, MDWE, the
 # Landlock domain (the probe apps and the smoke's behaviour checks cover those).
-#   nix/kernel-state.sh flower            check
+#   nix/kernel-state.sh flower            check an app
+#   nix/kernel-state.sh forker            check a member of the set (its user is drv-<name>)
 #   nix/kernel-state.sh flower --update   accept what the kernel says as the expectation
 set -eu
 app=$1
 here=$(dirname "${BASH_SOURCE[0]}")
 . "$here/vm-lib.sh"
-uid=$($SSH "id -u app-$app")
+uid=$($SSH "id -u app-$app 2>/dev/null || id -u drv-$app")
+member=0; $SSH "id -u app-$app" >/dev/null 2>&1 || member=1
 expect="$here/expect/kernel-$app.txt"
-dump=$($SSH "uid=$uid; $(cat <<'EOF'
+dump=$($SSH "uid=$uid; member=$member; $(cat <<'EOF'
 set -eu
-# The app itself, not its PulseAudio service (same UID): the one in the forker's cgroup.
-# The app itself, not its PulseAudio service (same UID) and not its init (drv-init):
-# the one in the forker's cgroup whose parent is the init.
-p=; for c in $(pgrep -u "$uid"); do grep -q "apps/app-$uid\$" /proc/$c/cgroup 2>/dev/null && [ "$(cat /proc/$c/comm)" != drv-init ] && { p=$c; break; }; done
+if [ "$member" = 1 ]; then
+  # The supervisor's child of that user.
+  p=$(pgrep -u "$uid" -P "$(pgrep -xo drv-supervisor)" | head -1)
+else
+  # The app itself, not its PulseAudio service (same UID) and not its init (drv-init):
+  # the one in the forker's cgroup whose parent is the init.
+  p=; for c in $(pgrep -u "$uid"); do grep -q "apps/app-$uid\$" /proc/$c/cgroup 2>/dev/null && [ "$(cat /proc/$c/comm)" != drv-init ] && { p=$c; break; }; done
+fi
 [ -n "$p" ] || { echo "no launched process of uid $uid"; exit 1; }
 echo "parent $(cat /proc/$(awk '/^PPid/ {print $2}' /proc/$p/status)/comm)"
 awk -v uid="$uid" '
@@ -30,7 +36,7 @@ awk -v uid="$uid" '
     gsub("/" uid "$", "/UID", root); gsub("/" uid "/", "/UID/", root); gsub("/" uid "$", "/UID", mp)
     gsub(",?relatime", "", opts)
     if (fstype == "overlay") sup = "host"
-    gsub(/,?(size|nr_inodes)=[^,]*/, "", sup); sub(/^,/, "", sup)
+    gsub(/(^|,)(size|nr_inodes)=[^,]*/, "", sup); sub(/^,/, "", sup)
     gsub("uid=" uid, "uid=UID", sup); gsub("gid=" uid, "gid=UID", sup)
     gsub(/\/nix\/store\/[a-z0-9]{32}-/, "/nix/store/HASH-", mp)
     printf "mount %s %s %s root=%s %s\n", mp, opts, fstype, root, sup }

@@ -621,6 +621,7 @@ in
           "--portal-user drv-portal"
           "--portal-exec '${cfg.package}/bin/drv-portal --files ${cfg.files} --docs /run/drv-doc'"
           "--portal-env RUST_BACKTRACE=1"
+          "--portal-dir ${cfg.files}:0700"
           "--docs /run/drv-doc"
           # The notification daemon: on the services' bus, where it alone owns
           # org.freedesktop.Notifications; the bridge forwards apps' notifications to it under

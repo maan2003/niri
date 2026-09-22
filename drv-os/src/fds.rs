@@ -72,17 +72,17 @@ fn take_inner() -> io::Result<Fds> {
             )));
         }
     }
-    let names = std::env::var_os(ENV_NAMES)
-        .ok_or_else(|| invalid(format!("{ENV_FDS} without {ENV_NAMES}: unnamed fds are refused")))?;
+    let names = std::env::var_os(ENV_NAMES).ok_or_else(|| {
+        invalid(format!(
+            "{ENV_FDS} without {ENV_NAMES}: unnamed fds are refused"
+        ))
+    })?;
     let names = names
         .to_str()
         .ok_or_else(|| invalid(format!("{ENV_NAMES} is not UTF-8")))?;
     let names: Vec<&str> = names.split(':').collect();
     if names.len() != count as usize {
-        return Err(invalid(format!(
-            "{} names for {count} fds",
-            names.len()
-        )));
+        return Err(invalid(format!("{} names for {count} fds", names.len())));
     }
     let mut fds = BTreeMap::new();
     for (i, name) in names.iter().enumerate() {
@@ -154,17 +154,22 @@ fn check_unix(
     listening: bool,
 ) -> io::Result<()> {
     use rustix::net::sockopt;
-    let domain = sockopt::socket_domain(fd).map_err(|e| invalid(format!("{name}: SO_DOMAIN: {e}")))?;
+    let domain =
+        sockopt::socket_domain(fd).map_err(|e| invalid(format!("{name}: SO_DOMAIN: {e}")))?;
     if domain != AddressFamily::UNIX {
         return Err(invalid(format!("{name} is not a unix socket")));
     }
     if let Some(kind) = kind {
-        let actual = sockopt::socket_type(fd).map_err(|e| invalid(format!("{name}: SO_TYPE: {e}")))?;
+        let actual =
+            sockopt::socket_type(fd).map_err(|e| invalid(format!("{name}: SO_TYPE: {e}")))?;
         if actual != kind {
-            return Err(invalid(format!("{name} is a {actual:?} socket, expected {kind:?}")));
+            return Err(invalid(format!(
+                "{name} is a {actual:?} socket, expected {kind:?}"
+            )));
         }
     }
-    let accepting = sockopt::socket_acceptconn(fd).map_err(|e| invalid(format!("{name}: SO_ACCEPTCONN: {e}")))?;
+    let accepting = sockopt::socket_acceptconn(fd)
+        .map_err(|e| invalid(format!("{name}: SO_ACCEPTCONN: {e}")))?;
     if accepting != listening {
         return Err(invalid(if listening {
             format!("{name} is not listening")
@@ -182,7 +187,9 @@ fn invalid(msg: String) -> io::Error {
 /// The giving side: `(name, fd)` pairs become the child's fds 3.. in order, and the two
 /// environment variables that say so. The caller `dup2`s them into place between fork and
 /// exec (see drv-supervisor).
-pub fn handoff<'a>(fds: &[(&str, BorrowedFd<'a>)]) -> io::Result<(Vec<(String, String)>, Vec<(i32, BorrowedFd<'a>)>)> {
+pub fn handoff<'a>(
+    fds: &[(&str, BorrowedFd<'a>)],
+) -> io::Result<(Vec<(String, String)>, Vec<(i32, BorrowedFd<'a>)>)> {
     let mut names = Vec::with_capacity(fds.len());
     let mut placed = Vec::with_capacity(fds.len());
     for (i, (name, fd)) in fds.iter().enumerate() {

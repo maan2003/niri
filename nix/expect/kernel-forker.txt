@@ -1,0 +1,61 @@
+parent drv-supervisor
+mount / ro,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=910,gid=910
+mount /dev rw,nosuid,noexec devtmpfs root=/ rw,mode=755
+mount /dev/hugepages rw,nosuid,noexec hugetlbfs root=/ rw,pagesize=2M
+mount /dev/mqueue rw,nosuid,noexec mqueue root=/ rw
+mount /dev/pts rw,nosuid,noexec devpts root=/ rw,gid=3,mode=620,ptmxmode=666
+mount /dev/shm rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=910,gid=910
+mount /dev/shm rw,nosuid,noexec tmpfs root=/ rw
+mount /etc ro,nosuid,nodev,noexec ext4 root=/etc rw
+mount /nix/store ro,nosuid,nodev overlay root=/ host
+mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible
+mount /run/drv rw,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
+mount /run/drv-apps rw,nosuid,nodev,noexec tmpfs root=/drv-apps rw,mode=755
+mount /run/drv-audio rw,nosuid,nodev,noexec tmpfs root=/drv-audio rw,mode=755
+mount /run/drv-bridge rw,nosuid,nodev,noexec tmpfs root=/drv-bridge rw,mode=755
+mount /run/drv-doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
+mount /run/drv-host rw,nosuid,nodev,noexec tmpfs root=/drv-host rw,mode=755
+mount /run/drv-pulse rw,nosuid,nodev,noexec tmpfs root=/drv-pulse rw,mode=755
+mount /run/drv-wayland rw,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
+mount /sys ro,nosuid,nodev,noexec sysfs root=/ rw
+mount /sys/fs/bpf ro,nosuid,nodev,noexec bpf root=/ rw,mode=700
+mount /sys/fs/cgroup ro,nosuid,nodev,noexec cgroup2 root=/ rw,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+mount /sys/fs/cgroup rw,nosuid,nodev,noexec cgroup2 root=/ rw,nsdelegate,memory_recursiveprot,memory_hugetlb_accounting
+mount /sys/fs/fuse/connections ro,nosuid,nodev,noexec fusectl root=/ rw
+mount /sys/fs/pstore ro,nosuid,nodev,noexec pstore root=/ rw
+mount /sys/kernel/config ro,nosuid,nodev,noexec configfs root=/ rw
+mount /sys/kernel/debug ro,nosuid,nodev,noexec debugfs root=/ rw
+mount /sys/kernel/security ro,nosuid,nodev,noexec securityfs root=/ rw
+mount /sys/kernel/tracing ro,nosuid,nodev,noexec tracefs root=/ rw
+mount /tmp rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=910,gid=910
+mount /var/lib/drv-apps rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps rw
+Uid: UID UID UID UID
+Gid: UID UID UID UID
+Groups: UID
+CapInh: 00000000002001c0
+CapPrm: 00000000002001c0
+CapEff: 00000000002001c0
+CapBnd: 00000000002001c0
+CapAmb: 00000000002001c0
+NoNewPrivs: 1
+Seccomp: 0
+ns mnt own
+ns net host
+ns pid host
+ns user host
+ns uts host
+ns ipc host
+ns cgroup host
+ns time host
+0::/system.slice/drv-supervisor.service
+task drv-forker parent drv-supervisor
+uid UID UID UID UID gid UID UID UID UID groups UID
+caps inh 00000000002001c0 prm 00000000002001c0 eff 00000000002001c0 bnd 00000000002001c0 amb 00000000002001c0
+securebits 0x0
+user_ns host
+landlock none
+no_new_privs 1
+seccomp mode 0 filters 0
+mdwe 0 no_inherit 0
+ns mnt own net host pid host uts host ipc host cgroup host time host
+root tmpfs:tmpfs mount-root

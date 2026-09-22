@@ -19,7 +19,9 @@ done
 count "set started once" "drv-supervisor: compositor running as uid" 1
 
 echo "== kernel state"
-if out=$(bash "$(dirname "$0")/kernel-state.sh" flower 2>&1); then echo "PASS $out"; else echo "FAIL kernel state of flower:"; echo "$out" | head -30; fails=$((fails + 1)); fi
+for who in flower forker compositor; do
+  if out=$(bash "$(dirname "$0")/kernel-state.sh" $who 2>&1); then echo "PASS $out"; else echo "FAIL kernel state of $who:"; echo "$out" | head -30; fails=$((fails + 1)); fi
+done
 echo "== an app's view (the hello probe)"
 H=/var/lib/drv-apps/100001/out
 for _ in $(seq 1 30); do $SSH test -e $H/done && break; sleep 1; done

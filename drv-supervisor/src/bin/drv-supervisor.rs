@@ -3,7 +3,6 @@
 //! connection between two members is a socketpair made here, before either exists.
 
 use std::ffi::CString;
-use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -12,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
 use std::sync::mpsc;
 use std::time::Duration;
-use std::{fs, thread};
+use std::{fs, io, thread};
 
 use clap::Parser;
 use drv_os::fds::{seqpacket_pair, stream_pair};
@@ -156,6 +155,10 @@ struct Args {
     /// `NAME=VALUE` in the portal's environment. Repeatable; it gets nothing else.
     #[arg(long = "portal-env")]
     portal_env: Vec<String>,
+    /// `PATH:MODE` (octal): a directory the portal owns (the person's files), created before
+    /// it starts and in its root.
+    #[arg(long = "portal-dir")]
+    portal_dirs: Vec<String>,
     /// Where the documents mount goes: the portal serves it, apps see their files under it.
     #[arg(long, default_value = "/run/drv-doc")]
     docs: PathBuf,
@@ -213,9 +216,33 @@ struct Set {
 
 fn supervise(args: Args) -> Result<(), String> {
     let set = Set {
-        seatd: service("drv-seatd", &args.seatd_user, &args.seatd_exec, &args.seatd_env, &[], &args.seatd_caps, &args.seatd_expose)?,
-        authd: service("drv-authd", &args.authd_user, &args.authd_exec, &[], &args.authd_dirs, &[], &args.authd_expose)?,
-        gpu: service("compositor-gpu", &args.gpu_user, &args.gpu_exec, &args.gpu_env, &[], &[], &args.gpu_expose)?,
+        seatd: service(
+            "drv-seatd",
+            &args.seatd_user,
+            &args.seatd_exec,
+            &args.seatd_env,
+            &[],
+            &args.seatd_caps,
+            &args.seatd_expose,
+        )?,
+        authd: service(
+            "drv-authd",
+            &args.authd_user,
+            &args.authd_exec,
+            &[],
+            &args.authd_dirs,
+            &[],
+            &args.authd_expose,
+        )?,
+        gpu: service(
+            "compositor-gpu",
+            &args.gpu_user,
+            &args.gpu_exec,
+            &args.gpu_env,
+            &[],
+            &[],
+            &args.gpu_expose,
+        )?,
         compositor: service(
             "compositor",
             &args.compositor_user,
@@ -225,10 +252,42 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &args.compositor_expose,
         )?,
-        locker: service("locker", &args.locker_user, &args.locker_exec, &args.locker_env, &[], &[], &args.locker_expose)?,
-        menu: service("drv-menu", &args.menu_user, &args.menu_exec, &args.menu_env, &[], &[], &args.menu_expose)?,
-        portal: service("drv-portal", &args.portal_user, &args.portal_exec, &args.portal_env, &[], &[], &args.portal_expose)?,
-        notifier: service("drv-notifier", &args.notifier_user, &args.notifier_exec, &args.notifier_env, &[], &[], &args.notifier_expose)?,
+        locker: service(
+            "locker",
+            &args.locker_user,
+            &args.locker_exec,
+            &args.locker_env,
+            &[],
+            &[],
+            &args.locker_expose,
+        )?,
+        menu: service(
+            "drv-menu",
+            &args.menu_user,
+            &args.menu_exec,
+            &args.menu_env,
+            &[],
+            &[],
+            &args.menu_expose,
+        )?,
+        portal: service(
+            "drv-portal",
+            &args.portal_user,
+            &args.portal_exec,
+            &args.portal_env,
+            &args.portal_dirs,
+            &[],
+            &args.portal_expose,
+        )?,
+        notifier: service(
+            "drv-notifier",
+            &args.notifier_user,
+            &args.notifier_exec,
+            &args.notifier_env,
+            &[],
+            &[],
+            &args.notifier_expose,
+        )?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -238,8 +297,24 @@ fn supervise(args: Args) -> Result<(), String> {
             &args.forker_caps,
             &args.forker_expose,
         )?,
-        appd: service("drv-appd", &args.appd_user, &args.appd_exec, &[], &[], &[], &args.appd_expose)?,
-        bridge: service("drv-bridge", &args.bridge_user, &args.bridge_exec, &args.bridge_env, &[], &[], &args.bridge_expose)?,
+        appd: service(
+            "drv-appd",
+            &args.appd_user,
+            &args.appd_exec,
+            &[],
+            &[],
+            &[],
+            &args.appd_expose,
+        )?,
+        bridge: service(
+            "drv-bridge",
+            &args.bridge_user,
+            &args.bridge_exec,
+            &args.bridge_env,
+            &[],
+            &[],
+            &args.bridge_expose,
+        )?,
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switch stays ours.
@@ -282,8 +357,13 @@ fn listen_seqpacket(path: &Path) -> Result<UnixListener, String> {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
     let _ = fs::remove_file(path);
-    let sock = rustix::net::socket_with(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)
-        .map_err(|e| format!("socket: {e}"))?;
+    let sock = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|e| format!("socket: {e}"))?;
     let addr = SocketAddrUnix::new(path).map_err(|e| format!("{}: {e}", path.display()))?;
     rustix::net::bind(&sock, &addr).map_err(|e| format!("bind {}: {e}", path.display()))?;
     rustix::net::listen(&sock, 64).map_err(|e| format!("listen on {}: {e}", path.display()))?;
@@ -322,7 +402,11 @@ fn mount_docs(at: &Path, uid: u32, gid: u32) -> Result<OwnedFd, String> {
         )
     };
     if rc != 0 {
-        return Err(format!("mount fuse on {}: {}", at.display(), io::Error::last_os_error()));
+        return Err(format!(
+            "mount fuse on {}: {}",
+            at.display(),
+            io::Error::last_os_error()
+        ));
     }
     Ok(OwnedFd::from(fuse))
 }
@@ -382,8 +466,16 @@ fn start_set(
 ) -> Result<Group, String> {
     let l = Links::make()?;
     let fuse = mount_docs(docs, set.portal.uid, set.portal.gid)?;
-    let members: [(&'static str, &Service, Vec<(&str, std::os::fd::BorrowedFd<'_>)>); 11] = [
-        ("drv-seatd", &set.seatd, vec![("compositor", l.compositor_seat.1.as_fd())]),
+    let members: [(
+        &'static str,
+        &Service,
+        Vec<(&str, std::os::fd::BorrowedFd<'_>)>,
+    ); 11] = [
+        (
+            "drv-seatd",
+            &set.seatd,
+            vec![("compositor", l.compositor_seat.1.as_fd())],
+        ),
         (
             "drv-authd",
             &set.authd,
@@ -392,7 +484,11 @@ fn start_set(
                 ("locker", l.locker_auth.1.as_fd()),
             ],
         ),
-        ("compositor-gpu", &set.gpu, vec![("compositor", l.compositor_gpu.1.as_fd())]),
+        (
+            "compositor-gpu",
+            &set.gpu,
+            vec![("compositor", l.compositor_gpu.1.as_fd())],
+        ),
         (
             "compositor",
             &set.compositor,
@@ -436,8 +532,16 @@ fn start_set(
                 ("fuse", fuse.as_fd()),
             ],
         ),
-        ("drv-notifier", &set.notifier, vec![("wayland", l.notifier_client.1.as_fd())]),
-        ("drv-forker", &set.forker, vec![("channel", l.appd_forker.1.as_fd())]),
+        (
+            "drv-notifier",
+            &set.notifier,
+            vec![("wayland", l.notifier_client.1.as_fd())],
+        ),
+        (
+            "drv-forker",
+            &set.forker,
+            vec![("channel", l.appd_forker.1.as_fd())],
+        ),
         (
             "drv-appd",
             &set.appd,
@@ -520,16 +624,29 @@ fn wait_first(children: &Group) -> String {
     thread::sleep(Duration::from_millis(200));
     let gone: Vec<String> = children
         .iter()
-        .filter_map(|(name, child)| exited(child.id() as i32, libc::WNOHANG).map(|how| format!("{name} ({how})")))
+        .filter_map(|(name, child)| {
+            exited(child.id() as i32, libc::WNOHANG).map(|how| format!("{name} ({how})"))
+        })
         .collect();
-    if gone.is_empty() { "? (lost)".to_owned() } else { gone.join(", ") }
+    if gone.is_empty() {
+        "? (lost)".to_owned()
+    } else {
+        gone.join(", ")
+    }
 }
 
 /// Whether `pid` has exited, and how, without reaping it. `flags` adds `WNOHANG` to poll.
 fn exited(pid: i32, flags: libc::c_int) -> Option<String> {
     // SAFETY: waitid with WNOWAIT leaves the child for `Child::wait` to reap.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT | flags) };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | flags,
+        )
+    };
     // SAFETY: a successful waitid filled the child fields.
     if rc != 0 || unsafe { info.si_pid() } == 0 {
         return None;
@@ -573,7 +690,8 @@ fn service(
             let (path, mode) = d
                 .split_once(':')
                 .ok_or_else(|| format!("{name}: dir {d:?} is not PATH:MODE"))?;
-            let mode = u32::from_str_radix(mode, 8).map_err(|e| format!("{name}: mode {mode:?}: {e}"))?;
+            let mode =
+                u32::from_str_radix(mode, 8).map_err(|e| format!("{name}: mode {mode:?}: {e}"))?;
             Ok((PathBuf::from(path), mode))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -594,5 +712,6 @@ fn service(
         // Only the forker keeps the network: apps with `network` get it from the forker's
         // namespace. Nobody else in the set talks to anything but its fds and sockets.
         network: name == "drv-forker",
+        cgroups: name == "drv-forker",
     })
 }

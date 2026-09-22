@@ -1,10 +1,11 @@
 //! Users, groups, fds and owned directories: the handful of libc calls every privileged piece
 //! needs, in one place.
 
+pub mod creds;
 pub mod fds;
 pub mod landlock;
 pub mod mounts;
-pub mod sandbox;
+pub mod root;
 pub mod seccomp;
 
 use std::ffi::CString;
@@ -154,7 +155,6 @@ pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

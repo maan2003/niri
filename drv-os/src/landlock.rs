@@ -1,6 +1,6 @@
-//! Landlock, raw: what the forker's child puts itself under before it becomes the app. Rules are paths with access bits;
-//! a rule on a directory covers everything beneath it, bind mounts included. Nothing here
-//! is permissive: a kernel without Landlock is an error, not a warning.
+//! Landlock, raw: what the forker's child puts itself under before it becomes the app. Rules are
+//! paths with access bits; a rule on a directory covers everything beneath it, bind mounts
+//! included. Nothing here is permissive: a kernel without Landlock is an error, not a warning.
 
 use std::fs::File;
 use std::io;
@@ -64,9 +64,19 @@ impl Ruleset {
     /// signals scoped to the domain where the kernel can (ABI 6).
     pub fn new() -> io::Result<Self> {
         // SAFETY: the version query takes no attr.
-        let abi = unsafe { libc::syscall(SYS_CREATE_RULESET, std::ptr::null::<RulesetAttr>(), 0usize, CREATE_RULESET_VERSION) };
+        let abi = unsafe {
+            libc::syscall(
+                SYS_CREATE_RULESET,
+                std::ptr::null::<RulesetAttr>(),
+                0usize,
+                CREATE_RULESET_VERSION,
+            )
+        };
         if abi < 0 {
-            return Err(io::Error::new(io::Error::last_os_error().kind(), "no Landlock in this kernel"));
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                "no Landlock in this kernel",
+            ));
         }
         let mut handled = (1 << 13) - 1; // ABI 1: up to MAKE_SYM
         if abi >= 2 {
@@ -81,12 +91,29 @@ impl Ruleset {
         let attr = RulesetAttr {
             handled_access_fs: handled,
             handled_access_net: 0,
-            scoped: if abi >= 6 { SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL } else { 0 },
+            scoped: if abi >= 6 {
+                SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL
+            } else {
+                0
+            },
         };
         // Older kernels want the shorter struct.
-        let size = if abi >= 6 { 24 } else if abi >= 4 { 16 } else { 8 };
+        let size = if abi >= 6 {
+            24
+        } else if abi >= 4 {
+            16
+        } else {
+            8
+        };
         // SAFETY: attr outlives the call; size is what the kernel expects for this ABI.
-        let fd = unsafe { libc::syscall(SYS_CREATE_RULESET, &attr as *const RulesetAttr, size as usize, 0u32) };
+        let fd = unsafe {
+            libc::syscall(
+                SYS_CREATE_RULESET,
+                &attr as *const RulesetAttr,
+                size as usize,
+                0u32,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -115,11 +142,16 @@ impl Ruleset {
     /// The same, `path` relative to `dir` (a detached tree's fd, say): the rule is on the
     /// inode, where the tree ends up mounted does not matter.
     pub fn allow_at(&self, dir: &impl AsRawFd, path: &Path, access: u64) -> io::Result<bool> {
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("NUL in {}", path.display())))?;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("NUL in {}", path.display()),
+            )
+        })?;
         // O_PATH: the inode, not an open file; std's OpenOptions wants read or write.
         // SAFETY: valid C string and fd.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        let fd =
+            unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::NotFound {
@@ -137,12 +169,30 @@ impl Ruleset {
         if allowed == 0 {
             return Ok(true);
         }
-        let rule = PathBeneath { allowed_access: allowed, parent_fd: file.as_raw_fd() };
+        let rule = PathBeneath {
+            allowed_access: allowed,
+            parent_fd: file.as_raw_fd(),
+        };
         // SAFETY: rule and the fd outlive the call.
-        let rc = unsafe { libc::syscall(SYS_ADD_RULE, self.fd.as_raw_fd(), RULE_PATH_BENEATH, &rule as *const PathBeneath, 0u32) };
+        let rc = unsafe {
+            libc::syscall(
+                SYS_ADD_RULE,
+                self.fd.as_raw_fd(),
+                RULE_PATH_BENEATH,
+                &rule as *const PathBeneath,
+                0u32,
+            )
+        };
         drop::<File>(file);
         if rc != 0 {
-            return Err(io::Error::new(io::Error::last_os_error().kind(), format!("rule for {}: {}", path.display(), io::Error::last_os_error())));
+            return Err(io::Error::new(
+                io::Error::last_os_error().kind(),
+                format!(
+                    "rule for {}: {}",
+                    path.display(),
+                    io::Error::last_os_error()
+                ),
+            ));
         }
         Ok(true)
     }

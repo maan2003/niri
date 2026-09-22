@@ -9,5 +9,5 @@ repository.workspace = true
 
 [dependencies]
 libc = "0.2"
-rustix = { version = "1.1.4", features = ["fs", "mount", "net", "process", "std", "thread"] }
+rustix = { version = "1.1.4", features = ["fs", "mount", "net", "process", "std", "stdio", "thread"] }
 seccompiler = "0.5"

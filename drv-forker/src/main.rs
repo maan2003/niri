@@ -15,13 +15,14 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use drv_os::landlock::{self, Ruleset};
-use drv_os::mounts::{attach, clone_tree, new_fs, set_attrs, Attr};
+use drv_os::mounts::{attach, clone_tree, new_fs, Attr};
+use drv_os::root::Root;
 use drv_policy::forker::{Request, Response};
 use drv_policy::seq;
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::fs::{Gid, Mode, OFlags, Uid, CWD};
 use rustix::process::Pid;
-use rustix::thread::{CapabilitiesSecureBits, CapabilitySet, CapabilitySets};
+use rustix::thread::CapabilitySet;
 
 /// What forking an app takes: the namespace and its mounts (SYS_ADMIN), the UID switch
 /// (SETUID, SETGID) and locking the securebits and emptying the bounding set (SETPCAP).
@@ -194,20 +195,16 @@ impl Forker {
                 run.push((p, src, writable));
             }
         }
-        set_securebits()?;
-        empty_bounding_set()?;
-        drop_capability(CapabilitySet::SETPCAP)?;
+        drv_os::creds::lock_securebits()?;
+        drv_os::creds::empty_bounding_set()?;
+        drv_os::creds::drop_capability(CapabilitySet::SETPCAP)?;
         rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
+        // The root: a fresh tmpfs, made our namespace's root (hung on our own runtime base
+        // for the moment it takes). The old root stays stacked beneath it, reachable through
+        // the handles below and nothing else, until the UID's directories are taken.
+        let mut root = Root::new(&self.args.runtime_base, true)?;
         // SAFETY: single-threaded.
-        unsafe {
-            rustix::thread::unshare_unsafe(
-                rustix::thread::UnshareFlags::NEWNS | rustix::thread::UnshareFlags::NEWNET,
-            )
-        }
-        .map_err(|e| format!("unshare: {e}"))?;
-        use rustix::mount::MountPropagationFlags as P;
-        rustix::mount::mount_change("/", P::PRIVATE | P::REC)
-            .map_err(|e| format!("make private: {e}"))?;
+        unsafe { root.unshare() }.map_err(|e| format!("namespaces: {e}"))?;
         // The per-UID directories' parents, as plain handles into this namespace's copy of
         // the old root (a handle from before the unshare would point into the parent's
         // namespace, which nothing may be cloned from): the UID's subdirectory of each is
@@ -215,57 +212,38 @@ impl Forker {
         let run_base = open_path(&self.args.runtime_base)?;
         let tmp_base = open_path(&self.args.runtime_base.join("tmp"))?;
         let state_base = open_path(&self.args.state_base)?;
-        // The root: a fresh tmpfs, made our namespace's root at once (hung on our own
-        // runtime base for the moment it takes). The old root stays stacked beneath it,
-        // reachable through the handles above and nothing else, until the UID's directories
-        // are taken; then it is detached.
-        let root = new_fs(
-            "tmpfs",
-            &[("mode", "0755")],
-            Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV,
-        )
-        .map_err(|e| format!("root tmpfs: {e}"))?;
-        attach(root, &self.args.runtime_base).map_err(|e| format!("attach root: {e}"))?;
-        rustix::process::chdir(&self.args.runtime_base).map_err(|e| format!("chdir: {e}"))?;
-        rustix::process::pivot_root(".", ".").map_err(|e| format!("pivot_root: {e}"))?;
-        rustix::process::chdir("/").map_err(|e| format!("chdir /: {e}"))?;
-        // From here every path resolves inside the new root. The fixed part:
-        let mount = |fd: OwnedFd, at: &str| -> Result<(), String> {
-            std::fs::create_dir_all(at).map_err(|e| format!("mkdir {at}: {e}"))?;
-            attach(fd, Path::new(at)).map_err(|e| format!("mount {at}: {e}"))
-        };
-        mount(store, &self.args.store.to_string_lossy())?;
-        mount(dev, "/dev")?;
-        mount(
+        // The fixed part:
+        root.mount(store, &self.args.store)?;
+        root.mount(dev, Path::new("/dev"))?;
+        root.mount(
             new_fs("tmpfs", &[("mode", "1777")], rw_noexec).map_err(|e| format!("shm: {e}"))?,
-            "/dev/shm",
+            Path::new("/dev/shm"),
         )?;
         // The app's own PID namespace seen through its own proc instance: the pid entries
         // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
-        mount(
+        root.mount(
             new_fs(
                 "proc",
                 &[("hidepid", "invisible"), ("subset", "pid")],
                 rw_noexec,
             )
             .map_err(|e| format!("proc: {e}"))?,
-            "/proc",
+            Path::new("/proc"),
         )?;
         let mut run_rules = Vec::new();
         let mut audio_mounts = Vec::new();
         for (p, src, writable) in run {
             let is_audio = RUN_AUDIO.contains(&p);
             match src {
-                Ok(fd) if !is_audio => mount(fd, p)?,
+                Ok(fd) if !is_audio => root.mount(fd, Path::new(p))?,
                 Ok(fd) => audio_mounts.push((p, fd)),
-                Err(target) => {
-                    std::fs::create_dir_all(Path::new(p).parent().unwrap())
-                        .map_err(|e| format!("{p}: {e}"))?;
-                    std::os::unix::fs::symlink(&target, p).map_err(|e| format!("{p}: {e}"))?;
-                }
+                Err(target) => root.symlink(&target, Path::new(p))?,
             }
             run_rules.push((p, writable, is_audio));
         }
+        root.build().map_err(|e| format!("root: {e}"))?;
+        drop(root);
+        let mount = |fd: OwnedFd, at: &str| drv_os::root::mount(fd, Path::new(at));
 
         // 2. The request. From here to the switch, only uid, network, gpu and audio are read.
         let Request::Launch(launch): Request =
@@ -326,10 +304,7 @@ impl Forker {
         mount(per_uid(&tmp_base, "tmp")?, "/tmp")?;
         let runtime = format!("{}/{uid}", self.args.runtime_base.display());
         mount(per_uid(&run_base, "runtime")?, &runtime)?;
-        // The old root, stacked beneath ours since the pivot: gone, with the handles into it.
         drop((run_base, tmp_base, state_base));
-        rustix::mount::unmount(".", rustix::mount::UnmountFlags::DETACH)
-            .map_err(|e| format!("detach old root: {e}"))?;
         if launch.network {
             let resolv = resolv.ok_or("no resolv.conf on the host")?;
             std::fs::create_dir_all("/run/host").map_err(|e| format!("/run/host: {e}"))?;
@@ -338,10 +313,9 @@ impl Forker {
             attach(resolv, Path::new("/run/host/resolv.conf"))
                 .map_err(|e| format!("resolv.conf: {e}"))?;
         }
-        // Nothing new at the top level, ever, and nothing runs from it.
-        let root = open_path(Path::new("/"))?;
-        set_attrs(&root, ro_noexec, false).map_err(|e| format!("root read-only: {e}"))?;
-        drop(root);
+        // The old root, stacked beneath ours since the pivot: gone, with the handles into it;
+        // the top level read-only.
+        drv_os::root::finish(ro_noexec).map_err(|e| format!("root: {e}"))?;
         // One cgroup per app UID under the subtree the supervisor delegated to us.
         let name = format!("app-{uid}");
         match rustix::fs::mkdirat(&apps_cgroup, &name, Mode::from_raw_mode(0o755)) {
@@ -365,24 +339,8 @@ impl Forker {
             .map_err(|e| format!("cgroup namespace: {e}"))?;
 
         // 3. The switch. Its own group and nothing else (set explicitly: gid 0 would see
-        // through hidepid). A non-root forker's capabilities survive setresuid, so they go
-        // explicitly, all of them.
-        rustix::thread::set_thread_groups(&[g]).map_err(|e| format!("setgroups: {e}"))?;
-        rustix::thread::set_thread_res_gid(g, g, g).map_err(|e| format!("setresgid: {e}"))?;
-        rustix::thread::set_thread_res_uid(u, u, u).map_err(|e| format!("setresuid: {e}"))?;
-        if rustix::process::getuid() != u || rustix::process::geteuid() != u {
-            return Err("uid did not change".into());
-        }
-        rustix::thread::clear_ambient_capability_set().map_err(|e| format!("ambient: {e}"))?;
-        rustix::thread::set_capabilities(
-            None,
-            CapabilitySets {
-                effective: CapabilitySet::empty(),
-                permitted: CapabilitySet::empty(),
-                inheritable: CapabilitySet::empty(),
-            },
-        )
-        .map_err(|e| format!("capset: {e}"))?;
+        // through hidepid), no capability of any kind.
+        drv_os::creds::switch_to(u, g, &[g], CapabilitySet::empty())?;
         rustix::process::chdir(HOME).map_err(|e| format!("chdir {HOME}: {e}"))?;
 
         // 4. As the app, with nothing: what it may open, then its command.
@@ -597,50 +555,6 @@ fn reap(pid: Pid) {
         "drv-forker: pid {} (uid {uid}) exited: {how}",
         pid.as_raw_nonzero()
     );
-}
-
-/// Every bit locked, before anything else: no root, no setuid fixups, no ambient raise, and
-/// (where the kernel knows them, 6.14) exec restricted to files, not scripts.
-fn set_securebits() -> Result<(), String> {
-    const NOROOT: u32 = 1 << 0;
-    const NO_SETUID_FIXUP: u32 = 1 << 2;
-    const KEEP_CAPS_LOCKED: u32 = 1 << 5;
-    const NO_CAP_AMBIENT_RAISE: u32 = 1 << 6;
-    const EXEC_RESTRICT_FILE: u32 = 1 << 8;
-    const EXEC_DENY_INTERACTIVE: u32 = 1 << 10;
-    let locked = |bit: u32| bit | (bit << 1);
-    let base =
-        locked(NOROOT) | locked(NO_SETUID_FIXUP) | KEEP_CAPS_LOCKED | locked(NO_CAP_AMBIENT_RAISE);
-    let exec = locked(EXEC_RESTRICT_FILE) | locked(EXEC_DENY_INTERACTIVE);
-    // rustix's flag set predates the exec bits: retain them past its check.
-    let set = |bits: u32| {
-        rustix::thread::set_capabilities_secure_bits(CapabilitiesSecureBits::from_bits_retain(bits))
-    };
-    if set(base | exec).is_ok() {
-        return Ok(());
-    }
-    set(base).map_err(|e| format!("securebits: {e}"))
-}
-
-/// Nothing exec'd from here on can gain a capability, whatever its file says.
-fn empty_bounding_set() -> Result<(), String> {
-    for cap in CapabilitySet::all().iter() {
-        if cap.bits().count_ones() == 1
-            && rustix::thread::capability_is_in_bounding_set(cap).map_err(|e| e.to_string())?
-        {
-            rustix::thread::remove_capability_from_bounding_set(cap)
-                .map_err(|e| format!("bounding set: {e}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn drop_capability(cap: CapabilitySet) -> Result<(), String> {
-    let mut caps = rustix::thread::capabilities(None).map_err(|e| e.to_string())?;
-    caps.effective.remove(cap);
-    caps.permitted.remove(cap);
-    caps.inheritable.remove(cap);
-    rustix::thread::set_capabilities(None, caps).map_err(|e| format!("capset: {e}"))
 }
 
 fn parse_range(s: &str) -> Result<(u32, u32), String> {
