@@ -2301,6 +2301,12 @@ impl State {
             Action::ShowLauncher => {
                 self.niri.show_launcher();
             }
+            Action::VolumeUp => self.niri.press_key("volume up"),
+            Action::VolumeDown => self.niri.press_key("volume down"),
+            Action::VolumeMute => self.niri.press_key("volume mute"),
+            Action::MicMute => self.niri.press_key("mic mute"),
+            Action::BrightnessUp => self.niri.press_key("brightness up"),
+            Action::BrightnessDown => self.niri.press_key("brightness down"),
             Action::ToggleOverview => {
                 self.niri.layout.toggle_overview();
                 self.niri.queue_redraw_all();
@@ -4846,6 +4852,12 @@ fn allowed_during_screenshot(action: &Action) -> bool {
             // Intended for binds such as volume up/down, lock the screen, etc.
             | Action::Spawn(_)
             | Action::SpawnSh(_)
+            | Action::VolumeUp
+            | Action::VolumeDown
+            | Action::VolumeMute
+            | Action::MicMute
+            | Action::BrightnessUp
+            | Action::BrightnessDown
             // The screenshot UI can handle these.
             | Action::MoveColumnLeft
             | Action::MoveColumnLeftOrToMonitorLeft

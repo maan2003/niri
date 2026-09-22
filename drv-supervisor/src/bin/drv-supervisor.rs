@@ -142,6 +142,34 @@ struct Args {
     /// `NAME=VALUE` in the notification daemon's environment. Repeatable; it gets nothing else.
     #[arg(long = "notifier-env")]
     notifier_env: Vec<String>,
+    /// System user the ssh agent runs as.
+    #[arg(long)]
+    agent_user: String,
+    /// The agent's command line, whitespace-separated (`drv-agent serve ...`).
+    #[arg(long)]
+    agent_exec: String,
+    /// `PATH:MODE` (octal): a directory the agent owns (its socket's), checked before it
+    /// starts and in its root.
+    #[arg(long = "agent-dir")]
+    agent_dirs: Vec<String>,
+    /// An entry under `/run` the agent sees (udev's database, for the authenticators). Repeatable.
+    #[arg(long = "agent-expose")]
+    agent_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the agent's environment. Repeatable; it gets nothing else.
+    #[arg(long = "agent-env")]
+    agent_env: Vec<String>,
+    /// System user the media keys service runs as (groups pipewire and video).
+    #[arg(long)]
+    keys_user: String,
+    /// The media keys service's command line, whitespace-separated (`drv-keys --wpctl ...`).
+    #[arg(long)]
+    keys_exec: String,
+    /// An entry under `/run` the media keys service sees (PipeWire's socket). Repeatable.
+    #[arg(long = "keys-expose")]
+    keys_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the media keys service's environment. Repeatable; it gets nothing else.
+    #[arg(long = "keys-env")]
+    keys_env: Vec<String>,
     /// System user the portal (file chooser and documents mount) runs as.
     #[arg(long)]
     portal_user: String,
@@ -208,6 +236,8 @@ struct Set {
     menu: Service,
     portal: Service,
     notifier: Service,
+    agent: Service,
+    keys: Service,
     forker: Service,
     appd: Service,
     bridge: Service,
@@ -286,6 +316,24 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &[],
             &args.notifier_expose,
+        )?,
+        agent: service(
+            "drv-agent",
+            &args.agent_user,
+            &args.agent_exec,
+            &args.agent_env,
+            &args.agent_dirs,
+            &[],
+            &args.agent_expose,
+        )?,
+        keys: service(
+            "drv-keys",
+            &args.keys_user,
+            &args.keys_exec,
+            &args.keys_env,
+            &[],
+            &[],
+            &args.keys_expose,
         )?,
         forker: service(
             "drv-forker",
@@ -419,6 +467,8 @@ struct Links {
     compositor_locker: (OwnedFd, OwnedFd),
     compositor_appd: (OwnedFd, OwnedFd),
     compositor_menu: (OwnedFd, OwnedFd),
+    /// The compositor's key line to drv-keys: a line per media key.
+    compositor_keys: (OwnedFd, OwnedFd),
     menu_client: (OwnedFd, OwnedFd),
     menu_appd: (OwnedFd, OwnedFd),
     portal_client: (OwnedFd, OwnedFd),
@@ -442,6 +492,7 @@ impl Links {
             compositor_locker: stream()?,
             compositor_appd: stream()?,
             compositor_menu: stream()?,
+            compositor_keys: stream()?,
             menu_client: stream()?,
             menu_appd: stream()?,
             portal_client: stream()?,
@@ -471,7 +522,7 @@ fn start_set(
         &'static str,
         &Service,
         Vec<(&str, std::os::fd::BorrowedFd<'_>)>,
-    ); 11] = [
+    ); 13] = [
         (
             "drv-seatd",
             &set.seatd,
@@ -500,6 +551,7 @@ fn start_set(
                 ("locker", l.compositor_locker.0.as_fd()),
                 ("appd", l.compositor_appd.0.as_fd()),
                 ("menu", l.compositor_menu.0.as_fd()),
+                ("keys", l.compositor_keys.0.as_fd()),
                 ("menu-client", l.menu_client.0.as_fd()),
                 ("portal-client", l.portal_client.0.as_fd()),
                 ("notifier-client", l.notifier_client.0.as_fd()),
@@ -537,6 +589,13 @@ fn start_set(
             "drv-notifier",
             &set.notifier,
             vec![("wayland", l.notifier_client.1.as_fd())],
+        ),
+        // No wire: its door is a socket in its directory, and the uid check is its own.
+        ("drv-agent", &set.agent, vec![]),
+        (
+            "drv-keys",
+            &set.keys,
+            vec![("compositor", l.compositor_keys.1.as_fd())],
         ),
         (
             "drv-forker",
@@ -705,5 +764,7 @@ fn service(
         // namespace. Nobody else in the set talks to anything but its fds and sockets.
         network: name == "drv-forker",
         cgroups: name == "drv-forker",
+        // The media keys write the backlight; nobody else touches sysfs.
+        writable_sys: name == "drv-keys",
     })
 }

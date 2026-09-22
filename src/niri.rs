@@ -240,6 +240,9 @@ pub struct Niri {
     pub launcher: Option<PolicyClient>,
     /// The poke line to drv-menu, from the supervisor: `show-launcher` writes a byte to it.
     pub menu: Option<std::os::unix::net::UnixStream>,
+    /// The key line to drv-keys, from the supervisor: the volume and brightness binds write
+    /// a line each to it. Volume and backlight are devices; the compositor has none.
+    pub keys: Option<std::os::unix::net::UnixStream>,
     /// The cast line to drv-portal, from the supervisor (`drv_portal::compositor`).
     pub portal: Option<OwnedFd>,
     pub portal_link: Option<RegistrationToken>,
@@ -3102,6 +3105,7 @@ impl Niri {
             policy,
             launcher: None,
             menu: None,
+            keys: None,
             portal: None,
             portal_link: None,
         };
@@ -3141,6 +3145,20 @@ impl Niri {
             // A backlog means the menu is busy; one more poke would not help.
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
             Err(err) => warn!("the line to drv-menu: {err}"),
+        }
+    }
+
+    /// A media key for drv-keys: `volume up`, `brightness down`, and so on.
+    pub fn press_key(&mut self, key: &str) {
+        let Some(keys) = self.keys.as_mut() else {
+            warn!("cannot press {key:?}: no line to drv-keys from the supervisor");
+            return;
+        };
+        match std::io::Write::write_all(keys, format!("{key}\n").as_bytes()) {
+            Ok(()) => (),
+            // A backlog means drv-keys is behind; one more press would not help.
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+            Err(err) => warn!("the line to drv-keys: {err}"),
         }
     }
 
@@ -6835,6 +6853,14 @@ impl Niri {
                 }
                 info!("menu attached");
                 self.menu = Some(sock);
+            }
+            Peer::Keys => {
+                let sock = std::os::unix::net::UnixStream::from(sock);
+                if let Err(err) = sock.set_nonblocking(true) {
+                    warn!("the line to drv-keys: {err}");
+                }
+                info!("media keys attached");
+                self.keys = Some(sock);
             }
         }
     }

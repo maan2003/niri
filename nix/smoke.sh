@@ -13,7 +13,7 @@ echo "== waiting for ssh"
 wait_ssh
 
 echo "== the set"
-for m in compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-portal drv-notifier drv-forker drv-appd drv-bridge; do
+for m in compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-portal drv-notifier drv-agent drv-keys drv-forker drv-appd drv-bridge; do
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
@@ -40,10 +40,20 @@ file_has "state linked into HOME" $H/home.txt 'out -> /home/app/.state/out'
 file_has "defaults linked from the store" $H/home.txt '^/nix/store/.*-drv-files-hello/.config/hello/greeting$'
 file_has "and readable through the closure" $H/home.txt '^hello from the store$'
 file_has "store not listable beyond the closure" $H/store.txt 'Permission denied'
+file_has "the ssh agent answers the grant" $H/agent.txt 'The agent has no identities'
+G=/var/lib/drv-apps/100002/out
+for _ in $(seq 1 30); do $SSH test -e $G/done && break; sleep 1; done
+$SSH grep -q 'no identities' $G/agent.txt && fail "the agent answered an app without the grant" || echo "PASS the agent's door is shut without the grant"
+expect "and says so" 'drv-agent: refused uid 100002'
 
 echo "== unlock"
 mark; key 1 2 3 4 ret; sleep 2
 expect "PIN accepted" "PIN accepted; unlocking"
+
+echo "== media keys"
+mark; key volumeup; sleep 2
+expect "volume-up reached drv-keys" 'drv-keys: volume up'
+absent "and wpctl took it" 'drv-keys: volume up: '
 
 echo "== notification"
 mark; menu noti; sleep 3

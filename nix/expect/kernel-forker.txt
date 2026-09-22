@@ -10,6 +10,7 @@ mount /etc ro,nosuid,nodev,noexec ext4 root=/etc rw
 mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible
 mount /run/drv rw,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
+mount /run/drv-agent rw,nosuid,nodev,noexec tmpfs root=/drv-agent rw,mode=755
 mount /run/drv-apps rw,nosuid,nodev,noexec tmpfs root=/drv-apps rw,mode=755
 mount /run/drv-audio rw,nosuid,nodev,noexec tmpfs root=/drv-audio rw,mode=755
 mount /run/drv-bridge rw,nosuid,nodev,noexec tmpfs root=/drv-bridge rw,mode=755

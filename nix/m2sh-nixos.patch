@@ -1,0 +1,145 @@
+diff -ruN a/config/home/profiles/m2sh.nix b/config/home/profiles/m2sh.nix
+--- a/config/home/profiles/m2sh.nix	2026-09-22 09:08:12.446060526 +0000
++++ b/config/home/profiles/m2sh.nix	2026-09-22 09:10:03.770845949 +0000
+@@ -11,7 +11,6 @@
+     # ../handy.nix
+     ../helix.nix
+     ../keepassxc.nix
+-    ../desktop/niri.nix
+     ../mpv.nix
+     ../sandboxed.nix
+     ../sioyek.nix
+@@ -26,14 +25,9 @@
+ 
+   persist.stateDir.rho = ".local/state/rho";
+ 
++  # rho-gui runs as an app of the drv desktop (nix/m2sh.nix in the niri repo), RHO_NOTCH in
++  # its manifest; nothing graphical runs as this user any more.
+   home.packages = [
+     pkgs.antigravity-hub
+-    # The M2 Air's notch, in physical pixels: rho-gui puts its status line at
+-    # the top and leaves this band in the middle empty. Width is tuned by eye.
+-    (pkgs.rho-gui-bin.overrideAttrs (old: {
+-      postFixup = (old.postFixup or "") + ''
+-        wrapProgram $out/bin/rho-gui --set-default RHO_NOTCH 290x56
+-      '';
+-    }))
+   ];
+ }
+diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/default.nix
+--- a/config/system/niri-builder/default.nix	2026-09-22 09:08:12.416060315 +0000
++++ b/config/system/niri-builder/default.nix	2026-09-22 09:10:03.766845921 +0000
+@@ -64,7 +64,7 @@
+     ]);
+     text = ''
+       action="''${1:-}"
+-      ref="''${2:-rho/gpu-process}"
++      ref="''${2:-rho/policy}"
+ 
+       case "$action" in
+         build|release) ;;
+@@ -116,9 +116,14 @@
+       cd "$repo"
+       build_start="$SECONDS"
+       # Same feature set as pkgs/niri.nix, spelled out so branches with
+-      # different defaults produce the same binary.
++      # different defaults produce the same binary. The desktop's services
++      # (services.drv, nix/module.nix in the niri repo) build alongside: the
++      # same list as the repo's flake and nix/cross-drv.sh.
+       cargo build --release --locked --target aarch64-unknown-linux-gnu \
+-        --no-default-features --features dbus,systemd,xdp-gnome-screencast
++        --no-default-features \
++        --features niri/dbus,niri/systemd,niri/xdp-gnome-screencast,drv-portal/service \
++        -p niri -p drv-supervisor -p drv-appd -p drv-forker -p drv-init -p drv-bridge \
++        -p drv-seat -p drv-auth -p drv-lock -p drv-menu -p drv-portal -p drv-agent -p drv-keys
+       build_seconds=$((SECONDS - build_start))
+ 
+       printf '%s\t%s\t%s\n' \
+@@ -131,13 +136,20 @@
+         stage="$state/.stage"
+         rm -rf "$stage"
+         mkdir -p "$stage/bin"
+-        # Line tables go to a companion file; the shipped binary keeps
+-        # .symtab so backtraces on the device still have function names.
++        # Line tables go to a companion file (niri's; the services are small
++        # enough to keep theirs); every shipped binary keeps .symtab so
++        # backtraces on the device still have function names.
+         debug_file="$state/niri_''${version}.debug"
+         llvm-objcopy --only-keep-debug "$binaries/niri" "$debug_file"
+         install -m 0755 "$binaries/niri" "$stage/bin/niri"
+         llvm-objcopy --strip-debug \
+           --add-gnu-debuglink="$debug_file" "$stage/bin/niri"
++        for b in "$binaries"/drv-* "$binaries"/*-probe; do
++          [ -f "$b" ] && [ -x "$b" ] || continue
++          case "$b" in *.d) continue;; esac
++          llvm-objcopy --strip-debug "$b" "$stage/bin/$(basename "$b")"
++          chmod 0755 "$stage/bin/$(basename "$b")"
++        done
+         # Session script, systemd units, desktop file, portal config and the
+         # default config ship raw; pkgs/niri-bin.nix installs them the same
+         # way pkgs/niri.nix does from a source checkout.
+diff -ruN a/flake.nix b/flake.nix
+--- a/flake.nix	2026-09-22 09:08:12.439060477 +0000
++++ b/flake.nix	2026-09-22 09:10:03.769845942 +0000
+@@ -39,6 +39,8 @@
+       flake = false;
+     };
+     transcriber.url = "sourcehut:~maan2003/transcriber";
++    niri.url = "github:maan2003/niri/rho/policy";
++    niri.inputs.nixpkgs.follows = "nixpkgs";
+     ws-mgr = {
+       url = "sourcehut:~maan2003/ws-mgr";
+       flake = false;
+diff -ruN a/hosts/m2sh.nix b/hosts/m2sh.nix
+--- a/hosts/m2sh.nix	2026-09-22 09:08:12.432060428 +0000
++++ b/hosts/m2sh.nix	2026-09-22 09:10:03.769845942 +0000
+@@ -43,6 +43,7 @@
+   # host never compiles niri; config/system/niri.nix and the Home Manager
+   # profile keep referring to pkgs.niri.
+   nixpkgs.overlays = [ (final: prev: { niri = final.niri-bin; }) ];
++  services.drv.package = pkgs.niri-bin;
+   system.replaceDependencies.replacements =
+     securityReplacements pkgs
+     ++ securityReplacements pkgs.pkgs-unstable
+@@ -60,7 +61,10 @@
+     ../config/system/network/tailscale.nix
+     # ../config/system/network/ivpn.nix
+     ../config/system/asahi-sound.nix
+-    ../config/system/niri.nix
++    # The drv desktop (the set of services and the apps as manifests) in place of
++    # greetd + niri-session; niri-bin ships all of its binaries.
++    inputs.niri.nixosModules.default
++    inputs.niri.nixosModules.m2sh
+     ../config/system/memory.nix
+     ../config/system/zram.nix
+     # ../config/system/fs/encrypted-swap.nix
+diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
+--- a/pkgs/niri-bin.nix	2026-09-22 09:08:12.424060371 +0000
++++ b/pkgs/niri-bin.nix	2026-09-22 09:10:03.768845935 +0000
+@@ -19,6 +19,7 @@
+   seatd,
+   systemd,
+   wayland,
++  fuse3,
+ }:
+ 
+ stdenv.mkDerivation (finalAttrs: {
+@@ -92,6 +93,7 @@
+     seatd
+     systemd # Includes libudev
+     wayland # For libwayland-client
++    fuse3 # drv-portal's documents mount
+   ];
+ 
+   postPatch = ''
+@@ -102,7 +104,9 @@
+ 
+   installPhase = ''
+     runHook preInstall
+-    install -Dm0755 bin/niri -t $out/bin
++    # niri and the desktop's services (drv-supervisor, drv-appd, drv-forker, drv-init,
++    # drv-bridge, drv-seatd, drv-authd, drv-lock, drv-menu, drv-portal, drv-agent, drv-keys).
++    install -Dm0755 bin/* -t $out/bin
+     install -Dm0644 resources/README.md resources/default-config.kdl -t $doc/share/doc/niri
+     install -Dm0644 resources/niri.desktop -t $out/share/wayland-sessions
+     install -Dm0644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal

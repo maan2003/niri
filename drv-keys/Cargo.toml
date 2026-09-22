@@ -1,0 +1,10 @@
+[package]
+name = "drv-keys"
+version = "26.4.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "The media keys: volume through PipeWire and the backlight through sysfs, on the compositor's word."
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+drv-os = { version = "26.4.0", path = "../drv-os" }

@@ -75,6 +75,8 @@ let
     ${pkgs.util-linux}/bin/unshare -U ${pkgs.coreutils}/bin/true > userns.txt 2>&1 || echo "denied: $?" >> userns.txt
     ${pkgs.coreutils}/bin/ls /proc > proc.txt 2>&1
     ${pkgs.coreutils}/bin/cat /proc/self/net/dev > net.txt 2>&1
+    # The ssh agent's door: open for the grant (hello), shut otherwise (gpu-probe).
+    SSH_AUTH_SOCK=''${SSH_AUTH_SOCK:-/run/drv-agent/agent} ${pkgs.openssh}/bin/ssh-add -l > agent.txt 2>&1 || echo "rc: $?" >> agent.txt
     ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
     ${pkgs.coreutils}/bin/touch done
@@ -125,10 +127,15 @@ in
     debug = true;
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
-    # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel.
+    # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel; the
+    # volume and brightness keys are drv-keys' actions instead of wpctl and brightnessctl.
     config = builtins.replaceStrings
-      [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\"" ]
-      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"") ]
+      [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\""
+        "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1+ -l 1.0\"; }" "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1-\"; }"
+        "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle\"; }" "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle\"; }"
+        "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"+10%\"; }" "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"10%-\"; }" ]
+      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"")
+        "{ volume-up; }" "{ volume-down; }" "{ volume-mute; }" "{ mic-mute; }" "{ brightness-up; }" "{ brightness-down; }" ]
       (builtins.readFile ../resources/default-config.kdl);
     apps = {
       # Sends one notification from inside the sandbox over its private bus. Not autostarted:
@@ -141,9 +148,11 @@ in
       hello = {
         uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false;
         state = [ "out" ];
+        agent = true;
+        packages = [ pkgs.openssh ];
         files = { ".config/hello/greeting" = "hello from the store"; };
       };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; autostart = true; menu = false; state = [ "out" ]; };
+      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; autostart = true; menu = false; state = [ "out" ]; packages = [ pkgs.openssh ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.

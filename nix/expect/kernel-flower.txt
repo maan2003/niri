@@ -8,6 +8,7 @@ mount /home/app/.state rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps/UID rw
 mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible,subset=pid
 mount /run/drv ro,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
+mount /run/drv-agent ro,nosuid,nodev,noexec tmpfs root=/drv-agent rw,mode=755
 mount /run/drv-apps/UID rw,nosuid,nodev,noexec tmpfs root=/drv-apps/UID rw,mode=755
 mount /run/drv-bridge ro,nosuid,nodev,noexec tmpfs root=/drv-bridge rw,mode=755
 mount /run/drv-doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
@@ -38,7 +39,7 @@ uid UID UID UID UID gid UID UID UID UID groups UID
 caps inh 0000000000000000 prm 0000000000000000 eff 0000000000000000 bnd 0000000000000000 amb 0000000000000000
 securebits 0xfef noroot noroot_locked no_setuid_fixup no_setuid_fixup_locked keep_caps_locked no_cap_ambient_raise no_cap_ambient_raise_locked exec_restrict_file exec_restrict_file_locked exec_deny_interactive exec_deny_interactive_locked
 user_ns host
-landlock layers 1 rules 396
+landlock layers 1 rules 397
 landlock layer 0 handles fs execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev net 0x0 scope 0x3
 no_new_privs 1
 seccomp mode 2 filters 2
@@ -50,6 +51,7 @@ rule overlay:overlay store/* layer1=execute,read_file
 rule overlay:overlay store/* layer1=execute,read_file,read_dir
 rule overlay:overlay store/* layer1=read_file,read_dir
 rule proc:proc / layer1=write_file,read_file,read_dir
+rule tmpfs:tmpfs /drv-agent layer1=read_file,read_dir
 rule tmpfs:tmpfs /drv-apps/tmp/UID layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
 rule tmpfs:tmpfs /drv-apps/UID layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
 rule tmpfs:tmpfs /drv-bridge layer1=read_file,read_dir

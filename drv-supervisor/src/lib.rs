@@ -42,6 +42,8 @@ pub struct Service {
     pub network: bool,
     /// Sees the cgroup tree writable (the forker: one cgroup per app under its subtree).
     pub cgroups: bool,
+    /// Sees `/sys` writable (the media keys: the backlight), as far as its groups allow.
+    pub writable_sys: bool,
 }
 
 /// A member's root, built in the child: what every member gets, plus its `expose` entries
@@ -71,7 +73,13 @@ fn build_root(service: &Service) -> Result<(), String> {
         ),
         ("/dev/shm".into(), fresh("tmpfs", &[("mode", "1777")])?),
         ("/proc".into(), fresh("proc", &[("hidepid", "invisible")])?),
-        ("/sys".into(), clone(Path::new("/sys"), ro_noexec)?),
+        (
+            "/sys".into(),
+            clone(
+                Path::new("/sys"),
+                if service.writable_sys { rw_noexec } else { ro_noexec },
+            )?,
+        ),
         ("/etc".into(), clone(Path::new("/etc"), ro_noexec)?),
         ("/tmp".into(), fresh("tmpfs", &[("mode", "1777")])?),
     ];

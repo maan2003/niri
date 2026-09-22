@@ -365,6 +365,12 @@ pub enum Action {
     StopAllCasts,
     LockSession,
     ShowLauncher,
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
+    MicMute,
+    BrightnessUp,
+    BrightnessDown,
     ToggleOverview,
     OpenOverview,
     CloseOverview,
@@ -703,6 +709,12 @@ impl From<niri_ipc::Action> for Action {
             niri_ipc::Action::StopAllCasts {} => Self::StopAllCasts,
             niri_ipc::Action::LockSession {} => Self::LockSession,
             niri_ipc::Action::ShowLauncher {} => Self::ShowLauncher,
+            niri_ipc::Action::VolumeUp {} => Self::VolumeUp,
+            niri_ipc::Action::VolumeDown {} => Self::VolumeDown,
+            niri_ipc::Action::VolumeMute {} => Self::VolumeMute,
+            niri_ipc::Action::MicMute {} => Self::MicMute,
+            niri_ipc::Action::BrightnessUp {} => Self::BrightnessUp,
+            niri_ipc::Action::BrightnessDown {} => Self::BrightnessDown,
             niri_ipc::Action::ToggleOverview {} => Self::ToggleOverview,
             niri_ipc::Action::OpenOverview {} => Self::OpenOverview,
             niri_ipc::Action::CloseOverview {} => Self::CloseOverview,
@@ -908,12 +920,24 @@ where
             }
             match Action::decode_node(child, ctx) {
                 Ok(action) => {
-                    if !matches!(action, Action::Spawn(_) | Action::SpawnSh(_)) {
+                    // The media keys are what spawn binds were for on a locked screen.
+                    let lockable = matches!(
+                        action,
+                        Action::Spawn(_)
+                            | Action::SpawnSh(_)
+                            | Action::VolumeUp
+                            | Action::VolumeDown
+                            | Action::VolumeMute
+                            | Action::MicMute
+                            | Action::BrightnessUp
+                            | Action::BrightnessDown
+                    );
+                    if !lockable {
                         if let Some(node) = allow_when_locked_node {
                             ctx.emit_error(DecodeError::unexpected(
                                 node,
                                 "property",
-                                "allow-when-locked can only be set on spawn binds",
+                                "allow-when-locked can only be set on spawn and media key binds",
                             ));
                         }
                     }

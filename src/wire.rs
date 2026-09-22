@@ -20,6 +20,8 @@ pub enum Peer {
     Appd,
     /// The poke line to drv-menu: a byte per `show-launcher`.
     Menu,
+    /// The key line to drv-keys: a line per media key.
+    Keys,
     /// drv-menu's Wayland connection.
     MenuClient,
     /// drv-portal's Wayland connection: a layer-shell client for its dialogs.
@@ -80,6 +82,7 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
         (Peer::Locker, "locker", Kind::Stream),
         (Peer::Appd, "appd", Kind::Stream),
         (Peer::Menu, "menu", Kind::Stream),
+        (Peer::Keys, "keys", Kind::Stream),
         (Peer::MenuClient, "menu-client", Kind::Stream),
         (Peer::PortalClient, "portal-client", Kind::Stream),
         (Peer::NotifierClient, "notifier-client", Kind::Stream),

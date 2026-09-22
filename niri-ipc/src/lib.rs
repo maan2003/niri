@@ -916,6 +916,18 @@ pub enum Action {
     LockSession {},
     /// Show the app menu (drv-menu).
     ShowLauncher {},
+    /// Raise the default sink's volume (drv-keys).
+    VolumeUp {},
+    /// Lower the default sink's volume (drv-keys).
+    VolumeDown {},
+    /// Toggle the default sink's mute (drv-keys).
+    VolumeMute {},
+    /// Toggle the default source's mute (drv-keys).
+    MicMute {},
+    /// Raise the backlight (drv-keys).
+    BrightnessUp {},
+    /// Lower the backlight (drv-keys).
+    BrightnessDown {},
     /// Toggle (open/close) the Overview.
     ToggleOverview {},
     /// Open the Overview.

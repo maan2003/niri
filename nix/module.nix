@@ -30,6 +30,8 @@ let
     "--host-views ${hostViews}"
   ]);
   hostViews = "/run/drv-host";
+  # The ssh agent's door: in every app's root, answering only the UIDs with the `agent` grant.
+  agentSocket = "/run/drv-agent/agent";
   # What XDG_DATA_DIRS points at: the MIME database and the icon theme's index, from the
   # store, in place of the whole system profile.
   appShare = pkgs.buildEnv {
@@ -46,6 +48,7 @@ let
     rootPaths = [ (appEtc name app) appShare config.hardware.graphics.package ]
       ++ config.hardware.graphics.extraPackages
       ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
+      ++ app.packages
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
   # The command, as launched. In front of the app's own: the linker (its /etc from the store,
@@ -106,10 +109,12 @@ hosts: files${lib.optionalString app.network " dns"}
     inherit name;
     inherit (app) uid gpu network audio jit userns globals grants autostart menu opens;
     closure = "${appClosure name app}/store-paths";
-    env = app.env // lib.optionalAttrs app.audio {
-      PIPEWIRE_REMOTE = appsSocket;
-      PULSE_SERVER = "unix:${pulseDir name}/native";
-    };
+    env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
+      // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
+      // lib.optionalAttrs app.audio {
+        PIPEWIRE_REMOTE = appsSocket;
+        PULSE_SERVER = "unix:${pulseDir name}/native";
+      } // app.env;
     exec = appExec name app;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = json.generate "appd.json" {
@@ -123,7 +128,7 @@ hosts: files${lib.optionalString app.network " dns"}
   };
   # What the forker binds into apps' roots (its own view has to hold them): the layout its
   # feature table names, plus the audio sockets when any app has audio.
-  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/opengl-driver" ]
+  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/drv-agent" "/run/opengl-driver" ]
     ++ lib.optionals (lib.any (a: a.audio) (lib.attrValues cfg.apps)) [ "/run/drv-audio" "/run/drv-pulse" ];
   # The services' bus: distinct UIDs, so the bus itself says who may own what: the
   # notification daemon its name, nobody else anything.
@@ -173,6 +178,19 @@ in
       supervisor = lib.mkOption { type = lib.types.int; default = 910; };
       menu = lib.mkOption { type = lib.types.int; default = 911; };
       notifier = lib.mkOption { type = lib.types.int; default = 913; };
+      agent = lib.mkOption { type = lib.types.int; default = 914; };
+      keys = lib.mkOption { type = lib.types.int; default = 915; };
+    };
+    resumePatch = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Patch the kernel to blank every plane on resume, so the old desktop is not shown before the compositor paints. Off where the kernel is not to be rebuilt.";
+    };
+    screenshots = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/var/lib/drv-files/Screenshots";
+      description = "A directory the compositor may write screenshots to (point the config's screenshot-path into it); under `files`, the chooser hands them on.";
     };
     notifier = lib.mkOption {
       type = lib.types.listOf lib.types.str;
@@ -285,6 +303,16 @@ in
             description = "Non-Wayland capabilities.";
           };
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
+          packages = lib.mkOption {
+            type = lib.types.listOf lib.types.package;
+            default = [ ];
+            description = "Programs the app may run besides its command: in its closure and its PATH.";
+          };
+          agent = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "May use the ssh agent (drv-agent, a member of the set, which holds the keys): SSH_AUTH_SOCK points at its door and the door knows this UID.";
+          };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
           menu = lib.mkOption {
@@ -379,12 +407,21 @@ in
       drv-portal = { uid = cfg.ids.portal; group = "drv-portal"; isSystemUser = true; };
       # The notification daemon: sees every notification, so a member of the set, not an app.
       drv-notifier = { uid = cfg.ids.notifier; group = "drv-notifier"; isSystemUser = true; };
+      # The ssh agent: holds the keys, opens the authenticators (udev makes their hidraw nodes
+      # its group's), answers the UIDs with the grant.
+      drv-agent = { uid = cfg.ids.agent; group = "drv-agent"; isSystemUser = true; };
+      # The media keys: the default sink through PipeWire, the backlight through sysfs.
+      drv-keys = { uid = cfg.ids.keys; group = "drv-keys"; isSystemUser = true; extraGroups = [ "pipewire" "video" ]; };
     };
     # The desktop's VT and tty0 (for switching to it), read-write for group tty, whose only
     # member is drv-seat. A getty's VT is no good: agetty resets it to 0620 on every start.
     services.udev.extraRules = ''
       SUBSYSTEM=="tty", KERNEL=="tty0", GROUP="tty", MODE="0660"
       SUBSYSTEM=="tty", KERNEL=="tty${toString cfg.vt}", GROUP="tty", MODE="0660"
+      # FIDO authenticators (Yubico) are the ssh agent's; the backlight is the media keys'
+      # (group video) to write.
+      SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", GROUP="drv-agent", MODE="0660"
+      ACTION=="add", SUBSYSTEM=="backlight", RUN+="${pkgs.coreutils}/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="${pkgs.coreutils}/bin/chmod g+w /sys/class/backlight/%k/brightness"
     '';
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
       drv-appd.gid = cfg.ids.appd;
@@ -400,6 +437,8 @@ in
       drv-menu.gid = cfg.ids.menu;
       drv-portal.gid = cfg.ids.portal;
       drv-notifier.gid = cfg.ids.notifier;
+      drv-agent.gid = cfg.ids.agent;
+      drv-keys.gid = cfg.ids.keys;
       render = { };
     };
 
@@ -449,11 +488,11 @@ in
     environment.etc."drv/appd.json".source = appdFile;
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
-    boot.kernelPatches = [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
+    boot.kernelPatches = lib.mkIf cfg.resumePatch [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
     # memfds are not executable unless asked for (MFD_EXEC), and the forker's seccomp filter
     # refuses apps the asking: with the noexec mounts, the store is the only place code runs from.
     boot.kernel.sysctl."vm.memfd_noexec" = 1;
-    boot.kernelParams = [ "drm_kms_helper.blank_on_resume=1" ];
+    boot.kernelParams = lib.mkIf cfg.resumePatch [ "drm_kms_helper.blank_on_resume=1" ];
 
     environment.etc."drv/config.kdl".text = cfg.config;
     environment.systemPackages = [ cfg.package ];
@@ -599,6 +638,9 @@ in
           # Apps as other UIDs must traverse the socket directory.
           "--compositor-dir /run/drv-compositor:0711"
           "--compositor-dir /run/drv-wayland:0711"
+        ] ++ lib.optionals (cfg.screenshots != null) [
+          "--compositor-dir ${cfg.screenshots}:0755"
+        ] ++ [
           # DRM and Mesa, as drv-gpu (group render), sealed with seccomp once the compositor
           # has handed it the devices. One group with the compositor: either dying restarts both.
           "--gpu-user drv-gpu"
@@ -631,6 +673,20 @@ in
           "--notifier-env WAYLAND_SOCKET=3"
           "--notifier-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           "--notifier-expose /run/drv-session"
+          # The ssh agent: OpenSSH's, behind a door that admits the UIDs with the `agent`
+          # grant. Its socket directory is a tmpfiles rule; udev's database is for libfido2
+          # to find the authenticators.
+          "--agent-user drv-agent"
+          "--agent-exec '${cfg.package}/bin/drv-agent serve --listen ${agentSocket} --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add${
+            lib.concatMapStrings (a: " --allow ${toString a.uid}") (lib.filter (a: a.agent) (lib.attrValues cfg.apps))}'"
+          "--agent-dir /run/drv-agent:0711"
+          "--agent-expose /run/udev"
+          # The media keys, on the compositor's word: the volume through PipeWire (group
+          # pipewire), the backlight through sysfs (group video, its /sys writable).
+          "--keys-user drv-keys"
+          "--keys-exec '${cfg.package}/bin/drv-keys --wpctl ${pkgs.wireplumber}/bin/wpctl'"
+          "--keys-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
+          "--keys-expose /run/pipewire"
           # The bridge: the apps' desktop services, keyed on the peer UID. Notifications go
           # to the services' bus; the file chooser and the screencast go down its supervisor
           # link to drv-portal; settings it answers itself. PipeWire is for the screencast
@@ -683,7 +739,9 @@ in
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
       "d ${cfg.files} 0700 drv-portal drv-portal -"
-    ] ++ lib.concatMap (app: let u = toString app.uid; in [
+      "d /run/drv-agent 0711 drv-agent drv-agent -"
+    ] ++ lib.optional (cfg.screenshots != null) "d ${cfg.screenshots} 0755 drv-compositor drv-compositor -"
+    ++ lib.concatMap (app: let u = toString app.uid; in [
       "d /run/drv-apps/${u} 0700 ${u} ${u} -"
       "d /run/drv-apps/tmp/${u} 0700 ${u} ${u} -"
       "d /var/lib/drv-apps/${u} 0700 ${u} ${u} -"

@@ -63,6 +63,8 @@
             ./drv-menu
             ./drv-portal
             ./drv-ui
+            ./drv-agent
+            ./drv-keys
               ./niri-visual-tests
               ./resources
               ./src
@@ -115,6 +117,10 @@
             "drv-menu"
             "-p"
             "drv-portal"
+            "-p"
+            "drv-agent"
+            "-p"
+            "drv-keys"
           ];
 
           nativeBuildInputs = [
@@ -334,6 +340,8 @@
         niri = final.callPackage niri-package { };
       };
 
+      # The m2sh host's desktop on top of it: its apps as manifests (nix/m2sh.nix).
+      nixosModules.m2sh = import ./nix/m2sh.nix;
       # `services.drv`: the multi-UID desktop from one app list (nix/module.nix).
       nixosModules.default =
         { pkgs, ... }:

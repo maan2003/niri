@@ -1002,6 +1002,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-agent"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "drv-appd"
 version = "26.4.0"
 dependencies = [
@@ -1065,6 +1074,14 @@ dependencies = [
  "drv-os",
  "libc",
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "drv-keys"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
 ]
 
 [[package]]
