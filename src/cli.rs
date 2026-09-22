@@ -29,6 +29,9 @@ pub struct Cli {
     /// Run an isolated desktop without a display server or DRM device.
     #[arg(long, conflicts_with = "session")]
     pub headless: bool,
+    /// Agent desktop session name (used by Rho to locate its private socket).
+    #[arg(long, default_value = "default")]
+    pub name: String,
     /// Headless output size in physical pixels.
     #[arg(long, default_value = "2560", requires = "headless", value_parser = clap::value_parser!(u16).range(1..=4096))]
     pub width: u16,
@@ -47,6 +50,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Sub {
+    /// Start and control an isolated agent desktop.
+    Wayland(crate::desktop::driver::WaylandArgs),
     /// Save an output screenshot through the Rho desktop protocol.
     Capture {
         /// Desktop socket; defaults to RHO_DESKTOP_SOCKET.

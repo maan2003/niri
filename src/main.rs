@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
+            Sub::Wayland(args) => return niri::desktop::driver::run(args).map_err(Into::into),
             Sub::Capture {
                 socket,
                 output,
@@ -202,7 +203,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         backend.add_output(&mut state.niri, 1, (cli.width, cli.height));
     }
 
-    let _desktop_socket = niri::desktop::start(&mut state)?;
+    let _desktop_socket = if cli.headless {
+        Some(niri::desktop::start(&mut state, &cli.name)?)
+    } else {
+        None
+    };
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();

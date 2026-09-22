@@ -24,6 +24,7 @@ use crate::render_helpers::{resources, shaders};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Headless {
+    pub video: Option<crate::desktop::video::Video>,
     renderer: Option<GlesRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
 }
@@ -31,6 +32,7 @@ pub struct Headless {
 impl Headless {
     pub fn new() -> Self {
         Self {
+            video: None,
             renderer: None,
             ipc_outputs: Default::default(),
         }
@@ -126,6 +128,11 @@ impl Headless {
     }
 
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
+        if let (Some(video), Some(renderer)) = (&mut self.video, &mut self.renderer) {
+            if let Err(error) = video.render(niri, renderer, output) {
+                warn!("desktop composition: {error:#}");
+            }
+        }
         let states = RenderElementStates::default();
         let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
@@ -146,7 +153,20 @@ impl Headless {
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        // FIXME: request redraw on unfinished animations remain
+        if self.video.is_some() && output_state.unfinished_animations_remain {
+            let output = output.clone();
+            if let Err(error) = niri.event_loop.insert_source(
+                calloop::timer::Timer::from_duration(std::time::Duration::from_millis(33)),
+                move |_, _, state| {
+                    if state.backend.headless().video.is_some() {
+                        state.niri.queue_redraw(&output);
+                    }
+                    calloop::timer::TimeoutAction::Drop
+                },
+            ) {
+                warn!("schedule desktop animation: {error}");
+            }
+        }
 
         RenderResult::Submitted
     }

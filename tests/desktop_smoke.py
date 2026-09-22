@@ -24,16 +24,15 @@ with tempfile.TemporaryDirectory(prefix="rho-desktop-test-") as tmp:
                                    stdout=log, stderr=log)
     try:
         deadline = time.monotonic() + 15
-        while not list(root.glob("rho-desktop-*.sock")):
+        while not (root / "rho-desktop/default.json").exists():
             assert process.poll() is None, (root / "log").read_text()
             assert time.monotonic() < deadline, (root / "log").read_text()
             time.sleep(.02)
-        path = next(root.glob("rho-desktop-*.sock"))
-        assert path.stat().st_mode & 0o777 == 0o600
+        path = json.loads((root / "rho-desktop/default.json").read_text())["socket"]
         def connect():
             s = socket.socket(socket.AF_UNIX)
             s.settimeout(5)
-            s.connect(str(path))
+            s.connect("\0" + path[1:])
             return s
         def send(s, request):
             s.sendall(json.dumps(request).encode() + b"\n")
@@ -46,8 +45,10 @@ with tempfile.TemporaryDirectory(prefix="rho-desktop-test-") as tmp:
                 assert header(f)["type"] == "error"
                 assert f.read() == b""
         with connect() as s, s.makefile("rb") as f:
-            send(s, {"type": "hello", "version": 1})
-            assert header(f) == {"type": "hello", "version": 1, "outputs": [
+            send(s, {"type": "hello", "version": 2})
+            hello=header(f)
+            assert hello.pop("media_socket").startswith("@rho-desktop-")
+            assert hello == {"type": "hello", "version": 2, "outputs": [
                 {"name": "headless-1", "width": 130, "height": 94, "scale": 2.0}]}
             # Two sequential captures exercise binary/JSON framing without reconnecting.
             for _ in range(2):

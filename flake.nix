@@ -26,6 +26,7 @@
           cairo,
           dbus,
           libGL,
+          libvpx,
           libdisplay-info,
           libinput,
           seatd,
@@ -85,6 +86,7 @@
             [
               cairo
               dbus
+              libvpx
               libGL
               libdisplay-info
               libinput
@@ -225,6 +227,7 @@
               #
               # This should only be set with `CARGO_BUILD_RUSTFLAGS="$CARGO_BUILD_RUSTFLAGS -C your-flags"`
               CARGO_BUILD_RUSTFLAGS = niri.RUSTFLAGS;
+              __EGL_VENDOR_LIBRARY_FILENAMES = "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
             };
           };
         }

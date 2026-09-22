@@ -58,7 +58,10 @@ name = "niri"
 path = "src/main.rs"
 
 [dependencies]
-rho-desktop-proto = { git = "https://github.com/maan2003/rho", rev = "e6aa2aa1ba29f58d7cef674ce926c26267138cd9" }
+rho-desktop-proto = { git = "https://github.com/maan2003/rho", rev = "02a67575bdf89f4f7ae7c592e541fd9a555077d9" }
+rho-desktop-media = { git = "https://github.com/maan2003/rho", rev = "02a67575bdf89f4f7ae7c592e541fd9a555077d9", features = ["encoder"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
+moq-net = { git = "https://github.com/maan2003/rho", rev = "02a67575bdf89f4f7ae7c592e541fd9a555077d9" }
 accesskit = { version = "0.21.0", optional = true }
 accesskit_unix = { version = "0.17.0", optional = true }
 anyhow.workspace = true
@@ -190,3 +193,6 @@ assets = [
     ["resources/niri.service", "/usr/lib/systemd/user/", "644"],
     ["resources/niri-shutdown.target", "/usr/lib/systemd/user/", "644"],
 ]
+
+[patch.crates-io]
+kio = { git = "https://github.com/maan2003/rho", rev = "02a67575bdf89f4f7ae7c592e541fd9a555077d9" }

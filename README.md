@@ -5,7 +5,7 @@ component, not a compatibility layer around an upstream compositor. Internal
 niri names and its useful CLI remain; upstream merge compatibility is not a
 design constraint. The fork retains GPL-3.0-or-later licensing.
 
-## Run the initial headless desktop
+## Run a headless desktop
 
 Build with the native dependencies listed in the upstream development docs,
 or enter `nix develop`:
@@ -30,36 +30,59 @@ The inherited compositor CLI is available in this executable:
 ```sh
 NIRI_SOCKET=/path/from/log rho-agent-desktop msg --json windows
 NIRI_SOCKET=/path/from/log rho-agent-desktop msg action maximize-column
-RHO_DESKTOP_SOCKET=/path/from/log rho-agent-desktop capture screenshot.png
+RHO_DESKTOP_SOCKET=@abstract-name-from-log rho-agent-desktop capture screenshot.png
 ```
 
-The initial Rho endpoint supports version negotiation, output discovery and
+The control endpoint supports version negotiation, output discovery and
 on-demand lossless BGRA screenshots. `capture` converts those pixels to PNG on
 the client. Protocol types and framing documentation live in
-[`rho-desktop-proto`](https://github.com/maan2003/rho/tree/rho/desktop-protocol/crates/rho-desktop-proto),
-pinned by Git revision in Cargo.toml. The protocol has no compositor, codec,
-Rho daemon, or GUI dependencies.
+[`rho-desktop-proto`](https://github.com/maan2003/rho/tree/rho/agent-desktop/crates/rho-desktop-proto),
+pinned by Git revision in Cargo.toml. The protocol crate has no compositor, codec, Rho daemon, or GUI dependencies.
 
 Applications are **not sandboxed**. Possession of the local desktop socket
-grants screenshot access. The socket is mode 0600 in a private runtime directory;
-headers, dimensions, and simultaneous connections are bounded.
+grants application control and screenshot access. Abstract sockets check peer UIDs; session descriptors live in a private runtime
+directory. Headers, dimensions, and simultaneous connections are bounded.
 
-## Architecture and remaining work
+## Live MoQ desktop
 
-- This program owns compositor state, application control, capture, and
-  eventually VP9/MoQ production. The existing `rho wayland` driver belongs here.
-- Rho owns the protocol, native viewer/decoder, annotations, and agent UI.
-  Annotations are client-side screenshot attachments, not compositor objects.
-- The Rho daemon will authorize and relay desktop streams over its existing
-  authenticated GUI Iroh connection. It must not link the compositor or encoder.
-- The current endpoint is local screenshot IPC, **not yet live video or the
-  daemon relay**. The earlier Sway-based video prototype remains separate.
-- Next: move the session/input CLI, implement subscriber-owned damage-driven
-  composition and VP9 Profile 1 encoding, then connect the existing native viewer.
-  No video subscriber must mean no video composition or encoding.
-- This initial backend advances application callbacks without composing output.
-  Production callback pacing, animation scheduling and desktop-session lifecycle
-  still need work before live streaming.
+VP9 Profile 1 (8-bit 4:4:4, screen-content tuning, no lookahead) runs **inside
+this compositor process**, on a subscription-owned encoder thread. Composition
+is damage-driven and capped at 30 fps. Static output gets one quality refinement
+and goes idle. With no subscribers, no video images are composed or encoded.
+There is no external screenshot/encoding process.
+
+The daemon discovers the named session through its workset worker, then connects
+directly to this process. Control and MoQ use same-user abstract Unix sockets
+across the filesystem namespace; the worker never relays media. The daemon
+relays MoQ tracks onto the GUI's single existing authenticated Iroh connection.
+Codec and compositor implementation are not daemon dependencies.
+
+```sh
+rho-agent-desktop wayland --session browser start -- YOUR_APPLICATION
+rho-agent-desktop wayland --session browser status
+rho-agent-desktop wayland --session browser click 500 300
+rho-agent-desktop wayland --session browser type 'hello'
+rho-agent-desktop wayland --session browser key ctrl+l
+rho-agent-desktop wayland --session browser screenshot --output browser.png
+rho-agent-desktop wayland --session browser stop
+```
+
+`rho wayland` forwards these commands. `tree`, `move`, `input`, and `drive` also
+remain available; `tree` now reports niri's window list rather than Sway's tree.
+Session descriptors are in `$XDG_RUNTIME_DIR/rho-desktop/NAME.json`.
+The direct `--headless` entry point accepts `--name NAME` (default: `default`).
+Peer credentials restrict both abstract sockets to the same host user. The
+compositor's inherited IPC and CLI are still available for window management.
+
+Open the desktop from the running Rho GUI’s agent menu (`w`), then enter the
+session name. It opens as a full-window overlay; closing it returns to the agent.
+No separate viewer process is needed.
+
+The native viewer handles pointer, keyboard, and scrolling. Input goes directly
+through the compositor's input handling; held keys/buttons release when the
+control connection closes or the viewer loses focus. Annotation freezes the
+presented frame on the client, supports drawing/undo/copy, and can add a PNG to
+the selected agent's prompt. No annotation protocol is required.
 
 Validation:
 
@@ -68,9 +91,10 @@ cargo test --locked --no-default-features --lib
 python3 tests/desktop_smoke.py target/debug/rho-agent-desktop
 ```
 
-The smoke test starts a real headless compositor and checks non-default scale,
-BGRA pixels, repeated binary framing, invalid requests, the inherited output CLI,
-and PNG export. It needs working EGL just like the program.
+The Rho repo's `wayland_stream` integration test starts a real daemon and desktop,
+decodes VP9, tests static idleness, late joins, independent viewer teardown, and
+RPC after detach. Set `RHO_AGENT_DESKTOP_BIN` to this executable. GUI decoding and
+software encoding require libvpx >= 1.15. The Nix development shell supplies it.
 
 ---
 

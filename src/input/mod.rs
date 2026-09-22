@@ -338,11 +338,26 @@ impl State {
         event: I::KeyboardKeyEvent,
         consumed_by_a11y: &mut bool,
     ) {
+        self.desktop_key(
+            event.key_code(),
+            event.state(),
+            Event::time_msec(&event),
+            consumed_by_a11y,
+        );
+    }
+    pub(crate) fn desktop_key(
+        &mut self,
+        code: Keycode,
+        key_state: KeyState,
+        time: u32,
+        consumed_by_a11y: &mut bool,
+    ) {
+        #[cfg(not(feature = "dbus"))]
+        let _ = consumed_by_a11y;
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
         let serial = SERIAL_COUNTER.next_serial();
-        let time = Event::time_msec(&event);
-        let pressed = event.state() == KeyState::Pressed;
+        let pressed = key_state == KeyState::Pressed;
 
         // Stop bind key repeat on any release. This won't work 100% correctly in cases like:
         // 1. Press Mod
@@ -366,23 +381,19 @@ impl State {
         // Accessibility modifier grabs should override XKB state changes (e.g. Caps Lock), so we
         // need to process them before keyboard.input() below.
         #[cfg(feature = "dbus")]
-        if self.a11y_process_key(
-            Duration::from_millis(u64::from(time)),
-            event.key_code(),
-            event.state(),
-        ) {
+        if self.a11y_process_key(Duration::from_millis(u64::from(time)), code, key_state) {
             *consumed_by_a11y = true;
             return;
         }
 
         let Some(Some(bind)) = self.niri.seat.get_keyboard().unwrap().input(
             self,
-            event.key_code(),
-            event.state(),
+            code,
+            key_state,
             serial,
             time,
             |this, mods, keysym| {
-                let key_code = event.key_code();
+                let key_code = code;
                 let modified = keysym.modified_sym();
                 let raw = keysym.raw_latin_sym_or_raw_current_sym();
 
@@ -2366,10 +2377,6 @@ impl State {
         &mut self,
         event: I::PointerMotionAbsoluteEvent,
     ) {
-        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
-        // Any of the early returns here mean that the pointer is not inside the hot corner.
-        self.niri.pointer_inside_hot_corner = false;
-
         let Some(pos) = self.compute_absolute_location(&event, None).or_else(|| {
             self.global_bounding_rectangle().map(|output_geo| {
                 event.position_transformed(output_geo.size) + output_geo.loc.to_f64()
@@ -2378,6 +2385,11 @@ impl State {
             return;
         };
 
+        self.desktop_motion(pos, event.time_msec());
+    }
+    pub(crate) fn desktop_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
+        let was_inside_hot_corner = self.niri.pointer_inside_hot_corner;
+        self.niri.pointer_inside_hot_corner = false;
         let serial = SERIAL_COUNTER.next_serial();
 
         let pointer = self.niri.seat.get_pointer().unwrap();
@@ -2409,7 +2421,7 @@ impl State {
             &MotionEvent {
                 location: pos,
                 serial,
-                time: event.time_msec(),
+                time: time,
             },
         );
 
@@ -2450,15 +2462,23 @@ impl State {
     }
 
     fn on_pointer_button<I: InputBackend>(&mut self, event: I::PointerButtonEvent) {
+        self.desktop_button(
+            event.button(),
+            event.button_code(),
+            event.state(),
+            event.time_msec(),
+        );
+    }
+    pub(crate) fn desktop_button(
+        &mut self,
+        button: Option<MouseButton>,
+        button_code: u32,
+        button_state: ButtonState,
+        time: u32,
+    ) {
         let pointer = self.niri.seat.get_pointer().unwrap();
 
         let serial = SERIAL_COUNTER.next_serial();
-
-        let button = event.button();
-
-        let button_code = event.button_code();
-
-        let button_state = event.state();
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
 
@@ -2740,7 +2760,7 @@ impl State {
                 button: button_code,
                 state: button_state,
                 serial,
-                time: event.time_msec(),
+                time: time,
             },
         );
         pointer.frame(self);
