@@ -489,6 +489,8 @@ struct Links {
     notifier_client: (OwnedFd, OwnedFd),
     compositor_portal: (OwnedFd, OwnedFd),
     bridge_portal: (OwnedFd, OwnedFd),
+    /// The ssh agent's line to the portal: the authenticator's PIN and touch prompts.
+    agent_portal: (OwnedFd, OwnedFd),
     /// The bridge's launch channel: the OpenURI portal starts the URI's handler.
     bridge_appd: (OwnedFd, OwnedFd),
     locker_auth: (OwnedFd, OwnedFd),
@@ -514,6 +516,7 @@ impl Links {
             bridge_appd: stream()?,
             compositor_portal: seq()?,
             bridge_portal: seq()?,
+            agent_portal: seq()?,
             locker_auth: seq()?,
             appd_forker: seq()?,
         })
@@ -596,6 +599,7 @@ fn start_set(
                 ("wayland", l.portal_client.1.as_fd()),
                 ("compositor", l.compositor_portal.1.as_fd()),
                 ("bridge", l.bridge_portal.1.as_fd()),
+                ("agent", l.agent_portal.1.as_fd()),
                 ("fuse", fuse.as_fd()),
             ],
         ),
@@ -604,8 +608,13 @@ fn start_set(
             &set.notifier,
             vec![("wayland", l.notifier_client.1.as_fd())],
         ),
-        // No wire: its door is a socket in its directory, and the uid check is its own.
-        ("drv-agent", &set.agent, vec![]),
+        // Its door is a socket in its directory, and the uid check is its own; the wire is
+        // for the person's PIN and touch, asked at the portal.
+        (
+            "drv-agent",
+            &set.agent,
+            vec![("portal", l.agent_portal.0.as_fd())],
+        ),
         (
             "drv-keys",
             &set.keys,

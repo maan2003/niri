@@ -5,25 +5,34 @@
 //! connection (SO_PEERCRED) and refused at accept otherwise. ssh-agent itself would refuse
 //! them all: it serves its own uid only, which is why the door is a separate process.
 //!
-//! Resident keys live on the authenticator and are loaded where the authenticator is, so one
-//! agent-protocol extension, `load-resident@drv`, carries the person's PIN from `drv-agent
-//! load` (run in a terminal app with the grant) and runs `ssh-add -K` here. Every other
-//! message goes to ssh-agent unread and its reply comes back the same way.
+//! The authenticator's PIN never passes through an app. When a granted app lists or signs
+//! while the agent holds no keys and an authenticator is plugged in, the door asks the
+//! person at drv-portal (fd `portal`) and loads the resident keys with `ssh-add -K` itself.
+//! ssh-agent's own prompts while signing (the PIN of a verify-required key, a touch) come
+//! the same way: we are its askpass, reaching the door over a socket in our `/tmp`.
 
-use std::io::{self, Read, Write};
+use std::collections::HashMap;
+use std::io::{self, BufRead as _, Read as _, Write as _};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use drv_os::fds::Kind;
+use drv_policy::seq;
+use drv_portal::protocol::{Request, Response, VERSION};
 
-const SSH_AGENT_SUCCESS: u8 = 6;
-const SSH_AGENTC_EXTENSION: u8 = 27;
-const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
-const EXTENSION: &[u8] = b"load-resident@drv";
+const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
+const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 /// Longer than any agent message has a right to be.
 const MAX_MESSAGE: usize = 256 * 1024;
+/// Where ssh-agent's askpass (us again) finds the door; our /tmp is private.
+const ASKPASS: &str = "/tmp/askpass";
 
 #[derive(Parser)]
 struct Args {
@@ -41,24 +50,33 @@ enum Cmd {
         /// ssh-agent's own socket, in our private /tmp.
         #[arg(long, default_value = "/tmp/ssh-agent")]
         private: PathBuf,
-        /// A UID that may use the agent (the manifest's `agent` grant). Repeatable.
+        /// `NAME=UID`: an app that may use the agent (the manifest's `agent` grant), named
+        /// for the person's prompts. Repeatable.
         #[arg(long = "allow")]
-        allow: Vec<u32>,
+        allow: Vec<String>,
         #[arg(long)]
         ssh_agent: PathBuf,
         #[arg(long)]
         ssh_add: PathBuf,
     },
-    /// Load the resident keys of the plugged-in authenticator into the agent: asks the PIN
-    /// on the terminal and sends it to the service, which has the authenticator.
-    Load,
 }
 
 fn main() {
-    // ssh-add's askpass while loading: it runs us with the prompt as the one argument, so
-    // this is told apart by the PIN the door put in the environment, not by a subcommand.
+    // ssh-add's askpass while loading: it runs us with the prompt as the one argument, and
+    // the PIN the door already has is in the environment.
     if let Some(pin) = std::env::var_os("DRV_PIN") {
         println!("{}", pin.to_string_lossy());
+        return;
+    }
+    // ssh-agent's askpass while signing: the prompt as the one argument, the door's socket
+    // in the environment (ours to it).
+    if let Some(sock) = std::env::var_os("DRV_ASKPASS") {
+        let prompt = std::env::args().nth(1).unwrap_or_default();
+        let kind = std::env::var("SSH_ASKPASS_PROMPT").unwrap_or_default();
+        if let Err(err) = askpass(Path::new(&sock), &kind, &prompt) {
+            drv_os::say!("drv-agent: askpass: {err}");
+            process::exit(1);
+        }
         return;
     }
     let result = match Args::parse().command {
@@ -69,7 +87,6 @@ fn main() {
             ssh_agent,
             ssh_add,
         } => serve(&listen, &private, &allow, &ssh_agent, &ssh_add),
-        Cmd::Load => load(),
     };
     if let Err(err) = result {
         drv_os::say!("drv-agent: {err}");
@@ -80,14 +97,35 @@ fn main() {
 fn serve(
     listen: &Path,
     private: &Path,
-    allow: &[u32],
+    allow: &[String],
     ssh_agent: &Path,
     ssh_add: &Path,
 ) -> Result<(), String> {
+    let allow: Vec<(String, u32)> = allow
+        .iter()
+        .map(|a| {
+            let parsed = match a.split_once('=') {
+                Some((name, uid)) => uid.parse().map(|uid| (name.to_owned(), uid)),
+                None => a.parse().map(|uid| (format!("uid {uid}"), uid)),
+            };
+            parsed.map_err(|_| format!("--allow {a}: not NAME=UID"))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the supervisor: {e}"))?;
+    let portal = fds
+        .socket("portal", Kind::SeqPacket)
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(ASKPASS);
+    let askpass = UnixListener::bind(ASKPASS).map_err(|e| format!("{ASKPASS}: {e}"))?;
+    let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut agent = Command::new(ssh_agent)
         .arg("-D")
         .arg("-a")
         .arg(private)
+        // Its prompts (a PIN, a touch) run us; `force`: it has no display and no terminal.
+        .env("SSH_ASKPASS", &me)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DRV_ASKPASS", ASKPASS)
         .stdout(Stdio::null())
         .spawn()
         .map_err(|e| format!("{}: {e}", ssh_agent.display()))?;
@@ -102,16 +140,23 @@ fn serve(
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = std::fs::remove_file(listen);
-    let listener =
-        UnixListener::bind(listen).map_err(|e| format!("{}: {e}", listen.display()))?;
+    let listener = UnixListener::bind(listen).map_err(|e| format!("{}: {e}", listen.display()))?;
     // The door is the uid check below, not the mode: apps of any uid may connect.
     std::fs::set_permissions(listen, std::os::unix::fs::PermissionsExt::from_mode(0o666))
         .map_err(|e| format!("{}: {e}", listen.display()))?;
-    drv_os::say!("drv-agent: serving {} for uids {allow:?}", listen.display());
-    let ctx = Ctx {
+    // The door is bound before the portal answers (its fonts take a moment): an app started
+    // meanwhile waits in the backlog instead of finding no socket.
+    let portal = Portal::start(portal)?;
+    drv_os::say!("drv-agent: serving {} for {allow:?}", listen.display());
+    let door = Arc::new(Door {
         private: private.to_owned(),
         ssh_add: ssh_add.to_owned(),
-    };
+        portal,
+        loading: Mutex::new(()),
+        signing: Mutex::new(Vec::new()),
+    });
+    let asked = door.clone();
+    std::thread::spawn(move || asked.serve_askpass(askpass));
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -127,58 +172,226 @@ fn serve(
                 continue;
             }
         };
-        if !allow.contains(&uid) {
+        let Some((app, _)) = allow.iter().find(|(_, u)| *u == uid) else {
             drv_os::say!("drv-agent: refused uid {uid}");
             continue;
-        }
-        let ctx = ctx.clone();
+        };
+        let (door, app) = (door.clone(), app.clone());
         std::thread::spawn(move || {
-            if let Err(err) = ctx.client(stream) {
-                drv_os::say!("drv-agent: uid {uid}: {err}");
+            if let Err(err) = door.client(&app, uid, stream) {
+                drv_os::say!("drv-agent: {app} (uid {uid}): {err}");
             }
         });
     }
     Ok(())
 }
 
-#[derive(Clone)]
-struct Ctx {
-    private: PathBuf,
-    ssh_add: PathBuf,
+/// Our line to drv-portal: requests under ids of our own, answers back on a thread to
+/// whoever waits for that id.
+struct Portal {
+    out: Mutex<OwnedFd>,
+    waiting: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
+    next: AtomicU64,
 }
 
-impl Ctx {
-    /// One client: each of its messages to ssh-agent and the reply back, except ours.
-    fn client(&self, mut client: UnixStream) -> io::Result<()> {
+impl Portal {
+    fn start(sock: OwnedFd) -> Result<Arc<Self>, String> {
+        seq::send(&sock, &Request::Hello { version: VERSION }, &[])
+            .map_err(|e| format!("hello to drv-portal: {e}"))?;
+        let (hello, _) =
+            seq::recv::<Response>(&sock).map_err(|e| format!("hello from drv-portal: {e}"))?;
+        match hello {
+            Response::Hello { version } if version == VERSION => {}
+            Response::Hello { version } => {
+                drv_os::say!("drv-agent: drv-portal speaks version {version}, we speak {VERSION}");
+            }
+            _ => return Err("no hello from drv-portal".to_owned()),
+        }
+        let reader = sock.try_clone().map_err(|e| format!("dup: {e}"))?;
+        let portal = Arc::new(Self {
+            out: Mutex::new(sock),
+            waiting: Mutex::default(),
+            next: AtomicU64::new(1),
+        });
+        let dispatcher = portal.clone();
+        std::thread::spawn(move || {
+            loop {
+                match seq::recv::<Response>(&reader) {
+                    Ok((resp, _)) => dispatcher.dispatch(resp),
+                    Err(err) => {
+                        drv_os::say!("drv-agent: drv-portal: {err}");
+                        process::exit(1);
+                    }
+                }
+            }
+        });
+        Ok(portal)
+    }
+
+    fn dispatch(&self, resp: Response) {
+        let id = match &resp {
+            Response::Pin { id, .. }
+            | Response::Cancelled { id }
+            | Response::Failed { id, .. }
+            | Response::Chosen { id, .. }
+            | Response::Cast { id, .. }
+            | Response::Granted { id }
+            | Response::Closed { id } => *id,
+            Response::Hello { .. } => return,
+        };
+        let waiter = self.waiting.lock().unwrap().remove(&id);
+        if let Some(tx) = waiter {
+            let _ = tx.send(resp);
+        }
+    }
+
+    fn send(&self, req: &Request) -> Result<(), String> {
+        seq::send(&*self.out.lock().unwrap(), req, &[]).map_err(|e| format!("drv-portal: {e}"))
+    }
+
+    /// A request under a fresh id, and where its answer arrives.
+    fn ask(
+        &self,
+        make: impl FnOnce(u64) -> Request,
+    ) -> Result<(u64, mpsc::Receiver<Response>), String> {
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.waiting.lock().unwrap().insert(id, tx);
+        if let Err(err) = self.send(&make(id)) {
+            self.waiting.lock().unwrap().remove(&id);
+            return Err(err);
+        }
+        Ok((id, rx))
+    }
+
+    /// The PIN the person typed, or None if they refused.
+    fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
+        let (app, prompt) = (app.to_owned(), prompt.to_owned());
+        let (_, rx) = self.ask(|id| Request::Pin {
+            id,
+            app,
+            uid,
+            prompt,
+        })?;
+        match rx.recv() {
+            Ok(Response::Pin { pin, .. }) => Ok(Some(pin)),
+            Ok(Response::Cancelled { .. }) => Ok(None),
+            Ok(_) => Err("drv-portal answered something else".to_owned()),
+            Err(_) => Err("drv-portal is gone".to_owned()),
+        }
+    }
+
+    /// A touch prompt, up until what this returns is dropped.
+    fn touch(self: &Arc<Self>, app: &str, uid: u32, prompt: &str) -> Result<Touching, String> {
+        let (app, prompt) = (app.to_owned(), prompt.to_owned());
+        let (id, rx) = self.ask(|id| Request::Touch {
+            id,
+            app,
+            uid,
+            prompt,
+        })?;
+        Ok(Touching {
+            portal: self.clone(),
+            id,
+            _rx: rx,
+        })
+    }
+}
+
+struct Touching {
+    portal: Arc<Portal>,
+    id: u64,
+    _rx: mpsc::Receiver<Response>,
+}
+
+impl Drop for Touching {
+    fn drop(&mut self) {
+        self.portal.waiting.lock().unwrap().remove(&self.id);
+        if let Err(err) = self.portal.send(&Request::Cancel { id: self.id }) {
+            drv_os::say!("drv-agent: {err}");
+        }
+    }
+}
+
+struct Door {
+    private: PathBuf,
+    ssh_add: PathBuf,
+    portal: Arc<Portal>,
+    /// One load at a time: a second client waits, then finds the keys there.
+    loading: Mutex<()>,
+    /// The apps in a sign request right now: whom ssh-agent's prompts are for.
+    signing: Mutex<Vec<(String, u32)>>,
+}
+
+impl Door {
+    /// One client: each of its messages to ssh-agent and the reply back. A list or a sign
+    /// with nothing loaded loads first.
+    fn client(&self, app: &str, uid: u32, mut client: UnixStream) -> io::Result<()> {
         let mut agent = UnixStream::connect(&self.private)?;
         loop {
             let Some(msg) = read_message(&mut client)? else {
                 return Ok(());
             };
-            let reply = match parse_extension(&msg) {
-                Some(pin) => match self.load_resident(pin) {
-                    Ok(()) => vec![SSH_AGENT_SUCCESS],
-                    Err(err) => {
-                        let mut reply = vec![SSH_AGENT_EXTENSION_FAILURE];
-                        put_string(&mut reply, err.as_bytes());
-                        reply
-                    }
-                },
-                None => {
-                    write_message(&mut agent, &msg)?;
-                    match read_message(&mut agent)? {
-                        Some(reply) => reply,
-                        None => return Err(io::Error::other("ssh-agent hung up")),
-                    }
-                }
+            let kind = msg[0];
+            if matches!(
+                kind,
+                SSH_AGENTC_REQUEST_IDENTITIES | SSH_AGENTC_SIGN_REQUEST
+            ) {
+                self.load_if_empty(app, uid);
+            }
+            let _signing =
+                (kind == SSH_AGENTC_SIGN_REQUEST).then(|| Signing::start(self, app, uid));
+            write_message(&mut agent, &msg)?;
+            let Some(reply) = read_message(&mut agent)? else {
+                return Err(io::Error::other("ssh-agent hung up"));
             };
             write_message(&mut client, &reply)?;
         }
     }
 
+    /// The first list or sign with nothing loaded, while an authenticator is plugged in:
+    /// the person's PIN from the portal, the resident keys from the authenticator.
+    fn load_if_empty(&self, app: &str, uid: u32) {
+        let _one = self.loading.lock().unwrap();
+        match self.count_keys() {
+            Ok(0) => {}
+            Ok(_) => return,
+            Err(err) => {
+                drv_os::say!("drv-agent: listing: {err}");
+                return;
+            }
+        }
+        if !authenticator_present() {
+            return;
+        }
+        let prompt = "Enter its PIN to load its ssh keys";
+        match self.portal.pin(app, uid, prompt) {
+            Ok(Some(pin)) => {
+                if let Err(err) = self.load_resident(&pin) {
+                    drv_os::say!("drv-agent: {app} (uid {uid}): {err}");
+                }
+            }
+            Ok(None) => drv_os::say!("drv-agent: {app} (uid {uid}): the PIN was refused"),
+            Err(err) => drv_os::say!("drv-agent: {err}"),
+        }
+    }
+
+    /// How many keys ssh-agent holds.
+    fn count_keys(&self) -> io::Result<u32> {
+        let mut agent = UnixStream::connect(&self.private)?;
+        write_message(&mut agent, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
+        let reply =
+            read_message(&mut agent)?.ok_or_else(|| io::Error::other("ssh-agent hung up"))?;
+        match reply.split_first() {
+            Some((&SSH_AGENT_IDENTITIES_ANSWER, rest)) if rest.len() >= 4 => {
+                Ok(u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]))
+            }
+            _ => Err(io::Error::other("no identities answer")),
+        }
+    }
+
     /// `ssh-add -K` against ssh-agent, the PIN through our own askpass.
-    fn load_resident(&self, pin: &[u8]) -> Result<(), String> {
-        let pin = std::str::from_utf8(pin).map_err(|_| "the PIN is not text".to_owned())?;
+    fn load_resident(&self, pin: &str) -> Result<(), String> {
         let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let out = Command::new(&self.ssh_add)
             .arg("-K")
@@ -206,33 +419,117 @@ impl Ctx {
             })
         }
     }
-}
 
-/// The PIN in a `load-resident@drv` extension request, if that is what `msg` is.
-fn parse_extension(msg: &[u8]) -> Option<&[u8]> {
-    let (&SSH_AGENTC_EXTENSION, rest) = msg.split_first()? else {
-        return None;
-    };
-    let (name, rest) = get_string(rest)?;
-    if name != EXTENSION {
-        return None;
+    /// ssh-agent's askpass calls, one connection each: `kind\tprompt` on a line. A PIN
+    /// (any kind but `none`) goes to the portal and the answer back as a line; a touch
+    /// (`none`) is shown until ssh-agent ends the caller and the connection closes.
+    fn serve_askpass(self: Arc<Self>, listener: UnixListener) {
+        for conn in listener.incoming() {
+            let Ok(conn) = conn else { continue };
+            let door = self.clone();
+            std::thread::spawn(move || door.askpass(conn));
+        }
     }
-    let (pin, rest) = get_string(rest)?;
-    rest.is_empty().then_some(pin)
+
+    fn askpass(&self, conn: UnixStream) {
+        let mut conn = io::BufReader::new(conn);
+        let mut line = String::new();
+        if conn.read_line(&mut line).is_err() {
+            return;
+        }
+        let line = line.trim_end();
+        let (kind, prompt) = line.split_once('\t').unwrap_or(("", line));
+        let (app, uid) = self
+            .signing
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap_or_else(|| ("an app".to_owned(), 0));
+        if kind == "none" {
+            match self.portal.touch(&app, uid, prompt) {
+                Ok(_up) => {
+                    let _ = conn.get_mut().read(&mut [0u8; 1]);
+                }
+                Err(err) => drv_os::say!("drv-agent: {err}"),
+            }
+            return;
+        }
+        match self.portal.pin(&app, uid, prompt) {
+            Ok(Some(pin)) => {
+                let _ = writeln!(conn.get_mut(), "{pin}");
+            }
+            Ok(None) => drv_os::say!("drv-agent: {app} (uid {uid}): the PIN was refused"),
+            Err(err) => drv_os::say!("drv-agent: {err}"),
+        }
+    }
 }
 
-fn get_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
-    let len = u32::from_be_bytes(buf.get(..4)?.try_into().ok()?) as usize;
-    let rest = buf.get(4..)?;
-    (rest.len() >= len).then(|| rest.split_at(len))
+/// An app's sign request, in flight: ssh-agent's prompts meanwhile are for it.
+struct Signing<'a> {
+    door: &'a Door,
+    app: String,
+    uid: u32,
 }
 
-fn put_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    out.extend_from_slice(s);
+impl<'a> Signing<'a> {
+    fn start(door: &'a Door, app: &str, uid: u32) -> Self {
+        door.signing.lock().unwrap().push((app.to_owned(), uid));
+        Self {
+            door,
+            app: app.to_owned(),
+            uid,
+        }
+    }
 }
 
-/// One agent message (its body, after the length); `None` at a clean end of stream.
+impl Drop for Signing<'_> {
+    fn drop(&mut self) {
+        let mut signing = self.door.signing.lock().unwrap();
+        if let Some(i) = signing
+            .iter()
+            .rposition(|(a, u)| *a == self.app && *u == self.uid)
+        {
+            signing.remove(i);
+        }
+    }
+}
+
+/// An authenticator we may open: a hidraw node udev gave our group.
+fn authenticator_present() -> bool {
+    let Ok(dev) = std::fs::read_dir("/dev") else {
+        return false;
+    };
+    dev.flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with("hidraw")
+            && rustix::fs::access(
+                e.path(),
+                rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+            )
+            .is_ok()
+    })
+}
+
+/// The askpass end: ssh-agent's prompt to the door, its answer to stdout. A touch (`none`)
+/// has no answer: we stay until ssh-agent ends us, and the door sees the socket close.
+fn askpass(sock: &Path, kind: &str, prompt: &str) -> Result<(), String> {
+    let door = UnixStream::connect(sock).map_err(|e| format!("{}: {e}", sock.display()))?;
+    let mut door = io::BufReader::new(door);
+    let prompt = prompt.replace(['\t', '\n', '\r'], " ");
+    writeln!(door.get_mut(), "{kind}\t{prompt}").map_err(|e| format!("door: {e}"))?;
+    let mut line = String::new();
+    door.read_line(&mut line)
+        .map_err(|e| format!("door: {e}"))?;
+    if kind == "none" {
+        return Ok(());
+    }
+    if line.is_empty() {
+        return Err("refused".to_owned());
+    }
+    print!("{line}");
+    Ok(())
+}
+
 fn read_message(from: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match from.read_exact(&mut len) {
@@ -253,53 +550,3 @@ fn write_message(to: &mut UnixStream, body: &[u8]) -> io::Result<()> {
     to.write_all(&(body.len() as u32).to_be_bytes())?;
     to.write_all(body)
 }
-
-/// The client half: the PIN from the terminal, the extension to the agent, its answer.
-fn load() -> Result<(), String> {
-    let sock = std::env::var_os("SSH_AUTH_SOCK").ok_or("SSH_AUTH_SOCK is not set")?;
-    let mut agent = UnixStream::connect(&sock)
-        .map_err(|e| format!("{}: {e}", Path::new(&sock).display()))?;
-    let pin = ask_pin()?;
-    let mut msg = vec![SSH_AGENTC_EXTENSION];
-    put_string(&mut msg, EXTENSION);
-    put_string(&mut msg, pin.as_bytes());
-    write_message(&mut agent, &msg).map_err(|e| format!("agent: {e}"))?;
-    let reply = read_message(&mut agent)
-        .map_err(|e| format!("agent: {e}"))?
-        .ok_or("the agent hung up: no grant for this app?")?;
-    match reply.split_first() {
-        Some((&SSH_AGENT_SUCCESS, _)) => {
-            println!("resident keys loaded");
-            Ok(())
-        }
-        Some((&SSH_AGENT_EXTENSION_FAILURE, rest)) => match get_string(rest) {
-            Some((text, _)) => Err(String::from_utf8_lossy(text).into_owned()),
-            None => Err("refused".to_owned()),
-        },
-        Some((kind, _)) => Err(format!("agent replied with message type {kind}")),
-        None => Err("empty reply".to_owned()),
-    }
-}
-
-/// A line from the terminal with echo off.
-fn ask_pin() -> Result<String, String> {
-    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
-    let stdin = io::stdin();
-    let saved = tcgetattr(&stdin).map_err(|e| format!("stdin is not a terminal: {e}"))?;
-    let mut quiet = saved.clone();
-    quiet.local_modes.remove(LocalModes::ECHO);
-    tcsetattr(&stdin, OptionalActions::Now, &quiet).map_err(|e| format!("termios: {e}"))?;
-    eprint!("PIN for the authenticator: ");
-    let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
-    let _ = tcsetattr(&stdin, OptionalActions::Now, &saved);
-    eprintln!();
-    read.map_err(|e| format!("stdin: {e}"))?;
-    let pin = line.trim_end_matches(['\n', '\r']).to_owned();
-    if pin.is_empty() {
-        return Err("no PIN".to_owned());
-    }
-    Ok(pin)
-}
-
-use std::io::BufRead as _;

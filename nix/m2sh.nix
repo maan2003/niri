@@ -2,8 +2,7 @@
 # person's apps as manifests. The nixos repo's hosts/m2sh.nix imports this next to greetd
 # and the Home Manager desktop, with `services.drv.package = pkgs.niri-bin` (the binaries
 # come prebuilt: nothing compiles here). Enrol the lock PIN once, as root:
-# `drv-authd set-pin --state-dir /var/lib/drv-auth`. Load the authenticator's ssh keys from
-# the terminal app: `drv-agent load`.
+# `drv-authd set-pin --state-dir /var/lib/drv-auth`.
 { config, lib, pkgs, ... }:
 let
   # The browser's managed policies (what programs.brave set): read from its /etc.
@@ -64,13 +63,13 @@ in
         env.RHO_NOTCH = "290x56";
         state = [ ".local/state/rho" ];
       };
-      # A terminal for ssh, nothing local: the agent's keys, known_hosts kept, fish and tmux
-      # on its PATH. `drv-agent load` here loads the authenticator's resident keys.
+      # A terminal for ssh, nothing local: the agent's keys (the authenticator's PIN is
+      # asked at the portal on first use), known_hosts kept, fish and tmux on its PATH.
       terminal = {
         uid = 100103;
         exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ];
         gpu = true; network = true; agent = true;
-        packages = [ pkgs.openssh pkgs.fish pkgs.tmux pkgs.coreutils config.services.drv.package ];
+        packages = [ pkgs.openssh pkgs.fish pkgs.tmux pkgs.coreutils ];
         state = [ ".ssh" ".config/fish" ".local/share/fish" ];
       };
       mail = {

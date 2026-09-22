@@ -1,11 +1,12 @@
-//! The bridge's line to drv-portal: one postcard message per `SOCK_SEQPACKET` datagram
-//! (`drv_policy::seq`). The bridge picks the id; the answers carry it back. Nothing here
-//! names a path or a screen the app could pick: the app says what it wants, the person
-//! says which file, or which screen.
+//! The bridge's line to drv-portal, and the ssh agent's: one postcard message per
+//! `SOCK_SEQPACKET` datagram (`drv_policy::seq`). The asker picks the id; the answers carry
+//! it back. Nothing here names a path or a screen the app could pick: the app says what it
+//! wants, the person says which file, or which screen. The agent's two requests put the
+//! authenticator's prompts in front of the person, where no app sees the PIN.
 
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Kind {
@@ -73,6 +74,22 @@ pub enum Request {
         uid: u32,
         device: Device,
     },
+    /// The ssh agent wants the authenticator's PIN for `app`'s use of it: `prompt` says
+    /// what for. `Pin` answers, or `Cancelled`.
+    Pin {
+        id: u64,
+        app: String,
+        uid: u32,
+        prompt: String,
+    },
+    /// The ssh agent waits for a touch on the authenticator for `app`. No answer but
+    /// `Cancelled` if the person refuses; the agent's `Cancel` takes it down.
+    Touch {
+        id: u64,
+        app: String,
+        uid: u32,
+        prompt: String,
+    },
     /// The app withdrew the request, or closed its session: the dialog goes down, or the
     /// cast stops. No answer follows.
     Cancel { id: u64 },
@@ -99,6 +116,8 @@ pub enum Response {
     },
     /// The person allows the device, until `Closed`.
     Granted { id: u64 },
+    /// The PIN the person typed for the agent.
+    Pin { id: u64, pin: String },
     /// The cast ended: the person stopped it, or the screen went away. Or the person
     /// revoked the device.
     Closed { id: u64 },

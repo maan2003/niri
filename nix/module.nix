@@ -336,7 +336,7 @@ in
           agent = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "May use the ssh agent (drv-agent, a member of the set, which holds the keys): SSH_AUTH_SOCK points at its door and the door knows this UID.";
+            description = "May use the ssh agent (drv-agent, a member of the set, which holds the keys): SSH_AUTH_SOCK points at its door and the door knows this UID. The authenticator's PIN and touch are asked at drv-portal, never in the app.";
           };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
@@ -710,11 +710,11 @@ in
           "--notifier-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           "--notifier-expose /run/drv-session"
           # The ssh agent: OpenSSH's, behind a door that admits the UIDs with the `agent`
-          # grant. Its socket directory is a tmpfiles rule; udev's database is for libfido2
-          # to find the authenticators.
+          # grant (named, for the portal's prompts). Its socket directory is a tmpfiles rule;
+          # udev's database is for libfido2 to find the authenticators.
           "--agent-user drv-agent"
           "--agent-exec '${cfg.package}/bin/drv-agent serve --listen ${agentSocket} --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add${
-            lib.concatMapStrings (a: " --allow ${toString a.uid}") (lib.filter (a: a.agent) (lib.attrValues cfg.apps))}'"
+            lib.concatStrings (lib.mapAttrsToList (n: a: lib.optionalString a.agent " --allow ${n}=${toString a.uid}") cfg.apps)}'"
           "--agent-dir /run/drv-agent:0711"
           "--agent-expose /run/udev"
           # The media keys, on the compositor's word: the volume through PipeWire (group

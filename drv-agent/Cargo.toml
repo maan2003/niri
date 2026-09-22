@@ -8,4 +8,6 @@ description = "The ssh agent: OpenSSH's ssh-agent behind a door that knows which
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 drv-os = { version = "26.4.0", path = "../drv-os" }
-rustix = { version = "1.1.4", features = ["fs", "net", "std", "termios"] }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+drv-portal = { version = "26.4.0", path = "../drv-portal", default-features = false }
+rustix = { version = "1.1.4", features = ["fs", "net", "std"] }

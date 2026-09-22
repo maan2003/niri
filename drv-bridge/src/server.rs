@@ -273,7 +273,8 @@ impl Portal {
             | protocol::Response::Closed { id }
             | protocol::Response::Cancelled { id }
             | protocol::Response::Failed { id, .. } => *id,
-            protocol::Response::Hello { .. } => return,
+            // The agent's answer, never ours.
+            protocol::Response::Hello { .. } | protocol::Response::Pin { .. } => return,
         };
         let waiter = self.waiting.lock().unwrap().remove(&id);
         if let Some(done) = waiter {
@@ -625,7 +626,8 @@ impl AppLink {
                 }
                 protocol::Response::Hello { .. }
                 | protocol::Response::Chosen { .. }
-                | protocol::Response::Granted { .. } => {}
+                | protocol::Response::Granted { .. }
+                | protocol::Response::Pin { .. } => {}
             }
         });
         match asked {

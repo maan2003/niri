@@ -1007,6 +1007,8 @@ version = "26.4.0"
 dependencies = [
  "clap",
  "drv-os",
+ "drv-policy",
+ "drv-portal",
  "rustix 1.1.4",
 ]
 

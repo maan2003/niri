@@ -1,6 +1,7 @@
 //! The person's side of the portals, a supervisor service. An app asks its private bus for
 //! a file or a screen; the bridge turns that into a request down our link (fd `bridge`); we
-//! ask the person on a layer-shell surface (fd `wayland`). A file comes from the tree we own
+//! ask the person on a layer-shell surface (fd `wayland`). The ssh agent asks the same way
+//! (fd `agent`) for the authenticator's PIN and touch, so no app ever sees the PIN. A file comes from the tree we own
 //! (`--files`) and is answered as a path under the documents mount, which we serve on fd
 //! `fuse` (see `docs`): the app never sees the tree, only the file it was given, and only as
 //! the UID it was given to. A screen or a window is started at the compositor over fd
@@ -50,14 +51,25 @@ struct Args {
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
+/// A PIN or a touch: a line or two, no list.
+const HEIGHT_SMALL: u32 = 180;
 const ROW: f64 = 28.;
 const PAD: f64 = 16.;
 const MAX_TYPED: usize = 200;
 
+/// Who asked, and gets the answer: ids are theirs, so they only mean something per wire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wire {
+    Bridge,
+    Agent,
+}
+
 struct Pending {
+    wire: Wire,
     id: u64,
     app: String,
     uid: u32,
+    /// The chooser's title; the agent's prompt.
     title: String,
     what: What,
 }
@@ -66,6 +78,10 @@ enum What {
     Choose(Ask),
     Cast { cursor: Cursor, screens: bool, windows: bool },
     Grant(Device),
+    /// The authenticator's PIN, typed here and sent to the agent.
+    Pin,
+    /// A touch on the authenticator: shown until the agent takes it down.
+    Touch,
 }
 
 fn device_name(device: Device) -> &'static str {
@@ -138,6 +154,19 @@ impl Dialog {
         }
     }
 
+    fn pinning(&self) -> bool {
+        matches!(self.req.what, What::Pin)
+    }
+
+    fn touching(&self) -> bool {
+        matches!(self.req.what, What::Touch)
+    }
+
+    /// The small dialogs: a PIN or a touch.
+    fn small(&self) -> bool {
+        self.pinning() || self.touching()
+    }
+
     /// Entries that pass the filter, as indices into `entries`.
     fn shown(&self) -> Vec<usize> {
         if self.saving() || self.typed.is_empty() {
@@ -167,6 +196,7 @@ struct App {
     files: PathBuf,
     docs: PathBuf,
     bridge: OwnedFd,
+    agent: OwnedFd,
     compositor: OwnedFd,
     grants: docs::Shared,
     queue: VecDeque<Pending>,
@@ -184,16 +214,28 @@ struct App {
 }
 
 impl App {
-    fn on_request(&mut self, qh: &QueueHandle<Self>, req: Request) {
+    fn on_request(&mut self, qh: &QueueHandle<Self>, wire: Wire, req: Request) {
         match req {
             Request::Hello { version } => {
                 if version != VERSION {
-                    drv_os::say!("drv-portal: the bridge speaks version {version}, we speak {VERSION}");
+                    let who = match wire {
+                        Wire::Bridge => "the bridge",
+                        Wire::Agent => "the ssh agent",
+                    };
+                    drv_os::say!("drv-portal: {who} speaks version {version}, we speak {VERSION}");
                 }
-                self.send(Response::Hello { version: VERSION });
+                self.reply(wire, Response::Hello { version: VERSION });
             }
             Request::Choose { id, app, uid, title, kind } => {
-                self.queue.push_back(Pending { id, app, uid, title, what: What::Choose(kind) });
+                self.queue.push_back(Pending { wire, id, app, uid, title, what: What::Choose(kind) });
+                self.next(qh);
+            }
+            Request::Pin { id, app, uid, prompt } => {
+                self.queue.push_back(Pending { wire, id, app, uid, title: prompt, what: What::Pin });
+                self.next(qh);
+            }
+            Request::Touch { id, app, uid, prompt } => {
+                self.queue.push_back(Pending { wire, id, app, uid, title: prompt, what: What::Touch });
                 self.next(qh);
             }
             Request::Cast { id, app, uid, cursor, screens, windows, again } => {
@@ -209,12 +251,12 @@ impl App {
                     }
                 }
                 let what = What::Cast { cursor, screens, windows };
-                self.queue.push_back(Pending { id, app, uid, title: String::new(), what });
+                self.queue.push_back(Pending { wire, id, app, uid, title: String::new(), what });
                 self.next(qh);
             }
             Request::Grant { id, app, uid, device } => {
                 let what = What::Grant(device);
-                self.queue.push_back(Pending { id, app, uid, title: String::new(), what });
+                self.queue.push_back(Pending { wire, id, app, uid, title: String::new(), what });
                 self.next(qh);
             }
             Request::Forget { app, uid } => {
@@ -223,11 +265,14 @@ impl App {
                 self.show_devices();
             }
             Request::Cancel { id } => {
-                self.queue.retain(|p| p.id != id);
-                if self.dialog.as_ref().is_some_and(|d| d.req.id == id) {
+                self.queue.retain(|p| !(p.id == id && p.wire == wire));
+                if self.dialog.as_ref().is_some_and(|d| d.req.id == id && d.req.wire == wire) {
                     self.dialog = None;
                     self.layer = None;
                     self.next(qh);
+                }
+                if wire != Wire::Bridge {
+                    return;
                 }
                 if let Some(live) = self.casts.remove(&id) {
                     drv_os::say!("drv-portal: {} (uid {}) closed its cast of {}", live.app, live.uid, live.label);
@@ -288,9 +333,18 @@ impl App {
         }
     }
 
+    /// To the bridge: casts and devices are its alone.
     fn send(&self, resp: Response) {
-        if let Err(err) = seq::send(&self.bridge, &resp, &[]) {
-            drv_os::say!("drv-portal: to the bridge: {err}");
+        self.reply(Wire::Bridge, resp);
+    }
+
+    fn reply(&self, wire: Wire, resp: Response) {
+        let (sock, who) = match wire {
+            Wire::Bridge => (&self.bridge, "the bridge"),
+            Wire::Agent => (&self.agent, "the ssh agent"),
+        };
+        if let Err(err) = seq::send(sock, &resp, &[]) {
+            drv_os::say!("drv-portal: to {who}: {err}");
         }
     }
 
@@ -371,7 +425,8 @@ impl App {
             Some("drv-portal"),
             None,
         );
-        layer.set_size(WIDTH, HEIGHT);
+        let small = self.dialog.as_ref().is_some_and(|d| d.small());
+        layer.set_size(WIDTH, if small { HEIGHT_SMALL } else { HEIGHT });
         layer.set_anchor(Anchor::empty());
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
@@ -383,7 +438,7 @@ impl App {
     fn list(&self, d: &mut Dialog) {
         d.entries.clear();
         d.note = None;
-        if d.granting().is_some() {
+        if d.granting().is_some() || d.small() {
             return;
         }
         if let What::Cast { screens, windows, .. } = d.req.what {
@@ -427,7 +482,8 @@ impl App {
     }
 
     fn finish(&mut self, qh: &QueueHandle<Self>, resp: Response) {
-        self.send(resp);
+        let wire = self.dialog.as_ref().map_or(Wire::Bridge, |d| d.req.wire);
+        self.reply(wire, resp);
         self.dialog = None;
         self.layer = None;
         self.next(qh);
@@ -441,6 +497,19 @@ impl App {
             self.devices.insert(id, LiveDevice { app: d.req.app.clone(), uid: d.req.uid, device });
             self.show_devices();
             self.finish(qh, Response::Granted { id });
+            return;
+        }
+        if d.pinning() {
+            if d.typed.is_empty() {
+                return;
+            }
+            let id = d.req.id;
+            let pin = std::mem::take(&mut d.typed);
+            drv_os::say!("drv-portal: {} (uid {}) gets the authenticator's PIN", d.req.app, d.req.uid);
+            self.finish(qh, Response::Pin { id, pin });
+            return;
+        }
+        if d.touching() {
             return;
         }
         let shown = d.shown();
@@ -579,6 +648,8 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     p.fill(0.08, 0.09, 0.12);
     let head = if let Some(device) = d.granting() {
         format!("{} wants to use your {}", d.req.app, device_name(device))
+    } else if d.small() {
+        format!("{} wants to use your security key", d.req.app)
     } else if d.casting() {
         format!("{} wants to see your screen", d.req.app)
     } else {
@@ -588,6 +659,21 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     p.text(PAD, PAD, 20., &head, Align::Left, fg);
     if !d.req.title.is_empty() {
         p.text(PAD, PAD + 30., 14., &d.req.title, Align::Left, dim);
+    }
+    if d.small() {
+        let line = if d.pinning() {
+            format!("PIN: {}_", "\u{25cf}".repeat(d.typed.chars().count()))
+        } else {
+            "touch it now".to_owned()
+        };
+        p.text(PAD, PAD + 54., 18., &line, Align::Left, blue);
+        let (hint, color) = match &d.note {
+            Some(note) => (note.as_str(), (1., 0.6, 0.5, 1.)),
+            None if d.pinning() => ("Enter send   Esc refuse", dim),
+            None => ("Esc refuse", dim),
+        };
+        p.text(PAD, p.height - PAD - ROW + 8., 13., hint, Align::Left, color);
+        return;
     }
     let line = if d.granting().is_some() {
         "until it exits or you revoke it (Mod+Shift+Esc revokes everything)".to_owned()
@@ -644,9 +730,13 @@ impl Client for App {
 
     fn key(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
         let Some(d) = self.dialog.as_mut() else { return };
-        // A yes or no: nothing to type, nothing to pick.
+        // A yes or no: nothing to type, nothing to pick. A touch: only a refusal.
         let yes_or_no = matches!(event.keysym, Keysym::Escape | Keysym::Return | Keysym::KP_Enter);
-        if d.granting().is_some() && !yes_or_no {
+        if (d.granting().is_some() && !yes_or_no) || (d.touching() && event.keysym != Keysym::Escape) {
+            return;
+        }
+        // A PIN: typed, erased, sent or refused; nothing to pick.
+        if d.pinning() && !yes_or_no && !matches!(event.keysym, Keysym::BackSpace) && event.utf8.is_none() {
             return;
         }
         match event.keysym {
@@ -677,14 +767,14 @@ impl Client for App {
                 if d.typed.pop().is_some() {
                     d.reset_selection();
                     self.draw();
-                } else {
+                } else if !d.pinning() {
                     self.up();
                 }
             }
             Keysym::Left => self.up(),
             _ => {
                 if let Some(s) = event.utf8 {
-                    let printable = s.chars().all(|c| !c.is_control() && c != '/');
+                    let printable = s.chars().all(|c| !c.is_control() && (c != '/' || d.pinning()));
                     if printable && d.typed.len() + s.len() <= MAX_TYPED {
                         d.typed.push_str(&s);
                         d.reset_selection();
@@ -725,6 +815,7 @@ fn run() -> Result<(), String> {
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the supervisor: {e}"))?;
     let wayland = fds.socket("wayland", Kind::Stream).map_err(|e| e.to_string())?;
     let bridge = fds.socket("bridge", Kind::SeqPacket).map_err(|e| e.to_string())?;
+    let agent = fds.socket("agent", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let compositor = fds.socket("compositor", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let fuse = fds.file("fuse").map_err(|e| e.to_string())?;
 
@@ -755,6 +846,7 @@ fn run() -> Result<(), String> {
     let ui = drv_ui::ui!(&globals, &qh)?;
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|e| format!("layer shell: {e}"))?;
     let bridge_out = bridge.try_clone().map_err(|e| format!("dup: {e}"))?;
+    let agent_out = agent.try_clone().map_err(|e| format!("dup: {e}"))?;
     let compositor_out = compositor.try_clone().map_err(|e| format!("dup: {e}"))?;
     seq::send(&compositor_out, &ToCompositor::Hello { version: compositor::VERSION }, &[])
         .map_err(|e| format!("hello to the compositor: {e}"))?;
@@ -766,6 +858,7 @@ fn run() -> Result<(), String> {
         files: args.files,
         docs: args.docs,
         bridge: bridge_out,
+        agent: agent_out,
         compositor: compositor_out,
         grants,
         queue: VecDeque::new(),
@@ -785,10 +878,24 @@ fn run() -> Result<(), String> {
             Generic::new(bridge, Interest::READ, Mode::Level),
             move |_, sock, app: &mut App| match seq::recv::<Request>(&*sock) {
                 Ok((req, _)) => {
-                    app.on_request(&src_qh, req);
+                    app.on_request(&src_qh, Wire::Bridge, req);
                     Ok(PostAction::Continue)
                 }
                 Err(err) => Err(io::Error::other(format!("the bridge: {err}"))),
+            },
+        )
+        .map_err(|e| format!("event loop: {e}"))?;
+    let agent_qh = qh.clone();
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(agent, Interest::READ, Mode::Level),
+            move |_, sock, app: &mut App| match seq::recv::<Request>(&*sock) {
+                Ok((req, _)) => {
+                    app.on_request(&agent_qh, Wire::Agent, req);
+                    Ok(PostAction::Continue)
+                }
+                Err(err) => Err(io::Error::other(format!("the ssh agent: {err}"))),
             },
         )
         .map_err(|e| format!("event loop: {e}"))?;
