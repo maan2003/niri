@@ -15,7 +15,7 @@ const DEFAULT_OUTPUT_HEIGHT: u32 = 1664;
 const DEFAULT_OUTPUT_SCALE: u32 = 2;
 #[derive(Clone, clap::Args)]
 pub struct WaylandArgs {
-    /// Session name. Names may contain ASCII letters, digits, `-`, and `_`.
+    /// Desktop name, scoped to the invoking agent.
     #[arg(long, id = "desktop_session", global = true, default_value = "default")]
     session: String,
 
@@ -106,9 +106,10 @@ pub fn run(args: WaylandArgs) -> Result<()> {
         "invalid session name"
     );
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required")?;
-    let base = args
-        .state_dir
-        .unwrap_or_else(|| PathBuf::from(runtime).join("rho-desktop"));
+    let base = args.state_dir.unwrap_or(super::desktop_directory(
+        PathBuf::from(runtime),
+        std::env::var("RHO_AGENT_ID").ok().as_deref(),
+    )?);
     std::fs::create_dir_all(&base)?;
     std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))?;
     let manifest = base.join(format!("{}.json", args.session));

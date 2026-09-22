@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix="rho-desktop-test-") as tmp:
     config.write_text('animations { off; }\nhotkey-overlay { skip-at-startup; }\n'
                       'xwayland-satellite { off; }\nlayout { background-color "#315b97"; }\n')
     env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
+    env.pop("RHO_AGENT_ID", None)
     with (root / "log").open("w") as log:
         process = subprocess.Popen([binary, "--headless", "--width", "130", "--height", "94",
                                     "--scale", "2", "--config", str(config)], env=env,
@@ -85,3 +86,41 @@ with tempfile.TemporaryDirectory(prefix="rho-desktop-test-") as tmp:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+# Multiple named sessions advertise ownership; names are scoped per agent.
+with tempfile.TemporaryDirectory(prefix="rho-desktop-owner-") as tmp:
+    root = Path(tmp)
+    base_env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
+    base_env.pop("RHO_AGENT_ID", None)
+    started = []
+    sockets = set()
+    try:
+        for agent, explicit, expected in [
+            ("agent-alpha", None, "default"),
+            ("agent-beta", "browser", "browser"),
+            ("agent-alpha", "browser", "browser"),
+            (None, None, "default"),
+        ]:
+            env = dict(base_env)
+            if agent:
+                env["RHO_AGENT_ID"] = agent
+            command = [binary, "wayland"]
+            if explicit:
+                command += ["--session", explicit]
+            subprocess.run(command + ["start", "--width", "128", "--height", "96", "--scale", "1"],
+                           env=env, check=True, capture_output=True)
+            started.append((command, env))
+            directory = root / "rho-desktop"
+            if agent:
+                directory = directory / "agents" / agent
+            descriptor = json.loads((directory / f"{expected}.json").read_text())
+            assert descriptor["agent"] == agent
+            assert descriptor["name"] == expected
+            assert descriptor["socket"] not in sockets
+            sockets.add(descriptor["socket"])
+            subprocess.run(command + ["status"], env=env, check=True, capture_output=True)
+        print("desktop advertisements passed: multiple sessions, per-agent names, owner metadata, standalone default")
+    finally:
+        for command, env in reversed(started):
+            subprocess.run(command + ["stop"], env=env, check=True, capture_output=True)

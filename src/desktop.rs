@@ -38,6 +38,23 @@ impl Drop for Socket {
     }
 }
 
+pub(super) fn desktop_directory(runtime: PathBuf, agent: Option<&str>) -> Result<PathBuf> {
+    let base = runtime.join("rho-desktop");
+    match agent {
+        Some(agent) => {
+            anyhow::ensure!(
+                !agent.is_empty()
+                    && agent
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "invalid desktop agent"
+            );
+            Ok(base.join("agents").join(agent))
+        }
+        None => Ok(base),
+    }
+}
+
 /// Runtime directories and their contents belong to the invoking user, not a sandbox.
 pub fn start(state: &mut State, name: &str) -> Result<Socket> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is required")?;
@@ -60,9 +77,13 @@ pub fn start(state: &mut State, name: &str) -> Result<Socket> {
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
         "invalid desktop session name"
     );
+    let agent = std::env::var("RHO_AGENT_ID").ok();
     let directory = std::env::var_os("RHO_DESKTOP_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&runtime).join("rho-desktop"));
+        .unwrap_or(desktop_directory(
+            PathBuf::from(&runtime),
+            agent.as_deref(),
+        )?);
     std::fs::create_dir_all(&directory)?;
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
     let lock = std::fs::OpenOptions::new()
@@ -122,7 +143,7 @@ pub fn start(state: &mut State, name: &str) -> Result<Socket> {
     std::fs::write(
         &temporary,
         serde_json::to_vec(
-            &serde_json::json!({"socket":path,"pid":std::process::id(),"ipc_socket":state.niri.ipc_server.as_ref().and_then(|ipc|ipc.socket_path.as_ref()),"wayland_display":state.niri.socket_name}),
+            &serde_json::json!({"agent":agent,"name":name,"socket":path,"pid":std::process::id(),"ipc_socket":state.niri.ipc_server.as_ref().and_then(|ipc|ipc.socket_path.as_ref()),"wayland_display":state.niri.socket_name}),
         )?,
     )?;
     std::fs::rename(temporary, &manifest)?;
