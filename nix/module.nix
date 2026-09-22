@@ -54,9 +54,15 @@ let
       ++ config.hardware.graphics.extraPackages
       ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
       ++ app.packages
-      ++ map storeRoot (lib.attrValues app.links)
+      ++ map storeRoot (lib.attrValues (appLinks app))
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
+  # Links in every app's root: /bin/sh and /usr/bin/env as the host has them (what scripts,
+  # ssh and `system()` expect on any Linux), plus the manifest's own.
+  appLinks = app: {
+    "/bin/sh" = config.environment.binsh;
+    "/usr/bin/env" = config.environment.usrbinenv;
+  } // app.links;
   # The command, as launched. In front of the app's own: the linker (its /etc from the store,
   # its state directories under $HOME/.state linked from HOME, the HOME defaults) and, for a
   # private bus, the compat shim (the bridge on it forwards to the
@@ -113,7 +119,8 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens links;
+    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens;
+    links = appLinks app;
     closure = "${appClosure name app}/store-paths";
     env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
       // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
@@ -318,8 +325,8 @@ in
           links = lib.mkOption {
             type = lib.types.attrsOf lib.types.str;
             default = { };
-            example = lib.literalExpression ''{ "/bin/sh" = "''${pkgs.bash}/bin/sh"; }'';
-            description = "Paths in the app's root made as links into the store (the targets join its closure): /bin/sh for scripts and ssh, say.";
+            example = lib.literalExpression ''{ "/usr/bin/python3" = "''${pkgs.python3}/bin/python3"; }'';
+            description = "Further paths in the app's root made as links into the store (the targets join its closure). Every app has /bin/sh and /usr/bin/env.";
           };
           packages = lib.mkOption {
             type = lib.types.listOf lib.types.package;
