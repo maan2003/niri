@@ -54,6 +54,7 @@ let
       ++ config.hardware.graphics.extraPackages
       ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
       ++ app.packages
+      ++ map storeRoot (lib.attrValues app.links)
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
   # The command, as launched. In front of the app's own: the linker (its /etc from the store,
@@ -112,7 +113,7 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens;
+    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens links;
     closure = "${appClosure name app}/store-paths";
     env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
       // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
@@ -314,6 +315,12 @@ in
             description = "Non-Wayland capabilities.";
           };
           env = lib.mkOption { type = lib.types.attrsOf lib.types.str; default = { }; };
+          links = lib.mkOption {
+            type = lib.types.attrsOf lib.types.str;
+            default = { };
+            example = lib.literalExpression ''{ "/bin/sh" = "''${pkgs.bash}/bin/sh"; }'';
+            description = "Paths in the app's root made as links into the store (the targets join its closure): /bin/sh for scripts and ssh, say.";
+          };
           packages = lib.mkOption {
             type = lib.types.listOf lib.types.package;
             default = [ ];
@@ -527,7 +534,8 @@ in
     # is listed. Not root: it holds the union of what its children keep plus what switching
     # them takes, and nothing outside that bounding set.
     # The host's views of itself for the apps' roots (DESIGN-app-namespace): a /dev of the
-    # basic nodes, a /dev/dri of the render nodes, and a /sys of what Mesa and libdrm read
+    # basic nodes (the forker mounts the app's own devpts at its pts), a /dev/dri of the render
+    # nodes, and a /sys of what Mesa and libdrm read
     # (the render node's device and its bus, the CPU topology), copied out of the real ones
     # once. The forker binds them; the real /dev and /sys never enter an app.
     systemd.services.drv-host-views = {
@@ -540,11 +548,12 @@ in
         set -eu
         T=$(mktemp -d ${hostViews}.XXXXXX)
         chmod 755 "$T"
-        mkdir -p "$T"/dev/shm "$T"/dev/dri "$T"/dev-gpu/dri "$T"/sys "$T"/sys-gpu
-        for n in null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9; do
+        mkdir -p "$T"/dev/shm "$T"/dev/pts "$T"/dev/dri "$T"/dev-gpu/dri "$T"/sys "$T"/sys-gpu
+        for n in null:1:3 zero:1:5 full:1:7 random:1:8 urandom:1:9 tty:5:0; do
           IFS=: read -r name maj min <<< "$n"
           mknod -m 666 "$T/dev/$name" c "$maj" "$min"
         done
+        ln -s pts/ptmx "$T"/dev/ptmx
         ln -s /proc/self/fd "$T"/dev/fd
         for i in 0:stdin 1:stdout 2:stderr; do ln -s "/proc/self/fd/''${i%%:*}" "$T/dev/''${i##*:}"; done
         # One entry of the real /sys, at the same place: links as links, files by content.

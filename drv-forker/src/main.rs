@@ -224,6 +224,17 @@ impl Forker {
             new_fs("tmpfs", &[("mode", "1777")], rw_noexec).map_err(|e| format!("shm: {e}"))?,
             "/dev/shm",
         )?;
+        // Its pseudo-terminals: a devpts instance of its own (every mount is one), reached
+        // through the view's /dev/ptmx link to pts/ptmx. Device nodes, so no NODEV.
+        mount(
+            new_fs(
+                "devpts",
+                &[("ptmxmode", "0666")],
+                Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC,
+            )
+            .map_err(|e| format!("pts: {e}"))?,
+            "/dev/pts",
+        )?;
         // The app's own PID namespace seen through its own proc instance: the pid entries
         // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
         mount(
@@ -314,6 +325,17 @@ impl Forker {
                 .map_err(|e| format!("resolv.conf: {e}"))?;
             attach(resolv, Path::new("/run/host/resolv.conf"))
                 .map_err(|e| format!("resolv.conf: {e}"))?;
+        }
+        // What the manifest wants at fixed places (`/bin/sh`): links into the store, made
+        // while the top level is still writable.
+        let store = self.args.store.to_string_lossy();
+        for (at, target) in &launch.links {
+            let at = Path::new(at);
+            let ok = at.is_absolute() && Path::new(target).starts_with(&*store);
+            if !ok {
+                return Err(format!("link {}: not absolute or not into the store", at.display()));
+            }
+            drv_os::root::symlink(Path::new(target), at)?;
         }
         // The old root, stacked beneath ours since the pivot: gone, with the handles into it;
         // the top level read-only.

@@ -40,6 +40,10 @@ pub struct Launch {
     /// The store paths the app may open (its closure, from closureInfo).
     #[serde(default)]
     pub closure: Vec<String>,
+    /// Absolute paths in the root made as links to store paths (`/bin/sh`, say: what scripts
+    /// and `system()` expect). Readable only if the target is in the closure.
+    #[serde(default)]
+    pub links: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

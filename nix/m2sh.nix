@@ -71,12 +71,15 @@ in
         exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ];
         gpu = true; network = true; agent = true;
         packages = [ pkgs.openssh pkgs.fish pkgs.tmux pkgs.coreutils config.services.drv.package ];
+        links = { "/bin/sh" = "${pkgs.bash}/bin/sh"; "/usr/bin/env" = "${pkgs.coreutils}/bin/env"; };
         state = [ ".ssh" ".config/fish" ".local/share/fish" ];
       };
       mail = {
         uid = 100104;
         exec = [ "${pkgs.thunderbird}/bin/thunderbird" ];
-        gpu = true; network = true; audio = true; bus = true;
+        # Gecko makes code at runtime even for its own UI (SpiderMonkey's trampolines):
+        # without jit it dies at startup.
+        gpu = true; network = true; audio = true; bus = true; jit = true;
         state = [ ".thunderbird" ];
         opens = [ "mailto" ];
       };

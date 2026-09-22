@@ -96,6 +96,9 @@ pub struct AppConfig {
     /// May make user namespaces (a browser's own sandbox).
     #[serde(default)]
     pub userns: bool,
+    /// Root paths made as links into the store: `/bin/sh`, say.
+    #[serde(default)]
+    pub links: BTreeMap<String, String>,
 }
 
 impl AppConfig {
@@ -277,6 +280,7 @@ impl Appd {
             userns: app.userns,
             // Inline: the forker mounts and rules, it does not read files.
             closure: app.closure_paths.clone(),
+            links: app.links.clone().into_iter().collect(),
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)

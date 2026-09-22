@@ -191,6 +191,12 @@ in
       # Records: the person is asked at drv-portal; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
       open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
+      # A terminal: a pty of its own, /bin/sh for what its shell runs.
+      terminal = {
+        uid = 100012; exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ]; gpu = true;
+        packages = [ pkgs.fish pkgs.coreutils ];
+        links = { "/bin/sh" = "${pkgs.bash}/bin/sh"; "/usr/bin/env" = "${pkgs.coreutils}/bin/env"; };
+      };
     };
   };
 
