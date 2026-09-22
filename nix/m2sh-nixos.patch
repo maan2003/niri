@@ -115,8 +115,8 @@ diff -ruN a/hosts/m2sh.nix b/hosts/m2sh.nix
      # ../config/system/fs/encrypted-swap.nix
 diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
 --- a/pkgs/niri-bin.nix	2026-09-22 09:08:12.424060371 +0000
-+++ b/pkgs/niri-bin.nix	2026-09-22 09:10:03.768845935 +0000
-@@ -19,6 +19,7 @@
++++ b/pkgs/niri-bin.nix	2026-09-22 09:40:34.078771259 +0000
+@@ -19,14 +19,18 @@
    seatd,
    systemd,
    wayland,
@@ -124,7 +124,28 @@ diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
  }:
  
  stdenv.mkDerivation (finalAttrs: {
-@@ -92,6 +93,7 @@
+   pname = "niri-bin";
+   # Copy version and hash from the pin printed by `niri-build release`
+   # (see tasks/releasing-niri.md). The url is templated from the version.
+-  version = "20260917-g9fa3ca81b598";
++  version = "20260922-g5e6dca59ec06";
+   # Rollbacks (swap version and hash):
++  #   the last niri-only archive (rho/gpu-process), before the drv desktop's binaries shipped:
++  #     version = "20260917-g9fa3ca81b598";
++  #     hash = "sha256-HyUbtMgZ+oj82AcIVIPyWyfM3SLjow6S7P8KigcuhXw=";
+   #   self-sealing GPU process, still with NIRI_GPU_THREAD (protocol v15):
+   #     version = "20260917-g8fe2bae74aa8";
+   #     hash = "sha256-x0nLn4q44VI8h6OVOwQWw1iLwAqBZtqJpYEJNsVVKfI=";
+@@ -53,7 +57,7 @@
+ 
+   src = fetchurl {
+     url = "https://pub-c02578899b644007b0b5aae08b7e73b3.r2.dev/niri/${finalAttrs.version}/aarch64-linux/niri_${finalAttrs.version}_arm64.tar.zst";
+-    hash = "sha256-HyUbtMgZ+oj82AcIVIPyWyfM3SLjow6S7P8KigcuhXw=";
++    hash = "sha256-XAGcXmJvCgpiLtCy7Kx6Az8Z+MY0H+Stny5v4z1LFVM=";
+   };
+ 
+   sourceRoot = ".";
+@@ -92,6 +96,7 @@
      seatd
      systemd # Includes libudev
      wayland # For libwayland-client
@@ -132,7 +153,7 @@ diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
    ];
  
    postPatch = ''
-@@ -102,7 +104,9 @@
+@@ -102,7 +107,9 @@
  
    installPhase = ''
      runHook preInstall
