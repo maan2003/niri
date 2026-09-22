@@ -10,7 +10,7 @@ use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::renderer::element::RenderElementStates;
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::ImportDma;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
@@ -20,7 +20,7 @@ use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
-use crate::render_helpers::{resources, shaders};
+use crate::render_helpers::{resources, shaders, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Headless {
@@ -133,7 +133,19 @@ impl Headless {
                 warn!("desktop composition: {error:#}");
             }
         }
-        let states = RenderElementStates::default();
+        // Frame callbacks use primary-scanout visibility even without a physical
+        // scanout. Empty states leave every client on the one-second fallback.
+        // Compute visibility without drawing or reading pixels when nobody watches.
+        let states = if let Some(renderer) = self.renderer.as_mut() {
+            let elements = niri.render::<GlesRenderer>(renderer, output, true, RenderTarget::Output);
+            let (_, states) = OutputDamageTracker::from_output(output)
+                .damage_output(0, &elements)
+                .expect("headless output has a mode");
+            states
+        } else {
+            Default::default()
+        };
+        niri.update_primary_scanout_output(output, &states);
         let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             get_monotonic_time(),
@@ -143,30 +155,38 @@ impl Headless {
         );
 
         let output_state = niri.output_state.get_mut(output).unwrap();
-        match mem::replace(&mut output_state.redraw_state, RedrawState::Idle) {
-            RedrawState::Idle => unreachable!(),
-            RedrawState::Queued => (),
-            RedrawState::WaitingForVBlank { .. } => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlank(_) => unreachable!(),
-            RedrawState::WaitingForEstimatedVBlankAndQueued(_) => unreachable!(),
-        }
+        assert!(matches!(output_state.redraw_state, RedrawState::Queued));
+        output_state.redraw_state = RedrawState::WaitingForVBlank { redraw_needed: false };
 
-        output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
-
-        if self.video.is_some() && output_state.unfinished_animations_remain {
-            let output = output.clone();
-            if let Err(error) = niri.event_loop.insert_source(
-                calloop::timer::Timer::from_duration(std::time::Duration::from_millis(33)),
+        // A virtual vblank coalesces commits and prevents callback-only clients
+        // from spinning. No recurring timer is armed for an idle output.
+        let output = output.clone();
+        let interval = std::time::Duration::from_nanos(
+            1_000_000_000_000 / output.current_mode().unwrap().refresh as u64,
+        );
+        niri.event_loop
+            .insert_source(
+                calloop::timer::Timer::from_duration(interval),
                 move |_, _, state| {
-                    if state.backend.headless().video.is_some() {
+                    let Some(output_state) = state.niri.output_state.get_mut(&output) else {
+                        return calloop::timer::TimeoutAction::Drop;
+                    };
+                    let RedrawState::WaitingForVBlank { redraw_needed } =
+                        mem::replace(&mut output_state.redraw_state, RedrawState::Idle)
+                    else {
+                        unreachable!()
+                    };
+                    output_state.frame_callback_sequence =
+                        output_state.frame_callback_sequence.wrapping_add(1);
+                    if redraw_needed || output_state.unfinished_animations_remain {
                         state.niri.queue_redraw(&output);
+                    } else {
+                        state.niri.send_frame_callbacks(&output);
                     }
                     calloop::timer::TimeoutAction::Drop
                 },
-            ) {
-                warn!("schedule desktop animation: {error}");
-            }
-        }
+            )
+            .expect("insert headless frame timer");
 
         RenderResult::Submitted
     }
