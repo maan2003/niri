@@ -1,35 +1,20 @@
-diff -ruN a/config/home/profiles/m2sh.nix b/config/home/profiles/m2sh.nix
---- a/config/home/profiles/m2sh.nix	2026-09-22 09:08:12.446060526 +0000
-+++ b/config/home/profiles/m2sh.nix	2026-09-22 09:10:03.770845949 +0000
-@@ -11,7 +11,6 @@
-     # ../handy.nix
-     ../helix.nix
-     ../keepassxc.nix
--    ../desktop/niri.nix
-     ../mpv.nix
-     ../sandboxed.nix
-     ../sioyek.nix
-@@ -26,14 +25,9 @@
- 
-   persist.stateDir.rho = ".local/state/rho";
- 
-+  # rho-gui runs as an app of the drv desktop (nix/m2sh.nix in the niri repo), RHO_NOTCH in
-+  # its manifest; nothing graphical runs as this user any more.
-   home.packages = [
+diff --git a/config/home/profiles/m2sh.nix b/config/home/profiles/m2sh.nix
+index e552a78339..92d4e10dc7 100644
+--- a/config/home/profiles/m2sh.nix
++++ b/config/home/profiles/m2sh.nix
+@@ -30,6 +30,7 @@
      pkgs.antigravity-hub
--    # The M2 Air's notch, in physical pixels: rho-gui puts its status line at
--    # the top and leaves this band in the middle empty. Width is tuned by eye.
--    (pkgs.rho-gui-bin.overrideAttrs (old: {
--      postFixup = (old.postFixup or "") + ''
--        wrapProgram $out/bin/rho-gui --set-default RHO_NOTCH 290x56
--      '';
--    }))
-   ];
- }
-diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/default.nix
---- a/config/system/niri-builder/default.nix	2026-09-22 09:08:12.416060315 +0000
-+++ b/config/system/niri-builder/default.nix	2026-09-22 09:40:57.069933614 +0000
-@@ -64,7 +64,7 @@
+     # The M2 Air's notch, in physical pixels: rho-gui puts its status line at
+     # the top and leaves this band in the middle empty. Width is tuned by eye.
++    # (The drv desktop's rho app gets the same through RHO_NOTCH in its manifest.)
+     (pkgs.rho-gui-bin.overrideAttrs (old: {
+       postFixup = (old.postFixup or "") + ''
+         wrapProgram $out/bin/rho-gui --set-default RHO_NOTCH 290x56
+diff --git a/config/system/niri-builder/default.nix b/config/system/niri-builder/default.nix
+index 18cc4e601d..91e1f810e3 100644
+--- a/config/system/niri-builder/default.nix
++++ b/config/system/niri-builder/default.nix
+@@ -64,7 +64,7 @@ let
      ]);
      text = ''
        action="''${1:-}"
@@ -38,7 +23,7 @@ diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/
  
        case "$action" in
          build|release) ;;
-@@ -116,9 +116,14 @@
+@@ -116,9 +116,14 @@ let
        cd "$repo"
        build_start="$SECONDS"
        # Same feature set as pkgs/niri.nix, spelled out so branches with
@@ -55,7 +40,7 @@ diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/
        build_seconds=$((SECONDS - build_start))
  
        printf '%s\t%s\t%s\n' \
-@@ -131,13 +136,21 @@
+@@ -131,13 +136,21 @@ let
          stage="$state/.stage"
          rm -rf "$stage"
          mkdir -p "$stage/bin"
@@ -79,9 +64,10 @@ diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/
          # Session script, systemd units, desktop file, portal config and the
          # default config ship raw; pkgs/niri-bin.nix installs them the same
          # way pkgs/niri.nix does from a source checkout.
-diff -ruN a/flake.nix b/flake.nix
---- a/flake.nix	2026-09-22 09:08:12.439060477 +0000
-+++ b/flake.nix	2026-09-22 09:10:03.769845942 +0000
+diff --git a/flake.nix b/flake.nix
+index c11bb91e2b..35a5bd7765 100644
+--- a/flake.nix
++++ b/flake.nix
 @@ -39,6 +39,8 @@
        flake = false;
      };
@@ -91,62 +77,80 @@ diff -ruN a/flake.nix b/flake.nix
      ws-mgr = {
        url = "sourcehut:~maan2003/ws-mgr";
        flake = false;
-diff -ruN a/hosts/m2sh.nix b/hosts/m2sh.nix
---- a/hosts/m2sh.nix	2026-09-22 09:08:12.432060428 +0000
-+++ b/hosts/m2sh.nix	2026-09-22 09:10:03.769845942 +0000
-@@ -43,6 +43,7 @@
-   # host never compiles niri; config/system/niri.nix and the Home Manager
-   # profile keep referring to pkgs.niri.
-   nixpkgs.overlays = [ (final: prev: { niri = final.niri-bin; }) ];
+diff --git a/hosts/m2sh.nix b/hosts/m2sh.nix
+index f400c3329a..2ac69ad177 100644
+--- a/hosts/m2sh.nix
++++ b/hosts/m2sh.nix
+@@ -40,9 +40,13 @@ in
+ {
+   system.stateVersion = "24.05";
+   # The compositor comes prebuilt from niri-builder (pkgs/niri-bin.nix) so this
+-  # host never compiles niri; config/system/niri.nix and the Home Manager
+-  # profile keep referring to pkgs.niri.
+-  nixpkgs.overlays = [ (final: prev: { niri = final.niri-bin; }) ];
++  # host never compiles niri. Two of them: the stock one (the last niri-only archive) is
++  # pkgs.niri for greetd, config/system/niri.nix and the Home Manager profile; the drv
++  # desktop's (niri plus its services) runs on VT 7, in the background at boot.
++  nixpkgs.overlays = [ (final: prev: { niri = final.niri-bin-stock; }) ];
 +  services.drv.package = pkgs.niri-bin;
++  # The system-wide PipeWire (and its PulseAudio server) of the drv module.
++  users.users.${config.users.mainUser}.extraGroups = [ "pipewire" ];
    system.replaceDependencies.replacements =
      securityReplacements pkgs
      ++ securityReplacements pkgs.pkgs-unstable
-@@ -60,7 +61,10 @@
-     ../config/system/network/tailscale.nix
+@@ -61,6 +65,10 @@ in
      # ../config/system/network/ivpn.nix
      ../config/system/asahi-sound.nix
--    ../config/system/niri.nix
-+    # The drv desktop (the set of services and the apps as manifests) in place of
+     ../config/system/niri.nix
++    # The drv desktop (the set of services and the apps as manifests) next to
 +    # greetd + niri-session; niri-bin ships all of its binaries.
 +    inputs.niri.nixosModules.default
 +    inputs.niri.nixosModules.m2sh
      ../config/system/memory.nix
      ../config/system/zram.nix
      # ../config/system/fs/encrypted-swap.nix
-diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
---- a/pkgs/niri-bin.nix	2026-09-22 09:08:12.424060371 +0000
-+++ b/pkgs/niri-bin.nix	2026-09-22 09:40:34.078771259 +0000
-@@ -19,14 +19,18 @@
+diff --git a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
+index 68aa9c349b..ea42d06301 100644
+--- a/pkgs/niri-bin.nix
++++ b/pkgs/niri-bin.nix
+@@ -19,14 +19,24 @@
    seatd,
    systemd,
    wayland,
 +  fuse3,
++  # Copy version and hash from the pin printed by `niri-build release`
++  # (see tasks/releasing-niri.md). The url is templated from the version.
++  version ? "20260922-g0fa3daeb15b9",
++  hash ? "sha256-S97AljZJ8PIQugm/FZ4rlpjNkj/joMwAbc0AOJDGegs=",
  }:
  
  stdenv.mkDerivation (finalAttrs: {
    pname = "niri-bin";
-   # Copy version and hash from the pin printed by `niri-build release`
-   # (see tasks/releasing-niri.md). The url is templated from the version.
+-  # Copy version and hash from the pin printed by `niri-build release`
+-  # (see tasks/releasing-niri.md). The url is templated from the version.
 -  version = "20260917-g9fa3ca81b598";
-+  version = "20260922-g5e6dca59ec06";
++  inherit version;
    # Rollbacks (swap version and hash):
-+  #   the last niri-only archive (rho/gpu-process), before the drv desktop's binaries shipped:
++  #   the drv desktop before it could sit beside greetd (no services.drv.homeVt):
++  #     version = "20260922-g5e6dca59ec06";
++  #     hash = "sha256-XAGcXmJvCgpiLtCy7Kx6Az8Z+MY0H+Stny5v4z1LFVM=";
++  #   the last niri-only archive (rho/gpu-process), before the drv desktop's binaries
++  #   shipped; niri-bin-stock (pkgs/overlay.nix) pins it for the host's own session:
 +  #     version = "20260917-g9fa3ca81b598";
 +  #     hash = "sha256-HyUbtMgZ+oj82AcIVIPyWyfM3SLjow6S7P8KigcuhXw=";
    #   self-sealing GPU process, still with NIRI_GPU_THREAD (protocol v15):
    #     version = "20260917-g8fe2bae74aa8";
    #     hash = "sha256-x0nLn4q44VI8h6OVOwQWw1iLwAqBZtqJpYEJNsVVKfI=";
-@@ -53,7 +57,7 @@
+@@ -53,7 +63,7 @@ stdenv.mkDerivation (finalAttrs: {
  
    src = fetchurl {
      url = "https://pub-c02578899b644007b0b5aae08b7e73b3.r2.dev/niri/${finalAttrs.version}/aarch64-linux/niri_${finalAttrs.version}_arm64.tar.zst";
 -    hash = "sha256-HyUbtMgZ+oj82AcIVIPyWyfM3SLjow6S7P8KigcuhXw=";
-+    hash = "sha256-XAGcXmJvCgpiLtCy7Kx6Az8Z+MY0H+Stny5v4z1LFVM=";
++    inherit hash;
    };
  
    sourceRoot = ".";
-@@ -92,6 +96,7 @@
+@@ -92,6 +102,7 @@ stdenv.mkDerivation (finalAttrs: {
      seatd
      systemd # Includes libudev
      wayland # For libwayland-client
@@ -154,7 +158,7 @@ diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
    ];
  
    postPatch = ''
-@@ -102,7 +107,9 @@
+@@ -102,7 +113,9 @@ stdenv.mkDerivation (finalAttrs: {
  
    installPhase = ''
      runHook preInstall
@@ -165,3 +169,19 @@ diff -ruN a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
      install -Dm0644 resources/README.md resources/default-config.kdl -t $doc/share/doc/niri
      install -Dm0644 resources/niri.desktop -t $out/share/wayland-sessions
      install -Dm0644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
+diff --git a/pkgs/overlay.nix b/pkgs/overlay.nix
+index 30b4267dcf..5e758ce242 100644
+--- a/pkgs/overlay.nix
++++ b/pkgs/overlay.nix
+@@ -119,6 +119,11 @@ in
+   ia-fonts = self.callPackage ./ia-fonts.nix { };
+   niri = self.callPackage ./niri.nix { };
+   niri-bin = self.callPackage ./niri-bin.nix { };
++  # The last niri-only build (rho/gpu-process): the host's own session under greetd.
++  niri-bin-stock = self.callPackage ./niri-bin.nix {
++    version = "20260917-g9fa3ca81b598";
++    hash = "sha256-HyUbtMgZ+oj82AcIVIPyWyfM3SLjow6S7P8KigcuhXw=";
++  };
+   nsproxy = self.callPackage ./nsproxy.nix { };
+   parent-ns-enter = self.callPackage ./parent-ns-enter { };
+   trace_processor = self.callPackage ./trace-processor.nix { };
