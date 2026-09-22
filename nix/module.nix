@@ -743,6 +743,9 @@ in
         # RuntimeDirectory= and StateDirectory= would chown them to us on every start.
         RuntimeDirectory = [ "drv" "drv-bridge" "drv-doc" ];
         RuntimeDirectoryMode = "0755";
+        # The documents mount (FUSE, served by drv-portal) outlives the set when the unit
+        # stops: a dead mount systemd can neither remove nor set up again. As root (the `+`).
+        ExecStopPost = [ "+-${pkgs.util-linux}/bin/umount --lazy --quiet /run/drv-doc" ];
         # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
         Delegate = true;
       };
