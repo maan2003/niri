@@ -1,7 +1,7 @@
 [package]
-name = "drv-trampoline"
+name = "drv-init"
 version.workspace = true
-description = "Exec'd as the app before the app: links its state, applies Landlock and MDWE, execs it"
+description = "PID 1 of an app's namespace: links its /etc and state, forks the app, stays as its init"
 authors.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -11,7 +11,8 @@ repository.workspace = true
 clap.workspace = true
 drv-os = { version = "26.4.0", path = "../drv-os" }
 libc = "0.2"
+rustix = { version = "1.1.4", features = ["process"] }
 
 [[bin]]
-name = "drv-trampoline"
+name = "drv-init"
 path = "src/main.rs"

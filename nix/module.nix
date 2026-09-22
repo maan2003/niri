@@ -52,7 +52,7 @@ let
   # its state directories under $HOME/.state linked from HOME, the HOME defaults) and, for a
   # private bus, the compat shim (the bridge on it forwards to the
   # services' bus, which keys everything on the app's UID).
-  appExec = name: app: [ "${cfg.package}/bin/drv-trampoline" "--etc" "${appEtc name app}" ]
+  appExec = name: app: [ "${cfg.package}/bin/drv-init" "--etc" "${appEtc name app}" ]
       ++ lib.concatMap (s: [ "--state" s ]) app.state
       ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ]
       ++ [ "--" ]

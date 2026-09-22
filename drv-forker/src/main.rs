@@ -115,7 +115,7 @@ impl Forker {
                 Err(e) => return err("channel", e),
             };
             // A fork with the child in PID, IPC and UTS namespaces of its own from the start:
-            // it is PID 1 there and stays, as the app's init (see `init`). Mount and net come
+            // it is PID 1 there, and so is drv-init, which it execs. Mount and net come
             // in the child, which has handles to take first.
             // SAFETY: single-threaded; the child runs ordinary code and never returns.
             let pid = unsafe {
@@ -456,95 +456,21 @@ impl Forker {
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()
             .map_err(|_| "NUL in env")?;
-        // 5. This process is PID 1 of the app's namespace and stays as its init; the app is
-        // its child. A pipe tells init whether the exec happened (closed on exec) or not.
-        let (exec_r, exec_w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
-            .map_err(|e| format!("pipe: {e}"))?;
-        // SAFETY: single-threaded; the child only execs or reports and exits.
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            return err("fork", io::Error::last_os_error());
-        }
-        if pid == 0 {
-            drop(exec_r);
-            let mut argv_p: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
-            argv_p.push(std::ptr::null());
-            let mut env_p: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
-            env_p.push(std::ptr::null());
-            // SAFETY: NUL-terminated arrays of NUL-terminated strings.
-            unsafe { libc::execve(exe.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
-            let _ = rustix::io::write(
-                &exec_w,
-                format!("exec {}: {}", launch.argv[0], io::Error::last_os_error()).as_bytes(),
-            );
-            std::process::exit(127);
-        }
-        drop(exec_w);
-        let mut failure = Vec::new();
-        let mut buf = [0u8; 512];
-        while let Ok(n) = rustix::io::read(&exec_r, &mut buf) {
-            if n == 0 {
-                break;
-            }
-            failure.extend_from_slice(&buf[..n]);
-        }
-        drop(exec_r);
-        if !failure.is_empty() {
-            return Err(String::from_utf8_lossy(&failure).into_owned());
-        }
+        // PID 1 of the app's namespace, from here on drv-init: it links what the app
+        // needs, forks the app and stays as its init. Forked goes first: after the exec there
+        // is nobody left to answer, and `which` has already found the file.
         seq::send(channel, &Response::Forked, &[]).map_err(|e| format!("channel: {e}"))?;
-        init(Pid::from_raw(pid).unwrap())
-    }
-}
-
-/// The app's init: PID 1 of its namespace, the app's own UID with nothing, under the same
-/// Landlock, seccomp and MDWE as the app. Reaps whatever gets orphaned, passes the signals
-/// it is sent on to the app, and ends when the app does, with its status. A PID 1 cannot
-/// be killed by a signal from inside its namespace, its own included, so a signal death of
-/// the app becomes exit status 128 + signal here.
-fn init(app: Pid) -> ! {
-    use std::sync::atomic::{AtomicI32, Ordering};
-    static APP: AtomicI32 = AtomicI32::new(0);
-    extern "C" fn forward(sig: libc::c_int) {
-        let pid = APP.load(Ordering::Relaxed);
-        if pid > 0 {
-            // SAFETY: async-signal-safe.
-            unsafe { libc::kill(pid, sig) };
-        }
-    }
-    APP.store(app.as_raw_nonzero().get(), Ordering::Relaxed);
-    // SAFETY: plain prctl with a NUL-terminated name.
-    unsafe { libc::prctl(libc::PR_SET_NAME, c"drv-init".as_ptr()) };
-    for sig in [
-        libc::SIGTERM,
-        libc::SIGINT,
-        libc::SIGHUP,
-        libc::SIGQUIT,
-        libc::SIGUSR1,
-        libc::SIGUSR2,
-    ] {
-        // SAFETY: a zeroed sigaction with a handler is a valid one; forward is signal-safe.
-        unsafe {
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = forward as *const () as usize;
-            sa.sa_flags = libc::SA_RESTART;
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
-        }
-    }
-    loop {
-        match rustix::process::waitpid(None, rustix::process::WaitOptions::empty()) {
-            Ok(Some((pid, status))) if pid == app => {
-                let code = match (status.exit_status(), status.terminating_signal()) {
-                    (Some(code), _) => code as i32,
-                    (_, Some(sig)) => 128 + sig,
-                    _ => 1,
-                };
-                std::process::exit(code);
-            }
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => {}
-            Err(_) => std::process::exit(0),
-        }
+        let mut argv_p: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
+        argv_p.push(std::ptr::null());
+        let mut env_p: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
+        env_p.push(std::ptr::null());
+        // SAFETY: NUL-terminated arrays of NUL-terminated strings.
+        unsafe { libc::execve(exe.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
+        Err(format!(
+            "exec {}: {}",
+            launch.argv[0],
+            io::Error::last_os_error()
+        ))
     }
 }
 

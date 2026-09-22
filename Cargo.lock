@@ -1058,6 +1058,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "drv-init"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
+ "libc",
+ "rustix 1.1.4",
+]
+
+[[package]]
 name = "drv-lock"
 version = "26.4.0"
 dependencies = [
@@ -1132,15 +1142,6 @@ dependencies = [
  "drv-policy",
  "libc",
  "rustix 1.1.4",
-]
-
-[[package]]
-name = "drv-trampoline"
-version = "26.4.0"
-dependencies = [
- "clap",
- "drv-os",
- "libc",
 ]
 
 [[package]]

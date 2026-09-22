@@ -16,8 +16,8 @@ expect="$here/expect/kernel-$app.txt"
 dump=$($SSH "uid=$uid; $(cat <<'EOF'
 set -eu
 # The app itself, not its PulseAudio service (same UID): the one in the forker's cgroup.
-# The app itself, not its PulseAudio service (same UID) and not its init (drv-init): the one
-# in the forker's cgroup whose parent is the init.
+# The app itself, not its PulseAudio service (same UID) and not its init (drv-init):
+# the one in the forker's cgroup whose parent is the init.
 p=; for c in $(pgrep -u "$uid"); do grep -q "apps/app-$uid\$" /proc/$c/cgroup 2>/dev/null && [ "$(cat /proc/$c/comm)" != drv-init ] && { p=$c; break; }; done
 [ -n "$p" ] || { echo "no launched process of uid $uid"; exit 1; }
 echo "parent $(cat /proc/$(awk '/^PPid/ {print $2}' /proc/$p/status)/comm)"

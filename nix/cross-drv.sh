@@ -10,7 +10,7 @@ cd "$state/repo"
 git log --oneline -1
 cargo build --release --locked --target aarch64-unknown-linux-gnu --no-default-features \
   --features drv-portal/service \
-  -p drv-supervisor -p drv-appd -p drv-forker -p drv-trampoline -p drv-bridge -p drv-seat -p drv-auth \
+  -p drv-supervisor -p drv-appd -p drv-forker -p drv-init -p drv-bridge -p drv-seat -p drv-auth \
   -p drv-lock -p drv-menu -p drv-portal 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Checking)'
 out=${OUT:-$state/drv-out}
 rm -rf "$out"; mkdir -p "$out/bin"
