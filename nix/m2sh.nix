@@ -66,15 +66,9 @@ in
         env.RHO_NOTCH = "290x56";
         state = [ ".local/state/rho" ];
       };
-      # A terminal for ssh, nothing local: the agent's keys (the authenticator's PIN is
-      # asked at the portal on first use), known_hosts kept, fish and tmux on its PATH.
-      terminal = {
-        uid = 100103;
-        exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ];
-        gpu = true; network = true; agent = true;
-        packages = [ pkgs.openssh pkgs.fish pkgs.tmux pkgs.coreutils ];
-        state = [ ".ssh" ".config/fish" ".local/share/fish" ];
-      };
+      # `terminal` (uid 100103) and `games` (100105) come from the nixos repo
+      # (config/system/drv-apps.nix): their HOMEs are Home Manager configurations of the
+      # person's shell, which live there.
       mail = {
         uid = 100104;
         exec = [ "${pkgs.thunderbird}/bin/thunderbird" ];

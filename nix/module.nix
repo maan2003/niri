@@ -56,8 +56,32 @@ let
       ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appInit name app ++ appCommand app))
       ++ app.packages
       ++ map storeRoot (lib.attrValues (appLinks app))
-      ++ lib.optional (app.files != { }) (appFiles name app);
+      # An environment variable that is one store path (the locale archive, the cursor
+      # theme) names something the app opens.
+      ++ map storeRoot (lib.filter (v: builtins.match "/nix/store/[^:]*" v != null) (lib.attrValues (appEnv name app)))
+      ++ lib.optional (hasFiles app) (appFiles name app);
   };
+  # What the app finds in its environment: the module's, the features', its own.
+  appEnv = name: app: cfg.env
+    // lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
+    // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
+    // lib.optionalAttrs app.nix { NIX_REMOTE = "daemon"; }
+    // lib.optionalAttrs app.audio {
+      PIPEWIRE_REMOTE = appsSocket;
+      PULSE_SERVER = "unix:${pulseDir name}/native";
+    } // app.env;
+  # The cursor every app and the compositor agree on, as environment and as config.
+  cursorEnv = lib.optionalAttrs (cfg.cursor.package != null) {
+    XCURSOR_THEME = cfg.cursor.name;
+    XCURSOR_SIZE = toString cfg.cursor.size;
+    XCURSOR_PATH = "${cfg.cursor.package}/share/icons";
+  };
+  cursorConfig = lib.optionalString (cfg.cursor.package != null) ''
+    cursor {
+        xcursor-theme "${cfg.cursor.name}"
+        xcursor-size ${toString cfg.cursor.size}
+    }
+  '';
   # Links in every app's root, made by drv-init: /bin/sh and /usr/bin/env as the host has
   # them (what scripts, ssh and `system()` expect on any Linux), Mesa's drivers where it
   # looks for them, plus the manifest's own.
@@ -83,15 +107,17 @@ let
       ++ appCommand app;
   appInit = name: app: [ "${cfg.package}/bin/drv-init" "--etc" "${appEtc name app}" ]
       ++ lib.concatMap (s: [ "--state" s ]) app.state
-      ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ];
+      ++ lib.optionals (hasFiles app) [ "--files" "${appFiles name app}" ];
   appCommand = app: lib.optionals app.bus [
       "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
       # Its configuration from the store: the app's /etc has no dbus-1.
       "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
       "${cfg.package}/bin/drv-dbus-shim" "--"
     ] ++ app.exec;
-  # HOME defaults: a tree the state linker links into HOME entry by entry.
-  appFiles = name: app: pkgs.runCommand "drv-files-${name}" { } (''
+  # HOME defaults: a tree drv-init links into HOME entry by entry, given as such (Home
+  # Manager's `home-files`, say) or built from the manifest's entries.
+  hasFiles = app: app.files != { };
+  appFiles = name: app: if !builtins.isAttrs app.files then app.files else pkgs.runCommand "drv-files-${name}" { } (''
     mkdir "$out"
   '' + lib.concatStrings (lib.mapAttrsToList (path: value: ''
     mkdir -p "$out/$(dirname ${lib.escapeShellArg path})"
@@ -132,19 +158,14 @@ hosts: files${lib.optionalString app.network " dns"}
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
     inherit (app) uid gpu network audio nix globals grants autostart menu opens agent;
-    env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
-      // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
-      // lib.optionalAttrs app.nix { NIX_REMOTE = "daemon"; }
-      // lib.optionalAttrs app.audio {
-        PIPEWIRE_REMOTE = appsSocket;
-        PULSE_SERVER = "unix:${pulseDir name}/native";
-      } // app.env;
+    env = appEnv name app;
     exec = appExec name app;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = json.generate "appd.json" {
     wayland-socket = "/run/drv/wayland";
-    # The shim logs every D-Bus call it answers when asked to.
-    env = cfg.env // lib.optionalAttrs cfg.debug { DRV_SHIM_TRACE = "1"; };
+    # The shim logs every D-Bus call it answers when asked to. (`cfg.env` is already in
+    # every entry's own.)
+    env = lib.optionalAttrs cfg.debug { DRV_SHIM_TRACE = "1"; };
     app = [
       # Services: identified, never launched. They may ask who other UIDs are (each keys
       # its app-facing socket on the peer UID).
@@ -235,8 +256,20 @@ in
         XDG_DATA_DIRS = "${appShare}/share";
         # GTK asks the portal for files instead of browsing a home that holds nothing.
         GTK_USE_PORTAL = "1";
-      };
+        # The host's locale: an app's /etc has no locale.conf, glibc reads these.
+        LANG = config.i18n.defaultLocale;
+        LOCALE_ARCHIVE = "${config.i18n.glibcLocales}/lib/locale/locale-archive";
+      } // cursorEnv;
       description = "Environment every app gets.";
+    };
+    cursor = {
+      package = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = "The cursor theme every app and the compositor use (XCURSOR_* in every app, `cursor {}` in the compositor's config). None: each draws its own default.";
+      };
+      name = lib.mkOption { type = lib.types.str; default = "default"; };
+      size = lib.mkOption { type = lib.types.int; default = 24; };
     };
     gpuEnv = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
@@ -302,9 +335,9 @@ in
             description = "Runs nix as a client of the host's daemon: the daemon's socket in its root, the whole store readable, nix on its PATH.";
           };
           files = lib.mkOption {
-            type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.path);
+            type = lib.types.either (lib.types.attrsOf (lib.types.either lib.types.str lib.types.path)) lib.types.path;
             default = { };
-            description = "HOME defaults: path under HOME to its content (text or a path), linked from the store, read-only.";
+            description = "HOME defaults, linked from the store, read-only: path under HOME to its content (text or a path), or a whole tree (a Home Manager configuration's `home-files`).";
           };
           jit = lib.mkOption {
             type = lib.types.bool;
@@ -513,7 +546,7 @@ in
     boot.kernel.sysctl."vm.memfd_noexec" = 1;
     boot.kernelParams = lib.mkIf cfg.resumePatch [ "drm_kms_helper.blank_on_resume=1" ];
 
-    environment.etc."drv/config.kdl".text = cfg.config;
+    environment.etc."drv/config.kdl".text = cursorConfig + cfg.config;
     # Low priority: a stock niri may be installed next to it for a session of the host's own.
     environment.systemPackages = [ (lib.lowPrio cfg.package) ];
 
@@ -724,6 +757,7 @@ in
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
         ] ++ lib.mapAttrsToList (n: v: "--gpu-env ${n}=${v}") cfg.gpuEnv
+          ++ lib.mapAttrsToList (n: v: "--compositor-env ${n}=${v}") cursorEnv
           ++ map (e: "--compositor-env ${e}") [
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
