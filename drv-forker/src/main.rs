@@ -16,7 +16,6 @@ use std::process::ExitCode;
 use clap::Parser;
 use drv_os::landlock::{self, Ruleset};
 use drv_os::mounts::{attach, clone_tree, new_fs, Attr};
-use drv_os::root::Root;
 use drv_policy::forker::{Request, Response};
 use drv_policy::seq;
 use rustix::event::{poll, PollFd, PollFlags};
@@ -199,12 +198,8 @@ impl Forker {
         drv_os::creds::empty_bounding_set()?;
         drv_os::creds::drop_capability(CapabilitySet::SETPCAP)?;
         rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
-        // The root: a fresh tmpfs, made our namespace's root (hung on our own runtime base
-        // for the moment it takes). The old root stays stacked beneath it, reachable through
-        // the handles below and nothing else, until the UID's directories are taken.
-        let mut root = Root::new(&self.args.runtime_base, true)?;
         // SAFETY: single-threaded.
-        unsafe { root.unshare() }.map_err(|e| format!("namespaces: {e}"))?;
+        unsafe { drv_os::root::unshare(true) }?;
         // The per-UID directories' parents, as plain handles into this namespace's copy of
         // the old root (a handle from before the unshare would point into the parent's
         // namespace, which nothing may be cloned from): the UID's subdirectory of each is
@@ -212,38 +207,40 @@ impl Forker {
         let run_base = open_path(&self.args.runtime_base)?;
         let tmp_base = open_path(&self.args.runtime_base.join("tmp"))?;
         let state_base = open_path(&self.args.state_base)?;
+        // The root: a fresh tmpfs, made our namespace's root (hung on our own runtime base
+        // for the moment it takes). The old root stays stacked beneath it, reachable through
+        // the handles above and nothing else, until the UID's directories are taken.
+        drv_os::root::pivot(&self.args.runtime_base)?;
+        let mount = |fd: OwnedFd, at: &str| drv_os::root::mount(fd, Path::new(at));
         // The fixed part:
-        root.mount(store, &self.args.store)?;
-        root.mount(dev, Path::new("/dev"))?;
-        root.mount(
+        mount(store, &self.args.store.to_string_lossy())?;
+        mount(dev, "/dev")?;
+        mount(
             new_fs("tmpfs", &[("mode", "1777")], rw_noexec).map_err(|e| format!("shm: {e}"))?,
-            Path::new("/dev/shm"),
+            "/dev/shm",
         )?;
         // The app's own PID namespace seen through its own proc instance: the pid entries
         // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
-        root.mount(
+        mount(
             new_fs(
                 "proc",
                 &[("hidepid", "invisible"), ("subset", "pid")],
                 rw_noexec,
             )
             .map_err(|e| format!("proc: {e}"))?,
-            Path::new("/proc"),
+            "/proc",
         )?;
         let mut run_rules = Vec::new();
         let mut audio_mounts = Vec::new();
         for (p, src, writable) in run {
             let is_audio = RUN_AUDIO.contains(&p);
             match src {
-                Ok(fd) if !is_audio => root.mount(fd, Path::new(p))?,
+                Ok(fd) if !is_audio => mount(fd, p)?,
                 Ok(fd) => audio_mounts.push((p, fd)),
-                Err(target) => root.symlink(&target, Path::new(p))?,
+                Err(target) => drv_os::root::symlink(&target, Path::new(p))?,
             }
             run_rules.push((p, writable, is_audio));
         }
-        root.build().map_err(|e| format!("root: {e}"))?;
-        drop(root);
-        let mount = |fd: OwnedFd, at: &str| drv_os::root::mount(fd, Path::new(at));
 
         // 2. The request. From here to the switch, only uid, network, gpu and audio are read.
         let Request::Launch(launch): Request =
@@ -315,7 +312,7 @@ impl Forker {
         }
         // The old root, stacked beneath ours since the pivot: gone, with the handles into it;
         // the top level read-only.
-        drv_os::root::finish(ro_noexec).map_err(|e| format!("root: {e}"))?;
+        drv_os::root::finish(ro_noexec)?;
         // One cgroup per app UID under the subtree the supervisor delegated to us.
         let name = format!("app-{uid}");
         match rustix::fs::mkdirat(&apps_cgroup, &name, Mode::from_raw_mode(0o755)) {

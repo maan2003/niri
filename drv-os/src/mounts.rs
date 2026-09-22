@@ -51,7 +51,7 @@ pub fn clone_tree(dir: impl AsFd, path: &Path, attrs: MountAttrFlags) -> io::Res
 }
 
 /// Exactly `attrs` of the four flags, and private propagation, on `mount` (and beneath).
-pub fn set_attrs(mount: &impl AsRawFd, attrs: MountAttrFlags, recursive: bool) -> io::Result<()> {
+pub fn set_attrs(mount: &impl AsFd, attrs: MountAttrFlags, recursive: bool) -> io::Result<()> {
     use MountAttrFlags as A;
     let four =
         A::MOUNT_ATTR_RDONLY | A::MOUNT_ATTR_NOSUID | A::MOUNT_ATTR_NODEV | A::MOUNT_ATTR_NOEXEC;
@@ -66,7 +66,7 @@ pub fn set_attrs(mount: &impl AsRawFd, attrs: MountAttrFlags, recursive: bool) -
     let rc = unsafe {
         libc::syscall(
             SYS_MOUNT_SETATTR,
-            mount.as_raw_fd(),
+            mount.as_fd().as_raw_fd(),
             c"".as_ptr(),
             flags,
             &attr as *const MountAttr,

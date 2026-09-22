@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use drv_os::mounts::{clone_tree, new_fs, Attr};
-use drv_os::root::Root;
 use drv_os::{dup_high, ensure_owned_dir};
 use rustix::fs::CWD;
 use rustix::thread::{CapabilitySet, Gid, Uid};
@@ -22,6 +21,7 @@ use rustix::thread::{CapabilitySet, Gid, Uid};
 /// `/etc` read-only, fresh `/tmp`, `/dev/shm` and `/proc`, under `/run` only `expose`, its
 /// `dirs`, nothing else of the host's; no network unless `network`), its environment exactly
 /// as listed.
+#[derive(Clone)]
 pub struct Service {
     pub name: String,
     pub uid: u32,
@@ -43,9 +43,10 @@ pub struct Service {
     pub cgroups: bool,
 }
 
-/// A member's root, planned before the fork: what every member gets, plus its `expose`
-/// entries under `/run` (a symlink into the store remade as one) and its `dirs`.
-fn member_root(service: &Service) -> Result<Root, String> {
+/// A member's root, built in the child: what every member gets, plus its `expose` entries
+/// under `/run` (a symlink into the store remade as one) and its `dirs`. Handles first, while
+/// the host's root is still in view; then the pivot and the mounts.
+fn build_root(service: &Service) -> Result<(), String> {
     let ro = Attr::MOUNT_ATTR_RDONLY | Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV;
     let ro_noexec = ro | Attr::MOUNT_ATTR_NOEXEC;
     let rw_noexec = Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV | Attr::MOUNT_ATTR_NOEXEC;
@@ -55,32 +56,31 @@ fn member_root(service: &Service) -> Result<Root, String> {
     let fresh = |fs: &str, opts: &[(&str, &str)]| {
         new_fs(fs, opts, rw_noexec).map_err(|e| format!("{fs}: {e}"))
     };
-    let mut root = Root::new(Path::new("/tmp"), !service.network)?;
-    let mut fixed: Vec<(&str, OwnedFd)> = vec![
-        ("/nix/store", clone(Path::new("/nix/store"), ro)?),
+    // SAFETY: the child of a single-threaded fork.
+    unsafe { drv_os::root::unshare(!service.network) }?;
+    let mut mounts: Vec<(PathBuf, OwnedFd)> = vec![
+        ("/nix/store".into(), clone(Path::new("/nix/store"), ro)?),
         // Device nodes, so no NODEV; the real ones: seatd and the compositor open them.
         (
-            "/dev",
+            "/dev".into(),
             clone(
                 Path::new("/dev"),
                 Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC,
             )?,
         ),
-        ("/dev/shm", fresh("tmpfs", &[("mode", "1777")])?),
-        ("/proc", fresh("proc", &[("hidepid", "invisible")])?),
-        ("/sys", clone(Path::new("/sys"), ro_noexec)?),
-        ("/etc", clone(Path::new("/etc"), ro_noexec)?),
-        ("/tmp", fresh("tmpfs", &[("mode", "1777")])?),
+        ("/dev/shm".into(), fresh("tmpfs", &[("mode", "1777")])?),
+        ("/proc".into(), fresh("proc", &[("hidepid", "invisible")])?),
+        ("/sys".into(), clone(Path::new("/sys"), ro_noexec)?),
+        ("/etc".into(), clone(Path::new("/etc"), ro_noexec)?),
+        ("/tmp".into(), fresh("tmpfs", &[("mode", "1777")])?),
     ];
     if service.cgroups {
-        fixed.push((
-            "/sys/fs/cgroup",
+        mounts.push((
+            "/sys/fs/cgroup".into(),
             clone(Path::new("/sys/fs/cgroup"), rw_noexec)?,
         ));
     }
-    for (path, fd) in fixed {
-        root.mount(fd, Path::new(path))?;
-    }
+    let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &service.expose {
         let rel = path
             .strip_prefix("/run")
@@ -91,19 +91,27 @@ fn member_root(service: &Service) -> Result<Root, String> {
         let meta =
             std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if meta.file_type().is_symlink() {
-            let target =
-                std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            root.symlink(&target, path)?;
+            links.push((
+                std::fs::read_link(path).map_err(|e| format!("{}: {e}", path.display()))?,
+                path.clone(),
+            ));
         } else {
-            root.mount(clone(path, rw_noexec)?, path)?;
+            mounts.push((path.clone(), clone(path, rw_noexec)?));
         }
     }
     for (dir, _) in &service.dirs {
         if !service.expose.contains(dir) {
-            root.mount(clone(dir, rw_noexec)?, dir)?;
+            mounts.push((dir.clone(), clone(dir, rw_noexec)?));
         }
     }
-    Ok(root)
+    drv_os::root::pivot(Path::new("/tmp"))?;
+    for (at, fd) in mounts {
+        drv_os::root::mount(fd, &at)?;
+    }
+    for (target, at) in links {
+        drv_os::root::symlink(&target, &at)?;
+    }
+    drv_os::root::finish(ro_noexec)
 }
 
 /// A capability by its kernel name without the `CAP_` prefix (`sys_tty_config`).
@@ -186,7 +194,6 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
     }
     let (fd_env, placed) =
         drv_os::fds::handoff(fds).map_err(|e| format!("{}: {e}", service.name))?;
-    let root = member_root(service).map_err(|e| format!("{}: {e}", service.name))?;
     // Copies above the target numbers, so the dup2s in the child never clobber each other
     // and are never a same-fd no-op (which would keep close-on-exec set).
     let mut dups = Vec::new();
@@ -200,19 +207,10 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
         .envs(service.env.iter().cloned())
         .envs(fd_env)
         .stdin(Stdio::null());
-    let (uid, gid, caps) = (
-        Uid::from_raw(service.uid),
-        Gid::from_raw(service.gid),
-        service.caps,
-    );
-    let groups: Vec<Gid> = service.groups.iter().map(|g| Gid::from_raw(*g)).collect();
+    let child_service = service.clone();
     let child_dups = dups.clone();
-    let ro_noexec = Attr::MOUNT_ATTR_RDONLY
-        | Attr::MOUNT_ATTR_NOSUID
-        | Attr::MOUNT_ATTR_NODEV
-        | Attr::MOUNT_ATTR_NOEXEC;
-    // SAFETY: only dup2, mount, credential and capability syscalls between fork and exec,
-    // on strings and handles made before it; the child is single-threaded.
+    // SAFETY: between fork and exec in a single-threaded parent (the supervisor has no
+    // threads), so the child may do ordinary work: it builds its root and switches user.
     unsafe {
         command.pre_exec(move || {
             for (high, target) in &child_dups {
@@ -220,13 +218,24 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
                     return Err(io::Error::last_os_error());
                 }
             }
-            // While CAP_SYS_ADMIN is still ours.
-            root.unshare()?;
-            root.build()?;
-            drv_os::root::finish(ro_noexec)?;
-            drv_os::creds::switch_to(uid, gid, &groups, caps).map_err(io::Error::other)?;
-            rustix::thread::set_no_new_privs(true)?;
-            Ok(())
+            let s = &child_service;
+            // While CAP_SYS_ADMIN is still ours. Only an errno reaches the parent; the words
+            // go to the journal from here.
+            let child = || -> Result<(), String> {
+                build_root(s)?;
+                let groups: Vec<Gid> = s.groups.iter().map(|g| Gid::from_raw(*g)).collect();
+                drv_os::creds::switch_to(
+                    Uid::from_raw(s.uid),
+                    Gid::from_raw(s.gid),
+                    &groups,
+                    s.caps,
+                )?;
+                rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))
+            };
+            child().map_err(|e| {
+                drv_os::say!("drv-supervisor: {}: {e}", s.name);
+                io::Error::other(e)
+            })
         });
     }
     let child = command

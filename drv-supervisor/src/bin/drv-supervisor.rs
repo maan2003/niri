@@ -9,7 +9,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::sync::mpsc;
 use std::time::Duration;
 use std::{fs, io, thread};
 
@@ -604,21 +603,17 @@ fn stop_set(apps: &AppsCgroup, children: Group) {
 
 /// Waits for the first of the group to exit, then names every member already gone, with
 /// how ("compositor-gpu (signal 9), compositor (exit status 1)"): a member's death takes
-/// its peers down within the same instant, and which thread reports first says nothing
-/// about who died first. The children are not reaped here (waiting on a `&Child` is not
-/// possible); `stop_set` reaps them all.
+/// its peers down within the same instant, and which exited first says nothing about who
+/// died first. The children are not reaped here (waiting on a `&Child` is not possible);
+/// `stop_set` reaps them all.
 fn wait_first(children: &Group) -> String {
-    let (tx, rx) = mpsc::channel();
-    for (_, child) in children {
-        let pid = child.id() as i32;
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = exited(pid, 0);
-            let _ = tx.send(());
-        });
-    }
-    if rx.recv().is_err() {
-        return "? (lost)".to_owned();
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    loop {
+        match waitid(WaitId::All, WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
+            Ok(_) => break,
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return format!("? (waitid: {e})"),
+        }
     }
     // A moment for the cascade, so the report has the cause and not only its first victim.
     thread::sleep(Duration::from_millis(200));
