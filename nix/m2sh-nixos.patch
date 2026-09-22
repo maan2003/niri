@@ -28,7 +28,7 @@ diff -ruN a/config/home/profiles/m2sh.nix b/config/home/profiles/m2sh.nix
  }
 diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/default.nix
 --- a/config/system/niri-builder/default.nix	2026-09-22 09:08:12.416060315 +0000
-+++ b/config/system/niri-builder/default.nix	2026-09-22 09:10:03.766845921 +0000
++++ b/config/system/niri-builder/default.nix	2026-09-22 09:40:57.069933614 +0000
 @@ -64,7 +64,7 @@
      ]);
      text = ''
@@ -55,7 +55,7 @@ diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/
        build_seconds=$((SECONDS - build_start))
  
        printf '%s\t%s\t%s\n' \
-@@ -131,13 +136,20 @@
+@@ -131,13 +136,21 @@
          stage="$state/.stage"
          rm -rf "$stage"
          mkdir -p "$stage/bin"
@@ -69,11 +69,12 @@ diff -ruN a/config/system/niri-builder/default.nix b/config/system/niri-builder/
          install -m 0755 "$binaries/niri" "$stage/bin/niri"
          llvm-objcopy --strip-debug \
            --add-gnu-debuglink="$debug_file" "$stage/bin/niri"
-+        for b in "$binaries"/drv-* "$binaries"/*-probe; do
-+          [ -f "$b" ] && [ -x "$b" ] || continue
-+          case "$b" in *.d) continue;; esac
-+          llvm-objcopy --strip-debug "$b" "$stage/bin/$(basename "$b")"
-+          chmod 0755 "$stage/bin/$(basename "$b")"
++        # By name, not by glob: the target directory keeps binaries of crates that no
++        # longer exist.
++        for b in drv-supervisor drv-appd drv-forker drv-init drv-bridge drv-seatd drv-authd \
++                 drv-lock drv-menu drv-portal drv-agent drv-keys chooser-probe cast-probe; do
++          llvm-objcopy --strip-debug "$binaries/$b" "$stage/bin/$b"
++          chmod 0755 "$stage/bin/$b"
 +        done
          # Session script, systemd units, desktop file, portal config and the
          # default config ship raw; pkgs/niri-bin.nix installs them the same
