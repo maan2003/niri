@@ -120,7 +120,6 @@ in
     if [ ! -e /var/lib/drv-auth/pin ]; then
       printf 1234 | ${config.services.drv.package}/bin/drv-authd set-pin --state-dir /var/lib/drv-auth
     fi
-    chown -R drv-auth:drv-auth /var/lib/drv-auth
   '') ];
 
   services.drv = {

@@ -101,6 +101,12 @@ impl Store {
             .truncate(true)
             .mode(0o600)
             .open(&tmp)?;
+        // `set-pin` runs as root, the daemon as the directory's owner: the file is theirs.
+        let dir = rustix::fs::stat(&self.dir)?;
+        let (uid, gid) = (rustix::process::Uid::from_raw(dir.st_uid), rustix::process::Gid::from_raw(dir.st_gid));
+        if uid != rustix::process::geteuid() {
+            rustix::fs::fchown(&f, Some(uid), Some(gid))?;
+        }
         f.write_all(data)?;
         f.sync_all()?;
         fs::rename(tmp, self.dir.join(name))
