@@ -125,6 +125,7 @@ in
 
   services.drv = {
     debug = true;
+    screenshots = "/var/lib/drv-screenshots";
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
     # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel; the

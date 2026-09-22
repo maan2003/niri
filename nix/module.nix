@@ -189,8 +189,8 @@ in
     screenshots = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
-      example = "/var/lib/drv-files/Screenshots";
-      description = "A directory the compositor may write screenshots to (point the config's screenshot-path into it); under `files`, the chooser hands them on.";
+      example = "/var/lib/drv-screenshots";
+      description = "A directory of the compositor's own to write screenshots to (point the config's screenshot-path into it). Not under `files`: that is the portal's, 0700. Screenshots also land on the clipboard.";
     };
     notifier = lib.mkOption {
       type = lib.types.listOf lib.types.str;

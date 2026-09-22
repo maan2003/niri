@@ -40,7 +40,7 @@ in
     enable = true;
     # The Asahi kernel comes from the cache; the resume blanking is not worth a kernel build.
     resumePatch = false;
-    screenshots = "/var/lib/drv-files/Screenshots";
+    screenshots = "/var/lib/drv-screenshots";
     apps = {
       # rho's own browser integration is off: it opens links through the portal (its private
       # bus), and this app is what `https` resolves to.
@@ -115,7 +115,7 @@ in
       }
 
       prefer-no-csd
-      screenshot-path "/var/lib/drv-files/Screenshots/%Y-%m-%d %H-%M-%S.png"
+      screenshot-path "/var/lib/drv-screenshots/%Y-%m-%d %H-%M-%S.png"
 
       overview {
           zoom 0.25

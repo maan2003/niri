@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
 use clap::Parser;
@@ -372,6 +372,11 @@ fn supervise(args: Args) -> Result<(), String> {
     // Datagrams with fds: the shim and the server speak `drv_bridge::wire`, not a stream.
     let bridge_listener = listen_seqpacket(&args.bridge_socket)?;
 
+    // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
+    // which would leave the console unusable. systemd's start limit takes it from here.
+    const DEATHS: usize = 5;
+    const WINDOW: Duration = Duration::from_secs(60);
+    let mut deaths: Vec<Instant> = Vec::new();
     loop {
         match start_set(&set, &cgroups, &listener, &bridge_listener, &args.docs) {
             Ok(children) => {
@@ -380,6 +385,15 @@ fn supervise(args: Args) -> Result<(), String> {
                 stop_set(&cgroups, children);
             }
             Err(err) => drv_os::say!("drv-supervisor: {err}"),
+        }
+        let now = Instant::now();
+        deaths.retain(|t| now.duration_since(*t) < WINDOW);
+        deaths.push(now);
+        if deaths.len() >= DEATHS {
+            return Err(format!(
+                "the set died {DEATHS} times within {}s; giving up",
+                WINDOW.as_secs()
+            ));
         }
         thread::sleep(Duration::from_secs(1));
     }
