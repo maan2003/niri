@@ -7,7 +7,7 @@ pub const VERSION: u32 = 1;
 /// Text from the app is cut here before it is shown.
 pub const MAX_TEXT: usize = 2048;
 /// Where apps find the socket.
-pub const SOCKET: &str = "/run/drv-shell/notify.sock";
+pub const SOCKET: &str = "/run/drv/notify.sock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToShell {

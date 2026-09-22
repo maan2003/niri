@@ -2886,11 +2886,23 @@ impl Niri {
         });
 
         // A second, world-connectable socket for apps running as other UIDs, which cannot enter
-        // our XDG_RUNTIME_DIR. Anyone may connect; the policy decides what they get.
+        // our XDG_RUNTIME_DIR: the supervisor's listener (fd `apps`, bound at /run/drv/wayland
+        // in every app's root) or, without a supervisor, a path from the environment. Anyone
+        // may connect; the policy decides what they get.
         let apps_socket = create_wayland_socket
-            .then(|| env::var_os(drv_policy::env::APPS_SOCKET).map(PathBuf::from))
+            .then(|| match crate::wire::take_apps_listener() {
+                Some(listener) => Some((PathBuf::from("/run/drv/wayland"), Ok(listener))),
+                None => env::var_os(drv_policy::env::APPS_SOCKET)
+                    .map(PathBuf::from)
+                    .map(|path| {
+                        let listener = bind_apps_socket(&path);
+                        (path, listener)
+                    }),
+            })
             .flatten()
-            .and_then(|path| match bind_apps_socket(&event_loop, &path) {
+            .and_then(|(path, listener)| match listener
+                .and_then(|listener| serve_apps_listener(&event_loop, listener))
+            {
                 Ok(()) => {
                     info!("listening on apps Wayland socket: {}", path.display());
                     Some(path)
@@ -7520,12 +7532,19 @@ impl Niri {
     }
 }
 
-fn bind_apps_socket(event_loop: &LoopHandle<'static, State>, path: &Path) -> anyhow::Result<()> {
+fn bind_apps_socket(path: &Path) -> anyhow::Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    listener.set_nonblocking(true)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o666))?;
+    Ok(listener)
+}
+
+fn serve_apps_listener(
+    event_loop: &LoopHandle<'static, State>,
+    listener: UnixListener,
+) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
     let source = Generic::new(listener, Interest::READ, Mode::Level);
     event_loop.insert_source(source, |_, listener, state| {
         loop {

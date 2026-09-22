@@ -1,6 +1,6 @@
 //! The ssh agent, a supervisor service. OpenSSH's ssh-agent runs here, as this uid, with the
 //! authenticators' hidraw nodes (a udev rule makes them ours) and its socket in our private
-//! `/tmp`. This process fronts it on the public socket (`/run/drv-agent/agent`, in every
+//! `/tmp`. This process fronts it on the public socket (`/run/drv/agent`, in every
 //! app's root) and lets through the UIDs the manifest grants `agent`, checked on each
 //! connection (SO_PEERCRED) and refused at accept otherwise. ssh-agent itself would refuse
 //! them all: it serves its own uid only, which is why the door is a separate process.
@@ -45,9 +45,6 @@ struct Args {
 enum Cmd {
     /// The service: ssh-agent behind the door.
     Serve {
-        /// The public socket, in every app's root.
-        #[arg(long, default_value = "/run/drv-agent/agent")]
-        listen: PathBuf,
         /// ssh-agent's own socket, in our private /tmp.
         #[arg(long, default_value = "/tmp/ssh-agent")]
         private: PathBuf,
@@ -78,11 +75,10 @@ fn main() {
     }
     let result = match Args::parse().command {
         Cmd::Serve {
-            listen,
             private,
             ssh_agent,
             ssh_add,
-        } => serve(&listen, &private, &ssh_agent, &ssh_add),
+        } => serve(&private, &ssh_agent, &ssh_add),
     };
     if let Err(err) = result {
         drv_os::say!("drv-agent: {err}");
@@ -90,11 +86,15 @@ fn main() {
     }
 }
 
-fn serve(listen: &Path, private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String> {
+fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String> {
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the supervisor: {e}"))?;
     let shell = fds
         .socket("shell", Kind::SeqPacket)
         .map_err(|e| e.to_string())?;
+    // The door (`/run/drv/agent`, in every app's root), bound by the supervisor before the
+    // set started: an app started meanwhile waits in the backlog instead of finding no
+    // socket. The door is the uid check below, not a mode: apps of any uid may connect.
+    let listener = fds.listener("listener").map_err(|e| e.to_string())?;
     let appd = Appd::open().map_err(|e| format!("drv-appd: {e}"))?;
     let _ = std::fs::remove_file(ASKPASS);
     let askpass = UnixListener::bind(ASKPASS).map_err(|e| format!("{ASKPASS}: {e}"))?;
@@ -120,15 +120,8 @@ fn serve(listen: &Path, private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Res
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = std::fs::remove_file(listen);
-    let listener = UnixListener::bind(listen).map_err(|e| format!("{}: {e}", listen.display()))?;
-    // The door is the uid check below, not the mode: apps of any uid may connect.
-    std::fs::set_permissions(listen, std::os::unix::fs::PermissionsExt::from_mode(0o666))
-        .map_err(|e| format!("{}: {e}", listen.display()))?;
-    // The door is bound before the shell answers (its fonts take a moment): an app started
-    // meanwhile waits in the backlog instead of finding no socket.
     let shell = Shell::start(shell)?;
-    drv_os::say!("drv-agent: serving {}", listen.display());
+    drv_os::say!("drv-agent: serving the door");
     let door = Arc::new(Door {
         private: private.to_owned(),
         ssh_add: ssh_add.to_owned(),

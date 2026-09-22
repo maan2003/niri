@@ -3,6 +3,7 @@
 //! the rest are taken by the event loop once it is up. Nothing arrives at runtime.
 
 use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixListener;
 use std::sync::Mutex;
 
 use drv_os::fds::{Fds, Kind};
@@ -27,6 +28,15 @@ pub enum Peer {
     FilesClient,
     /// The cast line to drv-cast: it starts and stops screencasts the person consented to.
     Cast,
+}
+
+/// The apps' Wayland listener, when the supervisor bound it (`/run/drv/wayland`, in every
+/// app's root): taken out of the handoff by `take`, collected by the socket setup.
+static APPS: Mutex<Option<UnixListener>> = Mutex::new(None);
+
+/// The apps' Wayland listener from the supervisor, once.
+pub fn take_apps_listener() -> Option<UnixListener> {
+    APPS.lock().unwrap().take()
 }
 
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
@@ -74,6 +84,10 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
     let Some(fds) = fds.as_mut() else {
         return out;
     };
+    match fds.listener("apps") {
+        Ok(listener) => *APPS.lock().unwrap() = Some(listener),
+        Err(err) => warn!("fd \"apps\" from the supervisor: {err}"),
+    }
     for (peer, name, kind) in [
         (Peer::Auth, "auth", Kind::SeqPacket),
         (Peer::Appd, "appd", Kind::Stream),

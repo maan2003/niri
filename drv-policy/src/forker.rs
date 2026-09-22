@@ -11,15 +11,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::seq;
 
-/// An app, as the manifest describes it. Booleans say what the app is; the forker owns what
-/// each one means on this host. The only path-shaped field is the closure, and any store
-/// path is content an app may be given.
+/// An app, as far as the forker is concerned: the UID, the mounts that depend on the
+/// manifest (the render node, the nix daemon's socket, the host's network) and the command.
+/// Everything the app does to its own root once it is the app (its `/etc`, HOME, the links,
+/// the Landlock rules, the syscall filter) is drv-init's, from the command line the system
+/// configuration gave it. No paths here: the forker has its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
     pub uid: u32,
     /// `argv[0]` is looked up in `PATH` from `env`.
     pub argv: Vec<String>,
-    /// The child's whole environment, plus `HOME` and `XDG_RUNTIME_DIR` which the forker sets.
+    /// The child's whole environment. `HOME` and `XDG_RUNTIME_DIR` are drv-init's to set.
     pub env: Vec<(String, String)>,
     /// Keep the host network. Otherwise the child gets a new, empty network namespace.
     #[serde(default)]
@@ -27,23 +29,9 @@ pub struct Launch {
     /// The render node and the host's view of it.
     #[serde(default)]
     pub gpu: bool,
-    /// The PipeWire and PulseAudio sockets.
+    /// The nix daemon's socket directory, at its own path.
     #[serde(default)]
-    pub audio: bool,
-    /// The app makes code at runtime (a JIT): no MDWE for it.
-    #[serde(default)]
-    pub jit: bool,
-    /// The app may make user namespaces (a browser's own sandbox). Otherwise `unshare`,
-    /// `clone` and `setns` with CLONE_NEWUSER fail and `clone3` is not there.
-    #[serde(default)]
-    pub userns: bool,
-    /// The store paths the app may open (its closure, from closureInfo).
-    #[serde(default)]
-    pub closure: Vec<String>,
-    /// Absolute paths in the root made as links to store paths (`/bin/sh`, say: what scripts
-    /// and `system()` expect). Readable only if the target is in the closure.
-    #[serde(default)]
-    pub links: Vec<(String, String)>,
+    pub nix: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

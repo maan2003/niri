@@ -11,7 +11,7 @@ mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible
 mount /run/drv rw,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
 mount /run/drv-compositor rw,nosuid,nodev,noexec tmpfs root=/drv-compositor rw,mode=755
-mount /run/drv-wayland rw,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
+mount /run/drv/doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
 mount /run/pipewire rw,nosuid,nodev,noexec tmpfs root=/pipewire rw,mode=755
 mount /run/udev rw,nosuid,nodev,noexec tmpfs root=/udev rw,mode=755
 mount /sys ro,nosuid,nodev,noexec sysfs root=/ rw

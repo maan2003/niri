@@ -31,13 +31,16 @@ pub unsafe fn unshare(new_net: bool) -> Result<(), String> {
     rustix::mount::mount_change("/", P::PRIVATE | P::REC).map_err(|e| format!("make private: {e}"))
 }
 
-/// A fresh tmpfs, made our root: hung on `base` (a directory of the old root) for the moment
-/// it takes. From here every path resolves inside the new root; the old one is stacked
-/// beneath, reachable through handles taken earlier and nothing else.
-pub fn pivot(base: &Path) -> Result<(), String> {
+/// A fresh tmpfs (mode 0755 plus `options`: an owner, a size), made our root: hung on `base`
+/// (a directory of the old root) for the moment it takes. From here every path resolves
+/// inside the new root; the old one is stacked beneath, reachable through handles taken
+/// earlier and nothing else.
+pub fn pivot(base: &Path, options: &[(&str, &str)]) -> Result<(), String> {
+    let mut all = vec![("mode", "0755")];
+    all.extend_from_slice(options);
     let root = new_fs(
         "tmpfs",
-        &[("mode", "0755")],
+        &all,
         Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV,
     )
     .map_err(|e| format!("root tmpfs: {e}"))?;

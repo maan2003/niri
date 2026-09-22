@@ -119,7 +119,7 @@ struct Args {
     shell_env: Vec<String>,
     /// The shell's notification socket, world-connectable: every connection is keyed on the
     /// peer UID.
-    #[arg(long, default_value = "/run/drv-shell/notify.sock")]
+    #[arg(long, default_value = "/run/drv/notify.sock")]
     notify_socket: PathBuf,
     /// System user the ssh agent runs as.
     #[arg(long)]
@@ -127,10 +127,9 @@ struct Args {
     /// The agent's command line, whitespace-separated (`drv-agent serve ...`).
     #[arg(long)]
     agent_exec: String,
-    /// `PATH:MODE` (octal): a directory the agent owns (its socket's), checked before it
-    /// starts and in its root.
-    #[arg(long = "agent-dir")]
-    agent_dirs: Vec<String>,
+    /// The agent's door, world-connectable: the agent asks drv-appd about every peer UID.
+    #[arg(long, default_value = "/run/drv/agent")]
+    agent_socket: PathBuf,
     /// An entry under `/run` the agent sees (udev's database, for the authenticators). Repeatable.
     #[arg(long = "agent-expose")]
     agent_expose: Vec<PathBuf>,
@@ -166,10 +165,10 @@ struct Args {
     #[arg(long = "files-dir")]
     files_dirs: Vec<String>,
     /// Where the documents mount goes: drv-files serves it, apps see their files under it.
-    #[arg(long, default_value = "/run/drv-doc")]
+    #[arg(long, default_value = "/run/drv/doc")]
     docs: PathBuf,
     /// drv-files' socket, world-connectable: every connection is keyed on the peer UID.
-    #[arg(long, default_value = "/run/drv-files/files.sock")]
+    #[arg(long, default_value = "/run/drv/files.sock")]
     files_socket: PathBuf,
     /// System user drv-cast (screencasts, cameras, microphones) runs as.
     #[arg(long)]
@@ -184,8 +183,12 @@ struct Args {
     #[arg(long = "cast-env")]
     cast_env: Vec<String>,
     /// drv-cast's socket, world-connectable: every connection is keyed on the peer UID.
-    #[arg(long, default_value = "/run/drv-cast/cast.sock")]
+    #[arg(long, default_value = "/run/drv/cast.sock")]
     cast_socket: PathBuf,
+    /// The compositor's Wayland socket for apps, world-connectable: the compositor asks
+    /// drv-appd who each client is.
+    #[arg(long, default_value = "/run/drv/wayland")]
+    apps_socket: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -293,7 +296,7 @@ fn supervise(args: Args) -> Result<(), String> {
             &args.agent_user,
             &args.agent_exec,
             &args.agent_env,
-            &args.agent_dirs,
+            &[],
             &[],
             &args.agent_expose,
         )?,
@@ -336,6 +339,8 @@ fn supervise(args: Args) -> Result<(), String> {
         files: listen_seqpacket(&args.files_socket)?,
         cast: listen_seqpacket(&args.cast_socket)?,
         notify: listen_seqpacket(&args.notify_socket)?,
+        agent: listen(&args.agent_socket)?,
+        apps: listen(&args.apps_socket)?,
     };
 
     // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
@@ -378,12 +383,15 @@ fn listen(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// The app-facing sockets of the services, bound here so an app started early waits in a
-/// backlog instead of finding no socket.
+/// The app-facing sockets of the services, all in the one directory the forker binds into
+/// every app (`/run/drv`, ours), bound here so an app started early waits in a backlog
+/// instead of finding no socket. Every one keys on the peer UID on the service's side.
 struct Doors {
     files: UnixListener,
     cast: UnixListener,
     notify: UnixListener,
+    agent: UnixListener,
+    apps: UnixListener,
 }
 
 /// Like `listen`, a `SOCK_SEQPACKET` listener.
@@ -545,10 +553,11 @@ fn start_set(
                 ("shell-client", l.shell_client.0.as_fd()),
                 ("files-client", l.files_client.0.as_fd()),
                 ("cast", l.compositor_cast.0.as_fd()),
+                ("apps", doors.apps.as_fd()),
             ],
         ),
-        // drv-files serves the documents mount: anything that touches /run/drv-doc (the
-        // forker, building an app's root) blocks until it answers, so it comes first.
+        // drv-files serves the documents mount: anything that touches it (the forker,
+        // cloning the doors for an app's root) blocks until it answers, so it comes first.
         (
             "drv-files",
             &set.files,
@@ -597,12 +606,15 @@ fn start_set(
                 ("listener", doors.cast.as_fd()),
             ],
         ),
-        // Its door is a socket in its directory, and the uid check is its own; the wire is
-        // for the person's PIN and touch, asked at the shell.
+        // Its door's uid check is its own; the wire is for the person's PIN and touch,
+        // asked at the shell.
         (
             "drv-agent",
             &set.agent,
-            vec![("shell", l.agent_shell.0.as_fd())],
+            vec![
+                ("shell", l.agent_shell.0.as_fd()),
+                ("listener", doors.agent.as_fd()),
+            ],
         ),
         (
             "drv-keys",
@@ -753,5 +765,6 @@ fn service(
         cgroups: name == "drv-forker",
         // The media keys write the backlight; nobody else touches sysfs.
         writable_sys: name == "drv-keys",
+        nix_daemon: name == "drv-forker",
     })
 }

@@ -51,6 +51,9 @@ in
         userns = true;
         etc = [ "brave/policies/managed/drv.json" ];
         state = [ ".config/BraveSoftware" ".cache/BraveSoftware" ];
+        # Its single-instance socket lives under TMPDIR; /tmp is of the run, so a link opened
+        # while it runs (a second launch) has to find the first one's socket in its state.
+        env.TMPDIR = "/home/app/.cache/BraveSoftware";
         opens = [ "http" "https" ];
       };
       # The shell. It does ssh itself (the agent) and opens links (the bus). The notch is the

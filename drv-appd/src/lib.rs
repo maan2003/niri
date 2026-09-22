@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```json
 /// {
-///   "wayland-socket": "/run/drv-wayland/wayland",
+///   "wayland-socket": "/run/drv/wayland",
 ///   "env": { "PIPEWIRE_RUNTIME_DIR": "/run/pipewire" },
 ///   "app": [
 ///     { "name": "compositor", "uid": 901, "grants": ["lookup"] },
@@ -87,21 +87,9 @@ pub struct AppConfig {
     /// OpenURI portal starts it with the URI as its last argument.
     #[serde(default)]
     pub opens: Vec<String>,
-    /// The store paths it may open: a file listing them (closureInfo's store-paths), read
-    /// once at load into `closure_paths`.
+    /// Runs nix: the daemon's socket in its root (and, from drv-init, the whole store).
     #[serde(default)]
-    pub closure: Option<String>,
-    #[serde(skip)]
-    pub closure_paths: Vec<String>,
-    /// A JIT inside: no MDWE.
-    #[serde(default)]
-    pub jit: bool,
-    /// May make user namespaces (a browser's own sandbox).
-    #[serde(default)]
-    pub userns: bool,
-    /// Root paths made as links into the store: `/bin/sh`, say.
-    #[serde(default)]
-    pub links: BTreeMap<String, String>,
+    pub nix: bool,
 }
 
 impl AppConfig {
@@ -138,21 +126,9 @@ impl std::error::Error for Error {}
 
 pub fn load_config(path: &Path) -> Result<Config, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::Io(path.to_owned(), e))?;
-    let mut config: Config =
+    let config: Config =
         serde_json::from_str(&text).map_err(|e| Error::Parse(path.to_owned(), e))?;
     check_config(&config).map_err(Error::Config)?;
-    // The closure lists are read now, before the syscall filter: at launch nothing is opened.
-    for app in &mut config.apps {
-        if let Some(list) = &app.closure {
-            let text = std::fs::read_to_string(list)
-                .map_err(|e| Error::Io(Path::new(list).to_owned(), e))?;
-            app.closure_paths = text
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect();
-        }
-    }
     Ok(config)
 }
 
@@ -261,7 +237,7 @@ impl Appd {
     }
 
     /// The child's environment: ours (`PATH`..), the config's `[env]`, the app's own, then
-    /// the compositor's apps socket as `WAYLAND_DISPLAY`. The forker sets `HOME` and
+    /// the compositor's apps socket as `WAYLAND_DISPLAY`. drv-init sets `HOME` and
     /// `XDG_RUNTIME_DIR`.
     fn env_for(&self, app: &AppConfig) -> Vec<(String, String)> {
         let mut env = self.base_env.clone();
@@ -294,12 +270,7 @@ impl Appd {
             env: self.env_for(app),
             network: app.network,
             gpu: app.gpu,
-            audio: app.audio,
-            jit: app.jit,
-            userns: app.userns,
-            // Inline: the forker mounts and rules, it does not read files.
-            closure: app.closure_paths.clone(),
-            links: app.links.clone().into_iter().collect(),
+            nix: app.nix,
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)
@@ -431,7 +402,7 @@ mod tests {
     fn identity() -> (Arc<Appd>, Arc<Recorder>) {
         let config: Config = serde_json::from_str(
             r#"{
-              "wayland-socket": "/run/drv-wayland/wayland",
+              "wayland-socket": "/run/drv/wayland",
               "env": { "PIPEWIRE_RUNTIME_DIR": "/run/pipewire" },
               "app": [
                 { "name": "compositor", "uid": 901, "grants": ["lookup"] },
@@ -466,7 +437,7 @@ mod tests {
         let requests = recorder.0.lock().unwrap();
         let req = &requests[0];
         assert_eq!(req.argv, vec!["firefox"]);
-        assert!(req.gpu && !req.audio && !req.network);
+        assert!(req.gpu && !req.nix && !req.network);
         let get = |k: &str| {
             req.env
                 .iter()
@@ -476,7 +447,7 @@ mod tests {
         assert_eq!(get("PATH"), Some("/bin"));
         assert_eq!(get("PIPEWIRE_RUNTIME_DIR"), Some("/run/pipewire"));
         assert_eq!(get("MOZ_ENABLE_WAYLAND"), Some("1"));
-        assert_eq!(get("WAYLAND_DISPLAY"), Some("/run/drv-wayland/wayland"));
+        assert_eq!(get("WAYLAND_DISPLAY"), Some("/run/drv/wayland"));
     }
 
     #[test]

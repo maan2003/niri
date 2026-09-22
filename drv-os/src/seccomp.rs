@@ -602,3 +602,52 @@ fn log_denied(nr: c_int, args: [u64; 3]) {
         write(STDERR_FILENO, buf.as_ptr().cast(), len);
     }
 }
+
+/// What no app gets, whatever its manifest: an executable memfd (so, with the noexec mounts
+/// and `vm.memfd_noexec`, only the store runs code) and io_uring. Without `userns`, no user
+/// namespace either: `unshare`, `clone` and `setns` refuse CLONE_NEWUSER and `clone3`, whose
+/// flags are behind a pointer, is not there (ENOSYS, which libc falls back from). Everything
+/// else passes: this is a denylist for a few doors, not the sandbox. drv-init applies it, as
+/// the app, before the app runs. Needs no_new_privs.
+pub fn refuse_app_doors(userns: bool) -> io::Result<()> {
+    const MFD_EXEC: u64 = 0x0010;
+    let arch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| err("unknown arch"))?;
+    let rule = |arg: u8, op: Op, value: u64| {
+        SeccompRule::new(vec![Cond::new(arg, Len::Dword, op, value).map_err(err)?]).map_err(err)
+    };
+    let newuser = CLONE_NEWUSER as u64;
+    let mut eperm: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    eperm.insert(
+        SYS_memfd_create,
+        vec![rule(1, Op::MaskedEq(MFD_EXEC), MFD_EXEC)?],
+    );
+    for nr in [SYS_io_uring_setup, SYS_io_uring_enter, SYS_io_uring_register] {
+        eperm.insert(nr, vec![]);
+    }
+    if !userns {
+        eperm.insert(SYS_unshare, vec![rule(0, Op::MaskedEq(newuser), newuser)?]);
+        eperm.insert(SYS_clone, vec![rule(0, Op::MaskedEq(newuser), newuser)?]);
+        // setns: to a user namespace by type, or by any type (0) which a userns fd satisfies.
+        eperm.insert(
+            SYS_setns,
+            vec![
+                rule(1, Op::MaskedEq(newuser), newuser)?,
+                rule(1, Op::Eq, 0)?,
+            ],
+        );
+    }
+    let apply = |rules: BTreeMap<i64, Vec<SeccompRule>>, action: SeccompAction| -> io::Result<()> {
+        let filter = SeccompFilter::new(rules, SeccompAction::Allow, action, arch).map_err(err)?;
+        let bpf: BpfProgram = filter.try_into().map_err(err)?;
+        seccompiler::apply_filter(&bpf).map_err(err)
+    };
+    apply(eperm, SeccompAction::Errno(EPERM as u32))?;
+    if !userns {
+        let mut enosys = BTreeMap::new();
+        enosys.insert(SYS_clone3, vec![]);
+        apply(enosys, SeccompAction::Errno(ENOSYS as u32))?;
+    }
+    Ok(())
+}

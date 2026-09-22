@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
 /// Where apps find the socket.
-pub const SOCKET: &str = "/run/drv-files/files.sock";
+pub const SOCKET: &str = "/run/drv/files.sock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Kind {

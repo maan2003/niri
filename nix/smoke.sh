@@ -36,7 +36,7 @@ hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_ca
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")
 [ -z "$leaked" ] && echo "PASS no privileged globals" || fail "privileged globals: $leaked"
 file_has "but the ordinary ones" $H/globals.txt "interface: 'xdg_wm_base'"
-file_has "state linked into HOME" $H/home.txt 'out -> /home/app/.state/out'
+file_has "state linked into HOME" $H/home.txt 'out -> /state/out'
 file_has "defaults linked from the store" $H/home.txt '^/nix/store/.*-drv-files-hello/.config/hello/greeting$'
 file_has "and readable through the closure" $H/home.txt '^hello from the store$'
 file_has "store not listable beyond the closure" $H/store.txt 'Permission denied'
@@ -68,9 +68,9 @@ key ret; sleep 1.2      # into notes/
 key ret; sleep 2.5      # todo.txt
 key ret; sleep 3        # save under the offered name
 R=/var/lib/drv-apps/100008/out/result.txt
-file_has "read the picked file" $R 'read /run/drv-doc/[0-9]+/todo.txt: Ok\("build the portal\\n"\)'
+file_has "read the picked file" $R 'read /run/drv/doc/[0-9]+/todo.txt: Ok\("build the portal\\n"\)'
 file_has "read-only pick" $R 'open it for writing: Err'
-file_has "saved a copy" $R 'wrote /run/drv-doc/[0-9]+/result copy.txt, length now Ok\('
+file_has "saved a copy" $R 'wrote /run/drv/doc/[0-9]+/result copy.txt, length now Ok\('
 expect "drv-files granted it" 'drv-files: chooser-test \(uid 100008\) gets /var/lib/drv-files/notes/todo.txt'
 
 echo "== screen cast"

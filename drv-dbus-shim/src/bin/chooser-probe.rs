@@ -80,10 +80,10 @@ fn main() -> anyhow::Result<()> {
     if let Some(uri) = uris.first() {
         let path = path_of(uri);
         out += &format!("read {path}: {:?}\n", fs::read_to_string(&path).map_err(|e| e.to_string()));
-        let listing = fs::read_dir("/run/drv-doc")
+        let listing = fs::read_dir("/run/drv/doc")
             .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>())
             .map_err(|e| e.to_string());
-        out += &format!("listing /run/drv-doc: {listing:?}\n");
+        out += &format!("listing /run/drv/doc: {listing:?}\n");
         let write = fs::OpenOptions::new().write(true).open(&path).map(|_| ()).map_err(|e| e.to_string());
         out += &format!("open it for writing: {write:?}\n");
     }

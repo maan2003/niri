@@ -44,6 +44,8 @@ pub struct Service {
     pub cgroups: bool,
     /// Sees `/sys` writable (the media keys: the backlight), as far as its groups allow.
     pub writable_sys: bool,
+    /// Sees the nix daemon's socket directory (the forker: apps with `nix` get it from there).
+    pub nix_daemon: bool,
 }
 
 /// A member's root, built in the child: what every member gets, plus its `expose` entries
@@ -89,6 +91,13 @@ fn build_root(service: &Service) -> Result<(), String> {
             clone(Path::new("/sys/fs/cgroup"), rw_noexec)?,
         ));
     }
+    if service.nix_daemon {
+        let socket = Path::new("/nix/var/nix/daemon-socket");
+        // A host without a daemon has no such directory: then no app gets nix.
+        if let Ok(fd) = clone(socket, ro_noexec) {
+            mounts.push((socket.into(), fd));
+        }
+    }
     let mut links: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &service.expose {
         let rel = path
@@ -113,7 +122,7 @@ fn build_root(service: &Service) -> Result<(), String> {
             mounts.push((dir.clone(), clone(dir, rw_noexec)?));
         }
     }
-    drv_os::root::pivot(Path::new("/tmp"))?;
+    drv_os::root::pivot(Path::new("/tmp"), &[])?;
     for (at, fd) in mounts {
         drv_os::root::mount(fd, &at)?;
     }

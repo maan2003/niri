@@ -11,8 +11,8 @@ let
   # Sound. Apps reach PipeWire through this socket alone (the daemon marks its clients
   # "drv-app", and WirePlumber's drv-access.lua decides what they may do), and PulseAudio
   # through a pipewire-pulse of their own, run as their UID, so what it does is theirs.
-  appsSocket = "/run/drv-audio/apps";
-  pulseDir = name: "/run/drv-pulse/${name}";
+  appsSocket = "/run/drv/audio/apps";
+  pulseDir = name: "/run/drv/pulse/${name}";
   pulseConfig = name: pkgs.writeTextDir "pipewire/pipewire-pulse.conf.d/10-drv.conf" ''
     pulse.properties = {
       server.address = [ "unix:${pulseDir name}/native" ]
@@ -22,18 +22,22 @@ let
   forkerExec = lib.concatStringsSep " " ([
     "${cfg.package}/bin/drv-forker"
     "--range ${toString cfg.uidRange.start}:${toString cfg.uidRange.count}"
-    "--runtime-base /run/drv-apps"
+    "--base /run/drv-apps"
     "--state-base /var/lib/drv-apps"
     "--host-views ${hostViews}"
-    # The host's resolv.conf for networked apps: under systemd-resolved it is a symlink into
-    # /run/systemd/resolve, which the forker's /run must hold (below).
+    # The doors: one directory, bound read-only into every app.
+    "--run /run/drv"
+    # The host's resolv.conf, handed to networked apps as an fd (drv-init copies it): under
+    # systemd-resolved it is a symlink into /run/systemd/resolve, which the forker's /run
+    # must hold (below).
     "--resolv ${hostResolv}"
   ]);
   resolved = config.services.resolved.enable;
   hostResolv = if resolved then "/run/systemd/resolve/stub-resolv.conf" else "/etc/resolv.conf";
   hostViews = "/run/drv-host";
+  nixPackage = config.nix.package;
   # The ssh agent's door: in every app's root, answering only the UIDs with the `agent` grant.
-  agentSocket = "/run/drv-agent/agent";
+  agentSocket = "/run/drv/agent";
   # What XDG_DATA_DIRS points at: the MIME database and the icon theme's index, from the
   # store, in place of the whole system profile.
   appShare = pkgs.buildEnv {
@@ -44,31 +48,43 @@ let
   # The store path a string under the store belongs to, context kept: `${pkg}/bin/x` -> pkg.
   storeRoot = p: builtins.appendContext (builtins.head (builtins.match "(/nix/store/[^/]+).*" p)) (builtins.getContext p);
   # What an app may open in the store (DESIGN-app-namespace, "Store"): the closure of its
-  # command, its /etc, the shared data profile, the graphics drivers, and the D-Bus shim if
-  # it has one. The forker turns the list into Landlock rules.
+  # command, its /etc, the shared data profile, the links' targets (the graphics drivers
+  # among them), and the D-Bus shim if it has one. drv-init turns the list into Landlock
+  # rules; an app with `nix` gets the whole store instead.
   appClosure = name: app: pkgs.closureInfo {
-    rootPaths = [ (appEtc name app) appShare config.hardware.graphics.package ]
-      ++ config.hardware.graphics.extraPackages
-      ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appExec name app))
+    rootPaths = [ (appEtc name app) appShare ]
+      ++ map storeRoot (lib.filter (lib.hasPrefix "/nix/store/") (appInit name app ++ appCommand app))
       ++ app.packages
       ++ map storeRoot (lib.attrValues (appLinks app))
       ++ lib.optional (app.files != { }) (appFiles name app);
   };
-  # Links in every app's root: /bin/sh and /usr/bin/env as the host has them (what scripts,
-  # ssh and `system()` expect on any Linux), plus the manifest's own.
+  # Links in every app's root, made by drv-init: /bin/sh and /usr/bin/env as the host has
+  # them (what scripts, ssh and `system()` expect on any Linux), Mesa's drivers where it
+  # looks for them, plus the manifest's own.
   appLinks = app: {
     "/bin/sh" = config.environment.binsh;
     "/usr/bin/env" = config.environment.usrbinenv;
+    "/run/opengl-driver" = config.systemd.tmpfiles.settings.graphics-driver."/run/opengl-driver"."L+".argument;
   } // app.links;
-  # The command, as launched. In front of the app's own: the linker (its /etc from the store,
-  # its state directories under $HOME/.state linked from HOME, the HOME defaults) and, for a
-  # private bus, the compat shim (drv-dbus-shim answers the desktop's D-Bus names by asking
-  # drv-files, drv-cast, drv-shell and drv-appd, which key everything on the app's UID).
-  appExec = name: app: [ "${cfg.package}/bin/drv-init" "--etc" "${appEtc name app}" ]
+  # The command, as launched. In front of the app's own: drv-init (DESIGN-app-namespace: it
+  # finishes the root the forker left, restricts itself and stays as the app's init) with
+  # everything it needs, and, for a private bus, the compat shim (drv-dbus-shim answers the
+  # desktop's D-Bus names by asking drv-files, drv-cast, drv-shell and drv-appd, which key
+  # everything on the app's UID).
+  appExec = name: app: appInit name app
+      # The closure lists the rest of the command, so it is not part of what it lists.
+      ++ [ "--closure" "${appClosure name app}/store-paths" ]
+      ++ lib.mapAttrsToList (at: target: "--link=${at}=${target}") (appLinks app)
+      ++ lib.optional app.jit "--jit"
+      ++ lib.optional app.userns "--userns"
+      ++ lib.optional app.nix "--nix"
+      ++ lib.optional app.network "--resolv"
+      ++ [ "--home" app.home "--" ]
+      ++ appCommand app;
+  appInit = name: app: [ "${cfg.package}/bin/drv-init" "--etc" "${appEtc name app}" ]
       ++ lib.concatMap (s: [ "--state" s ]) app.state
-      ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ]
-      ++ [ "--" ]
-    ++ lib.optionals app.bus [
+      ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ];
+  appCommand = app: lib.optionals app.bus [
       "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
       # Its configuration from the store: the app's /etc has no dbus-1.
       "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
@@ -91,7 +107,7 @@ let
   in pkgs.runCommand "drv-etc-${name}" { } ''
     mkdir "$out"
     cd "$out"
-    echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:/home/app:${pkgs.shadow}/bin/nologin" > passwd
+    echo "app-${name}:x:${toString app.uid}:${toString app.uid}:${name}:${if app.home == "persist" then "/state" else "/home/app"}:${pkgs.shadow}/bin/nologin" > passwd
     echo "app-${name}:x:${toString app.uid}:" > group
     printf 'passwd: files
 group: files
@@ -104,8 +120,7 @@ hosts: files${lib.optionalString app.network " dns"}
     ln -s ${pkgs.tzdata}/share/zoneinfo zoneinfo
     ln -s zoneinfo/${if config.time.timeZone != null then config.time.timeZone else "UTC"} localtime
     ${lib.optionalString app.network ''
-      # The forker puts the host's live one there for a networked app.
-      ln -s /run/host/resolv.conf resolv.conf
+      # resolv.conf: drv-init copies the host's live one in.
       mkdir -p ssl/certs
       ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-bundle.crt
       ln -s ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt ssl/certs/ca-certificates.crt
@@ -116,11 +131,10 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens agent;
-    links = appLinks app;
-    closure = "${appClosure name app}/store-paths";
+    inherit (app) uid gpu network audio nix globals grants autostart menu opens agent;
     env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
       // lib.optionalAttrs app.agent { SSH_AUTH_SOCK = agentSocket; }
+      // lib.optionalAttrs app.nix { NIX_REMOTE = "daemon"; }
       // lib.optionalAttrs app.audio {
         PIPEWIRE_REMOTE = appsSocket;
         PULSE_SERVER = "unix:${pulseDir name}/native";
@@ -128,7 +142,7 @@ hosts: files${lib.optionalString app.network " dns"}
     exec = appExec name app;
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = json.generate "appd.json" {
-    wayland-socket = "/run/drv-wayland/wayland";
+    wayland-socket = "/run/drv/wayland";
     # The shim logs every D-Bus call it answers when asked to.
     env = cfg.env // lib.optionalAttrs cfg.debug { DRV_SHIM_TRACE = "1"; };
     app = [
@@ -141,10 +155,9 @@ hosts: files${lib.optionalString app.network " dns"}
       { name = "agent"; uid = cfg.ids.agent; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
-  # What the forker binds into apps' roots (its own view has to hold them): the layout its
-  # feature table names, plus the audio sockets when any app has audio.
-  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-files" "/run/drv-cast" "/run/drv-shell" "/run/drv-doc" "/run/drv-agent" "/run/opengl-driver" ]
-    ++ lib.optionals (lib.any (a: a.audio) (lib.attrValues cfg.apps)) [ "/run/drv-audio" "/run/drv-pulse" ];
+  # What the forker's own /run holds: where it builds the roots, the host's views and the
+  # doors it binds into every one of them.
+  appRun = [ "/run/drv-apps" hostViews "/run/drv" ];
 in
 {
   options.services.drv = {
@@ -212,7 +225,7 @@ in
     files = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/drv-files";
-      description = "The person's files: owned by drv-files, shown by its file chooser, handed to apps one at a time through /run/drv-doc.";
+      description = "The person's files: owned by drv-files, shown by its file chooser, handed to apps one at a time through /run/drv/doc.";
     };
     env = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
@@ -238,7 +251,12 @@ in
     apps = lib.mkOption {
       default = { };
       description = "Named apps, each with a fixed UID from the range.";
-      type = lib.types.attrsOf (lib.types.submodule ({ name, ... }: {
+      type = lib.types.attrsOf (lib.types.submodule ({ name, config, ... }: {
+        # An app with `nix`: the client and its configuration.
+        config = lib.mkIf config.nix {
+          packages = [ nixPackage ];
+          etc = [ "nix/nix.conf" ];
+        };
         options = {
           uid = lib.mkOption { type = lib.types.int; };
           exec = lib.mkOption {
@@ -267,11 +285,21 @@ in
             default = [ ];
             description = "Further entries of the host's /etc for this app.";
           };
+          home = lib.mkOption {
+            type = lib.types.enum [ "run" "persist" ];
+            default = "run";
+            description = "`run`: HOME is of the run, with `state` linked from /state (the app's /var/lib/drv-apps/<uid>). `persist`: HOME is /state itself, all of it kept.";
+          };
           state = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
             example = [ ".config/chromium" ".cache/chromium" ];
-            description = "Paths under HOME that persist between runs (under /var/lib/drv-apps/<uid>). Everything else in HOME is gone with the run.";
+            description = "With `home = \"run\"`: paths under HOME that persist between runs (under /state). Everything else in HOME is gone with the run.";
+          };
+          nix = lib.mkOption {
+            type = lib.types.bool;
+            default = false;
+            description = "Runs nix as a client of the host's daemon: the daemon's socket in its root, the whole store readable, nix on its PATH.";
           };
           files = lib.mkOption {
             type = lib.types.attrsOf (lib.types.either lib.types.str lib.types.path);
@@ -299,7 +327,7 @@ in
             type = lib.types.attrsOf lib.types.str;
             default = { };
             example = lib.literalExpression ''{ "/usr/bin/python3" = "''${pkgs.python3}/bin/python3"; }'';
-            description = "Further paths in the app's root made as links into the store (the targets join its closure). Every app has /bin/sh and /usr/bin/env.";
+            description = "Further paths in the app's root made as links into the store (the targets join its closure). Every app has /bin/sh, /usr/bin/env and /run/opengl-driver.";
           };
           packages = lib.mkOption {
             type = lib.types.listOf lib.types.package;
@@ -345,7 +373,7 @@ in
       serviceConfig = {
         User = "app-${name}";
         Group = "app-${name}";
-        RuntimeDirectory = "drv-pulse/${name}";
+        RuntimeDirectory = "drv/pulse/${name}";
         RuntimeDirectoryMode = "0700";
         ExecStart = "${config.services.pipewire.package}/bin/pipewire -c pipewire-pulse.conf";
         # Until PipeWire listens.
@@ -480,7 +508,7 @@ in
     # Suspend must not hand the old desktop back before the compositor paints: the kernel
     # resumes with every plane off until the first commit (see the patch).
     boot.kernelPatches = lib.mkIf cfg.resumePatch [ { name = "drm-blank-on-resume"; patch = ./linux-drm-blank-on-resume.patch; } ];
-    # memfds are not executable unless asked for (MFD_EXEC), and the forker's seccomp filter
+    # memfds are not executable unless asked for (MFD_EXEC), and drv-init's seccomp filter
     # refuses apps the asking: with the noexec mounts, the store is the only place code runs from.
     boot.kernel.sysctl."vm.memfd_noexec" = 1;
     boot.kernelParams = lib.mkIf cfg.resumePatch [ "drm_kms_helper.blank_on_resume=1" ];
@@ -588,9 +616,9 @@ in
           "--appd-user drv-appd"
           "--appd-exec '${cfg.package}/bin/drv-appd --config /etc/drv/appd.json'"
           # drv-appd's privileged helper: forks once per request over the channel the
-          # supervisor made for the two of them, before reading it; the child builds the
-          # app's root and becomes the UID. Every directory it binds already exists
-          # (tmpfiles, below): it makes and chowns nothing.
+          # supervisor made for the two of them, before reading it; the child mounts the
+          # app's root (a tmpfs the app owns, the store, the views, the doors, /state) and
+          # becomes the UID; drv-init, as the UID, does the rest.
           "--forker-user drv-forker"
           "--forker-exec '${forkerExec}'"
           "--forker-dir /run/drv-apps:0711"
@@ -601,7 +629,7 @@ in
           ++ map (p: "--forker-expose ${p}") (appRun ++ lib.optional resolved "/run/systemd/resolve")
           ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
           # udev: libinput initialises the evdev devices seatd hands over from udev's database.
-          ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/pipewire" ]
+          ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv" "/run/pipewire" ]
           # Mesa's drivers live behind this symlink.
           ++ map (p: "--gpu-expose ${p}") [ "/run/opengl-driver" ]
           ++ [
@@ -625,9 +653,10 @@ in
           # With its outputs up, the compositor switches away: the desktop starts in the background.
           "--compositor-env DRV_HOME_VT=${toString cfg.homeVt}"
         ] ++ [
-          # Apps as other UIDs must traverse the socket directory.
           "--compositor-dir /run/drv-compositor:0711"
-          "--compositor-dir /run/drv-wayland:0711"
+          # The apps' Wayland socket: bound by the supervisor in the doors' directory, handed
+          # to the compositor, which asks drv-appd who each client is.
+          "--apps-socket /run/drv/wayland"
         ] ++ lib.optionals (cfg.screenshots != null) [
           "--compositor-dir ${cfg.screenshots}:0755"
         ] ++ [
@@ -646,19 +675,19 @@ in
           "--shell-env DRV_APPD_SOCKET=${appdSocket}"
           "--shell-env RUST_BACKTRACE=1"
           "--shell-expose /run/drv"
-          "--notify-socket /run/drv-shell/notify.sock"
+          "--notify-socket /run/drv/notify.sock"
           # The file chooser and the documents mount (drv-files): the supervisor mounts a
-          # FUSE filesystem at /run/drv-doc and hands drv-files its serving end; apps see
+          # FUSE filesystem at /run/drv/doc and hands drv-files its serving end; apps see
           # the files they were given under it, as their own UID only. Its socket is keyed
           # on the peer UID, named through drv-appd.
           "--files-user drv-files"
-          "--files-exec '${cfg.package}/bin/drv-files --files ${cfg.files} --docs /run/drv-doc'"
+          "--files-exec '${cfg.package}/bin/drv-files --files ${cfg.files} --docs /run/drv/doc'"
           "--files-env DRV_APPD_SOCKET=${appdSocket}"
           "--files-env RUST_BACKTRACE=1"
           "--files-dir ${cfg.files}:0700"
           "--files-expose /run/drv"
-          "--files-socket /run/drv-files/files.sock"
-          "--docs /run/drv-doc"
+          "--files-socket /run/drv/files.sock"
+          "--docs /run/drv/doc"
           # Screencasts, cameras and microphones (drv-cast): asks the person at the shell,
           # starts casts down its link to the compositor, grants and revokes devices through
           # WirePlumber, hands apps PipeWire remotes that see one node. Its socket is keyed
@@ -670,15 +699,15 @@ in
           "--cast-env RUST_BACKTRACE=1"
           "--cast-expose /run/drv"
           "--cast-expose /run/pipewire"
-          "--cast-socket /run/drv-cast/cast.sock"
+          "--cast-socket /run/drv/cast.sock"
           # The ssh agent: OpenSSH's, behind a door that admits the UIDs whose manifest record
           # has `agent` (asked of drv-appd, which also names them for the shell's prompts).
-          # Its socket directory is a tmpfiles rule; udev's database is for libfido2 to find
+          # Its door is the supervisor's to bind; udev's database is for libfido2 to find
           # the authenticators.
           "--agent-user drv-agent"
-          "--agent-exec '${cfg.package}/bin/drv-agent serve --listen ${agentSocket} --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add'"
+          "--agent-exec '${cfg.package}/bin/drv-agent serve --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add'"
           "--agent-env DRV_APPD_SOCKET=${appdSocket}"
-          "--agent-dir /run/drv-agent:0711"
+          "--agent-socket ${agentSocket}"
           "--agent-expose /run/udev"
           "--agent-expose /run/drv"
           # The media keys, on the compositor's word: the volume through PipeWire (group
@@ -699,42 +728,36 @@ in
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
           "DRV_APPD_SOCKET=${appdSocket}"
-          "DRV_APPS_SOCKET=/run/drv-wayland/wayland"
           "XDG_RUNTIME_DIR=/run/drv-compositor"
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
         ]);
-        # Ours: the public sockets and the documents mount. Every directory a member owns is
-        # a tmpfiles rule below (the supervisor checks owner and mode and makes nothing):
-        # RuntimeDirectory= and StateDirectory= would chown them to us on every start.
-        RuntimeDirectory = [ "drv" "drv-files" "drv-cast" "drv-shell" "drv-doc" ];
-        RuntimeDirectoryMode = "0755";
+        # Every directory a member owns, and the doors' directory of ours, is a tmpfiles rule
+        # below (the supervisor checks owner and mode and makes nothing): RuntimeDirectory=
+        # and StateDirectory= would chown them to us on every start.
         # The documents mount (FUSE, served by drv-files) outlives the set when the unit
         # stops: a dead mount systemd can neither remove nor set up again. As root (the `+`).
-        ExecStopPost = [ "+-${pkgs.util-linux}/bin/umount --lazy --quiet /run/drv-doc" ];
+        ExecStopPost = [ "+-${pkgs.util-linux}/bin/umount --lazy --quiet /run/drv/doc" ];
         # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
         Delegate = true;
       };
     };
 
-    # The apps' directories, one set per UID, made here so the forker never makes or chowns
-    # anything: the runtime directory, /tmp and what persists (HOME/.state).
+    # The doors' directory (the supervisor's: the sockets, the documents mount, PipeWire's
+    # apps socket, the apps' PulseAudio sockets), where the forker builds the roots, and
+    # what persists per app (its /state), made here so the forker never makes or chowns
+    # anything on the host.
     systemd.tmpfiles.rules = [
+      "d /run/drv 0755 drv-supervisor drv-supervisor -"
+      "d /run/drv/doc 0755 drv-supervisor drv-supervisor -"
+      "d /run/drv/audio 0755 pipewire pipewire -"
       "d /run/drv-apps 0711 drv-forker drv-forker -"
       "d /run/drv-compositor 0711 drv-compositor drv-compositor -"
-      "d /run/drv-wayland 0711 drv-compositor drv-compositor -"
-      "d /run/drv-apps/tmp 0711 drv-forker drv-forker -"
-      "d /run/drv-audio 0755 pipewire pipewire -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
       "d ${cfg.files} 0700 drv-files drv-files -"
-      "d /run/drv-agent 0711 drv-agent drv-agent -"
     ] ++ lib.optional (cfg.screenshots != null) "d ${cfg.screenshots} 0755 drv-compositor drv-compositor -"
-    ++ lib.concatMap (app: let u = toString app.uid; in [
-      "d /run/drv-apps/${u} 0700 ${u} ${u} -"
-      "d /run/drv-apps/tmp/${u} 0700 ${u} ${u} -"
-      "d /var/lib/drv-apps/${u} 0700 ${u} ${u} -"
-    ]) (lib.attrValues cfg.apps);
+    ++ map (app: "d /var/lib/drv-apps/${toString app.uid} 0700 ${toString app.uid} ${toString app.uid} -") (lib.attrValues cfg.apps);
 
   } ]);
 }

@@ -76,7 +76,7 @@ let
     ${pkgs.coreutils}/bin/ls /proc > proc.txt 2>&1
     ${pkgs.coreutils}/bin/cat /proc/self/net/dev > net.txt 2>&1
     # The ssh agent's door: open for the grant (hello), shut otherwise (gpu-probe).
-    SSH_AUTH_SOCK=''${SSH_AUTH_SOCK:-/run/drv-agent/agent} ${pkgs.openssh}/bin/ssh-add -l > agent.txt 2>&1 || echo "rc: $?" >> agent.txt
+    SSH_AUTH_SOCK=''${SSH_AUTH_SOCK:-/run/drv/agent} ${pkgs.openssh}/bin/ssh-add -l > agent.txt 2>&1 || echo "rc: $?" >> agent.txt
     ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
     ${pkgs.coreutils}/bin/touch done
@@ -104,7 +104,12 @@ in
     "f+ /var/lib/drv-files/notes/todo.txt 0600 drv-files drv-files - build the portal\\n"
   ];
   services.openssh.settings.PermitRootLogin = "yes";
-  users.users.root.openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4pE2ZiZIJvxrTMzKzwfVBtUPp2Ek7MGselzb0w6wDE maan2003@devbox-01" ];
+  # The dev key in the repo (nix/dev-vm-key: the VM listens on localhost only) and the
+  # person's own.
+  users.users.root.openssh.authorizedKeys.keys = [
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICW0SCsYGlDnCl1mdjoS/HtlG1LTfYlhuTlDux7f/QQS dev-vm"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4pE2ZiZIJvxrTMzKzwfVBtUPp2Ek7MGselzb0w6wDE maan2003@devbox-01"
+  ];
   networking.firewall.enable = false;
   fonts.enableDefaultPackages = true;
 
@@ -175,7 +180,7 @@ in
         userns = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
-      # shim asks drv-files, the person picks, and the file arrives under /run/drv-doc.
+      # shim asks drv-files, the person picks, and the file arrives under /run/drv/doc.
       # Then it saves a copy the same way. Results in its home, result.txt.
       chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; state = [ "out" ]; };
       # A client of screen sharing, as a browser would use it: session, Start (the person

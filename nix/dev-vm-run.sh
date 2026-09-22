@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Run the dev VM on a host without a GPU: qemu's GTK window with virgl rendering on
 # llvmpipe, inside a headless Wayland session (rho wayland). Screenshots and input
-# then work through that session. ssh: -p 2222 root@127.0.0.1 with /tmp/niri-vm/id_ed25519.
+# then work through that session. ssh: /tmp/niri-vm/ssh (written here: -p 2222
+# root@127.0.0.1 with the repo's nix/dev-vm-key, which the guest trusts).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p /tmp/niri-vm
-[ -f /tmp/niri-vm/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /tmp/niri-vm/id_ed25519
+install -m 600 nix/dev-vm-key /tmp/niri-vm/id_ed25519
+install -m 644 nix/dev-vm-key.pub /tmp/niri-vm/id_ed25519.pub
+cat > /tmp/niri-vm/ssh <<'EOF'
+#!/usr/bin/env bash
+exec ssh -q -p 2222 -i /tmp/niri-vm/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR root@127.0.0.1 "$@"
+EOF
+chmod 755 /tmp/niri-vm/ssh
 nix build -o /tmp/niri-vm/result .#packages.x86_64-linux.dev-vm
 GLVND=$(nix build --no-link --print-out-paths nixpkgs#libglvnd)
 MESA=$(nix build --no-link --print-out-paths nixpkgs#mesa)

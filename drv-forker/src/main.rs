@@ -1,21 +1,23 @@
 //! drv-appd's privileged helper, kept dumb on purpose. It hears from exactly one peer, drv-appd,
 //! over the socketpair the supervisor made for the two of them, and forks once per request
-//! before looking at it: the parent only receives bytes, forks and reaps. The child builds the
-//! app's root in a mount namespace of its own (ARCH-app-policy, "Launching";
-//! DESIGN-app-namespace), becomes the UID, restricts itself and execs. No config files, no
-//! policy, no idea what an "app" is beyond the request type: drv-appd is the brain; a bug here
-//! is reachable only through it. Zygote on Android has the same shape.
+//! before looking at it: the parent only receives bytes, forks and reaps. The child does what
+//! takes privilege and nothing else (ARCH-app-policy, "Launching"; DESIGN-app-namespace): a
+//! mount namespace with a root tmpfs the app owns, the few mounts into it (the store, the
+//! device and sysfs views, proc, the doors, the app's state), the cgroup, the UID switch, and
+//! the exec of drv-init, which as the app makes the rest of the root and restricts itself.
+//! No config files, no policy, no idea what an "app" is beyond the request type: drv-appd is
+//! the brain; a bug here is reachable only through it. Zygote on Android has the same shape.
 
+use std::convert::Infallible;
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use drv_os::landlock::{self, Ruleset};
-use drv_os::mounts::{attach, clone_tree, new_fs, Attr};
+use drv_os::mounts::{clone_tree, new_fs, set_attrs, Attr};
 use drv_policy::forker::{Request, Response};
 use drv_policy::seq;
 use rustix::event::{poll, PollFd, PollFlags};
@@ -30,25 +32,11 @@ const NEEDED: CapabilitySet = CapabilitySet::SYS_ADMIN
     .union(CapabilitySet::SETGID)
     .union(CapabilitySet::SETPCAP);
 
-/// The layout of `/run` as the system configuration makes it. Every app: the appd socket,
-/// the apps' Wayland socket, the doors of drv-files, drv-cast and drv-shell (each keyed on
-/// the peer UID), the ssh agent's door (which asks drv-appd about the UID; the rest are
-/// refused there), the driver link (a symlink into the store, remade as one), its own
-/// runtime directory, and the documents mount, which it writes.
-const RUN: &[&str] = &[
-    "/run/drv",
-    "/run/drv-wayland",
-    "/run/drv-files",
-    "/run/drv-cast",
-    "/run/drv-shell",
-    "/run/drv-agent",
-    "/run/opengl-driver",
-];
-const RUN_DOCS: &str = "/run/drv-doc";
-/// `audio`: PipeWire's apps socket and the per-app PulseAudio servers.
-const RUN_AUDIO: &[&str] = &["/run/drv-audio", "/run/drv-pulse"];
-/// HOME, the same path for every app: a tmpfs of the run, with what persists at `.state`.
-const HOME: &str = "/home/app";
+/// The app's persistent directory, the one mount made for its UID.
+const STATE: &str = "/state";
+/// The root tmpfs's size: `/tmp`, `/etc`, a HOME of the run and the runtime directory
+/// share it. What persists is on `/state`.
+const ROOT_SIZE: &str = "1g";
 
 #[derive(Parser)]
 #[command(name = "drv-forker", about = "Fork sandboxed apps for drv-appd")]
@@ -56,21 +44,29 @@ struct Args {
     /// `start:count`: the UIDs apps may run as.
     #[arg(long)]
     range: String,
-    /// Per-UID `XDG_RUNTIME_DIR` parent; `tmp/<uid>` under it is the app's /tmp. The
-    /// directories exist (tmpfiles); nothing is made or chowned here.
+    /// A directory of ours to hang an app's new root on for the moment the pivot takes.
     #[arg(long, default_value = "/run/drv-apps")]
-    runtime_base: PathBuf,
-    /// Per-UID state parent, bound at `$HOME/.state`.
+    base: PathBuf,
+    /// Per-UID state parent: `<state-base>/<uid>` is the app's `/state`. The directories
+    /// exist (tmpfiles); nothing is made or chowned here.
     #[arg(long, default_value = "/var/lib/drv-apps")]
     state_base: PathBuf,
     /// The store: the only executable thing in an app's root.
     #[arg(long, default_value = "/nix/store")]
     store: PathBuf,
+    /// The doors: the one directory the system configuration fills with every socket an
+    /// app may reach and the documents mount, bound read-only at the same path in every
+    /// app's root (the mount inside it as it is). Each door keys on the peer UID itself.
+    #[arg(long, default_value = "/run/drv")]
+    run: PathBuf,
+    /// The nix daemon's socket directory, at the same path inside for an app with `nix`.
+    #[arg(long, default_value = "/nix/var/nix/daemon-socket")]
+    daemon_socket: PathBuf,
     /// The host's generated views of itself (`dev`, `dev-gpu`, `sys`, `sys-gpu`), written
     /// at boot.
     #[arg(long, default_value = "/run/drv-host")]
     host_views: PathBuf,
-    /// The host's resolv.conf, at `/run/host/resolv.conf` for a networked app.
+    /// The host's resolv.conf, handed to drv-init as fd `resolv` for a networked app.
     #[arg(long, default_value = "/etc/resolv.conf")]
     resolv: PathBuf,
 }
@@ -156,12 +152,13 @@ impl Forker {
         }
     }
 
-    /// The child, from clone to exec. Everything that needs no input first, then the request,
-    /// then what needs the UID, then the switch; argv, env and the closure are touched only
-    /// once the process is the app. Returns only an error; success is exec.
-    fn child(&self, channel: &OwnedFd, bytes: &[u8]) -> Result<std::convert::Infallible, String> {
-        // 1. No input: handles on everything of the host's we will need, then privilege we
-        // will never need again goes, then a mount namespace of our own, emptied.
+    /// The child, from clone to exec. Handles on the host first, then the request (its UID
+    /// and the three features that are mounts), then the namespace and its root, then the
+    /// switch; argv and env are touched only once the process is the app. Returns only an
+    /// error; success is exec.
+    fn child(&self, channel: &OwnedFd, bytes: &[u8]) -> Result<Infallible, String> {
+        // 1. Handles on everything of the host's we will need. A handle taken before the
+        // unshare stays valid in the new namespace; nothing can be cloned from there after.
         let host_net = rustix::fs::open(
             "/proc/self/ns/net",
             OFlags::RDONLY | OFlags::CLOEXEC,
@@ -186,82 +183,21 @@ impl Forker {
         let dri = view("dev-gpu/dri", dev_attr).ok();
         let sys = view("sys", ro_noexec)?;
         let sys_gpu = view("sys-gpu", ro_noexec).ok();
-        let resolv = clone(&self.args.resolv, ro_noexec).ok();
-        let mut run: Vec<(&str, Result<OwnedFd, PathBuf>, bool)> = Vec::new();
-        for (paths, writable) in [(RUN, false), (&[RUN_DOCS][..], true), (RUN_AUDIO, false)] {
-            for p in paths {
-                let path = Path::new(p);
-                let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{p}: {e}"))?;
-                // The driver link: a symlink into the store, remade as one.
-                let attrs = if writable { rw_noexec } else { ro_noexec };
-                let src = if meta.file_type().is_symlink() {
-                    Err(std::fs::read_link(path).map_err(|e| format!("{p}: {e}"))?)
-                } else {
-                    Ok(clone(path, attrs)?)
-                };
-                run.push((p, src, writable));
-            }
-        }
-        drv_os::creds::lock_securebits()?;
-        drv_os::creds::empty_bounding_set()?;
-        drv_os::creds::drop_capability(CapabilitySet::SETPCAP)?;
-        rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
-        // SAFETY: single-threaded.
-        unsafe { drv_os::root::unshare(true) }?;
-        // The per-UID directories' parents, as plain handles into this namespace's copy of
-        // the old root (a handle from before the unshare would point into the parent's
-        // namespace, which nothing may be cloned from): the UID's subdirectory of each is
-        // cloned through them once the UID is known, while the old root is still there.
-        let run_base = open_path(&self.args.runtime_base)?;
-        let tmp_base = open_path(&self.args.runtime_base.join("tmp"))?;
-        let state_base = open_path(&self.args.state_base)?;
-        // The root: a fresh tmpfs, made our namespace's root (hung on our own runtime base
-        // for the moment it takes). The old root stays stacked beneath it, reachable through
-        // the handles above and nothing else, until the UID's directories are taken.
-        drv_os::root::pivot(&self.args.runtime_base)?;
-        let mount = |fd: OwnedFd, at: &str| drv_os::root::mount(fd, Path::new(at));
-        // The fixed part:
-        mount(store, &self.args.store.to_string_lossy())?;
-        mount(dev, "/dev")?;
-        mount(
-            new_fs("tmpfs", &[("mode", "1777")], rw_noexec).map_err(|e| format!("shm: {e}"))?,
-            "/dev/shm",
-        )?;
-        // Its pseudo-terminals: a devpts instance of its own (every mount is one), reached
-        // through the view's /dev/ptmx link to pts/ptmx. Device nodes, so no NODEV.
-        mount(
-            new_fs(
-                "devpts",
-                &[("ptmxmode", "0666")],
-                Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC,
-            )
-            .map_err(|e| format!("pts: {e}"))?,
-            "/dev/pts",
-        )?;
-        // The app's own PID namespace seen through its own proc instance: the pid entries
-        // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
-        mount(
-            new_fs(
-                "proc",
-                &[("hidepid", "invisible"), ("subset", "pid")],
-                rw_noexec,
-            )
-            .map_err(|e| format!("proc: {e}"))?,
-            "/proc",
-        )?;
-        let mut run_rules = Vec::new();
-        let mut audio_mounts = Vec::new();
-        for (p, src, writable) in run {
-            let is_audio = RUN_AUDIO.contains(&p);
-            match src {
-                Ok(fd) if !is_audio => mount(fd, p)?,
-                Ok(fd) => audio_mounts.push((p, fd)),
-                Err(target) => drv_os::root::symlink(&target, Path::new(p))?,
-            }
-            run_rules.push((p, writable, is_audio));
-        }
+        // The doors, the documents mount among them: read-only at the top, the mount inside
+        // left as it is (apps write the documents they were given).
+        let run = clone(&self.args.run, rw_noexec)?;
+        set_attrs(&run, ro_noexec, false)
+            .map_err(|e| format!("{}: {e}", self.args.run.display()))?;
+        let daemon_socket = clone(&self.args.daemon_socket, ro_noexec).ok();
+        // The host's resolver, open for reading: drv-init copies it into a networked app's /etc.
+        let resolv = rustix::fs::open(
+            &self.args.resolv,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .ok();
 
-        // 2. The request. From here to the switch, only uid, network, gpu and audio are read.
+        // 2. The request. Until the switch, only uid, network, gpu and nix are read.
         let Request::Launch(launch): Request =
             seq::decode(bytes).map_err(|e| format!("request: {e}"))?;
         let uid = launch.uid;
@@ -269,6 +205,24 @@ impl Forker {
             return Err(format!("uid {uid} is outside the app range"));
         }
         let uid_s = uid.to_string();
+        let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
+        if launch.argv.is_empty() {
+            return Err("empty argv".into());
+        }
+
+        // 3. Privilege we will never need again goes, then a mount namespace of our own,
+        // emptied, with the host's network only if asked.
+        drv_os::creds::lock_securebits()?;
+        drv_os::creds::empty_bounding_set()?;
+        drv_os::creds::drop_capability(CapabilitySet::SETPCAP)?;
+        rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))?;
+        // SAFETY: single-threaded.
+        unsafe { drv_os::root::unshare(true) }?;
+        // The state directories' parent, as a plain handle into this namespace's copy of the
+        // old root (a handle from before the unshare would point into the parent's
+        // namespace, which nothing may be cloned from): the UID's subdirectory is cloned
+        // through it below, while the old root is still there.
+        let state_base = open_path(&self.args.state_base)?;
         if launch.network {
             rustix::thread::move_into_link_name_space(
                 host_net.as_fd(),
@@ -277,72 +231,82 @@ impl Forker {
             .map_err(|e| format!("rejoin the network: {e}"))?;
         }
         drop(host_net);
-        if launch.gpu {
+        // The root: a fresh tmpfs the app owns (drv-init makes /tmp, /etc, HOME and the
+        // runtime directory in it, as the app), made our namespace's root. The old root
+        // stays stacked beneath it, reachable through the handles above and nothing else.
+        drv_os::root::pivot(
+            &self.args.base,
+            &[("uid", &uid_s), ("gid", &uid_s), ("size", ROOT_SIZE)],
+        )?;
+        // The mountpoints and the mounts on them, as the app's effective UID (the
+        // capabilities stay: SECBIT_NO_SETUID_FIXUP): the root is the app's, so a directory
+        // made in it as us would not be, and its state directory opens for it alone.
+        let own_uid = rustix::process::getuid();
+        rustix::thread::set_thread_res_uid(own_uid, u, own_uid)
+            .map_err(|e| format!("euid {uid}: {e}"))?;
+        let mounted = (|| -> Result<(), String> {
+            let mount = |fd: OwnedFd, at: &str| drv_os::root::mount(fd, Path::new(at));
+            mount(store, &self.args.store.to_string_lossy())?;
+            mount(dev, "/dev")?;
             mount(
-                dri.ok_or("no render node view (no GPU on this host?)")?,
-                "/dev/dri",
+                new_fs(
+                    "tmpfs",
+                    &[("mode", "1777"), ("uid", &uid_s), ("gid", &uid_s)],
+                    rw_noexec,
+                )
+                .map_err(|e| format!("shm: {e}"))?,
+                "/dev/shm",
             )?;
-            mount(sys_gpu.ok_or("no sys-gpu view")?, "/sys")?;
-            drop(sys);
-        } else {
-            mount(sys, "/sys")?;
-            drop((dri, sys_gpu));
-        }
-        if launch.audio {
-            for (p, fd) in audio_mounts {
-                mount(fd, p)?;
+            // Its pseudo-terminals: a devpts instance of its own (every mount is one), reached
+            // through the view's /dev/ptmx link to pts/ptmx. Device nodes, so no NODEV.
+            mount(
+                new_fs(
+                    "devpts",
+                    &[("ptmxmode", "0666")],
+                    Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NOEXEC,
+                )
+                .map_err(|e| format!("pts: {e}"))?,
+                "/dev/pts",
+            )?;
+            // The app's own PID namespace seen through its own proc instance: the pid entries
+            // and nothing else (no /proc/sys, meminfo, cpuinfo: side channels, not the app's).
+            mount(
+                new_fs(
+                    "proc",
+                    &[("hidepid", "invisible"), ("subset", "pid")],
+                    rw_noexec,
+                )
+                .map_err(|e| format!("proc: {e}"))?,
+                "/proc",
+            )?;
+            if launch.gpu {
+                mount(
+                    dri.ok_or("no render node view (no GPU on this host?)")?,
+                    "/dev/dri",
+                )?;
+                mount(sys_gpu.ok_or("no sys-gpu view")?, "/sys")?;
+            } else {
+                mount(sys, "/sys")?;
             }
-        } else {
-            drop(audio_mounts);
-        }
-        let owned = |fs: &str, opts: &[(&str, &str)]| -> Result<OwnedFd, String> {
-            let mut all = vec![("uid", uid_s.as_str()), ("gid", uid_s.as_str())];
-            all.extend_from_slice(opts);
-            new_fs(fs, &all, rw_noexec).map_err(|e| format!("{fs}: {e}"))
-        };
-        // The app's own: /etc (filled by the linker from the store), HOME (what persists at
-        // .state inside), /tmp and its runtime directory (kept for the boot).
-        let (u, g) = (Uid::from_raw(uid), Gid::from_raw(uid));
-        mount(owned("tmpfs", &[("mode", "0755")])?, "/etc")?;
-        mount(owned("tmpfs", &[("mode", "0700"), ("size", "256m")])?, HOME)?;
-        let per_uid = |base: &OwnedFd, what: &str| {
-            clone_tree(base, Path::new(&uid_s), rw_noexec).map_err(|e| format!("{what}/{uid}: {e}"))
-        };
-        // The one mount inside something the app owns: paths through its 0700 HOME resolve
-        // only for it, so this runs as the app's effective UID (the capabilities stay:
-        // SECBIT_NO_SETUID_FIXUP); no override capability needed.
-        let own = rustix::process::getuid();
-        rustix::thread::set_thread_res_uid(own, u, own).map_err(|e| format!("euid {uid}: {e}"))?;
-        let state =
-            per_uid(&state_base, "state").and_then(|fd| mount(fd, &format!("{HOME}/.state")));
-        rustix::thread::set_thread_res_uid(own, own, own).map_err(|e| format!("euid back: {e}"))?;
-        state?;
-        mount(per_uid(&tmp_base, "tmp")?, "/tmp")?;
-        let runtime = format!("{}/{uid}", self.args.runtime_base.display());
-        mount(per_uid(&run_base, "runtime")?, &runtime)?;
-        drop((run_base, tmp_base, state_base));
-        if launch.network {
-            let resolv = resolv.ok_or("no resolv.conf on the host")?;
-            std::fs::create_dir_all("/run/host").map_err(|e| format!("/run/host: {e}"))?;
-            std::fs::File::create("/run/host/resolv.conf")
-                .map_err(|e| format!("resolv.conf: {e}"))?;
-            attach(resolv, Path::new("/run/host/resolv.conf"))
-                .map_err(|e| format!("resolv.conf: {e}"))?;
-        }
-        // What the manifest wants at fixed places (`/bin/sh`): links into the store, made
-        // while the top level is still writable.
-        let store = self.args.store.to_string_lossy();
-        for (at, target) in &launch.links {
-            let at = Path::new(at);
-            let ok = at.is_absolute() && Path::new(target).starts_with(&*store);
-            if !ok {
-                return Err(format!("link {}: not absolute or not into the store", at.display()));
+            mount(run, &self.args.run.to_string_lossy())?;
+            if launch.nix {
+                mount(
+                    daemon_socket.ok_or("no nix daemon socket directory on this host")?,
+                    &self.args.daemon_socket.to_string_lossy(),
+                )?;
             }
-            drv_os::root::symlink(Path::new(target), at)?;
-        }
-        // The old root, stacked beneath ours since the pivot: gone, with the handles into it;
-        // the top level read-only.
-        drv_os::root::finish(ro_noexec)?;
+            let state = clone_tree(&state_base, Path::new(&uid_s), rw_noexec)
+                .map_err(|e| format!("state/{uid}: {e}"))?;
+            mount(state, STATE)
+        })();
+        rustix::thread::set_thread_res_uid(own_uid, own_uid, own_uid)
+            .map_err(|e| format!("euid back: {e}"))?;
+        mounted?;
+        drop(state_base);
+        // The old root, stacked beneath ours since the pivot: gone, with the handles into it.
+        // The top level stays writable (it is the app's; nothing in it is ours) but runs
+        // nothing: the store is the one mount without noexec.
+        drv_os::root::finish(rw_noexec)?;
         // One cgroup per app UID under the subtree the supervisor delegated to us.
         let name = format!("app-{uid}");
         match rustix::fs::mkdirat(&apps_cgroup, &name, Mode::from_raw_mode(0o755)) {
@@ -365,64 +329,14 @@ impl Forker {
         unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::NEWCGROUP) }
             .map_err(|e| format!("cgroup namespace: {e}"))?;
 
-        // 3. The switch. Its own group and nothing else (set explicitly: gid 0 would see
+        // 4. The switch. Its own group and nothing else (set explicitly: gid 0 would see
         // through hidepid), no capability of any kind.
         drv_os::creds::switch_to(u, g, &[g], CapabilitySet::empty())?;
-        rustix::process::chdir(HOME).map_err(|e| format!("chdir {HOME}: {e}"))?;
 
-        // 4. As the app, with nothing: what it may open, then its command.
-        let rules = Ruleset::new().map_err(|e| format!("landlock: {e}"))?;
-        let all = rules.all();
-        let allow = |path: &str, access: u64| {
-            rules
-                .allow(Path::new(path), access)
-                .map_err(|e| format!("landlock {path}: {e}"))
-        };
-        let mut missing = 0;
-        for path in &launch.closure {
-            if !allow(path, landlock::READ | landlock::EXECUTE)? {
-                missing += 1;
-            }
-        }
-        if missing > 0 {
-            drv_os::say!("drv-forker: uid {uid}: {missing} closure paths are not on this machine");
-        }
-        allow(
-            "/dev",
-            landlock::READ | landlock::WRITE_FILE | landlock::IOCTL_DEV,
-        )?;
-        allow("/dev/shm", all & !landlock::EXECUTE)?;
-        allow("/sys", landlock::READ)?;
-        allow("/proc", landlock::READ | landlock::WRITE_FILE)?;
-        for path in ["/etc", HOME, "/tmp", &runtime] {
-            allow(path, all)?;
-        }
-        if launch.network {
-            allow("/run/host", landlock::READ)?;
-        }
-        for (p, writable, is_audio) in run_rules {
-            if !is_audio || launch.audio {
-                allow(p, if writable { all } else { landlock::READ })?;
-            }
-        }
-        rules
-            .restrict_self()
-            .map_err(|e| format!("landlock: {e}"))?;
-        refuse_syscalls(launch.userns)?;
-        if !launch.jit {
-            const PR_SET_MDWE: libc::c_int = 65;
-            const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
-            // SAFETY: plain prctl.
-            if unsafe { libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) } != 0 {
-                return err("mdwe", io::Error::last_os_error());
-            }
-        }
-        if launch.argv.is_empty() {
-            return Err("empty argv".into());
-        }
+        // 5. As the app, with nothing: its command (drv-init, which the system configuration
+        // puts first: it makes the rest of the root, restricts itself, runs the app and stays
+        // as its init), with the resolver's fd for a networked app.
         let mut env: Vec<(String, String)> = launch.env.clone();
-        env.push(("HOME".into(), HOME.into()));
-        env.push(("XDG_RUNTIME_DIR".into(), runtime.clone()));
         let path = env
             .iter()
             .find(|(k, _)| k == "PATH")
@@ -430,6 +344,18 @@ impl Forker {
             .unwrap_or_default();
         let exe = which(&launch.argv[0], &path)
             .ok_or_else(|| format!("{}: not found in PATH", launch.argv[0]))?;
+        let mut placed = Vec::new();
+        if launch.network {
+            let resolv = resolv.ok_or("no resolv.conf on the host")?;
+            let (fd_env, fds) = drv_os::fds::handoff(&[("resolv", resolv.as_fd())])
+                .map_err(|e| format!("resolv: {e}"))?;
+            env.extend(fd_env);
+            // A copy above the target, so the dup2 below is never a same-fd no-op (which
+            // would keep close-on-exec set).
+            for (target, fd) in fds {
+                placed.push((drv_os::dup_high(fd.as_raw_fd())?, target));
+            }
+        }
         let c_argv: Vec<CString> = launch
             .argv
             .iter()
@@ -441,92 +367,32 @@ impl Forker {
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect::<Result<_, _>>()
             .map_err(|_| "NUL in env")?;
-        // PID 1 of the app's namespace, from here on drv-init: it links what the app
-        // needs, forks the app and stays as its init. Forked goes first: after the exec there
-        // is nobody left to answer, and `which` has already found the file.
+        // Forked goes first: after the exec there is nobody left to answer, and `which` has
+        // already found the file. From here a failure is the journal's, not the channel's.
         seq::send(channel, &Response::Forked, &[]).map_err(|e| format!("channel: {e}"))?;
+        for (high, target) in placed {
+            // SAFETY: plain dup2 of fds we own.
+            if unsafe { libc::dup2(high, target) } < 0 {
+                drv_os::say!(
+                    "drv-forker: uid {uid}: dup2: {}",
+                    io::Error::last_os_error()
+                );
+                std::process::exit(1);
+            }
+        }
         let mut argv_p: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
         argv_p.push(std::ptr::null());
         let mut env_p: Vec<*const libc::c_char> = c_env.iter().map(|s| s.as_ptr()).collect();
         env_p.push(std::ptr::null());
         // SAFETY: NUL-terminated arrays of NUL-terminated strings.
         unsafe { libc::execve(exe.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
-        Err(format!(
-            "exec {}: {}",
+        drv_os::say!(
+            "drv-forker: uid {uid}: exec {}: {}",
             launch.argv[0],
             io::Error::last_os_error()
-        ))
-    }
-}
-
-/// What no app gets, whatever its manifest: an executable memfd (so, with the noexec mounts
-/// and `vm.memfd_noexec`, only the store runs code) and io_uring. Without `userns`, no user
-/// namespace either: `unshare`, `clone` and `setns` refuse CLONE_NEWUSER and `clone3`, whose
-/// flags are behind a pointer, is not there (ENOSYS, which libc falls back from). Everything
-/// else passes: this is a denylist for a few doors, not the sandbox.
-fn refuse_syscalls(userns: bool) -> Result<(), String> {
-    use std::collections::BTreeMap;
-
-    use seccompiler::{
-        SeccompAction, SeccompCmpArgLen as Len, SeccompCmpOp as Op, SeccompCondition as Cond,
-        SeccompFilter, SeccompRule,
-    };
-    const MFD_EXEC: u64 = 0x0010;
-    let arch = std::env::consts::ARCH
-        .try_into()
-        .map_err(|_| "seccomp: unknown arch")?;
-    let rule = |arg: u8, op: Op, value: u64| {
-        SeccompRule::new(vec![
-            Cond::new(arg, Len::Dword, op, value).map_err(|e| format!("seccomp: {e}"))?
-        ])
-        .map_err(|e| format!("seccomp: {e}"))
-    };
-    let newuser = libc::CLONE_NEWUSER as u64;
-    let mut eperm: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-    eperm.insert(
-        libc::SYS_memfd_create,
-        vec![rule(1, Op::MaskedEq(MFD_EXEC), MFD_EXEC)?],
-    );
-    for nr in [
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-    ] {
-        eperm.insert(nr, vec![]);
-    }
-    if !userns {
-        eperm.insert(
-            libc::SYS_unshare,
-            vec![rule(0, Op::MaskedEq(newuser), newuser)?],
         );
-        eperm.insert(
-            libc::SYS_clone,
-            vec![rule(0, Op::MaskedEq(newuser), newuser)?],
-        );
-        // setns: to a user namespace by type, or by any type (0) which a userns fd satisfies.
-        eperm.insert(
-            libc::SYS_setns,
-            vec![
-                rule(1, Op::MaskedEq(newuser), newuser)?,
-                rule(1, Op::Eq, 0)?,
-            ],
-        );
+        std::process::exit(1);
     }
-    let apply =
-        |rules: BTreeMap<i64, Vec<SeccompRule>>, action: SeccompAction| -> Result<(), String> {
-            let filter = SeccompFilter::new(rules, SeccompAction::Allow, action, arch)
-                .map_err(|e| format!("seccomp: {e}"))?;
-            let bpf: seccompiler::BpfProgram =
-                filter.try_into().map_err(|e| format!("seccomp: {e}"))?;
-            seccompiler::apply_filter(&bpf).map_err(|e| format!("seccomp: {e}"))
-        };
-    apply(eperm, SeccompAction::Errno(libc::EPERM as u32))?;
-    if !userns {
-        let mut enosys = BTreeMap::new();
-        enosys.insert(libc::SYS_clone3, vec![]);
-        apply(enosys, SeccompAction::Errno(libc::ENOSYS as u32))?;
-    }
-    Ok(())
 }
 
 /// `argv[0]` as a path: itself if it has a slash, else the first hit in `path`.

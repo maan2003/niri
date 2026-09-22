@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 pub const VERSION: u32 = 1;
 /// Where apps find the socket.
-pub const SOCKET: &str = "/run/drv-cast/cast.sock";
+pub const SOCKET: &str = "/run/drv/cast.sock";
 
 /// What a cast shows: a whole screen by connector name, or one window by the compositor's
 /// id for it.

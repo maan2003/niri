@@ -103,3 +103,16 @@ pub fn drop_for_good(cap: CapabilitySet) -> Result<(), String> {
         .map_err(|e| format!("bounding set: {e}"))?;
     drop_capability(cap)
 }
+
+/// Memory-deny-write-execute: no mapping of this process (and its children: the bit
+/// survives fork and exec) may be both writable and executable, or become executable after
+/// being writable. Not for apps with a JIT.
+pub fn refuse_exec_gain() -> Result<(), String> {
+    const PR_SET_MDWE: libc::c_int = 65;
+    const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
+    // SAFETY: plain prctl.
+    if unsafe { libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) } != 0 {
+        return Err(format!("mdwe: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}

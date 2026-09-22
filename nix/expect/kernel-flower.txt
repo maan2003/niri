@@ -1,23 +1,14 @@
 parent drv-init
-mount / ro,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=909,gid=909
+mount / rw,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=UID,gid=UID
 mount /dev ro,nosuid,noexec tmpfs root=/drv-host/dev rw,mode=755
 mount /dev/pts rw,nosuid,noexec devpts root=/ rw,mode=600,ptmxmode=666
-mount /dev/shm rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=909,gid=909
-mount /etc rw,nosuid,nodev,noexec tmpfs root=/ rw,mode=755,uid=UID,gid=UID
-mount /home/app rw,nosuid,nodev,noexec tmpfs root=/ rw,mode=700,uid=UID,gid=UID
-mount /home/app/.state rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps/UID rw
+mount /dev/shm rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=UID,gid=UID
 mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible,subset=pid
 mount /run/drv ro,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
-mount /run/drv-agent ro,nosuid,nodev,noexec tmpfs root=/drv-agent rw,mode=755
-mount /run/drv-apps/UID rw,nosuid,nodev,noexec tmpfs root=/drv-apps/UID rw,mode=755
-mount /run/drv-cast ro,nosuid,nodev,noexec tmpfs root=/drv-cast rw,mode=755
-mount /run/drv-doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
-mount /run/drv-files ro,nosuid,nodev,noexec tmpfs root=/drv-files rw,mode=755
-mount /run/drv-shell ro,nosuid,nodev,noexec tmpfs root=/drv-shell rw,mode=755
-mount /run/drv-wayland ro,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
+mount /run/drv/doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
+mount /state rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps/UID rw
 mount /sys ro,nosuid,nodev,noexec tmpfs root=/drv-host/sys rw,mode=755
-mount /tmp rw,nosuid,nodev,noexec tmpfs root=/drv-apps/tmp/UID rw,mode=755
 Uid: UID UID UID UID
 Gid: UID UID UID UID
 Groups: UID
@@ -42,28 +33,23 @@ uid UID UID UID UID gid UID UID UID UID groups UID
 caps inh 0000000000000000 prm 0000000000000000 eff 0000000000000000 bnd 0000000000000000 amb 0000000000000000
 securebits 0xfef noroot noroot_locked no_setuid_fixup no_setuid_fixup_locked keep_caps_locked no_cap_ambient_raise no_cap_ambient_raise_locked exec_restrict_file exec_restrict_file_locked exec_deny_interactive exec_deny_interactive_locked
 user_ns host
-landlock layers 1 rules 399
+landlock layers 1 rules 395
 landlock layer 0 handles fs execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev net 0x0 scope 0x3
 no_new_privs 1
 seccomp mode 2 filters 2
 mdwe 1 no_inherit 0
 ns mnt own net own pid own uts own ipc own cgroup own time host
 root tmpfs:tmpfs mount-root
+rule ext4:vda /var/lib/drv-apps/UID layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
 rule fuse:fuse / layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
 rule overlay:overlay store/* layer1=execute,read_file
 rule overlay:overlay store/* layer1=execute,read_file,read_dir
-rule overlay:overlay store/* layer1=read_file,read_dir
 rule proc:proc / layer1=write_file,read_file,read_dir
-rule tmpfs:tmpfs /drv-agent layer1=read_file,read_dir
-rule tmpfs:tmpfs /drv-apps/tmp/UID layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
-rule tmpfs:tmpfs /drv-apps/UID layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
-rule tmpfs:tmpfs /drv-cast layer1=read_file,read_dir
-rule tmpfs:tmpfs /drv-files layer1=read_file,read_dir
 rule tmpfs:tmpfs /drv-host/dev layer1=write_file,read_file,read_dir,ioctl_dev
 rule tmpfs:tmpfs /drv-host/sys layer1=read_file,read_dir
-rule tmpfs:tmpfs /drv layer1=read_file,read_dir
-rule tmpfs:tmpfs /drv-shell layer1=read_file,read_dir
-rule tmpfs:tmpfs /drv-wayland layer1=read_file,read_dir
-rule tmpfs:tmpfs / layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
-rule tmpfs:tmpfs / layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
+rule tmpfs:tmpfs /etc layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
+rule tmpfs:tmpfs /home layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
 rule tmpfs:tmpfs / layer1=write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
+rule tmpfs:tmpfs /run/app layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev
+rule tmpfs:tmpfs /run layer1=read_file,read_dir
+rule tmpfs:tmpfs /tmp layer1=execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev

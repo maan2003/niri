@@ -43,7 +43,7 @@ struct Args {
     #[arg(long)]
     files: PathBuf,
     /// Where apps see the documents mount (the supervisor mounted our fd `fuse` there).
-    #[arg(long, default_value = "/run/drv-doc")]
+    #[arg(long, default_value = "/run/drv/doc")]
     docs: PathBuf,
 }
 
@@ -519,7 +519,7 @@ fn run() -> Result<(), String> {
     let listener = fds.listener_of("listener", Kind::SeqPacket).map_err(|e| e.to_string())?;
 
     // The mount is up before we are; serving it is its own thread, and losing it ends us.
-    // Served first: anything touching /run/drv-doc (the forker building an app's root)
+    // Served first: anything touching the mount (the forker cloning the doors for an app)
     // blocks until we answer, and drv-appd, which we wait for next, needs the forker.
     let grants: docs::Shared = Arc::default();
     // SAFETY: getuid has no preconditions.
