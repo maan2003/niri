@@ -1,0 +1,9 @@
+// Minimal isolated desktop: no global session integration or auto-start programs.
+animations { off; }
+hotkey-overlay { skip-at-startup; }
+xwayland-satellite { off; }
+layout {
+    gaps 0
+    default-column-width { proportion 1.0; }
+    background-color "#20242a"
+}

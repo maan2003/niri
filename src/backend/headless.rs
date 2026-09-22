@@ -1,7 +1,6 @@
-//! Headless backend for tests.
-//!
-//! This can eventually grow into a more complete backend if needed, but for now it's missing some
-//! crucial parts like dmabufs.
+//! Headless outputs for agent desktops and compositor tests.
+//! Composition is on-demand through the desktop capture endpoint; application
+//! frame callbacks continue independently of screenshot consumers.
 
 use std::mem;
 use std::sync::{Arc, Mutex};
@@ -13,6 +12,7 @@ use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::ImportDma;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::utils::Size;
@@ -89,6 +89,8 @@ impl Headless {
             serial: Some(serial),
         });
 
+        niri.add_output(output.clone(), None, false);
+
         let physical_properties = output.physical_properties();
         self.ipc_outputs.lock().unwrap().insert(
             OutputId::next(),
@@ -110,8 +112,6 @@ impl Headless {
                 logical: Some(logical_output(&output)),
             },
         );
-
-        niri.add_output(output, None, false);
     }
 
     pub fn seat_name(&self) -> String {
@@ -151,8 +151,10 @@ impl Headless {
         RenderResult::Submitted
     }
 
-    pub fn import_dmabuf(&mut self, _dmabuf: &Dmabuf) -> bool {
-        unimplemented!()
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        self.renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.import_dmabuf(dmabuf, None).is_ok())
     }
 
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {

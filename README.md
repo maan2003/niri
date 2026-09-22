@@ -1,3 +1,81 @@
+# rho-agent-desktop
+
+Rho's separately built agent desktop, hard-forked from niri. This is a Rho
+component, not a compatibility layer around an upstream compositor. Internal
+niri names and its useful CLI remain; upstream merge compatibility is not a
+design constraint. The fork retains GPL-3.0-or-later licensing.
+
+## Run the initial headless desktop
+
+Build with the native dependencies listed in the upstream development docs,
+or enter `nix develop`:
+
+```sh
+cargo build --locked --no-default-features --bin rho-agent-desktop
+runtime=$(mktemp -d)
+chmod 700 "$runtime"
+XDG_RUNTIME_DIR="$runtime" target/debug/rho-agent-desktop \
+  --headless --width 2560 --height 1664 --scale 2 \
+  --config resources/agent-desktop.kdl -- YOUR_APPLICATION
+```
+
+Surfaceless EGL is required; Mesa software rendering works without a GPU.
+`--headless` never selects a host Wayland/X11 display or DRM backend.
+The private runtime directory is required. The compositor exports
+`WAYLAND_DISPLAY`, `NIRI_SOCKET`, and `RHO_DESKTOP_SOCKET` to launched children;
+it also logs the socket paths for external clients.
+
+The inherited compositor CLI is available in this executable:
+
+```sh
+NIRI_SOCKET=/path/from/log rho-agent-desktop msg --json windows
+NIRI_SOCKET=/path/from/log rho-agent-desktop msg action maximize-column
+RHO_DESKTOP_SOCKET=/path/from/log rho-agent-desktop capture screenshot.png
+```
+
+The initial Rho endpoint supports version negotiation, output discovery and
+on-demand lossless BGRA screenshots. `capture` converts those pixels to PNG on
+the client. Protocol types and framing documentation live in
+[`rho-desktop-proto`](https://github.com/maan2003/rho/tree/rho/desktop-protocol/crates/rho-desktop-proto),
+pinned by Git revision in Cargo.toml. The protocol has no compositor, codec,
+Rho daemon, or GUI dependencies.
+
+Applications are **not sandboxed**. Possession of the local desktop socket
+grants screenshot access. The socket is mode 0600 in a private runtime directory;
+headers, dimensions, and simultaneous connections are bounded.
+
+## Architecture and remaining work
+
+- This program owns compositor state, application control, capture, and
+  eventually VP9/MoQ production. The existing `rho wayland` driver belongs here.
+- Rho owns the protocol, native viewer/decoder, annotations, and agent UI.
+  Annotations are client-side screenshot attachments, not compositor objects.
+- The Rho daemon will authorize and relay desktop streams over its existing
+  authenticated GUI Iroh connection. It must not link the compositor or encoder.
+- The current endpoint is local screenshot IPC, **not yet live video or the
+  daemon relay**. The earlier Sway-based video prototype remains separate.
+- Next: move the session/input CLI, implement subscriber-owned damage-driven
+  composition and VP9 Profile 1 encoding, then connect the existing native viewer.
+  No video subscriber must mean no video composition or encoding.
+- This initial backend advances application callbacks without composing output.
+  Production callback pacing, animation scheduling and desktop-session lifecycle
+  still need work before live streaming.
+
+Validation:
+
+```sh
+cargo test --locked --no-default-features --lib
+python3 tests/desktop_smoke.py target/debug/rho-agent-desktop
+```
+
+The smoke test starts a real headless compositor and checks non-default scale,
+BGRA pixels, repeated binary framing, invalid requests, the inherited output CLI,
+and PNG export. It needs working EGL just like the program.
+
+---
+
+## Upstream background
+
 <h1 align="center"><img alt="niri" src="https://github.com/user-attachments/assets/07d05cd0-d5dc-4a28-9a35-51bae8f119a0"></h1>
 <p align="center">A scrollable-tiling Wayland compositor.</p>
 <p align="center">

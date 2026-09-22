@@ -98,6 +98,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
+            Sub::Capture {
+                socket,
+                output,
+                path,
+            } => {
+                niri::desktop::save_capture(socket, output, path)?;
+                return Ok(());
+            }
             Sub::Validate { config } => {
                 tracy_client::Client::start();
 
@@ -155,6 +163,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let config_includes = config_load_result.includes;
 
+    if cli.headless {
+        let mut output = niri_config::Output::default();
+        output.name = "headless-1".to_owned();
+        output.scale = Some(niri_config::FloatOrInt(cli.scale as f64));
+        config.outputs.0.insert(0, output);
+    }
+
     let spawn_at_startup = mem::take(&mut config.spawn_at_startup);
     let spawn_sh_at_startup = mem::take(&mut config.spawn_sh_at_startup);
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
@@ -174,11 +189,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        cli.headless,
         true,
         cli.session,
     )
     .unwrap();
+
+    if cli.headless {
+        let backend = state.backend.headless();
+        backend.add_renderer()?;
+        // Output configuration supplies scale at creation, before applications connect.
+        backend.add_output(&mut state.niri, 1, (cli.width, cli.height));
+    }
+
+    let _desktop_socket = niri::desktop::start(&mut state)?;
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();

@@ -2399,6 +2399,7 @@ dependencies = [
  "proptest",
  "proptest-derive",
  "rayon",
+ "rho-desktop-proto",
  "sd-notify",
  "serde",
  "serde_json",
@@ -3330,6 +3331,15 @@ name = "regex-syntax"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
+
+[[package]]
+name = "rho-desktop-proto"
+version = "0.1.0"
+source = "git+https://github.com/maan2003/rho?rev=e6aa2aa1ba29f58d7cef674ce926c26267138cd9#e6aa2aa1ba29f58d7cef674ce926c26267138cd9"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "rustc-hash"

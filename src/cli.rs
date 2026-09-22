@@ -8,7 +8,7 @@ use niri_ipc::{Action, OutputAction};
 use crate::utils::version;
 
 #[derive(Parser)]
-#[command(author, version = version(), about, long_about = None)]
+#[command(author, version = version(), about = "Rho agent desktop", long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
 #[command(subcommand_value_name = "SUBCOMMAND")]
 #[command(subcommand_help_heading = "Subcommands")]
@@ -26,6 +26,17 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Run an isolated desktop without a display server or DRM device.
+    #[arg(long, conflicts_with = "session")]
+    pub headless: bool,
+    /// Headless output size in physical pixels.
+    #[arg(long, default_value = "2560", requires = "headless", value_parser = clap::value_parser!(u16).range(1..=4096))]
+    pub width: u16,
+    #[arg(long, default_value = "1664", requires = "headless", value_parser = clap::value_parser!(u16).range(1..=4096))]
+    pub height: u16,
+    /// Headless output scale.
+    #[arg(long, default_value = "2", requires = "headless", value_parser = clap::value_parser!(u32).range(1..=4))]
+    pub scale: u32,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,
@@ -36,6 +47,16 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Sub {
+    /// Save an output screenshot through the Rho desktop protocol.
+    Capture {
+        /// Desktop socket; defaults to RHO_DESKTOP_SOCKET.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long, default_value = "headless-1")]
+        output: String,
+        /// Destination PNG file.
+        path: PathBuf,
+    },
     /// Communicate with the running niri instance.
     Msg {
         #[command(subcommand)]

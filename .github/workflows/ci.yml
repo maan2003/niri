@@ -41,6 +41,13 @@ jobs:
       - name: Test
         run: cargo test --all --exclude niri-visual-tests -- --nocapture
 
+      - name: Headless desktop protocol
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          cargo build --locked --no-default-features --bin rho-agent-desktop
+          python3 tests/desktop_smoke.py target/debug/rho-agent-desktop
+
   build:
     strategy:
       fail-fast: false
