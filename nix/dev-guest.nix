@@ -116,12 +116,12 @@ in
 
   # Dev PIN 1234, enrolled once. Real installs run `drv-authd set-pin` by hand. As root
   # (the `+`): the unit's own user may not write drv-auth's directory.
-  systemd.services.drv-supervisor.serviceConfig.ExecStartPre = "+" + pkgs.writeShellScript "drv-enrol-dev-pin" ''
+  systemd.services.drv-supervisor.serviceConfig.ExecStartPre = [ ("+" + pkgs.writeShellScript "drv-enrol-dev-pin" ''
     if [ ! -e /var/lib/drv-auth/pin ]; then
       printf 1234 | ${config.services.drv.package}/bin/drv-authd set-pin --state-dir /var/lib/drv-auth
     fi
     chown -R drv-auth:drv-auth /var/lib/drv-auth
-  '';
+  '') ];
 
   services.drv = {
     debug = true;

@@ -603,6 +603,12 @@ in
         AmbientCapabilities = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
         CapabilityBoundingSet = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
         NoNewPrivileges = true;
+        # The tty udev rules (above) run on device events only: on a system switched to this
+        # configuration while running, the nodes keep their old mode. As root (the `+`).
+        ExecStartPre = [ ("+" + pkgs.writeShellScript "drv-seat-tty" ''
+          ${pkgs.coreutils}/bin/chgrp tty /dev/tty0 /dev/tty${toString cfg.vt}
+          ${pkgs.coreutils}/bin/chmod 0660 /dev/tty0 /dev/tty${toString cfg.vt}
+        '') ];
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/drv-supervisor"
           "--socket ${appdSocket}"
