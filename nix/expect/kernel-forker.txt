@@ -47,7 +47,7 @@ ns uts host
 ns ipc host
 ns cgroup host
 ns time host
-0::/system.slice/drv-supervisor.service
+0::/system.slice/drv-supervisor.service/set
 task drv-forker parent drv-supervisor
 uid UID UID UID UID gid UID UID UID UID groups UID
 caps inh 00000000002001c0 prm 00000000002001c0 eff 00000000002001c0 bnd 00000000002001c0 amb 00000000002001c0

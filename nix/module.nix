@@ -551,11 +551,11 @@ in
       serviceConfig = {
         User = "drv-supervisor";
         # setuid/setgid/setpcap: become each child's user with its own bounding set; chown:
-        # the children's directories and the forker's cgroup subtree; kill: stopping a group
-        # member of another UID; sys_admin and sys_tty_config only to hand on to the forker
-        # and seatd.
-        AmbientCapabilities = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_KILL" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
-        CapabilityBoundingSet = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_KILL" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
+        # the forker's cgroup subtree, once at startup, then dropped for good; sys_admin for
+        # the members' roots and to hand on to the forker, sys_tty_config to hand on to seatd.
+        # No kill: the members die by their cgroup's kill switch.
+        AmbientCapabilities = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
+        CapabilityBoundingSet = [ "CAP_SETUID" "CAP_SETGID" "CAP_SETPCAP" "CAP_CHOWN" "CAP_SYS_ADMIN" "CAP_SYS_TTY_CONFIG" ];
         NoNewPrivileges = true;
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/drv-supervisor"
@@ -662,10 +662,10 @@ in
           "RUST_BACKTRACE=1"
           "RUST_LOG=niri=debug"
         ]);
-        # Fresh per start, made as ours and handed over (chown is ours, mkdir under /run is
-        # not). What must outlive a start (the apps' directories, the PIN store) is a tmpfiles
-        # rule below: StateDirectory= would chown their contents to us on every start.
-        RuntimeDirectory = [ "drv" "drv-compositor" "drv-wayland" "drv-bridge" "drv-doc" ];
+        # Ours: the public sockets and the documents mount. Every directory a member owns is
+        # a tmpfiles rule below (the supervisor checks owner and mode and makes nothing):
+        # RuntimeDirectory= and StateDirectory= would chown them to us on every start.
+        RuntimeDirectory = [ "drv" "drv-bridge" "drv-doc" ];
         RuntimeDirectoryMode = "0755";
         # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
         Delegate = true;
@@ -676,6 +676,8 @@ in
     # anything: the runtime directory, /tmp and what persists (HOME/.state).
     systemd.tmpfiles.rules = [
       "d /run/drv-apps 0711 drv-forker drv-forker -"
+      "d /run/drv-compositor 0711 drv-compositor drv-compositor -"
+      "d /run/drv-wayland 0711 drv-compositor drv-compositor -"
       "d /run/drv-apps/tmp 0711 drv-forker drv-forker -"
       "d /run/drv-audio 0755 pipewire pipewire -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"

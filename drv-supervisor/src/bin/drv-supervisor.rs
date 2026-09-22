@@ -15,7 +15,7 @@ use std::{fs, io, thread};
 use clap::Parser;
 use drv_os::fds::{seqpacket_pair, stream_pair};
 use drv_os::{user_groups, user_ids};
-use drv_supervisor::{capability, start_service, AppsCgroup, Service};
+use drv_supervisor::{capability, start_service, Cgroups, Service};
 use rustix::thread::CapabilitySet;
 
 #[derive(Parser)]
@@ -316,19 +316,20 @@ fn supervise(args: Args) -> Result<(), String> {
         )?,
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
-    // kill switch stays ours.
-    let apps = AppsCgroup::create(set.forker.uid, set.forker.gid)?;
+    // kill switches stay ours. That chown was the only one: CHOWN goes, for good.
+    let cgroups = Cgroups::create(set.forker.uid, set.forker.gid)?;
+    drv_os::creds::drop_for_good(CapabilitySet::CHOWN)?;
 
     let listener = listen(&args.socket)?;
     // Datagrams with fds: the shim and the server speak `drv_bridge::wire`, not a stream.
     let bridge_listener = listen_seqpacket(&args.bridge_socket)?;
 
     loop {
-        match start_set(&set, &listener, &bridge_listener, &args.docs) {
+        match start_set(&set, &cgroups, &listener, &bridge_listener, &args.docs) {
             Ok(children) => {
                 let gone = wait_first(&children);
                 drv_os::say!("drv-supervisor: {gone} exited; restarting the set");
-                stop_set(&apps, children);
+                stop_set(&cgroups, children);
             }
             Err(err) => drv_os::say!("drv-supervisor: {err}"),
         }
@@ -459,6 +460,7 @@ type Group = Vec<(&'static str, Child)>;
 /// Starts the set in order; a member that fails to start takes the ones already up down.
 fn start_set(
     set: &Set,
+    cgroups: &Cgroups,
     listener: &UnixListener,
     bridge_listener: &UnixListener,
     docs: &Path,
@@ -564,7 +566,7 @@ fn start_set(
     ];
     let mut children: Group = Vec::new();
     for (name, service, fds) in members {
-        match start_service(service, &fds) {
+        match start_service(service, &fds, &cgroups.set_procs) {
             Ok(child) => {
                 drv_os::say!(
                     "drv-supervisor: {name} running as uid {}, pid {}",
@@ -574,9 +576,7 @@ fn start_set(
                 children.push((name, child));
             }
             Err(err) => {
-                for (_, child) in children {
-                    stop(child);
-                }
+                stop_set(cgroups, children);
                 return Err(err);
             }
         }
@@ -584,20 +584,17 @@ fn start_set(
     Ok(children)
 }
 
-/// Terminates and reaps a child.
-fn stop(mut child: Child) {
-    // SAFETY: our child's pid, not yet reaped.
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    let _ = child.wait();
-}
-
-/// The apps first (one cgroup write), then every member of the set.
-fn stop_set(apps: &AppsCgroup, children: Group) {
-    if let Err(err) = apps.kill_all() {
+/// The apps first (one cgroup write), then every member of the set (one more), then the
+/// reaping.
+fn stop_set(cgroups: &Cgroups, children: Group) {
+    if let Err(err) = cgroups.kill_apps() {
         drv_os::say!("drv-supervisor: killing the apps: {err}");
     }
-    for (_, child) in children {
-        stop(child);
+    if let Err(err) = cgroups.kill_set() {
+        drv_os::say!("drv-supervisor: killing the set: {err}");
+    }
+    for (_, mut child) in children {
+        let _ = child.wait();
     }
 }
 

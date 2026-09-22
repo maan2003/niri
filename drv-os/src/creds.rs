@@ -95,3 +95,11 @@ pub fn switch_to(uid: Uid, gid: Gid, groups: &[Gid], caps: CapabilitySet) -> Res
     }
     Ok(())
 }
+
+/// `cap` gone from every set of this process and from its bounding set: nothing this process
+/// or anything it starts can have it again (needs SETPCAP).
+pub fn drop_for_good(cap: CapabilitySet) -> Result<(), String> {
+    rustix::thread::remove_capability_from_bounding_set(cap)
+        .map_err(|e| format!("bounding set: {e}"))?;
+    drop_capability(cap)
+}

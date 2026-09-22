@@ -163,7 +163,10 @@ impl Forker {
             Mode::empty(),
         )
         .map_err(|e| format!("/proc/self/ns/net: {e}"))?;
-        let apps_cgroup = open_path(&drv_os::own_cgroup()?.join("apps"))?;
+        // The apps' cgroup is our cgroup's sibling: the supervisor keeps its members in `set`
+        // and the apps' subtree, ours to fill, in `apps` next to it.
+        let own = drv_os::own_cgroup()?;
+        let apps_cgroup = open_path(&own.parent().ok_or("own cgroup has no parent")?.join("apps"))?;
         let ro = Attr::MOUNT_ATTR_RDONLY | Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV;
         let ro_noexec = ro | Attr::MOUNT_ATTR_NOEXEC;
         let rw_noexec = Attr::MOUNT_ATTR_NOSUID | Attr::MOUNT_ATTR_NODEV | Attr::MOUNT_ATTR_NOEXEC;

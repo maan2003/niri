@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use drv_os::mounts::{clone_tree, new_fs, Attr};
-use drv_os::{dup_high, ensure_owned_dir};
+use drv_os::{check_owned_dir, dup_high};
 use rustix::fs::CWD;
 use rustix::thread::{CapabilitySet, Gid, Uid};
 
@@ -30,7 +30,8 @@ pub struct Service {
     pub groups: Vec<u32>,
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
-    /// `(path, mode)`: directories to own before the first start.
+    /// `(path, mode)`: directories it owns (tmpfiles rules), checked before each start and in its
+    /// root.
     pub dirs: Vec<(PathBuf, u32)>,
     /// Capabilities a non-root service keeps (ambient, so they survive the exec): its whole
     /// bounding set, so nothing it runs can have more.
@@ -135,59 +136,89 @@ pub fn capability(name: &str) -> Result<CapabilitySet, String> {
     })
 }
 
-/// The apps' cgroup: `<ours>/apps`, made once. drv-forker owns the directory (it makes
-/// `app-<uid>` cgroups in it) and its process files (moving a process in needs write access
-/// to those of the common ancestor, so our own `cgroup.procs` goes to it too); `cgroup.kill`
-/// stays ours, and one write to it ends every app at once.
-pub struct AppsCgroup {
-    kill: PathBuf,
+/// Our two cgroups under the subtree systemd delegated to us, made once. `apps`: drv-forker
+/// owns the directory (it makes `app-<uid>` cgroups in it) and its process files; our own
+/// `cgroup.procs` is group-writable for it (the common ancestor of any move). The one chown
+/// of our life. `set`: ours, where every member puts itself before it switches user. Both
+/// `cgroup.kill` files stay ours: one write to each ends every app, then every member, with
+/// no CAP_KILL.
+pub struct Cgroups {
+    apps_kill: PathBuf,
+    set_kill: PathBuf,
+    /// `set/cgroup.procs`: a member's child writes `0` to it, as us, before the switch.
+    pub set_procs: PathBuf,
 }
 
-impl AppsCgroup {
-    /// systemd's `Delegate=yes` made our subtree ours; hand the apps part of it to the forker.
+impl Cgroups {
     pub fn create(forker_uid: u32, forker_gid: u32) -> Result<Self, String> {
         let ours = drv_os::own_cgroup()?;
-        let dir = ours.join("apps");
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(format!("mkdir {}: {e}", dir.display())),
-        }
+        let mkdir = |dir: &Path| match std::fs::create_dir(dir) {
+            Ok(()) | Err(_) if dir.is_dir() => Ok(()),
+            Err(e) => Err(format!("mkdir {}: {e}", dir.display())),
+            Ok(()) => Ok(()),
+        };
+        let apps = ours.join("apps");
+        mkdir(&apps)?;
         let owner = (
             Some(rustix::process::Uid::from_raw(forker_uid)),
             Some(rustix::process::Gid::from_raw(forker_gid)),
         );
         for path in [
-            ours.join("cgroup.procs"),
-            dir.clone(),
-            dir.join("cgroup.procs"),
-            dir.join("cgroup.threads"),
-            dir.join("cgroup.subtree_control"),
+            apps.clone(),
+            apps.join("cgroup.procs"),
+            apps.join("cgroup.threads"),
+            apps.join("cgroup.subtree_control"),
         ] {
             rustix::fs::chown(&path, owner.0, owner.1)
                 .map_err(|e| format!("chown {}: {e}", path.display()))?;
         }
+        // Moving a process needs write access to the common ancestor's cgroup.procs: ours,
+        // for the forker (set -> apps/app-<uid>) and for us (root -> set) alike. Ours by
+        // owner, the forker's by group.
+        let procs = ours.join("cgroup.procs");
+        rustix::fs::chown(&procs, None, owner.1)
+            .map_err(|e| format!("chgrp {}: {e}", procs.display()))?;
+        rustix::fs::chmod(&procs, rustix::fs::Mode::from_raw_mode(0o664))
+            .map_err(|e| format!("chmod {}: {e}", procs.display()))?;
+        let set = ours.join("set");
+        mkdir(&set)?;
         Ok(Self {
-            kill: dir.join("cgroup.kill"),
+            apps_kill: apps.join("cgroup.kill"),
+            set_kill: set.join("cgroup.kill"),
+            set_procs: set.join("cgroup.procs"),
         })
     }
 
     /// SIGKILLs every process in every app cgroup. Returns once the kernel has taken the
     /// request; the processes go shortly after.
-    pub fn kill_all(&self) -> Result<(), String> {
-        File::options()
-            .write(true)
-            .open(&self.kill)
-            .and_then(|mut f| f.write_all(b"1"))
-            .map_err(|e| format!("write {}: {e}", self.kill.display()))
+    pub fn kill_apps(&self) -> Result<(), String> {
+        kill(&self.apps_kill)
     }
+
+    /// SIGKILLs every member of the set.
+    pub fn kill_set(&self) -> Result<(), String> {
+        kill(&self.set_kill)
+    }
+}
+
+fn kill(path: &Path) -> Result<(), String> {
+    File::options()
+        .write(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(b"1"))
+        .map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Forks a service with `fds` as its named fds (`LISTEN_FDS`/`LISTEN_FDNAMES`, from 3 up).
 /// Everything else we hold stays close-on-exec and never reaches it.
-pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Result<Child, String> {
+pub fn start_service(
+    service: &Service,
+    fds: &[(&str, BorrowedFd<'_>)],
+    set_procs: &Path,
+) -> Result<Child, String> {
     for (dir, mode) in &service.dirs {
-        ensure_owned_dir(dir, service.uid, service.gid, *mode)?;
+        check_owned_dir(dir, service.uid, service.gid, *mode)
+            .map_err(|e| format!("{}: {e}", service.name))?;
     }
     if service.argv.is_empty() {
         return Err(format!("service {}: empty command", service.name));
@@ -209,6 +240,7 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
         .stdin(Stdio::null());
     let child_service = service.clone();
     let child_dups = dups.clone();
+    let set_procs = set_procs.to_owned();
     // SAFETY: between fork and exec in a single-threaded parent (the supervisor has no
     // threads), so the child may do ordinary work: it builds its root and switches user.
     unsafe {
@@ -222,6 +254,9 @@ pub fn start_service(service: &Service, fds: &[(&str, BorrowedFd<'_>)]) -> Resul
             // While CAP_SYS_ADMIN is still ours. Only an errno reaches the parent; the words
             // go to the journal from here.
             let child = || -> Result<(), String> {
+                // Into the set's cgroup, as us: one write to its cgroup.kill ends us all.
+                std::fs::write(&set_procs, b"0")
+                    .map_err(|e| format!("{}: {e}", set_procs.display()))?;
                 build_root(s)?;
                 let groups: Vec<Gid> = s.groups.iter().map(|g| Gid::from_raw(*g)).collect();
                 drv_os::creds::switch_to(

@@ -43,7 +43,7 @@ ns uts host
 ns ipc host
 ns cgroup host
 ns time host
-0::/system.slice/drv-supervisor.service
+0::/system.slice/drv-supervisor.service/set
 task niri parent drv-supervisor
 uid UID UID UID UID gid UID UID UID UID groups 323 UID
 caps inh 0000000000000000 prm 0000000000000000 eff 0000000000000000 bnd 0000000000000000 amb 0000000000000000

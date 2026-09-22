@@ -12,7 +12,7 @@ use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{AtFlags, FileType, Mode};
+use rustix::fs::FileType;
 
 /// `eprintln!` for daemons: one `write(2)` per line. `eprintln!` writes every fragment of
 /// the format string on its own, and journald has split a line between two of them.
@@ -123,35 +123,22 @@ pub fn own_cgroup() -> Result<PathBuf, String> {
     Ok(PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
 }
 
-pub fn ensure_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    match rustix::fs::mkdir(path, Mode::from_raw_mode(mode)) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-        Err(err) => return Err(format!("mkdir {}: {err}", path.display())),
-    }
-    // Not opened: once it is the other UID's 0700 directory we may not (no CAP_DAC_OVERRIDE).
-    // lstat, then act by path; the parent is ours, so nothing swaps the entry under us.
-    let st = rustix::fs::lstat(path).map_err(|err| format!("stat {}: {err}", path.display()))?;
+/// `path` exists, is a directory, and is `uid:gid` with `mode`: made by a tmpfiles rule, not
+/// by us (we chown nothing).
+pub fn check_owned_dir(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<(), String> {
+    let st = rustix::fs::lstat(path)
+        .map_err(|err| format!("{}: {err} (a tmpfiles rule makes it)", path.display()))?;
     if !FileType::from_raw_mode(st.st_mode).is_dir() {
         return Err(format!("{}: not a directory", path.display()));
     }
-    // Mode first, while the directory is still ours: chmod on someone else's needs
-    // CAP_FOWNER, chown only CAP_CHOWN. Both only when something is off.
-    if st.st_mode & 0o7777 != mode {
-        rustix::fs::chmod(path, Mode::from_raw_mode(mode))
-            .map_err(|err| format!("chmod {}: {err}", path.display()))?;
-    }
-    if st.st_uid != uid || st.st_gid != gid {
-        rustix::fs::chownat(
-            rustix::fs::CWD,
-            path,
-            Some(rustix::process::Uid::from_raw(uid)),
-            Some(rustix::process::Gid::from_raw(gid)),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(|err| format!("chown {}: {err}", path.display()))?;
+    if st.st_uid != uid || st.st_gid != gid || st.st_mode & 0o7777 != mode {
+        return Err(format!(
+            "{}: {}:{} mode {:o}, wanted {uid}:{gid} mode {mode:o} (a tmpfiles rule makes it)",
+            path.display(),
+            st.st_uid,
+            st.st_gid,
+            st.st_mode & 0o7777
+        ));
     }
     Ok(())
 }
