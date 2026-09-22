@@ -1,7 +1,7 @@
 //! Confinement of the compositor core.
 //!
 //! By the time the event loop starts, the core holds everything it was given: the links to
-//! drv-seatd, drv-appd, drv-forker, drv-portal and the GPU process (all from the supervisor)
+//! drv-seatd, drv-appd, drv-forker, drv-cast and the GPU process (all from the supervisor)
 //! and its Wayland and IPC listeners. `lockdown` then applies the shared seccomp allowlist
 //! (`drv_os::seccomp`). What stays open after that: accepting clients, reading files (config,
 //! keymaps, cursor themes), anonymous files (smithay's keymap copy for clients on an old

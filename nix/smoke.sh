@@ -13,7 +13,7 @@ echo "== waiting for ssh"
 wait_ssh
 
 echo "== the set"
-for m in compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-portal drv-notifier drv-agent drv-keys drv-forker drv-appd drv-bridge; do
+for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-agent drv-keys drv-forker drv-appd; do
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
@@ -58,7 +58,7 @@ absent "and wpctl took it" 'drv-keys: volume up: '
 echo "== notification"
 mark; menu noti; sleep 3
 expect "notify-test launched" 'launched "notify-test" as uid 100007'
-expect "reached the server as Notify" 'notify-test: Notify \{'
+expect "reached the shell" 'drv-shell: notify-test \(uid 100007\) notifies: "<b>Hello</b>"'
 expect "notify-test exited 0" 'uid 100007\) exited: exit status: 0'
 
 echo "== file chooser"
@@ -71,27 +71,27 @@ R=/var/lib/drv-apps/100008/out/result.txt
 file_has "read the picked file" $R 'read /run/drv-doc/[0-9]+/todo.txt: Ok\("build the portal\\n"\)'
 file_has "read-only pick" $R 'open it for writing: Err'
 file_has "saved a copy" $R 'wrote /run/drv-doc/[0-9]+/result copy.txt, length now Ok\('
-expect "portal granted it" 'drv-portal: chooser-test \(uid 100008\) gets /var/lib/drv-files/notes/todo.txt'
+expect "drv-files granted it" 'drv-files: chooser-test \(uid 100008\) gets /var/lib/drv-files/notes/todo.txt'
 
 echo "== screen cast"
 $SSH rm -f /var/lib/drv-apps/100009/out/cast.txt
 mark; menu cast; sleep 3
 key ret; sleep 5        # consent
-expect "portal started the cast" 'drv-portal: cast-test \(uid 100009\) shares Virtual-1 on PipeWire node [0-9]+'
+expect "drv-cast started the cast" 'drv-cast: cast-test \(uid 100009\) shares Virtual-1 on PipeWire node [0-9]+'
 C=/var/lib/drv-apps/100009/out/cast.txt
 file_has "Start answered with a stream" $C 'Start: response 0, streams Some'
 file_has "remote sees its node only" $C 'the remote sees: \[\(0, "Core"\), \([0-9]+, "Factory"\), \([0-9]+, "Node"\)\]$'
 key meta_l-shift-esc; sleep 3
-expect "revoke ended the cast" 'drv-portal: the cast of Virtual-1 for cast-test ended'
+expect "revoke ended the cast" 'drv-cast: the cast of Virtual-1 for cast-test ended'
 file_has "probe got Session.Closed" $C '^Closed by the desktop$'
 expect "cast-test exited 0" 'uid 100009\) exited: exit status: 0'
 
 echo "== microphone"
 mark; menu mic; sleep 3
 key ret; sleep 3        # allow
-expect "mic granted" 'drv-portal: mic-test \(uid 100010\) may use the microphone'
+expect "mic granted" 'drv-cast: mic-test \(uid 100010\) may use the microphone'
 key meta_l-alt-l; sleep 3   # lock-session: the lock is the other switch that revokes
-expect "locking revoked the mic" 'drv-portal: mic-test \(uid 100010\) loses the microphone'
+expect "locking revoked the mic" 'drv-cast: mic-test \(uid 100010\) loses the microphone'
 expect "session locked" 'locking session'
 key 1 2 3 4 ret; sleep 2
 expect "unlocked again" 'PIN accepted; unlocking'
@@ -101,9 +101,9 @@ $SSH rm -f /var/lib/drv-apps/100011/out/open.txt
 mark; menu open; sleep 6
 O=/var/lib/drv-apps/100011/out/open.txt
 file_has "three calls answered" $O '^not a uri: o "/org/freedesktop/portal/desktop/request/'
-expect "https went to chromium" '"chromium" \(uid 100005\) opens "https://example.com/\?from=uid-100011" for the bridge'
+expect "https went to chromium" '"chromium" \(uid 100005\) opens "https://example.com/\?from=uid-100011" for open-test \(uid 100011\)'
 expect "mailto refused" 'no app opens mailto: URIs'
-expect "junk refused" 'not a URI \([0-9]+ bytes\)'
+expect "junk refused" 'drv-dbus-shim: OpenURI: "-https://example.com" is not a URI'
 
 echo "== health"
 absent "no panics" 'panicked at|RUST_BACKTRACE'

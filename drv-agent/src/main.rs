@@ -7,7 +7,7 @@
 //!
 //! The authenticator's PIN never passes through an app. When a granted app lists or signs
 //! while the agent holds no keys and an authenticator is plugged in, the door asks the
-//! person at drv-portal (fd `portal`) and loads the resident keys with `ssh-add -K` itself.
+//! person at the shell (fd `shell`) and loads the resident keys with `ssh-add -K` itself.
 //! ssh-agent's own prompts while signing (the PIN of a verify-required key, a touch) come
 //! the same way: we are its askpass, reaching the door over a socket in our `/tmp`.
 
@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use drv_os::fds::Kind;
 use drv_policy::seq;
-use drv_portal::protocol::{Request, Response, VERSION};
+use drv_policy::door::{self, Door as Appd};
+use drv_shell::ask::{Request, Response, VERSION};
 
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
@@ -50,10 +51,6 @@ enum Cmd {
         /// ssh-agent's own socket, in our private /tmp.
         #[arg(long, default_value = "/tmp/ssh-agent")]
         private: PathBuf,
-        /// `NAME=UID`: an app that may use the agent (the manifest's `agent` grant), named
-        /// for the person's prompts. Repeatable.
-        #[arg(long = "allow")]
-        allow: Vec<String>,
         #[arg(long)]
         ssh_agent: PathBuf,
         #[arg(long)]
@@ -83,10 +80,9 @@ fn main() {
         Cmd::Serve {
             listen,
             private,
-            allow,
             ssh_agent,
             ssh_add,
-        } => serve(&listen, &private, &allow, &ssh_agent, &ssh_add),
+        } => serve(&listen, &private, &ssh_agent, &ssh_add),
     };
     if let Err(err) = result {
         drv_os::say!("drv-agent: {err}");
@@ -94,27 +90,12 @@ fn main() {
     }
 }
 
-fn serve(
-    listen: &Path,
-    private: &Path,
-    allow: &[String],
-    ssh_agent: &Path,
-    ssh_add: &Path,
-) -> Result<(), String> {
-    let allow: Vec<(String, u32)> = allow
-        .iter()
-        .map(|a| {
-            let parsed = match a.split_once('=') {
-                Some((name, uid)) => uid.parse().map(|uid| (name.to_owned(), uid)),
-                None => a.parse().map(|uid| (format!("uid {uid}"), uid)),
-            };
-            parsed.map_err(|_| format!("--allow {a}: not NAME=UID"))
-        })
-        .collect::<Result<_, _>>()?;
+fn serve(listen: &Path, private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String> {
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the supervisor: {e}"))?;
-    let portal = fds
-        .socket("portal", Kind::SeqPacket)
+    let shell = fds
+        .socket("shell", Kind::SeqPacket)
         .map_err(|e| e.to_string())?;
+    let appd = Appd::open().map_err(|e| format!("drv-appd: {e}"))?;
     let _ = std::fs::remove_file(ASKPASS);
     let askpass = UnixListener::bind(ASKPASS).map_err(|e| format!("{ASKPASS}: {e}"))?;
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -144,14 +125,14 @@ fn serve(
     // The door is the uid check below, not the mode: apps of any uid may connect.
     std::fs::set_permissions(listen, std::os::unix::fs::PermissionsExt::from_mode(0o666))
         .map_err(|e| format!("{}: {e}", listen.display()))?;
-    // The door is bound before the portal answers (its fonts take a moment): an app started
+    // The door is bound before the shell answers (its fonts take a moment): an app started
     // meanwhile waits in the backlog instead of finding no socket.
-    let portal = Portal::start(portal)?;
-    drv_os::say!("drv-agent: serving {} for {allow:?}", listen.display());
+    let shell = Shell::start(shell)?;
+    drv_os::say!("drv-agent: serving {}", listen.display());
     let door = Arc::new(Door {
         private: private.to_owned(),
         ssh_add: ssh_add.to_owned(),
-        portal,
+        shell,
         loading: Mutex::new(()),
         signing: Mutex::new(Vec::new()),
     });
@@ -165,18 +146,27 @@ fn serve(
                 continue;
             }
         };
-        let uid = match rustix::net::sockopt::socket_peercred(&stream) {
-            Ok(cred) => cred.uid.as_raw(),
+        let uid = match door::peer_uid(&stream) {
+            Ok(uid) => uid,
             Err(err) => {
                 drv_os::say!("drv-agent: peer credentials: {err}");
                 continue;
             }
         };
-        let Some((app, _)) = allow.iter().find(|(_, u)| *u == uid) else {
-            drv_os::say!("drv-agent: refused uid {uid}");
-            continue;
+        // drv-appd's record for the uid says whether it may knock, and names it for the
+        // person's prompts.
+        let app = match appd.who(uid) {
+            Ok(policy) if policy.agent => policy.name.clone(),
+            Ok(_) => {
+                drv_os::say!("drv-agent: refused uid {uid}");
+                continue;
+            }
+            Err(err) => {
+                drv_os::say!("drv-agent: refused uid {uid}: {err}");
+                continue;
+            }
         };
-        let (door, app) = (door.clone(), app.clone());
+        let door = door.clone();
         std::thread::spawn(move || {
             if let Err(err) = door.client(&app, uid, stream) {
                 drv_os::say!("drv-agent: {app} (uid {uid}): {err}");
@@ -186,57 +176,54 @@ fn serve(
     Ok(())
 }
 
-/// Our line to drv-portal: requests under ids of our own, answers back on a thread to
+/// Our line to the shell: requests under ids of our own, answers back on a thread to
 /// whoever waits for that id.
-struct Portal {
+struct Shell {
     out: Mutex<OwnedFd>,
     waiting: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
     next: AtomicU64,
 }
 
-impl Portal {
+impl Shell {
     fn start(sock: OwnedFd) -> Result<Arc<Self>, String> {
         seq::send(&sock, &Request::Hello { version: VERSION }, &[])
-            .map_err(|e| format!("hello to drv-portal: {e}"))?;
+            .map_err(|e| format!("hello to the shell: {e}"))?;
         let (hello, _) =
-            seq::recv::<Response>(&sock).map_err(|e| format!("hello from drv-portal: {e}"))?;
+            seq::recv::<Response>(&sock).map_err(|e| format!("hello from the shell: {e}"))?;
         match hello {
             Response::Hello { version } if version == VERSION => {}
             Response::Hello { version } => {
-                drv_os::say!("drv-agent: drv-portal speaks version {version}, we speak {VERSION}");
+                drv_os::say!("drv-agent: the shell speaks version {version}, we speak {VERSION}");
             }
-            _ => return Err("no hello from drv-portal".to_owned()),
+            _ => return Err("no hello from the shell".to_owned()),
         }
         let reader = sock.try_clone().map_err(|e| format!("dup: {e}"))?;
-        let portal = Arc::new(Self {
+        let shell = Arc::new(Self {
             out: Mutex::new(sock),
             waiting: Mutex::default(),
             next: AtomicU64::new(1),
         });
-        let dispatcher = portal.clone();
+        let dispatcher = shell.clone();
         std::thread::spawn(move || {
             loop {
                 match seq::recv::<Response>(&reader) {
                     Ok((resp, _)) => dispatcher.dispatch(resp),
                     Err(err) => {
-                        drv_os::say!("drv-agent: drv-portal: {err}");
+                        drv_os::say!("drv-agent: the shell: {err}");
                         process::exit(1);
                     }
                 }
             }
         });
-        Ok(portal)
+        Ok(shell)
     }
 
     fn dispatch(&self, resp: Response) {
         let id = match &resp {
-            Response::Pin { id, .. }
+            Response::Secret { id, .. }
             | Response::Cancelled { id }
-            | Response::Failed { id, .. }
-            | Response::Chosen { id, .. }
-            | Response::Cast { id, .. }
-            | Response::Granted { id }
-            | Response::Closed { id } => *id,
+            | Response::Yes { id }
+            | Response::Picked { id, .. } => *id,
             Response::Hello { .. } => return,
         };
         let waiter = self.waiting.lock().unwrap().remove(&id);
@@ -246,7 +233,7 @@ impl Portal {
     }
 
     fn send(&self, req: &Request) -> Result<(), String> {
-        seq::send(&*self.out.lock().unwrap(), req, &[]).map_err(|e| format!("drv-portal: {e}"))
+        seq::send(&*self.out.lock().unwrap(), req, &[]).map_err(|e| format!("the shell: {e}"))
     }
 
     /// A request under a fresh id, and where its answer arrives.
@@ -267,17 +254,18 @@ impl Portal {
     /// The PIN the person typed, or None if they refused.
     fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
         let (app, prompt) = (app.to_owned(), prompt.to_owned());
-        let (_, rx) = self.ask(|id| Request::Pin {
+        let (_, rx) = self.ask(|id| Request::Secret {
             id,
             app,
             uid,
+            what: "use your security key".to_owned(),
             prompt,
         })?;
         match rx.recv() {
-            Ok(Response::Pin { pin, .. }) => Ok(Some(pin)),
+            Ok(Response::Secret { secret, .. }) => Ok(Some(secret)),
             Ok(Response::Cancelled { .. }) => Ok(None),
-            Ok(_) => Err("drv-portal answered something else".to_owned()),
-            Err(_) => Err("drv-portal is gone".to_owned()),
+            Ok(_) => Err("the shell answered something else".to_owned()),
+            Err(_) => Err("the shell is gone".to_owned()),
         }
     }
 
@@ -288,10 +276,11 @@ impl Portal {
             id,
             app,
             uid,
+            what: "use your security key".to_owned(),
             prompt,
         })?;
         Ok(Touching {
-            portal: self.clone(),
+            shell: self.clone(),
             id,
             _rx: rx,
         })
@@ -299,15 +288,15 @@ impl Portal {
 }
 
 struct Touching {
-    portal: Arc<Portal>,
+    shell: Arc<Shell>,
     id: u64,
     _rx: mpsc::Receiver<Response>,
 }
 
 impl Drop for Touching {
     fn drop(&mut self) {
-        self.portal.waiting.lock().unwrap().remove(&self.id);
-        if let Err(err) = self.portal.send(&Request::Cancel { id: self.id }) {
+        self.shell.waiting.lock().unwrap().remove(&self.id);
+        if let Err(err) = self.shell.send(&Request::Cancel { id: self.id }) {
             drv_os::say!("drv-agent: {err}");
         }
     }
@@ -316,7 +305,7 @@ impl Drop for Touching {
 struct Door {
     private: PathBuf,
     ssh_add: PathBuf,
-    portal: Arc<Portal>,
+    shell: Arc<Shell>,
     /// One load at a time: a second client waits, then finds the keys there.
     loading: Mutex<()>,
     /// The apps in a sign request right now: whom ssh-agent's prompts are for.
@@ -350,7 +339,7 @@ impl Door {
     }
 
     /// The first list or sign with nothing loaded, while an authenticator is plugged in:
-    /// the person's PIN from the portal, the resident keys from the authenticator.
+    /// the person's PIN from the shell, the resident keys from the authenticator.
     fn load_if_empty(&self, app: &str, uid: u32) {
         let _one = self.loading.lock().unwrap();
         match self.count_keys() {
@@ -365,7 +354,7 @@ impl Door {
             return;
         }
         let prompt = "Enter its PIN to load its ssh keys";
-        match self.portal.pin(app, uid, prompt) {
+        match self.shell.pin(app, uid, prompt) {
             Ok(Some(pin)) => {
                 if let Err(err) = self.load_resident(&pin) {
                     drv_os::say!("drv-agent: {app} (uid {uid}): {err}");
@@ -421,7 +410,7 @@ impl Door {
     }
 
     /// ssh-agent's askpass calls, one connection each: `kind\tprompt` on a line. A PIN
-    /// (any kind but `none`) goes to the portal and the answer back as a line; a touch
+    /// (any kind but `none`) goes to the shell and the answer back as a line; a touch
     /// (`none`) is shown until ssh-agent ends the caller and the connection closes.
     fn serve_askpass(self: Arc<Self>, listener: UnixListener) {
         for conn in listener.incoming() {
@@ -447,7 +436,7 @@ impl Door {
             .cloned()
             .unwrap_or_else(|| ("an app".to_owned(), 0));
         if kind == "none" {
-            match self.portal.touch(&app, uid, prompt) {
+            match self.shell.touch(&app, uid, prompt) {
                 Ok(_up) => {
                     let _ = conn.get_mut().read(&mut [0u8; 1]);
                 }
@@ -455,7 +444,7 @@ impl Door {
             }
             return;
         }
-        match self.portal.pin(&app, uid, prompt) {
+        match self.shell.pin(&app, uid, prompt) {
             Ok(Some(pin)) => {
                 let _ = writeln!(conn.get_mut(), "{pin}");
             }

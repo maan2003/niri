@@ -1,24 +1,32 @@
-//! The app's side: a D-Bus service on the app's private bus, running as the app. It owns
-//! the desktop names, answers what it can itself (settings, versions), and turns the rest
-//! into `wire` for the server. Whatever an app does to this process, it gains only the
-//! ability to speak `wire` directly, which it could anyway.
+//! The D-Bus shim, run as the app on its private session bus (`dbus-run-session`). It owns
+//! the desktop names apps expect (`org.freedesktop.portal.Desktop`,
+//! `org.freedesktop.Notifications`), answers what it can itself (settings, versions) and
+//! turns the rest into the set's own wires: files to drv-files, screens and cameras to
+//! drv-cast, notifications to drv-shell, URIs to drv-appd. Each of those keys the
+//! connection on this uid; the shim is compatibility, never a boundary. Whatever an app
+//! does to this process, it gains only the ability to speak those wires directly, which it
+//! could anyway. D-Bus ends here.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use anyhow::{bail, Context as _};
-use drv_bridge::wire::{self, Chooser, Cursor, Source, ToServer, ToShim};
-use drv_bridge::{sender_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH};
+use anyhow::{Context as _, bail};
+use clap::Parser;
+use drv_cast::wire::{Cursor, FromCast, Source, ToCast};
+use drv_dbus_shim::{sender_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH};
+use drv_files::wire::{FromFiles, Kind as Chooser, ToFiles};
+use drv_policy::PolicyClient;
 use drv_policy::seq;
+use drv_shell::notify::{FromShell, ToShell};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use zbus::blocking::Connection;
 use zbus::message::{Header, Message, Type as MessageType};
 use zbus::zvariant::{Array, ObjectPath, OwnedObjectPath, OwnedValue, Signature, Structure, Value};
-
-use crate::TRACE;
 
 const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
 const FILE_CHOOSER_VERSION: u32 = 4;
@@ -42,13 +50,37 @@ const CURSOR_MODES: u32 = 1 | 2 | 4;
 const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 const FAILED: &str = "org.freedesktop.DBus.Error.Failed";
 
-pub fn run(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
-    let sock = connect(&socket).with_context(|| socket.display().to_string())?;
-    seq::send(&sock, &ToServer::Hello { version: wire::VERSION }, &[]).context("hello to the bridge")?;
-    match seq::recv::<ToShim>(&sock).context("hello from the bridge")?.0 {
-        ToShim::Hello { version } if version == wire::VERSION => {}
-        other => bail!("the bridge answered {other:?}, not version {}", wire::VERSION),
+static TRACE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("DRV_SHIM_TRACE").is_some());
+
+#[derive(Parser)]
+#[command(name = "drv-dbus-shim", about = "The desktop's D-Bus names on an app's private bus")]
+struct Args {
+    /// drv-files' socket.
+    #[arg(long, default_value = drv_files::wire::SOCKET)]
+    files: PathBuf,
+    /// drv-cast's socket.
+    #[arg(long, default_value = drv_cast::wire::SOCKET)]
+    cast: PathBuf,
+    /// drv-shell's notification socket.
+    #[arg(long, default_value = drv_shell::notify::SOCKET)]
+    notify: PathBuf,
+    /// drv-appd's public socket, for OpenURI.
+    #[arg(long, env = "DRV_APPD_SOCKET", default_value = "/run/drv/appd.sock")]
+    appd: PathBuf,
+    /// The app, run once the names are owned.
+    #[arg(trailing_var_arg = true, required = true)]
+    command: Vec<String>,
+}
+
+fn main() {
+    let args = Args::parse();
+    if let Err(err) = run(args) {
+        drv_os::say!("drv-dbus-shim: {err:#}");
+        std::process::exit(1);
     }
+}
+
+fn run(args: Args) -> anyhow::Result<()> {
     let bus_iter = zbus::blocking::connection::Builder::session()?
         .build_message_iterator()
         .context("the app's private bus")?;
@@ -58,10 +90,11 @@ pub fn run(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
 
     let shim = Arc::new(Shim {
         bus,
-        sock,
-        sending: Mutex::new(()),
+        paths: Paths { files: args.files, cast: args.cast, notify: args.notify, appd: args.appd },
+        files: OnceLock::new(),
+        cast: OnceLock::new(),
+        notify: OnceLock::new(),
         next: AtomicU64::new(1),
-        waiting: Mutex::new(HashMap::new()),
         state: Mutex::new(State::default()),
     });
     {
@@ -70,45 +103,151 @@ pub fn run(socket: PathBuf, command: Vec<String>) -> anyhow::Result<()> {
             for msg in bus_iter {
                 let Ok(msg) = msg else { break };
                 if let Err(err) = shim.on_app_message(&msg) {
-                    drv_os::say!("drv-bridge: from app: {err:#}");
-                }
-            }
-        });
-    }
-    {
-        let shim = shim.clone();
-        std::thread::spawn(move || loop {
-            match seq::recv::<ToShim>(&shim.sock) {
-                Ok((msg, fds)) => shim.on_server_message(msg, fds),
-                Err(err) => {
-                    drv_os::say!("drv-bridge: lost the bridge server: {err}");
-                    break;
+                    drv_os::say!("drv-dbus-shim: from app: {err:#}");
                 }
             }
         });
     }
 
-    let status = Command::new(&command[0])
-        .args(&command[1..])
+    let status = Command::new(&args.command[0])
+        .args(&args.command[1..])
         .status()
-        .with_context(|| command[0].clone())?;
+        .with_context(|| args.command[0].clone())?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
 fn connect(path: &Path) -> anyhow::Result<OwnedFd> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
     let sock = rustix::net::socket_with(AddressFamily::UNIX, SocketType::SEQPACKET, SocketFlags::CLOEXEC, None)?;
-    rustix::net::connect(&sock, &SocketAddrUnix::new(path)?)?;
+    rustix::net::connect(&sock, &SocketAddrUnix::new(path)?).with_context(|| path.display().to_string())?;
     Ok(sock)
+}
+
+// ---------------------------------------------------------------- a service's line
+
+/// An answer from a service names the request it answers, or nothing (an event).
+trait Answer: DeserializeOwned + std::fmt::Debug + Send + 'static {
+    fn req(&self) -> Option<u64>;
+    const VERSION: u32;
+    fn is_hello(&self, version: u32) -> bool;
+}
+
+impl Answer for FromFiles {
+    fn req(&self) -> Option<u64> {
+        match self {
+            FromFiles::Chosen { req, .. } | FromFiles::Cancelled { req } | FromFiles::Failed { req, .. } => Some(*req),
+            FromFiles::Hello { .. } => None,
+        }
+    }
+    const VERSION: u32 = drv_files::wire::VERSION;
+    fn is_hello(&self, version: u32) -> bool {
+        matches!(self, FromFiles::Hello { version: v } if *v == version)
+    }
+}
+
+impl Answer for FromCast {
+    fn req(&self) -> Option<u64> {
+        FromCast::req(self)
+    }
+    const VERSION: u32 = drv_cast::wire::VERSION;
+    fn is_hello(&self, version: u32) -> bool {
+        matches!(self, FromCast::Hello { version: v } if *v == version)
+    }
+}
+
+impl Answer for FromShell {
+    fn req(&self) -> Option<u64> {
+        match self {
+            FromShell::Notified { req, .. } | FromShell::Failed { req, .. } => Some(*req),
+            FromShell::Hello { .. } => None,
+        }
+    }
+    const VERSION: u32 = drv_shell::notify::VERSION;
+    fn is_hello(&self, version: u32) -> bool {
+        matches!(self, FromShell::Hello { version: v } if *v == version)
+    }
+}
+
+type On<From> = Box<dyn FnOnce(From, Vec<OwnedFd>) + Send>;
+
+/// One connection to one service, made on first use. Requests go out under our numbers;
+/// answers come back on a reader thread and find their asker here. Events go to `on_event`.
+struct Link<From: Answer> {
+    sock: OwnedFd,
+    sending: Mutex<()>,
+    waiting: Mutex<HashMap<u64, On<From>>>,
+}
+
+impl<From: Answer> Link<From> {
+    fn open<To: Serialize>(
+        path: &Path,
+        hello: To,
+        on_event: impl Fn(From) + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        let sock = connect(path)?;
+        seq::send(&sock, &hello, &[]).context("hello")?;
+        let (answer, _) = seq::recv::<From>(&sock).context("hello back")?;
+        if !answer.is_hello(From::VERSION) {
+            bail!("{} answered {answer:?}, not version {}", path.display(), From::VERSION);
+        }
+        let link = Arc::new(Self { sock, sending: Mutex::new(()), waiting: Mutex::new(HashMap::new()) });
+        let reader = link.clone();
+        let who = path.display().to_string();
+        std::thread::spawn(move || {
+            loop {
+                match seq::recv::<From>(&reader.sock) {
+                    Ok((msg, fds)) => match msg.req() {
+                        Some(req) => {
+                            let waiter = reader.waiting.lock().unwrap().remove(&req);
+                            match waiter {
+                                Some(on) => on(msg, fds),
+                                None => drv_os::say!("drv-dbus-shim: {who} answered {req}, which nobody asked"),
+                            }
+                        }
+                        None => on_event(msg),
+                    },
+                    Err(err) => {
+                        drv_os::say!("drv-dbus-shim: lost {who}: {err}");
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(link)
+    }
+
+    fn tell<To: Serialize>(&self, msg: &To) -> anyhow::Result<()> {
+        let _one = self.sending.lock().unwrap();
+        seq::send(&self.sock, msg, &[]).context("to the service")
+    }
+
+    /// Sends `msg`; `on` gets the answer, on the reader thread.
+    fn ask<To: Serialize>(&self, req: u64, msg: &To, on: impl FnOnce(From, Vec<OwnedFd>) + Send + 'static) -> anyhow::Result<()> {
+        self.waiting.lock().unwrap().insert(req, Box::new(on));
+        if let Err(err) = self.tell(msg) {
+            self.waiting.lock().unwrap().remove(&req);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn forget(&self, req: u64) {
+        self.waiting.lock().unwrap().remove(&req);
+    }
 }
 
 // ---------------------------------------------------------------- state
 
-type Answer = Box<dyn FnOnce(ToShim, Vec<OwnedFd>) + Send>;
+/// Which service a request handle went to.
+#[derive(Clone, Copy)]
+enum Where {
+    Files,
+    Cast,
+}
 
 /// A screencast session, from `CreateSession` to `Close` or the cast's end.
 struct Session {
-    /// Our number for it at the server.
+    /// Our number for it at drv-cast.
     id: u64,
     /// The unique name of the app-side connection that made it: `Closed` goes there.
     caller: String,
@@ -127,28 +266,35 @@ struct Session {
 #[derive(Default)]
 struct State {
     /// Request handles still waiting on the person, by path, with the request at the
-    /// server: `Request.Close` withdraws it there.
-    handles: HashMap<String, u64>,
+    /// service: `Request.Close` withdraws it there.
+    handles: HashMap<String, (Where, u64)>,
     /// Sessions by their path.
     sessions: HashMap<String, Session>,
     /// The camera was allowed this run.
     camera: bool,
 }
 
+struct Paths {
+    files: PathBuf,
+    cast: PathBuf,
+    notify: PathBuf,
+    appd: PathBuf,
+}
+
 struct Shim {
     bus: Connection,
-    sock: OwnedFd,
-    sending: Mutex<()>,
+    paths: Paths,
+    files: OnceLock<Arc<Link<FromFiles>>>,
+    cast: OnceLock<Arc<Link<FromCast>>>,
+    notify: OnceLock<Arc<Link<FromShell>>>,
     next: AtomicU64,
-    /// Answers from the server find their asker here.
-    waiting: Mutex<HashMap<u64, Answer>>,
     state: Mutex<State>,
 }
 
 /// What a call got.
 enum Ours {
     Reply(Message),
-    /// Answered already, or will be when the server answers.
+    /// Answered already, or will be when the service answers.
     Done,
 }
 
@@ -197,19 +343,59 @@ impl Shim {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn tell(&self, msg: &ToServer) -> anyhow::Result<()> {
-        let _one = self.sending.lock().unwrap();
-        seq::send(&self.sock, msg, &[]).context("to the bridge")
+    /// drv-files' line, opened on the first file request.
+    fn files(&self) -> anyhow::Result<Arc<Link<FromFiles>>> {
+        if let Some(l) = self.files.get() {
+            return Ok(l.clone());
+        }
+        let hello = ToFiles::Hello { version: drv_files::wire::VERSION };
+        let link = Link::open(&self.paths.files, hello, |_| {}).context("drv-files")?;
+        Ok(self.files.get_or_init(|| link).clone())
     }
 
-    /// Sends `msg`; `on` gets the answer, on the server's thread.
-    fn ask(&self, req: u64, msg: &ToServer, on: impl FnOnce(ToShim, Vec<OwnedFd>) + Send + 'static) -> anyhow::Result<()> {
-        self.waiting.lock().unwrap().insert(req, Box::new(on));
-        if let Err(err) = self.tell(msg) {
-            self.waiting.lock().unwrap().remove(&req);
-            return Err(err);
+    /// drv-cast's line, opened on the first cast or camera request. `CastClosed` events
+    /// end sessions.
+    fn cast(self: &Arc<Self>) -> anyhow::Result<Arc<Link<FromCast>>> {
+        if let Some(l) = self.cast.get() {
+            return Ok(l.clone());
         }
-        Ok(())
+        let hello = ToCast::Hello { version: drv_cast::wire::VERSION };
+        let shim = self.clone();
+        let link = Link::open(&self.paths.cast, hello, move |ev| {
+            if let FromCast::CastClosed { session } = ev {
+                shim.session_closed(session);
+            }
+        })
+        .context("drv-cast")?;
+        Ok(self.cast.get_or_init(|| link).clone())
+    }
+
+    /// drv-shell's notification line, opened on the first notification.
+    fn notify(&self) -> anyhow::Result<Arc<Link<FromShell>>> {
+        if let Some(l) = self.notify.get() {
+            return Ok(l.clone());
+        }
+        let hello = ToShell::Hello { version: drv_shell::notify::VERSION };
+        let link = Link::open(&self.paths.notify, hello, |_| {}).context("drv-shell")?;
+        Ok(self.notify.get_or_init(|| link).clone())
+    }
+
+    /// drv-cast ended a session (the person, or the compositor): the app hears `Closed`.
+    fn session_closed(&self, session: u64) {
+        let closed = {
+            let mut state = self.state.lock().unwrap();
+            let path = state.sessions.iter().find(|(_, s)| s.id == session).map(|(p, _)| p.clone());
+            path.and_then(|p| state.sessions.remove(&p).map(|s| (p, s)))
+        };
+        if let Some((path, s)) = closed {
+            let sent = Message::signal(path.as_str(), SESSION_IFACE, "Closed")
+                .and_then(|b| b.destination(s.caller.as_str()))
+                .and_then(|b| b.build(&HashMap::<&str, Value<'_>>::new()))
+                .and_then(|signal| self.bus.send(&signal));
+            if let Err(err) = sent {
+                drv_os::say!("drv-dbus-shim: session closed signal: {err}");
+            }
+        }
     }
 
     /// The portal `Response` signal on a request handle, to the app-side caller.
@@ -218,38 +404,6 @@ impl Shim {
             .destination(caller)?
             .build(&(code, results))?;
         self.bus.send(&signal).context("response signal")
-    }
-
-    fn on_server_message(&self, msg: ToShim, fds: Vec<OwnedFd>) {
-        match msg.req() {
-            Some(req) => {
-                let waiter = self.waiting.lock().unwrap().remove(&req);
-                match waiter {
-                    Some(on) => on(msg, fds),
-                    None => drv_os::say!("drv-bridge: the bridge answered {req}, which nobody asked"),
-                }
-            }
-            None => match msg {
-                ToShim::CastClosed { session } => {
-                    let closed = {
-                        let mut state = self.state.lock().unwrap();
-                        let path = state.sessions.iter().find(|(_, s)| s.id == session).map(|(p, _)| p.clone());
-                        path.and_then(|p| state.sessions.remove(&p).map(|s| (p, s)))
-                    };
-                    if let Some((path, s)) = closed {
-                        let sent = Message::signal(path.as_str(), SESSION_IFACE, "Closed")
-                            .and_then(|b| b.destination(s.caller.as_str()))
-                            .and_then(|b| b.build(&HashMap::<&str, Value<'_>>::new()))
-                            .and_then(|signal| self.bus.send(&signal));
-                        if let Err(err) = sent {
-                            drv_os::say!("drv-bridge: session closed signal: {err}");
-                        }
-                    }
-                }
-                ToShim::Hello { .. } => {}
-                _ => {}
-            },
-        }
     }
 
     fn on_app_message(self: &Arc<Self>, msg: &Message) -> anyhow::Result<()> {
@@ -265,13 +419,13 @@ impl Shim {
             )
         };
         if *TRACE {
-            drv_os::say!("drv-bridge: {}", what());
+            drv_os::say!("drv-dbus-shim: {}", what());
         }
         let reply = match self.call(msg, &hdr) {
             Ok(Ours::Reply(reply)) => reply,
             Ok(Ours::Done) => return Ok(()),
             Err(err) => {
-                drv_os::say!("drv-bridge: {}: {err:#}", what());
+                drv_os::say!("drv-dbus-shim: {}: {err:#}", what());
                 failed(&hdr, format!("{err:#}"))?
             }
         };
@@ -310,15 +464,25 @@ impl Shim {
                 }
             };
             if let Some(s) = session {
-                self.tell(&ToServer::CastClose { session: s.id })?;
+                self.cast()?.tell(&ToCast::CastClose { session: s.id })?;
             }
             return Ok(Ours::Reply(Message::method_return(hdr)?.build(&())?));
         }
         if interface == REQUEST_IFACE && member == "Close" && path.starts_with(PORTAL_PATH) {
-            let req = self.state.lock().unwrap().handles.remove(&path);
-            if let Some(req) = req {
-                self.waiting.lock().unwrap().remove(&req);
-                self.tell(&ToServer::Cancel { req })?;
+            let handle = self.state.lock().unwrap().handles.remove(&path);
+            if let Some((at, req)) = handle {
+                match at {
+                    Where::Files => {
+                        let files = self.files()?;
+                        files.forget(req);
+                        files.tell(&ToFiles::Cancel { req })?;
+                    }
+                    Where::Cast => {
+                        let cast = self.cast()?;
+                        cast.forget(req);
+                        cast.tell(&ToCast::Cancel { req })?;
+                    }
+                }
             }
             return Ok(Ours::Reply(Message::method_return(hdr)?.build(&())?));
         }
@@ -368,16 +532,16 @@ impl Shim {
         if let Some(props) = fixed {
             return reply(props, hdr).map(Ours::Reply);
         }
-        // The camera's `IsCameraPresent` is the server's to say.
+        // The camera's `IsCameraPresent` is drv-cast's to say.
         let shim = self.clone();
         let msg = msg.clone();
         let req = self.next();
-        self.ask(req, &ToServer::CameraPresent { req }, move |answer, _| {
+        self.cast()?.ask(req, &ToCast::CameraPresent { req }, move |answer, _| {
             let hdr = msg.header();
-            let present = matches!(answer, ToShim::Present { present: true, .. });
+            let present = matches!(answer, FromCast::Present { present: true, .. });
             let props = vec![("version", Value::U32(CAMERA_VERSION)), ("IsCameraPresent", Value::Bool(present))];
             if let Err(err) = reply(props, &hdr).and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                drv_os::say!("drv-bridge: camera properties: {err:#}");
+                drv_os::say!("drv-dbus-shim: camera properties: {err:#}");
             }
         })?;
         Ok(Ours::Done)
@@ -422,10 +586,10 @@ impl Shim {
     }
 
     /// `OpenFile`/`SaveFile`: the handle goes back now, the `Response` signal when the
-    /// person has picked.
+    /// person has picked at drv-files.
     fn file_chooser(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         let caller = caller_of(hdr)?;
-        let (_parent, title, options): (String, String, HashMap<String, OwnedValue>) =
+        let (_parent, _title, options): (String, String, HashMap<String, OwnedValue>) =
             msg.body().deserialize().context("FileChooser arguments")?;
         let string = |key: &str| options.get(key).cloned().and_then(|v| String::try_from(v).ok());
         let flag = |key: &str| options.get(key).cloned().and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
@@ -437,19 +601,20 @@ impl Shim {
             },
             other => bail!("no {other} on {FILE_CHOOSER}"),
         };
+        let files = self.files()?;
         let handle = handle_for(msg, &caller, &options, "handle_token");
         // The reply first, then the signal: the spec's order.
         self.bus.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
         let req = self.next();
-        self.state.lock().unwrap().handles.insert(handle.clone(), req);
+        self.state.lock().unwrap().handles.insert(handle.clone(), (Where::Files, req));
         let shim = self.clone();
-        self.ask(req, &ToServer::Choose { req, title, kind }, move |answer, _| {
+        files.ask(req, &ToFiles::Choose { req, kind }, move |answer, _| {
             shim.state.lock().unwrap().handles.remove(&handle);
             let (code, uris): (u32, Vec<String>) = match answer {
-                ToShim::Files { paths, .. } => (0, paths.iter().map(|p| file_uri(p)).collect()),
-                ToShim::Cancelled { .. } => (1, Vec::new()),
+                FromFiles::Chosen { paths, .. } => (0, paths.iter().map(|p| file_uri(p)).collect()),
+                FromFiles::Cancelled { .. } => (1, Vec::new()),
                 other => {
-                    drv_os::say!("drv-bridge: file chooser: {other:?}");
+                    drv_os::say!("drv-dbus-shim: file chooser: {other:?}");
                     (2, Vec::new())
                 }
             };
@@ -458,15 +623,15 @@ impl Shim {
                 results.insert("uris", Value::from(uris));
             }
             if let Err(err) = shim.respond(&handle, &caller, code, results) {
-                drv_os::say!("drv-bridge: file chooser response: {err}");
+                drv_os::say!("drv-dbus-shim: file chooser response: {err}");
             }
         })?;
         Ok(Ours::Done)
     }
 
-    /// `org.freedesktop.portal.ScreenCast`: the session is ours, the person consents at
-    /// drv-portal on `Start`, and `OpenPipeWireRemote` hands out a connection that sees the
-    /// one node.
+    /// `org.freedesktop.portal.ScreenCast`: the session is ours, the person consents at the
+    /// shell on `Start`, and `OpenPipeWireRemote` hands out a connection that sees the one
+    /// node.
     fn screen_cast(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         let caller = caller_of(hdr)?;
         let reply_handle = |handle: &str| -> anyhow::Result<Message> {
@@ -529,14 +694,15 @@ impl Shim {
             "Start" => {
                 let (session, _parent, options): (OwnedObjectPath, String, HashMap<String, OwnedValue>) =
                     msg.body().deserialize()?;
+                let req = self.next();
                 let (ask, persist) = {
                     let mut state = self.state.lock().unwrap();
                     let s = state.sessions.get_mut(session.as_str()).context("no such session")?;
                     anyhow::ensure!(!s.started, "the session was started already");
                     s.started = true;
                     (
-                        ToServer::Cast {
-                            req: 0,
+                        ToCast::Cast {
+                            req,
                             session: s.id,
                             cursor: s.cursor,
                             screens: s.screens,
@@ -546,21 +712,15 @@ impl Shim {
                         s.persist,
                     )
                 };
-                let req = self.next();
-                let ask = match ask {
-                    ToServer::Cast { session, cursor, screens, windows, again, .. } => {
-                        ToServer::Cast { req, session, cursor, screens, windows, again }
-                    }
-                    other => other,
-                };
+                let cast = self.cast()?;
                 let handle = handle_for(msg, &caller, &options, "handle_token");
                 self.bus.send(&reply_handle(&handle)?)?;
-                self.state.lock().unwrap().handles.insert(handle.clone(), req);
+                self.state.lock().unwrap().handles.insert(handle.clone(), (Where::Cast, req));
                 let shim = self.clone();
-                self.ask(req, &ask, move |answer, _| {
+                cast.ask(req, &ask, move |answer, _| {
                     shim.state.lock().unwrap().handles.remove(&handle);
                     let res = match answer {
-                        ToShim::Cast { node_id, source, width, height, token, .. } => {
+                        FromCast::Cast { node_id, source, width, height, token, .. } => {
                             let mut stream: HashMap<&str, Value<'_>> = HashMap::new();
                             let (source_type, source_id) = match source {
                                 Source::Screen(name) => (1, name),
@@ -581,7 +741,7 @@ impl Shim {
                             match streams {
                                 Ok(streams) => results.insert("streams", Value::from(streams)),
                                 Err(err) => {
-                                    drv_os::say!("drv-bridge: screencast streams: {err:#}");
+                                    drv_os::say!("drv-dbus-shim: screencast streams: {err:#}");
                                     return;
                                 }
                             };
@@ -592,14 +752,14 @@ impl Shim {
                             }
                             shim.respond(&handle, &caller, 0, results)
                         }
-                        ToShim::Cancelled { .. } => shim.respond(&handle, &caller, 1, HashMap::new()),
+                        FromCast::Cancelled { .. } => shim.respond(&handle, &caller, 1, HashMap::new()),
                         other => {
-                            drv_os::say!("drv-bridge: screencast: {other:?}");
+                            drv_os::say!("drv-dbus-shim: screencast: {other:?}");
                             shim.respond(&handle, &caller, 2, HashMap::new())
                         }
                     };
                     if let Err(err) = res {
-                        drv_os::say!("drv-bridge: screencast: {err:#}");
+                        drv_os::say!("drv-dbus-shim: screencast: {err:#}");
                     }
                 })?;
                 Ok(Ours::Done)
@@ -615,31 +775,26 @@ impl Shim {
                     .get(session.as_str())
                     .context("no such session")?
                     .id;
-                self.remote(msg, ToServer::CastRemote { req: 0, session: id })
+                let req = self.next();
+                self.remote(msg, req, ToCast::CastRemote { req, session: id })
             }
             other => bail!("no {other} on {SCREEN_CAST}"),
         }
     }
 
-    /// Asks the server for a PipeWire connection and answers `msg` with the fd it sends.
-    fn remote(self: &Arc<Self>, msg: &Message, ask: ToServer) -> anyhow::Result<Ours> {
-        let req = self.next();
-        let ask = match ask {
-            ToServer::CastRemote { session, .. } => ToServer::CastRemote { req, session },
-            ToServer::CameraRemote { .. } => ToServer::CameraRemote { req },
-            other => other,
-        };
+    /// Asks drv-cast for a PipeWire connection and answers `msg` with the fd it sends.
+    fn remote(self: &Arc<Self>, msg: &Message, req: u64, ask: ToCast) -> anyhow::Result<Ours> {
         let shim = self.clone();
         let msg = msg.clone();
-        self.ask(req, &ask, move |answer, mut fds| {
+        self.cast()?.ask(req, &ask, move |answer, mut fds| {
             let hdr = msg.header();
             let reply = match (answer, fds.pop()) {
-                (ToShim::Remote { .. }, Some(fd)) => Message::method_return(&hdr).and_then(|b| b.build(&zbus::zvariant::Fd::from(fd))).map_err(Into::into),
-                (ToShim::Failed { reason, .. }, _) => failed(&hdr, reason),
+                (FromCast::Remote { .. }, Some(fd)) => Message::method_return(&hdr).and_then(|b| b.build(&zbus::zvariant::Fd::from(fd))).map_err(Into::into),
+                (FromCast::Failed { reason, .. }, _) => failed(&hdr, reason),
                 (other, _) => failed(&hdr, format!("no remote: {other:?}")),
             };
             if let Err(err) = reply.and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                drv_os::say!("drv-bridge: remote: {err:#}");
+                drv_os::say!("drv-dbus-shim: remote: {err:#}");
             }
         })?;
         Ok(Ours::Done)
@@ -652,6 +807,7 @@ impl Shim {
             "AccessCamera" => {
                 let caller = caller_of(hdr)?;
                 let (options,): (HashMap<String, OwnedValue>,) = msg.body().deserialize()?;
+                let cast = self.cast()?;
                 let handle = handle_for(msg, &caller, &options, "handle_token");
                 // The reply first, then the signal: the spec's order.
                 self.bus.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
@@ -661,34 +817,36 @@ impl Shim {
                 }
                 let req = self.next();
                 let shim = self.clone();
-                self.ask(req, &ToServer::Camera { req }, move |answer, _| {
+                cast.ask(req, &ToCast::Camera { req }, move |answer, _| {
                     let code = match answer {
-                        ToShim::Granted { .. } => {
+                        FromCast::Granted { .. } => {
                             shim.state.lock().unwrap().camera = true;
                             0
                         }
-                        ToShim::Cancelled { .. } => 1,
+                        FromCast::Cancelled { .. } => 1,
                         other => {
-                            drv_os::say!("drv-bridge: camera: {other:?}");
+                            drv_os::say!("drv-dbus-shim: camera: {other:?}");
                             2
                         }
                     };
                     if let Err(err) = shim.respond(&handle, &caller, code, HashMap::new()) {
-                        drv_os::say!("drv-bridge: camera response: {err}");
+                        drv_os::say!("drv-dbus-shim: camera response: {err}");
                     }
                 })?;
                 Ok(Ours::Done)
             }
             "OpenPipeWireRemote" => {
                 anyhow::ensure!(self.state.lock().unwrap().camera, "the camera was not allowed");
-                self.remote(msg, ToServer::CameraRemote { req: 0 })
+                let req = self.next();
+                self.remote(msg, req, ToCast::CameraRemote { req })
             }
             other => bail!("no {other} on {CAMERA}"),
         }
     }
 
-    /// `OpenURI`: the server has the manifest handler started; no prompt. `writable`, `ask`
-    /// and the parent window are ignored.
+    /// `OpenURI`: drv-appd starts the manifest handler; no prompt. `writable`, `ask` and
+    /// the parent window are ignored. Its own connection, on its own thread: the answer
+    /// waits on a launch.
     fn open_uri(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         if member != "OpenURI" {
             bail!("no {member} on {OPEN_URI}");
@@ -698,20 +856,24 @@ impl Shim {
             msg.body().deserialize().context("OpenURI arguments")?;
         let handle = handle_for(msg, &caller, &options, "handle_token");
         self.bus.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
-        let req = self.next();
         let shim = self.clone();
-        self.ask(req, &ToServer::Open { req, uri }, move |answer, _| {
-            let code = match answer {
-                ToShim::Done { .. } => 0,
-                other => {
-                    drv_os::say!("drv-bridge: OpenURI: {other:?}");
+        std::thread::spawn(move || {
+            let opened = PolicyClient::connect(shim.paths.appd.clone())
+                .and_then(|mut appd| appd.open(uri.clone()));
+            let code = match opened {
+                Ok(uid) => {
+                    drv_os::say!("drv-dbus-shim: {uri:?} opens as uid {uid}");
+                    0
+                }
+                Err(err) => {
+                    drv_os::say!("drv-dbus-shim: OpenURI: {err}");
                     2
                 }
             };
             if let Err(err) = shim.respond(&handle, &caller, code, HashMap::new()) {
-                drv_os::say!("drv-bridge: OpenURI response: {err}");
+                drv_os::say!("drv-dbus-shim: OpenURI response: {err}");
             }
-        })?;
+        });
         Ok(Ours::Done)
     }
 
@@ -719,12 +881,16 @@ impl Shim {
         Ok(Ours::Reply(match member {
             "GetCapabilities" => Message::method_return(hdr)?.build(&vec!["body"])?,
             "GetServerInformation" => Message::method_return(hdr)?.build(&(
-                "drv-bridge",
+                "drv-dbus-shim",
                 "drv",
                 env!("CARGO_PKG_VERSION"),
                 "1.2",
             ))?,
-            "CloseNotification" => Message::method_return(hdr)?.build(&())?,
+            "CloseNotification" => {
+                let (id,): (u32,) = msg.body().deserialize()?;
+                self.notify()?.tell(&ToShell::Close { id })?;
+                Message::method_return(hdr)?.build(&())?
+            }
             "Notify" => {
                 #[allow(clippy::type_complexity)]
                 let (_app_name, replaces, _icon, summary, body, _actions, _hints, _timeout): (
@@ -737,18 +903,19 @@ impl Shim {
                     HashMap<String, OwnedValue>,
                     i32,
                 ) = msg.body().deserialize()?;
+                let notify = self.notify()?;
                 let req = self.next();
                 let shim = self.clone();
                 let msg = msg.clone();
-                self.ask(req, &ToServer::Notify { req, replaces, summary, body }, move |answer, _| {
+                notify.ask(req, &ToShell::Notify { req, replaces, summary, body }, move |answer, _| {
                     let hdr = msg.header();
                     let reply = match answer {
-                        ToShim::Notified { id, .. } => Message::method_return(&hdr).and_then(|b| b.build(&id)).map_err(Into::into),
-                        ToShim::Failed { reason, .. } => failed(&hdr, reason),
+                        FromShell::Notified { id, .. } => Message::method_return(&hdr).and_then(|b| b.build(&id)).map_err(Into::into),
+                        FromShell::Failed { reason, .. } => failed(&hdr, reason),
                         other => failed(&hdr, format!("{other:?}")),
                     };
                     if let Err(err) = reply.and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
-                        drv_os::say!("drv-bridge: notification reply: {err:#}");
+                        drv_os::say!("drv-dbus-shim: notification reply: {err:#}");
                     }
                 })?;
                 return Ok(Ours::Done);
@@ -758,7 +925,7 @@ impl Shim {
     }
 }
 
-/// There is no other portal behind the bridge.
+/// There is no other portal behind the shim.
 fn unknown(hdr: &Header<'_>, interface: &str, member: &str) -> anyhow::Result<Ours> {
-    error(hdr, UNKNOWN_METHOD, format!("the bridge does not carry {interface}.{member}")).map(Ours::Reply)
+    error(hdr, UNKNOWN_METHOD, format!("the shim does not carry {interface}.{member}")).map(Ours::Reply)
 }

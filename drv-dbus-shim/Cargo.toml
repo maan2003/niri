@@ -1,0 +1,26 @@
+[package]
+name = "drv-dbus-shim"
+version.workspace = true
+description = "In the app, on its private bus: the desktop's D-Bus names, answered by asking the set's services over their sockets"
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["env"] }
+drv-cast = { version = "26.4.0", path = "../drv-cast", default-features = false }
+drv-files = { version = "26.4.0", path = "../drv-files", default-features = false }
+drv-os = { version = "26.4.0", path = "../drv-os" }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+drv-shell = { version = "26.4.0", path = "../drv-shell", default-features = false }
+# The cast probe lists what its remote sees.
+pipewire = { version = "0.10", features = ["v0_3_33"] }
+rustix = { version = "1.1.4", features = ["net", "std"] }
+serde.workspace = true
+zbus = { version = "5", features = ["bus-impl"] }
+
+[[bin]]
+name = "drv-dbus-shim"
+path = "src/main.rs"

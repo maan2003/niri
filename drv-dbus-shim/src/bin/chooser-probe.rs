@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use anyhow::Context as _;
-use drv_bridge::{sender_component, PORTAL_NAME, PORTAL_PATH};
+use drv_dbus_shim::{sender_component, PORTAL_NAME, PORTAL_PATH};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 

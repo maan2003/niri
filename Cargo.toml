@@ -5,16 +5,16 @@ members = [
     "drv-policy",
     "drv-seat",
     "drv-auth",
-    "drv-lock",
-    "drv-menu",
-    "drv-portal",
+    "drv-shell",
+    "drv-files",
+    "drv-cast",
+    "drv-dbus-shim",
     "drv-ui",
     "drv-supervisor",
     "drv-appd",
     "drv-forker",
     "drv-init",
     "drv-os",
-    "drv-bridge",
     "drv-agent",
     "drv-keys",
     "niri-visual-tests",
@@ -101,7 +101,7 @@ drv-policy = { version = "26.4.0", path = "drv-policy" }
 drv-os = { version = "26.4.0", path = "drv-os" }
 drv-seat = { version = "26.4.0", path = "drv-seat" }
 drv-auth = { version = "26.4.0", path = "drv-auth" }
-drv-portal = { version = "26.4.0", path = "drv-portal", default-features = false }
+drv-cast = { version = "26.4.0", path = "drv-cast", default-features = false }
 ordered-float = "5"
 pango = { version = "0.21.5", features = ["v1_44"] }
 pangocairo = "0.21.5"

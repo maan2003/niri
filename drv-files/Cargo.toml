@@ -1,0 +1,25 @@
+[package]
+name = "drv-files"
+version = "26.4.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "The person's files: the chooser that shows them and the documents mount that hands one to an app."
+
+[features]
+default = ["service"]
+# The binary and its UI; off for crates that want only the wire.
+service = ["dep:clap", "dep:drv-os", "dep:drv-ui", "dep:fuser", "dep:libc", "dep:rustix"]
+
+[dependencies]
+clap = { workspace = true, optional = true }
+drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+drv-ui = { version = "26.4.0", path = "../drv-ui", optional = true }
+fuser = { version = "0.18", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
+rustix = { version = "1.1.4", features = ["net"], optional = true }
+serde.workspace = true
+
+[[bin]]
+name = "drv-files"
+required-features = ["service"]

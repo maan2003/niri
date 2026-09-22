@@ -31,13 +31,16 @@ const NEEDED: CapabilitySet = CapabilitySet::SYS_ADMIN
     .union(CapabilitySet::SETPCAP);
 
 /// The layout of `/run` as the system configuration makes it. Every app: the appd socket,
-/// the apps' Wayland socket, the bridge, the ssh agent's door (which knows the UIDs with
-/// the grant; the rest are refused there), the driver link (a symlink into the store,
-/// remade as one), its own runtime directory, and the documents mount, which it writes.
+/// the apps' Wayland socket, the doors of drv-files, drv-cast and drv-shell (each keyed on
+/// the peer UID), the ssh agent's door (which asks drv-appd about the UID; the rest are
+/// refused there), the driver link (a symlink into the store, remade as one), its own
+/// runtime directory, and the documents mount, which it writes.
 const RUN: &[&str] = &[
     "/run/drv",
     "/run/drv-wayland",
-    "/run/drv-bridge",
+    "/run/drv-files",
+    "/run/drv-cast",
+    "/run/drv-shell",
     "/run/drv-agent",
     "/run/opengl-driver",
 ];

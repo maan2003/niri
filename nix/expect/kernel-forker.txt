@@ -13,10 +13,12 @@ mount /run/drv rw,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
 mount /run/drv-agent rw,nosuid,nodev,noexec tmpfs root=/drv-agent rw,mode=755
 mount /run/drv-apps rw,nosuid,nodev,noexec tmpfs root=/drv-apps rw,mode=755
 mount /run/drv-audio rw,nosuid,nodev,noexec tmpfs root=/drv-audio rw,mode=755
-mount /run/drv-bridge rw,nosuid,nodev,noexec tmpfs root=/drv-bridge rw,mode=755
+mount /run/drv-cast rw,nosuid,nodev,noexec tmpfs root=/drv-cast rw,mode=755
 mount /run/drv-doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
+mount /run/drv-files rw,nosuid,nodev,noexec tmpfs root=/drv-files rw,mode=755
 mount /run/drv-host rw,nosuid,nodev,noexec tmpfs root=/drv-host rw,mode=755
 mount /run/drv-pulse rw,nosuid,nodev,noexec tmpfs root=/drv-pulse rw,mode=755
+mount /run/drv-shell rw,nosuid,nodev,noexec tmpfs root=/drv-shell rw,mode=755
 mount /run/drv-wayland rw,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
 mount /sys ro,nosuid,nodev,noexec sysfs root=/ rw
 mount /sys/fs/bpf ro,nosuid,nodev,noexec bpf root=/ rw,mode=700

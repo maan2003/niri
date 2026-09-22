@@ -34,6 +34,9 @@ pub struct Ui {
     pub shm: Shm,
     pub pool: SlotPool,
     pub keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// The surface of ours the keyboard is on, if any: a client with several surfaces
+    /// (drv-shell) routes keys by it.
+    pub focus: Option<wl_surface::WlSurface>,
 }
 
 impl Ui {
@@ -117,6 +120,7 @@ macro_rules! ui {
                 shm,
                 pool,
                 keyboard: None,
+                focus: None,
             })
         })()
     }};
@@ -186,11 +190,12 @@ macro_rules! client {
                 _: &$crate::wayland_client::Connection,
                 _: &$crate::wayland_client::QueueHandle<Self>,
                 _: &$crate::wayland_client::protocol::wl_keyboard::WlKeyboard,
-                _: &$crate::wayland_client::protocol::wl_surface::WlSurface,
+                surface: &$crate::wayland_client::protocol::wl_surface::WlSurface,
                 _: u32,
                 _: &[u32],
                 _: &[$crate::sctk::seat::keyboard::Keysym],
             ) {
+                <Self as $crate::Client>::ui(self).focus = Some(surface.clone());
             }
 
             fn leave(
@@ -198,9 +203,13 @@ macro_rules! client {
                 _: &$crate::wayland_client::Connection,
                 _: &$crate::wayland_client::QueueHandle<Self>,
                 _: &$crate::wayland_client::protocol::wl_keyboard::WlKeyboard,
-                _: &$crate::wayland_client::protocol::wl_surface::WlSurface,
+                surface: &$crate::wayland_client::protocol::wl_surface::WlSurface,
                 _: u32,
             ) {
+                let ui = <Self as $crate::Client>::ui(self);
+                if ui.focus.as_ref() == Some(surface) {
+                    ui.focus = None;
+                }
             }
 
             fn press_key(

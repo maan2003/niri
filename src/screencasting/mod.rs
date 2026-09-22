@@ -1,4 +1,4 @@
-//! Screencasting for drv-portal.
+//! Screencasting for drv-cast.
 //!
 //! The core owns the cast session, picks targets and paces frames; the GPU process owns the
 //! PipeWire streams and buffers (see `gpu::cast`).
@@ -31,7 +31,7 @@ use cast::{from_gpu_cursor_mode, to_gpu_cursor_mode, Cast, CastSizeChange, Curso
 pub struct Screencasting {
     pub casts: Vec<Cast>,
 
-    /// Sessions drv-portal started, by the portal's own cast id.
+    /// Sessions drv-cast started, by its own cast id.
     pub portal_casts: HashMap<CastSessionId, u64>,
 
     /// Dynamic-target casts waiting for their first target to start.
@@ -65,7 +65,7 @@ pub enum ScreenCastToNiri {
         stream_id: CastStreamId,
         target: StreamTargetId,
         cursor_mode: CursorMode,
-        /// drv-portal's id for the cast: what it hears the node id and the end under.
+        /// drv-cast's id for the cast: what it hears the node id and the end under.
         portal_cast: u64,
     },
 }
@@ -172,8 +172,8 @@ impl State {
                     cast.node_id = Some(node_id);
                     let (width, height) = cast.size().map_or((0, 0), |s| (s.w, s.h));
                     let cast = cast.portal_cast;
-                    debug!("telling drv-portal cast {cast} is node {node_id}");
-                    self.niri.tell_portal(drv_portal::compositor::ToPortal::Started {
+                    debug!("telling drv-cast cast {cast} is node {node_id}");
+                    self.niri.tell_portal(drv_cast::compositor::FromCompositor::Started {
                         cast,
                         node_id,
                         width,
@@ -546,16 +546,16 @@ impl State {
         }
     }
 
-    /// drv-portal's cast line. It speaks only after the person consented, so what it asks
+    /// drv-cast's line. It speaks only after the person consented, so what it asks
     /// for is started as is; the app behind it never reaches us.
-    pub fn on_portal_msg(&mut self, msg: drv_portal::compositor::ToCompositor) {
-        use drv_portal::compositor::{Cursor, Output, Source, ToCompositor, ToPortal, Window, VERSION};
+    pub fn on_portal_msg(&mut self, msg: drv_cast::compositor::ToCompositor) {
+        use drv_cast::compositor::{Cursor, FromCompositor, Output, Source, ToCompositor, Window, VERSION};
         match msg {
             ToCompositor::Hello { version } => {
                 if version != VERSION {
-                    warn!("drv-portal speaks cast protocol {version}, we speak {VERSION}");
+                    warn!("drv-cast speaks cast protocol {version}, we speak {VERSION}");
                 }
-                self.niri.tell_portal(ToPortal::Hello { version: VERSION });
+                self.niri.tell_portal(FromCompositor::Hello { version: VERSION });
             }
             ToCompositor::Outputs => {
                 let outputs = self.backend.ipc_outputs();
@@ -577,7 +577,7 @@ impl State {
                     })
                     .collect();
                 list.sort_by(|a, b| a.name.cmp(&b.name));
-                self.niri.tell_portal(ToPortal::Outputs(list));
+                self.niri.tell_portal(FromCompositor::Outputs(list));
             }
             ToCompositor::Windows => {
                 use crate::niri::ClientState;
@@ -595,7 +595,7 @@ impl State {
                     let title = with_toplevel_role(toplevel, |role| role.title.clone().unwrap_or_default());
                     list.push(Window { id: mapped.id().get(), title, app });
                 });
-                self.niri.tell_portal(ToPortal::Windows(list));
+                self.niri.tell_portal(FromCompositor::Windows(list));
             }
             ToCompositor::Start { cast, source, cursor } => {
                 let session_id = CastSessionId::next();
@@ -633,7 +633,7 @@ impl State {
                     .map(|(s, _)| *s);
                 match session {
                     Some(session_id) => self.niri.stop_cast(session_id),
-                    None => debug!("drv-portal stopped cast {cast}, which is not running"),
+                    None => debug!("drv-cast stopped cast {cast}, which is not running"),
                 }
             }
         }
@@ -915,21 +915,21 @@ impl Niri {
         }
 
         if let Some(cast) = self.casting.portal_casts.remove(&session_id) {
-            self.tell_portal(drv_portal::compositor::ToPortal::Stopped { cast });
+            self.tell_portal(drv_cast::compositor::FromCompositor::Stopped { cast });
         }
 
         self.refresh_cast_indicator();
     }
 
-    /// One message to drv-portal, if its line is up. Nonblocking: a portal that stopped
+    /// One message to drv-cast, if its line is up. Nonblocking: a drv-cast that stopped
     /// reading takes the whole set down anyway.
-    pub fn tell_portal(&self, msg: drv_portal::compositor::ToPortal) {
+    pub fn tell_portal(&self, msg: drv_cast::compositor::FromCompositor) {
         let Some(sock) = &self.portal else {
-            warn!("no line to drv-portal; dropping {msg:?}");
+            warn!("no line to drv-cast; dropping {msg:?}");
             return;
         };
         if let Err(err) = drv_policy::seq::send(sock, &msg, &[]) {
-            warn!("to drv-portal: {err}");
+            warn!("to drv-cast: {err}");
         }
     }
 
@@ -941,7 +941,7 @@ impl Niri {
         for id in ids {
             self.stop_cast(id);
         }
-        self.tell_portal(drv_portal::compositor::ToPortal::Revoke);
+        self.tell_portal(drv_cast::compositor::FromCompositor::Revoke);
     }
 
     fn cast_session_ids(&self) -> HashSet<CastSessionId> {

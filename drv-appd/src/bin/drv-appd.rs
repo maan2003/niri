@@ -1,7 +1,7 @@
 //! drv-appd's process. Its fds come from the supervisor by name: `listener` (the public
-//! socket, lookups only), `channel` (to drv-forker), `compositor`, `menu` and `bridge` (the
-//! launch channels of the three launchers; the bridge's only opens URIs). Nothing here is found;
-//! all of it was put in place before we ran.
+//! socket: lookups, and apps opening URIs), `channel` (to drv-forker), `compositor` and
+//! `shell` (the launch channels of the two launchers). Nothing here is found; all of it was
+//! put in place before we ran.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,11 +29,8 @@ fn run(args: Args) -> Result<(), String> {
     let compositor = fds
         .socket("compositor", Kind::Stream)
         .map_err(|e| e.to_string())?;
-    let menu = fds
-        .socket("menu", Kind::Stream)
-        .map_err(|e| e.to_string())?;
-    let bridge = fds
-        .socket("bridge", Kind::Stream)
+    let shell = fds
+        .socket("shell", Kind::Stream)
         .map_err(|e| e.to_string())?;
     let config = load_config(&args.config).map_err(|e| e.to_string())?;
     let base_env: Vec<(String, String)> = std::env::var("PATH")
@@ -44,8 +41,7 @@ fn run(args: Args) -> Result<(), String> {
     // The compositor's Hello on its channel (sent once its apps socket listens) starts the
     // autostart apps; they live as long as the set does.
     appd.serve_launcher("the compositor".to_owned(), compositor, true);
-    appd.serve_launcher("the menu".to_owned(), menu, false);
-    appd.serve_launcher("the bridge".to_owned(), bridge, false);
+    appd.serve_launcher("the shell".to_owned(), shell, false);
 
     // From here on: our fds and what arrives on them, new connections on the listener, and
     // threads.

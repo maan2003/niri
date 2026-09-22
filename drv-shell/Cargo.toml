@@ -1,24 +1,24 @@
 [package]
-name = "drv-portal"
+name = "drv-shell"
 version = "26.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "The person's side of the portals: the file chooser with its documents mount, and screen sharing consent."
+description = "The desktop's own surfaces: the lock screen, the app menu, the person's prompts, notifications."
 
 [features]
 default = ["service"]
 # The binary and its UI; off for crates that want only the protocols.
-service = ["dep:clap", "dep:drv-os", "dep:drv-ui", "dep:fuser", "dep:libc"]
+service = ["dep:drv-auth", "dep:drv-os", "dep:drv-ui", "dep:rustix", "dep:zeroize"]
 
 [dependencies]
-clap = { workspace = true, optional = true }
+drv-auth = { version = "26.4.0", path = "../drv-auth", optional = true }
 drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
 drv-ui = { version = "26.4.0", path = "../drv-ui", optional = true }
-fuser = { version = "0.18", default-features = false, optional = true }
-libc = { version = "0.2", optional = true }
+rustix = { version = "1.1.4", features = ["net"], optional = true }
 serde.workspace = true
+zeroize = { version = "1", optional = true }
 
 [[bin]]
-name = "drv-portal"
+name = "drv-shell"
 required-features = ["service"]

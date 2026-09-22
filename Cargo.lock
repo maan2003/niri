@@ -1008,7 +1008,7 @@ dependencies = [
  "clap",
  "drv-os",
  "drv-policy",
- "drv-portal",
+ "drv-shell",
  "rustix 1.1.4",
 ]
 
@@ -1042,18 +1042,47 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv-bridge"
+name = "drv-cast"
+version = "26.4.0"
+dependencies = [
+ "anyhow",
+ "drv-os",
+ "drv-policy",
+ "drv-shell",
+ "pipewire",
+ "rustix 1.1.4",
+ "serde",
+]
+
+[[package]]
+name = "drv-dbus-shim"
 version = "26.4.0"
 dependencies = [
  "anyhow",
  "clap",
+ "drv-cast",
+ "drv-files",
  "drv-os",
  "drv-policy",
- "drv-portal",
+ "drv-shell",
  "pipewire",
  "rustix 1.1.4",
  "serde",
  "zbus",
+]
+
+[[package]]
+name = "drv-files"
+version = "26.4.0"
+dependencies = [
+ "clap",
+ "drv-os",
+ "drv-policy",
+ "drv-ui",
+ "fuser",
+ "libc",
+ "rustix 1.1.4",
+ "serde",
 ]
 
 [[package]]
@@ -1087,25 +1116,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv-lock"
-version = "26.4.0"
-dependencies = [
- "drv-auth",
- "drv-os",
- "drv-ui",
- "zeroize",
-]
-
-[[package]]
-name = "drv-menu"
-version = "26.4.0"
-dependencies = [
- "drv-os",
- "drv-policy",
- "drv-ui",
-]
-
-[[package]]
 name = "drv-os"
 version = "26.4.0"
 dependencies = [
@@ -1125,19 +1135,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "drv-portal"
-version = "26.4.0"
-dependencies = [
- "clap",
- "drv-os",
- "drv-policy",
- "drv-ui",
- "fuser",
- "libc",
- "serde",
-]
-
-[[package]]
 name = "drv-seat"
 version = "26.4.0"
 dependencies = [
@@ -1150,6 +1147,19 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "udev",
+]
+
+[[package]]
+name = "drv-shell"
+version = "26.4.0"
+dependencies = [
+ "drv-auth",
+ "drv-os",
+ "drv-policy",
+ "drv-ui",
+ "rustix 1.1.4",
+ "serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -2567,9 +2577,9 @@ dependencies = [
  "directories",
  "drm-ffi",
  "drv-auth",
+ "drv-cast",
  "drv-os",
  "drv-policy",
- "drv-portal",
  "drv-seat",
  "fastrand",
  "futures-util",

@@ -71,6 +71,9 @@ pub struct AppConfig {
     pub grants: Vec<Grant>,
     #[serde(default)]
     pub icon: Option<String>,
+    /// May use the ssh agent; drv-agent asks on every connection.
+    #[serde(default)]
+    pub agent: bool,
     /// Extra environment for this app only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -109,6 +112,7 @@ impl AppConfig {
             globals: self.globals.clone(),
             grants: self.grants.clone(),
             icon: self.icon.clone(),
+            agent: self.agent,
         }
     }
 }
@@ -227,6 +231,21 @@ impl Appd {
         self.config.apps.iter().find(|a| a.name == name)
     }
 
+    /// Starts the manifest's handler for `uri`'s scheme, with the URI as its last argument.
+    /// `who` is for the log.
+    pub fn open_for(&self, who: &str, uri: &str) -> Result<u32, String> {
+        let scheme = rpc::uri_scheme(uri).ok_or_else(|| format!("{uri:?} is not a URI"))?;
+        let app = self
+            .config
+            .apps
+            .iter()
+            .find(|a| a.opens.contains(&scheme))
+            .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
+        let uid = self.start(app, Some(uri))?;
+        drv_os::say!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {who}", app.name);
+        Ok(uid)
+    }
+
     fn by_uid(&self, uid: u32) -> Option<&AppConfig> {
         self.config.apps.iter().find(|a| a.uid == uid)
     }
@@ -257,7 +276,7 @@ impl Appd {
 
     /// Starts `app`; with `uri`, as the handler of its scheme, which the manifest must say
     /// it is. The URI is the one argument that ever comes from outside the manifest.
-    fn start(self: &Arc<Self>, app: &AppConfig, uri: Option<&str>) -> Result<u32, String> {
+    fn start(&self, app: &AppConfig, uri: Option<&str>) -> Result<u32, String> {
         let mut argv = app
             .exec
             .clone()
@@ -345,10 +364,13 @@ impl Handler for Appd {
         ))
     }
 
-    fn open(&self, peer: u32, _uri: &str) -> Result<u32, String> {
-        Err(format!(
-            "uid {peer} asked to open a URI on the public socket; only a launch channel may"
-        ))
+    /// An app opening a URI (the shim's `OpenURI`): the manifest handler starts for it.
+    /// Anything not in the manifest is refused.
+    fn open(&self, peer: u32, uri: &str) -> Result<u32, String> {
+        let Some(app) = self.by_uid(peer) else {
+            return Err(format!("uid {peer} is not an app; it opens nothing"));
+        };
+        self.open_for(&format!("{} (uid {peer})", app.name), uri)
     }
 }
 
@@ -381,21 +403,7 @@ impl Handler for Launcher {
     }
 
     fn open(&self, _peer: u32, uri: &str) -> Result<u32, String> {
-        let scheme = rpc::uri_scheme(uri).ok_or_else(|| format!("{uri:?} is not a URI"))?;
-        let app = self
-            .appd
-            .config
-            .apps
-            .iter()
-            .find(|a| a.opens.contains(&scheme))
-            .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
-        let uid = self.appd.start(app, Some(uri))?;
-        drv_os::say!(
-            "drv-appd: {:?} (uid {uid}) opens {uri:?} for {}",
-            app.name,
-            self.who
-        );
-        Ok(uid)
+        self.appd.open_for(&self.who, uri)
     }
 
     fn hello(&self, _peer: u32) {
@@ -530,11 +538,11 @@ mod tests {
         ] {
             assert!(launcher.open(5, bad).is_err(), "{bad}");
         }
-        assert!(id
-            .open(5, "https://example.com")
-            .unwrap_err()
-            .contains("public socket"));
+        // The public socket: an app may open, a uid that is no app may not.
+        assert!(id.open(5, "https://example.com").unwrap_err().contains("not an app"));
         assert_eq!(recorder.0.lock().unwrap().len(), 1);
+        assert_eq!(id.open(100042, "https://example.com"), Ok(100042));
+        assert_eq!(recorder.0.lock().unwrap().len(), 2);
     }
 
     #[test]

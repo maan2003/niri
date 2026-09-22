@@ -914,7 +914,7 @@ pub enum Action {
     StopAllCasts {},
     /// Lock the session now.
     LockSession {},
-    /// Show the app menu (drv-menu).
+    /// Show the app menu (drv-shell).
     ShowLauncher {},
     /// Raise the default sink's volume (drv-keys).
     VolumeUp {},

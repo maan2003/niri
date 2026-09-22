@@ -99,9 +99,9 @@ in
   services.openssh.enable = true;
   # Something for the chooser to show.
   systemd.tmpfiles.rules = [
-    "d /var/lib/drv-files/notes 0700 drv-portal drv-portal -"
-    "f+ /var/lib/drv-files/hello.txt 0600 drv-portal drv-portal - hello from the persons files\\n"
-    "f+ /var/lib/drv-files/notes/todo.txt 0600 drv-portal drv-portal - build the portal\\n"
+    "d /var/lib/drv-files/notes 0700 drv-files drv-files -"
+    "f+ /var/lib/drv-files/hello.txt 0600 drv-files drv-files - hello from the persons files\\n"
+    "f+ /var/lib/drv-files/notes/todo.txt 0600 drv-files drv-files - build the portal\\n"
   ];
   services.openssh.settings.PermitRootLogin = "yes";
   users.users.root.openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP4pE2ZiZIJvxrTMzKzwfVBtUPp2Ek7MGselzb0w6wDE maan2003@devbox-01" ];
@@ -127,7 +127,7 @@ in
     screenshots = "/var/lib/drv-screenshots";
     enable = true;
     # niri's stock binds; its spawn lines name apps that do not exist here and are refused.
-    # Mod+D shows the menu (drv-menu, a supervisor service) instead of spawning fuzzel; the
+    # Mod+D shows the menu (drv-shell, a supervisor service) instead of spawning fuzzel; the
     # volume and brightness keys are drv-keys' actions instead of wpctl and brightnessctl.
     config = builtins.replaceStrings
       [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\""
@@ -143,7 +143,7 @@ in
       notify-test = {
         uid = 100007;
         bus = true;
-        exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the bridge" ];
+        exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the shim" ];
       };
       hello = {
         uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false;
@@ -175,11 +175,11 @@ in
         userns = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
-      # bridge asks drv-portal, the person picks, and the file arrives under /run/drv-doc.
+      # shim asks drv-files, the person picks, and the file arrives under /run/drv-doc.
       # Then it saves a copy the same way. Results in its home, result.txt.
       chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; state = [ "out" ]; };
       # A client of screen sharing, as a browser would use it: session, Start (the person
-      # picks a screen at drv-portal), the PipeWire remote, and what that remote can see.
+      # picks a screen at the shell), the PipeWire remote, and what that remote can see.
       # Holds the cast 20 s, then closes. Results in its home, cast.txt.
       cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; audio = true; state = [ "out" ]; };
       # Plays a sound: playback is free for an audio app.
@@ -188,7 +188,7 @@ in
         exec = [ "${pkgs.pipewire}/bin/pw-play" "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga" ];
         audio = true;
       };
-      # Records: the person is asked at drv-portal; Mod+Shift+Esc ends it.
+      # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
       open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
       # A terminal: a pty of its own.
@@ -202,7 +202,7 @@ in
     pkgs.foot
   ];
 
-  # A camera for the portal: a loopback device fed a test pattern, which WirePlumber
+  # A camera for drv-cast: a loopback device fed a test pattern, which WirePlumber
   # picks up like any v4l2 camera (the spa videotestsrc node lacks node-level formats,
   # which browsers ask for).
   # The stock kernel, from the cache: the module above needs its build tree, and a patched

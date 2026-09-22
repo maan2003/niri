@@ -11,7 +11,6 @@ mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible
 mount /run/drv rw,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
 mount /run/drv-compositor rw,nosuid,nodev,noexec tmpfs root=/drv-compositor rw,mode=755
-mount /run/drv-session rw,nosuid,nodev,noexec tmpfs root=/drv-session rw,mode=755
 mount /run/drv-wayland rw,nosuid,nodev,noexec tmpfs root=/drv-wayland rw,mode=755
 mount /run/pipewire rw,nosuid,nodev,noexec tmpfs root=/pipewire rw,mode=755
 mount /run/udev rw,nosuid,nodev,noexec tmpfs root=/udev rw,mode=755
@@ -25,6 +24,7 @@ mount /sys/kernel/debug ro,nosuid,nodev,noexec debugfs root=/ rw
 mount /sys/kernel/security ro,nosuid,nodev,noexec securityfs root=/ rw
 mount /sys/kernel/tracing ro,nosuid,nodev,noexec tracefs root=/ rw
 mount /tmp rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=910,gid=910
+mount /var/lib/drv-screenshots rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-screenshots rw
 Uid: UID UID UID UID
 Gid: UID UID UID UID
 Groups: 323 UID

@@ -1,15 +1,12 @@
 # NixOS module for the multi-UID desktop. One app list becomes the passwd entries, drv-appd's
-# manifest, the session bus policy and the units. Nothing shares a UID: the supervisor and the
-# forker are root, and drv-appd, the compositor, the bridge, the session bus and every app
-# each have their own. What a process may reach is its UID plus the groups, grants and /run
-# entries listed here; nothing else.
+# manifest and the units. Nothing shares a UID: drv-appd, the compositor, the shell, drv-files,
+# drv-cast and every app each have their own. What a process may reach is its UID plus the
+# groups, grants and /run entries listed here; nothing else.
 { niri }:
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.drv;
   json = pkgs.formats.json { };
-  bridgeSocket = "/run/drv-bridge/bridge.sock";
-  sessionBus = "unix:path=/run/drv-session/bus";
   appdSocket = "/run/drv/appd.sock";
   # Sound. Apps reach PipeWire through this socket alone (the daemon marks its clients
   # "drv-app", and WirePlumber's drv-access.lua decides what they may do), and PulseAudio
@@ -47,8 +44,8 @@ let
   # The store path a string under the store belongs to, context kept: `${pkg}/bin/x` -> pkg.
   storeRoot = p: builtins.appendContext (builtins.head (builtins.match "(/nix/store/[^/]+).*" p)) (builtins.getContext p);
   # What an app may open in the store (DESIGN-app-namespace, "Store"): the closure of its
-  # command, its /etc, the shared data profile, the graphics drivers, and the bus shim if it
-  # has one. The forker turns the list into Landlock rules.
+  # command, its /etc, the shared data profile, the graphics drivers, and the D-Bus shim if
+  # it has one. The forker turns the list into Landlock rules.
   appClosure = name: app: pkgs.closureInfo {
     rootPaths = [ (appEtc name app) appShare config.hardware.graphics.package ]
       ++ config.hardware.graphics.extraPackages
@@ -65,8 +62,8 @@ let
   } // app.links;
   # The command, as launched. In front of the app's own: the linker (its /etc from the store,
   # its state directories under $HOME/.state linked from HOME, the HOME defaults) and, for a
-  # private bus, the compat shim (the bridge on it forwards to the
-  # services' bus, which keys everything on the app's UID).
+  # private bus, the compat shim (drv-dbus-shim answers the desktop's D-Bus names by asking
+  # drv-files, drv-cast, drv-shell and drv-appd, which key everything on the app's UID).
   appExec = name: app: [ "${cfg.package}/bin/drv-init" "--etc" "${appEtc name app}" ]
       ++ lib.concatMap (s: [ "--state" s ]) app.state
       ++ lib.optionals (app.files != { }) [ "--files" "${appFiles name app}" ]
@@ -75,7 +72,7 @@ let
       "${pkgs.dbus}/bin/dbus-run-session" "--dbus-daemon=${pkgs.dbus}/bin/dbus-daemon"
       # Its configuration from the store: the app's /etc has no dbus-1.
       "--config-file=${pkgs.dbus}/share/dbus-1/session.conf" "--"
-      "${cfg.package}/bin/drv-bridge" "app" "--"
+      "${cfg.package}/bin/drv-dbus-shim" "--"
     ] ++ app.exec;
   # HOME defaults: a tree the state linker links into HOME entry by entry.
   appFiles = name: app: pkgs.runCommand "drv-files-${name}" { } (''
@@ -119,7 +116,7 @@ hosts: files${lib.optionalString app.network " dns"}
   inRange = uid: uid >= cfg.uidRange.start && uid < rangeEnd;
   appEntries = lib.mapAttrsToList (name: app: {
     inherit name;
-    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens;
+    inherit (app) uid gpu network audio jit userns globals grants autostart menu opens agent;
     links = appLinks app;
     closure = "${appClosure name app}/store-paths";
     env = lib.optionalAttrs (app.packages != [ ]) { PATH = lib.makeBinPath app.packages; }
@@ -132,37 +129,22 @@ hosts: files${lib.optionalString app.network " dns"}
   } // lib.optionalAttrs (app.icon != null) { icon = app.icon; }) cfg.apps;
   appdFile = json.generate "appd.json" {
     wayland-socket = "/run/drv-wayland/wayland";
-    env = cfg.env;
+    # The shim logs every D-Bus call it answers when asked to.
+    env = cfg.env // lib.optionalAttrs cfg.debug { DRV_SHIM_TRACE = "1"; };
     app = [
-      # Services: identified, never launched. They may ask who other UIDs are.
+      # Services: identified, never launched. They may ask who other UIDs are (each keys
+      # its app-facing socket on the peer UID).
       { name = "compositor"; uid = cfg.ids.compositor; grants = [ "lookup" ]; }
-      { name = "bridge"; uid = cfg.ids.bridge; grants = [ "lookup" ]; }
+      { name = "shell"; uid = cfg.ids.shell; grants = [ "lookup" ]; }
+      { name = "files"; uid = cfg.ids.files; grants = [ "lookup" ]; }
+      { name = "cast"; uid = cfg.ids.cast; grants = [ "lookup" ]; }
+      { name = "agent"; uid = cfg.ids.agent; grants = [ "lookup" ]; }
     ] ++ appEntries;
   };
   # What the forker binds into apps' roots (its own view has to hold them): the layout its
   # feature table names, plus the audio sockets when any app has audio.
-  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-bridge" "/run/drv-doc" "/run/drv-agent" "/run/opengl-driver" ]
+  appRun = [ "/run/drv-apps" hostViews "/run/drv" "/run/drv-wayland" "/run/drv-files" "/run/drv-cast" "/run/drv-shell" "/run/drv-doc" "/run/drv-agent" "/run/opengl-driver" ]
     ++ lib.optionals (lib.any (a: a.audio) (lib.attrValues cfg.apps)) [ "/run/drv-audio" "/run/drv-pulse" ];
-  # The services' bus: distinct UIDs, so the bus itself says who may own what: the
-  # notification daemon its name, nobody else anything.
-  sessionBusConfig = pkgs.writeText "drv-session-bus.conf" ''
-    <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
-     "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-    <busconfig>
-      <type>session</type>
-      <listen>${sessionBus}</listen>
-      <auth>EXTERNAL</auth>
-      <policy context="default">
-        <allow user="*"/>
-        <allow send_destination="*"/>
-        <allow receive_sender="*"/>
-        <deny own="*"/>
-      </policy>
-      <policy user="drv-notifier">
-        <allow own="org.freedesktop.Notifications"/>
-      </policy>
-    </busconfig>
-  '';
 in
 {
   options.services.drv = {
@@ -170,27 +152,24 @@ in
     debug = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Log every portal call apps make to the bridge.";
+      description = "Log every D-Bus call apps make to their shim.";
     };
     package = lib.mkOption {
       type = lib.types.package;
       default = niri;
-      description = "niri build with drv-supervisor, drv-appd, drv-forker, drv and drv-bridge.";
+      description = "niri build with the drv services (supervisor, appd, forker, shell, files, cast, agent, keys) and the D-Bus shim.";
     };
     ids = {
       appd = lib.mkOption { type = lib.types.int; default = 901; };
       compositor = lib.mkOption { type = lib.types.int; default = 902; };
-      bridge = lib.mkOption { type = lib.types.int; default = 903; };
-      portal = lib.mkOption { type = lib.types.int; default = 912; };
-      bus = lib.mkOption { type = lib.types.int; default = 904; };
+      cast = lib.mkOption { type = lib.types.int; default = 903; };
+      files = lib.mkOption { type = lib.types.int; default = 912; };
       gpu = lib.mkOption { type = lib.types.int; default = 905; };
       auth = lib.mkOption { type = lib.types.int; default = 906; };
       seat = lib.mkOption { type = lib.types.int; default = 907; };
-      lock = lib.mkOption { type = lib.types.int; default = 908; };
+      shell = lib.mkOption { type = lib.types.int; default = 908; };
       forker = lib.mkOption { type = lib.types.int; default = 909; };
       supervisor = lib.mkOption { type = lib.types.int; default = 910; };
-      menu = lib.mkOption { type = lib.types.int; default = 911; };
-      notifier = lib.mkOption { type = lib.types.int; default = 913; };
       agent = lib.mkOption { type = lib.types.int; default = 914; };
       keys = lib.mkOption { type = lib.types.int; default = 915; };
     };
@@ -203,12 +182,7 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       example = "/var/lib/drv-screenshots";
-      description = "A directory of the compositor's own to write screenshots to (point the config's screenshot-path into it). Not under `files`: that is the portal's, 0700. Screenshots also land on the clipboard.";
-    };
-    notifier = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [ "${pkgs.mako}/bin/mako" ];
-      description = "The notification daemon's command line: a member of the set, the one owner of org.freedesktop.Notifications on the services' bus, its Wayland connection on fd 3.";
+      description = "A directory of the compositor's own to write screenshots to (point the config's screenshot-path into it). Not under `files`: that is drv-files', 0700. Screenshots also land on the clipboard.";
     };
     vt = lib.mkOption {
       type = lib.types.int;
@@ -238,12 +212,11 @@ in
     files = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/drv-files";
-      description = "The person's files: owned by drv-portal, shown by its file chooser, handed to apps one at a time through /run/drv-doc.";
+      description = "The person's files: owned by drv-files, shown by its file chooser, handed to apps one at a time through /run/drv-doc.";
     };
     env = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = {
-        DRV_BRIDGE_SOCKET = bridgeSocket;
         DRV_APPD_SOCKET = appdSocket;
         XDG_SESSION_TYPE = "wayland";
         XDG_DATA_DIRS = "${appShare}/share";
@@ -282,7 +255,7 @@ in
           bus = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "Give the app a private session bus with the bridge shim on it (notifications).";
+            description = "Give the app a private session bus with drv-dbus-shim on it (portals, notifications).";
           };
           audio = lib.mkOption {
             type = lib.types.bool;
@@ -336,7 +309,7 @@ in
           agent = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "May use the ssh agent (drv-agent, a member of the set, which holds the keys): SSH_AUTH_SOCK points at its door and the door knows this UID. The authenticator's PIN and touch are asked at drv-portal, never in the app.";
+            description = "May use the ssh agent (drv-agent, a member of the set, which holds the keys): SSH_AUTH_SOCK points at its door and the door asks drv-appd about this UID. The authenticator's PIN and touch are asked at the shell, never in the app.";
           };
           icon = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
           autostart = lib.mkOption { type = lib.types.bool; default = false; };
@@ -409,29 +382,25 @@ in
         # Devices come from drv-seatd; PipeWire is for screencasts.
         extraGroups = [ "pipewire" ];
       };
-      # PipeWire is for the screencast remotes it hands to apps.
-      drv-bridge = { uid = cfg.ids.bridge; group = "drv-bridge"; isSystemUser = true; extraGroups = [ "pipewire" ]; };
-      drv-bus = { uid = cfg.ids.bus; group = "drv-bus"; isSystemUser = true; };
+      # Screencasts, cameras and microphones: PipeWire is for the grants and the remotes it
+      # hands to apps.
+      drv-cast = { uid = cfg.ids.cast; group = "drv-cast"; isSystemUser = true; extraGroups = [ "pipewire" ]; };
       # The GPU process. Mesa opens render nodes itself.
       drv-gpu = { uid = cfg.ids.gpu; group = "drv-gpu"; isSystemUser = true; extraGroups = [ "render" ]; };
       drv-auth = { uid = cfg.ids.auth; group = "drv-auth"; isSystemUser = true; };
       # The seat daemon: cards, evdev nodes and the VT are group-owned devices; the VT ioctls
       # come from CAP_SYS_TTY_CONFIG, which the supervisor leaves it.
       drv-seat = { uid = cfg.ids.seat; group = "drv-seat"; isSystemUser = true; extraGroups = [ "video" "input" "tty" ]; };
-      # The lock screen: no devices, no sockets; everything it talks to comes down its wire.
-      drv-lock = { uid = cfg.ids.lock; group = "drv-lock"; isSystemUser = true; };
+      # The shell: the lock screen, the app menu, the person's prompts and the notifications.
+      # No devices; everything but the notification socket comes down its wires.
+      drv-shell = { uid = cfg.ids.shell; group = "drv-shell"; isSystemUser = true; };
       # The forker: not root. The supervisor leaves it setuid, setgid, setpcap and sys_admin,
       # and hands it the supervisor's cgroup subtree.
       drv-forker = { uid = cfg.ids.forker; group = "drv-forker"; isSystemUser = true; };
       # The supervisor: the capabilities its unit grants it (below), nothing else.
       drv-supervisor = { uid = cfg.ids.supervisor; group = "drv-supervisor"; isSystemUser = true; };
-      # The app menu: a launcher because the supervisor handed it a channel; its Wayland
-      # connection is a supervisor fd too.
-      drv-menu = { uid = cfg.ids.menu; group = "drv-menu"; isSystemUser = true; };
-      # The portal: owns the person's files, shows the chooser, serves the documents mount.
-      drv-portal = { uid = cfg.ids.portal; group = "drv-portal"; isSystemUser = true; };
-      # The notification daemon: sees every notification, so a member of the set, not an app.
-      drv-notifier = { uid = cfg.ids.notifier; group = "drv-notifier"; isSystemUser = true; };
+      # drv-files: owns the person's files, shows the chooser, serves the documents mount.
+      drv-files = { uid = cfg.ids.files; group = "drv-files"; isSystemUser = true; };
       # The ssh agent: holds the keys, opens the authenticators (udev makes their hidraw nodes
       # its group's), answers the UIDs with the grant.
       drv-agent = { uid = cfg.ids.agent; group = "drv-agent"; isSystemUser = true; };
@@ -451,17 +420,14 @@ in
     users.groups = lib.mapAttrs' (name: app: lib.nameValuePair "app-${name}" { gid = app.uid; }) cfg.apps // {
       drv-appd.gid = cfg.ids.appd;
       drv-compositor.gid = cfg.ids.compositor;
-      drv-bridge.gid = cfg.ids.bridge;
-      drv-bus.gid = cfg.ids.bus;
+      drv-cast.gid = cfg.ids.cast;
       drv-gpu.gid = cfg.ids.gpu;
       drv-auth.gid = cfg.ids.auth;
       drv-seat.gid = cfg.ids.seat;
-      drv-lock.gid = cfg.ids.lock;
+      drv-shell.gid = cfg.ids.shell;
       drv-forker.gid = cfg.ids.forker;
       drv-supervisor.gid = cfg.ids.supervisor;
-      drv-menu.gid = cfg.ids.menu;
-      drv-portal.gid = cfg.ids.portal;
-      drv-notifier.gid = cfg.ids.notifier;
+      drv-files.gid = cfg.ids.files;
       drv-agent.gid = cfg.ids.agent;
       drv-keys.gid = cfg.ids.keys;
       render = { };
@@ -480,7 +446,7 @@ in
       extraConfig.pipewire."50-drv" = {
         "module.protocol-native.args".sockets = [
           { name = "pipewire-0"; }
-          # The bridge's line for grants and cameras.
+          # drv-cast's line for grants and cameras.
           { name = "pipewire-0-manager"; mode = "0660"; }
           { name = appsSocket; mode = "0666"; }
         ];
@@ -497,14 +463,14 @@ in
         ];
         "wireplumber.profiles".main."script.drv-access" = "required";
       };
-      # The bridge hands apps remotes cut down to a few nodes (a cast, the cameras).
+      # drv-cast hands apps remotes cut down to a few nodes (a cast, the cameras).
       # WirePlumber grants every new client everything a moment after it connects, which
-      # would undo that cut, so those clients get nothing from it. The bridge's own
+      # would undo that cut, so those clients get nothing from it. drv-cast's own
       # connection uses the manager socket and is left alone.
-      wireplumber.extraConfig."50-drv-bridge" = {
+      wireplumber.extraConfig."50-drv-cast" = {
         "access.rules" = [
           {
-            matches = [ { "pipewire.sec.uid" = toString cfg.ids.bridge; "pipewire.sec.socket" = "pipewire-0"; } ];
+            matches = [ { "pipewire.sec.uid" = toString cfg.ids.cast; "pipewire.sec.socket" = "pipewire-0"; } ];
             actions.update-props.default_permissions = "-";
           }
         ];
@@ -523,20 +489,8 @@ in
     # Low priority: a stock niri may be installed next to it for a session of the host's own.
     environment.systemPackages = [ (lib.lowPrio cfg.package) ];
 
-    # The services' bus: the compositor, the bridge and the notification daemon, each its own
-    # UID. Sandboxed apps never see it.
-    systemd.services.drv-session-bus = {
-      wantedBy = [ "multi-user.target" ];
-      serviceConfig = {
-        User = "drv-bus";
-        ExecStart = "${pkgs.dbus}/bin/dbus-daemon --nofork --nopidfile --config-file=${sessionBusConfig}";
-        RuntimeDirectory = "drv-session";
-        RuntimeDirectoryMode = "0755";
-      };
-    };
-
-    # Starts the trusted set (drv-seatd, drv-authd, the compositor with its GPU process and
-    # locker, drv-appd with its forker) as their own users, wires them with socketpairs and
+    # Starts the trusted set (drv-seatd, drv-authd, the compositor with its GPU process, the
+    # shell, drv-files, drv-cast, drv-agent, drv-keys, drv-appd with its forker) as their own users, wires them with socketpairs and
     # restarts what dies; their logs land here. The compositor's environment is exactly what
     # is listed. Not root: it holds the union of what its children keep plus what switching
     # them takes, and nothing outside that bounding set.
@@ -613,8 +567,8 @@ in
 
     systemd.services.drv-supervisor = {
       wantedBy = [ "multi-user.target" ];
-      after = [ "drv-session-bus.service" "drv-host-views.service" ];
-      requires = [ "drv-session-bus.service" "drv-host-views.service" ];
+      after = [ "drv-host-views.service" ];
+      requires = [ "drv-host-views.service" ];
       serviceConfig = {
         User = "drv-supervisor";
         # setuid/setgid/setpcap: become each child's user with its own bounding set; chown:
@@ -647,12 +601,10 @@ in
           ++ map (p: "--forker-expose ${p}") (appRun ++ lib.optional resolved "/run/systemd/resolve")
           ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
           # udev: libinput initialises the evdev devices seatd hands over from udev's database.
-          ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/drv-session" "/run/pipewire" ]
+          ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/pipewire" ]
           # Mesa's drivers live behind this symlink.
           ++ map (p: "--gpu-expose ${p}") [ "/run/opengl-driver" ]
           ++ [
-          # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
-          # set-pin`) and pushes the unlock straight to the compositor; the lock app only asks.
           # The only process on the seat: opens DRM and evdev nodes through libseat's builtin
           # backend and hands the fds to the compositor. Its own user with the device groups
           # and CAP_SYS_TTY_CONFIG for the VT.
@@ -662,6 +614,8 @@ in
           "--seatd-env LIBSEAT_BACKEND=builtin"
           "--seatd-env RUST_BACKTRACE=1"
           "--seatd-env RUST_LOG=niri=debug"
+          # Verifies the lock PIN (argon2id in /var/lib/drv-auth, enrol with `drv-authd
+          # set-pin`) and pushes the unlock straight to the compositor; the shell only asks.
           "--authd-user drv-auth"
           "--authd-exec '${cfg.package}/bin/drv-authd serve --state-dir /var/lib/drv-auth --idle-timeout ${toString cfg.idleTimeout}'"
           "--authd-dir /var/lib/drv-auth:0700"
@@ -681,62 +635,59 @@ in
           # has handed it the devices. One group with the compositor: either dying restarts both.
           "--gpu-user drv-gpu"
           "--gpu-exec '${cfg.package}/bin/niri gpu-process --mode drm'"
-          # The lock screen, in the compositor's group: draws and takes the PIN, nothing more.
-          # Its Wayland connection and its drv-authd connection come down its wire from the
-          # supervisor; it has no socket to find and none finds it.
-          "--locker-user drv-lock"
-          "--locker-exec '${cfg.package}/bin/drv-lock'"
-          "--locker-env RUST_BACKTRACE=1"
-          # The app menu: draws the launchable names and launches the pick down its channel
-          # to drv-appd when the compositor's `show-launcher` bind pokes it. Its Wayland
-          # connection is a supervisor fd; it needs nothing under /run.
-          "--menu-user drv-menu"
-          "--menu-exec '${cfg.package}/bin/drv-menu'"
-          "--menu-env RUST_BACKTRACE=1"
-          # The file chooser and the documents mount (drv-portal): the supervisor mounts a
-          # FUSE filesystem at /run/drv-doc and hands the portal its serving end; apps see
-          # the files they were given under it, as their own UID only.
-          "--portal-user drv-portal"
-          "--portal-exec '${cfg.package}/bin/drv-portal --files ${cfg.files} --docs /run/drv-doc'"
-          "--portal-env RUST_BACKTRACE=1"
-          "--portal-dir ${cfg.files}:0700"
+          # The shell: the lock screen (its PIN goes down its wire to drv-authd; the lock
+          # itself is the compositor's), the app menu (launches down its channel to drv-appd
+          # when the compositor's `show-launcher` bind pokes it), the person's prompts for
+          # drv-cast and drv-agent, and the notifications (its socket, keyed on the peer
+          # UID). Its Wayland connection is a supervisor fd; drv-appd's socket is for the
+          # notifiers' names.
+          "--shell-user drv-shell"
+          "--shell-exec '${cfg.package}/bin/drv-shell'"
+          "--shell-env DRV_APPD_SOCKET=${appdSocket}"
+          "--shell-env RUST_BACKTRACE=1"
+          "--shell-expose /run/drv"
+          "--notify-socket /run/drv-shell/notify.sock"
+          # The file chooser and the documents mount (drv-files): the supervisor mounts a
+          # FUSE filesystem at /run/drv-doc and hands drv-files its serving end; apps see
+          # the files they were given under it, as their own UID only. Its socket is keyed
+          # on the peer UID, named through drv-appd.
+          "--files-user drv-files"
+          "--files-exec '${cfg.package}/bin/drv-files --files ${cfg.files} --docs /run/drv-doc'"
+          "--files-env DRV_APPD_SOCKET=${appdSocket}"
+          "--files-env RUST_BACKTRACE=1"
+          "--files-dir ${cfg.files}:0700"
+          "--files-expose /run/drv"
+          "--files-socket /run/drv-files/files.sock"
           "--docs /run/drv-doc"
-          # The notification daemon: on the services' bus, where it alone owns
-          # org.freedesktop.Notifications; the bridge forwards apps' notifications to it under
-          # their manifest names. Its Wayland connection is the supervisor's fd 3.
-          "--notifier-user drv-notifier"
-          "--notifier-exec '${lib.concatStringsSep " " cfg.notifier}'"
-          "--notifier-env WAYLAND_SOCKET=3"
-          "--notifier-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
-          "--notifier-expose /run/drv-session"
-          # The ssh agent: OpenSSH's, behind a door that admits the UIDs with the `agent`
-          # grant (named, for the portal's prompts). Its socket directory is a tmpfiles rule;
-          # udev's database is for libfido2 to find the authenticators.
+          # Screencasts, cameras and microphones (drv-cast): asks the person at the shell,
+          # starts casts down its link to the compositor, grants and revokes devices through
+          # WirePlumber, hands apps PipeWire remotes that see one node. Its socket is keyed
+          # on the peer UID, named through drv-appd.
+          "--cast-user drv-cast"
+          "--cast-exec '${cfg.package}/bin/drv-cast'"
+          "--cast-env DRV_APPD_SOCKET=${appdSocket}"
+          "--cast-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
+          "--cast-env RUST_BACKTRACE=1"
+          "--cast-expose /run/drv"
+          "--cast-expose /run/pipewire"
+          "--cast-socket /run/drv-cast/cast.sock"
+          # The ssh agent: OpenSSH's, behind a door that admits the UIDs whose manifest record
+          # has `agent` (asked of drv-appd, which also names them for the shell's prompts).
+          # Its socket directory is a tmpfiles rule; udev's database is for libfido2 to find
+          # the authenticators.
           "--agent-user drv-agent"
-          "--agent-exec '${cfg.package}/bin/drv-agent serve --listen ${agentSocket} --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add${
-            lib.concatStrings (lib.mapAttrsToList (n: a: lib.optionalString a.agent " --allow ${n}=${toString a.uid}") cfg.apps)}'"
+          "--agent-exec '${cfg.package}/bin/drv-agent serve --listen ${agentSocket} --ssh-agent ${pkgs.openssh}/bin/ssh-agent --ssh-add ${pkgs.openssh}/bin/ssh-add'"
+          "--agent-env DRV_APPD_SOCKET=${appdSocket}"
           "--agent-dir /run/drv-agent:0711"
           "--agent-expose /run/udev"
+          "--agent-expose /run/drv"
           # The media keys, on the compositor's word: the volume through PipeWire (group
           # pipewire), the backlight through sysfs (group video, its /sys writable).
           "--keys-user drv-keys"
           "--keys-exec '${cfg.package}/bin/drv-keys --wpctl ${pkgs.wireplumber}/bin/wpctl'"
           "--keys-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
           "--keys-expose /run/pipewire"
-          # The bridge: the apps' desktop services, keyed on the peer UID. Notifications go
-          # to the services' bus; the file chooser and the screencast go down its supervisor
-          # link to drv-portal; settings it answers itself. PipeWire is for the screencast
-          # remotes: a connection per share that sees the one node.
-          "--bridge-user drv-bridge"
-          "--bridge-exec '${cfg.package}/bin/drv-bridge serve'"
-          "--bridge-socket ${bridgeSocket}"
-          "--bridge-env DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
-          "--bridge-env DRV_APPD_SOCKET=${appdSocket}"
-          "--bridge-env PIPEWIRE_RUNTIME_DIR=/run/pipewire"
-          "--bridge-env RUST_BACKTRACE=1"
-        ] ++ lib.optionals cfg.debug [
-          "--bridge-env DRV_BRIDGE_TRACE=1"
-        ] ++ map (p: "--bridge-expose ${p}") [ "/run/drv" "/run/drv-session" "/run/pipewire" ]
+        ]
           ++ map (e: "--gpu-env ${e}") [
           # No home directory after the seal, so no shader cache on disk.
           "MESA_SHADER_CACHE_DISABLE=true"
@@ -745,7 +696,6 @@ in
           "RUST_LOG=niri=debug"
         ] ++ lib.mapAttrsToList (n: v: "--gpu-env ${n}=${v}") cfg.gpuEnv
           ++ map (e: "--compositor-env ${e}") [
-          "DBUS_SESSION_BUS_ADDRESS=${sessionBus}"
           # Screencasts go to the system PipeWire, like everyone's audio.
           "PIPEWIRE_RUNTIME_DIR=/run/pipewire"
           "DRV_APPD_SOCKET=${appdSocket}"
@@ -757,9 +707,9 @@ in
         # Ours: the public sockets and the documents mount. Every directory a member owns is
         # a tmpfiles rule below (the supervisor checks owner and mode and makes nothing):
         # RuntimeDirectory= and StateDirectory= would chown them to us on every start.
-        RuntimeDirectory = [ "drv" "drv-bridge" "drv-doc" ];
+        RuntimeDirectory = [ "drv" "drv-files" "drv-cast" "drv-shell" "drv-doc" ];
         RuntimeDirectoryMode = "0755";
-        # The documents mount (FUSE, served by drv-portal) outlives the set when the unit
+        # The documents mount (FUSE, served by drv-files) outlives the set when the unit
         # stops: a dead mount systemd can neither remove nor set up again. As root (the `+`).
         ExecStopPost = [ "+-${pkgs.util-linux}/bin/umount --lazy --quiet /run/drv-doc" ];
         # Our cgroup subtree becomes ours (then the forker's): one cgroup per app under it.
@@ -777,7 +727,7 @@ in
       "d /run/drv-audio 0755 pipewire pipewire -"
       "d /var/lib/drv-apps 0711 drv-forker drv-forker -"
       "d /var/lib/drv-auth 0700 drv-auth drv-auth -"
-      "d ${cfg.files} 0700 drv-portal drv-portal -"
+      "d ${cfg.files} 0700 drv-files drv-files -"
       "d /run/drv-agent 0711 drv-agent drv-agent -"
     ] ++ lib.optional (cfg.screenshots != null) "d ${cfg.screenshots} 0755 drv-compositor drv-compositor -"
     ++ lib.concatMap (app: let u = toString app.uid; in [

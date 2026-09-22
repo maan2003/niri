@@ -18,7 +18,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub use client::PolicyClient;
+pub mod door;
 use serde::{Deserialize, Serialize};
+
+/// `s` cut to `max` bytes on a character boundary: text from an app, before anyone shows it.
+pub fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Optional globals the compositor may hide from a client. Anything not listed here is always
 /// advertised.
@@ -101,6 +114,9 @@ pub struct AppPolicy {
     /// Icon name, for the same places as `name`.
     #[serde(default)]
     pub icon: Option<String>,
+    /// May use the ssh agent (drv-agent checks it on every connection).
+    #[serde(default)]
+    pub agent: bool,
 }
 
 impl AppPolicy {
@@ -112,6 +128,7 @@ impl AppPolicy {
             globals: Vec::new(),
             grants: Vec::new(),
             icon: None,
+            agent: false,
         }
     }
 
@@ -123,6 +140,7 @@ impl AppPolicy {
             globals: Global::ALL.to_vec(),
             grants: vec![Grant::Lookup],
             icon: None,
+            agent: true,
         }
     }
 

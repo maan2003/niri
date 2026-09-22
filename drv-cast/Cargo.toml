@@ -1,0 +1,24 @@
+[package]
+name = "drv-cast"
+version = "26.4.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Screen sharing, cameras and microphones: consent at the shell, the compositor's streams, PipeWire connections cut down to what was allowed."
+
+[features]
+default = ["service"]
+# The binary; off for crates that want only the wires (the compositor, the shim).
+service = ["dep:anyhow", "dep:drv-os", "dep:drv-shell", "pipewire", "dep:rustix"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
+drv-policy = { version = "26.4.0", path = "../drv-policy" }
+drv-shell = { version = "26.4.0", path = "../drv-shell", default-features = false, optional = true }
+pipewire = { version = "0.10", features = ["v0_3_33"], optional = true }
+rustix = { version = "1.1.4", features = ["net", "process", "std"], optional = true }
+serde.workspace = true
+
+[[bin]]
+name = "drv-cast"
+required-features = ["service"]

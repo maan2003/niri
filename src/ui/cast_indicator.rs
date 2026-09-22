@@ -1,7 +1,7 @@
 //! "Screen is being shared" / "Microphone: app" / "Camera: app" indicator.
 //!
 //! The compositor draws it above everything on every output while a screencast session is
-//! live or an app holds the microphone or the camera (drv-portal says which), and never into
+//! live or an app holds the microphone or the camera (drv-cast says which), and never into
 //! the cast itself. Apps cannot draw or cover it, so the human at the screen always knows,
 //! and sees the key that ends all of it.
 
@@ -34,7 +34,7 @@ const BORDER: i32 = 3;
 pub struct CastIndicator {
     /// Live screencast sessions; shown while there are any.
     sessions: usize,
-    /// Apps holding the microphone, by name; drv-portal's word.
+    /// Apps holding the microphone, by name; drv-cast's word.
     mic: Vec<String>,
     /// Apps holding the camera, by name.
     camera: Vec<String>,

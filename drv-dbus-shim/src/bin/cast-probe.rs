@@ -1,5 +1,5 @@
 //! Exercises screen sharing from inside an app sandbox, as a browser would: creates a
-//! portal session on its private bus, asks to start (the person consents at drv-portal),
+//! portal session on its private bus, asks to start (the person consents at the shell),
 //! opens the PipeWire remote and lists what that connection can see, which should be the
 //! core and the one node. Then holds the cast for a while, or until the desktop ends it
 //! (Session.Closed), and closes the session. Results in `$HOME/cast.txt` as they come.
@@ -10,7 +10,7 @@ use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use drv_bridge::{sender_component, PORTAL_NAME, PORTAL_PATH};
+use drv_dbus_shim::{sender_component, PORTAL_NAME, PORTAL_PATH};
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 

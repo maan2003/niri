@@ -238,12 +238,12 @@ pub struct Niri {
     /// Our launch channel to drv-appd, from the supervisor's wire (`Attach::Appd`). The public
     /// socket launches nothing; without this, spawn binds do nothing.
     pub launcher: Option<PolicyClient>,
-    /// The poke line to drv-menu, from the supervisor: `show-launcher` writes a byte to it.
+    /// The poke line to drv-shell, from the supervisor: `show-launcher` writes a byte to it.
     pub menu: Option<std::os::unix::net::UnixStream>,
     /// The key line to drv-keys, from the supervisor: the volume and brightness binds write
     /// a line each to it. Volume and backlight are devices; the compositor has none.
     pub keys: Option<std::os::unix::net::UnixStream>,
-    /// The cast line to drv-portal, from the supervisor (`drv_portal::compositor`).
+    /// The cast line to drv-cast, from the supervisor (`drv_cast::compositor`).
     pub portal: Option<OwnedFd>,
     pub portal_link: Option<RegistrationToken>,
 
@@ -3134,17 +3134,17 @@ impl Niri {
         }
     }
 
-    /// Asks drv-menu, over the line the supervisor linked, to show the app menu.
+    /// Asks drv-shell, over the line the supervisor linked, to show the app menu.
     pub fn show_launcher(&mut self) {
         let Some(menu) = self.menu.as_mut() else {
-            warn!("cannot show the menu: no line to drv-menu from the supervisor");
+            warn!("cannot show the menu: no line to drv-shell from the supervisor");
             return;
         };
         match std::io::Write::write(menu, b"\n") {
             Ok(_) => (),
             // A backlog means the menu is busy; one more poke would not help.
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
-            Err(err) => warn!("the line to drv-menu: {err}"),
+            Err(err) => warn!("the poke line to drv-shell: {err}"),
         }
     }
 
@@ -6834,7 +6834,6 @@ impl Niri {
         use crate::wire::Peer;
         match peer {
             Peer::Auth => self.install_auth(sock),
-            Peer::Locker => self.insert_locker(sock),
             Peer::Appd => match PolicyClient::from_stream(sock.into()) {
                 Ok(client) => {
                     info!("launch channel to drv-appd attached");
@@ -6842,14 +6841,13 @@ impl Niri {
                 }
                 Err(err) => warn!("the launch channel from the supervisor is broken: {err}"),
             },
-            Peer::MenuClient => self.insert_layer_client(sock, "menu"),
-            Peer::PortalClient => self.insert_layer_client(sock, "portal"),
-            Peer::NotifierClient => self.insert_layer_client(sock, "notifier"),
-            Peer::Portal => self.install_portal(sock),
+            Peer::ShellClient => self.insert_shell(sock),
+            Peer::FilesClient => self.insert_layer_client(sock, "files"),
+            Peer::Cast => self.install_portal(sock),
             Peer::Menu => {
                 let sock = std::os::unix::net::UnixStream::from(sock);
                 if let Err(err) = sock.set_nonblocking(true) {
-                    warn!("the line to drv-menu: {err}");
+                    warn!("the poke line to drv-shell: {err}");
                 }
                 info!("menu attached");
                 self.menu = Some(sock);
@@ -6898,20 +6896,20 @@ impl Niri {
         info!("attached to drv-authd");
     }
 
-    /// drv-portal's cast line: requests come in here, answers and cast events go out on a
+    /// drv-cast's line: requests come in here, answers and cast events go out on a
     /// dup we keep.
     fn install_portal(&mut self, sock: OwnedFd) {
         if let Some(token) = self.portal_link.take() {
             self.event_loop.remove(token);
         }
         if let Err(err) = rustix::io::ioctl_fionbio(&sock, true) {
-            warn!("drv-portal socket nonblocking: {err}");
+            warn!("drv-cast socket nonblocking: {err}");
             return;
         }
         let out = match sock.try_clone() {
             Ok(out) => out,
             Err(err) => {
-                warn!("drv-portal socket dup: {err}");
+                warn!("drv-cast socket dup: {err}");
                 return;
             }
         };
@@ -6919,14 +6917,14 @@ impl Niri {
         let token = self
             .event_loop
             .insert_source(source, |_, sock, state| {
-                match drv_policy::seq::recv::<drv_portal::compositor::ToCompositor>(&*sock) {
+                match drv_policy::seq::recv::<drv_cast::compositor::ToCompositor>(&*sock) {
                     Ok((msg, _)) => {
                         #[cfg(feature = "xdp-gnome-screencast")]
                         state.on_portal_msg(msg);
                         #[cfg(not(feature = "xdp-gnome-screencast"))]
                         {
                             let _ = state;
-                            warn!("built without screencasting; ignoring drv-portal's {msg:?}");
+                            warn!("built without screencasting; ignoring drv-cast's {msg:?}");
                         }
                         Ok(PostAction::Continue)
                     }
@@ -6934,7 +6932,7 @@ impl Niri {
                         Ok(PostAction::Continue)
                     }
                     Err(err) => {
-                        warn!("drv-portal connection lost: {err}");
+                        warn!("drv-cast connection lost: {err}");
                         state.niri.portal = None;
                         state.niri.portal_link = None;
                         Ok(PostAction::Remove)
@@ -6944,12 +6942,13 @@ impl Niri {
             .unwrap();
         self.portal = Some(out);
         self.portal_link = Some(token);
-        info!("attached to drv-portal");
+        info!("attached to drv-cast");
     }
 
-    /// The supervisor handed us the locker's Wayland connection. No lookup: it is the locker
-    /// because it came down the wire, and it gets exactly the session-lock global.
-    fn insert_locker(&mut self, sock: OwnedFd) {
+    /// The supervisor handed us drv-shell's Wayland connection. No lookup: it is the shell
+    /// because it came down the wire. It gets session-lock (the lock screen) and layer-shell
+    /// (the menu, the prompts, the notifications) and nothing else.
+    fn insert_shell(&mut self, sock: OwnedFd) {
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
             compositor_state: Default::default(),
@@ -6958,23 +6957,22 @@ impl Niri {
             restricted: false,
             credentials_unknown: false,
             policy: Arc::new(AppPolicy {
-                name: "locker".to_owned(),
+                name: "shell".to_owned(),
                 gpu: false,
-                globals: vec![PolicyGlobal::SessionLock],
+                globals: vec![PolicyGlobal::SessionLock, PolicyGlobal::LayerShell],
                 grants: Vec::new(),
                 icon: None,
+                agent: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
-            Ok(_) => info!("locker attached"),
-            Err(err) => warn!("error inserting the locker: {err}"),
+            Ok(_) => info!("shell attached"),
+            Err(err) => warn!("error inserting the shell: {err}"),
         }
     }
 
-    /// drv-menu's Wayland connection, from the supervisor: a layer-shell client and nothing
-    /// else, no lookup.
-    /// A supervisor service that draws layer-shell surfaces (the menu, the portal's dialogs):
-    /// its connection came down our wire, its policy is this and nothing in the manifest.
+    /// A supervisor service that draws layer-shell surfaces (drv-files' chooser): its
+    /// connection came down our wire, its policy is this and nothing in the manifest.
     fn insert_layer_client(&mut self, sock: OwnedFd, name: &str) {
         let config = self.config.borrow();
         let data = Arc::new(ClientState {
@@ -6989,6 +6987,7 @@ impl Niri {
                 globals: vec![PolicyGlobal::LayerShell],
                 grants: Vec::new(),
                 icon: None,
+                agent: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {

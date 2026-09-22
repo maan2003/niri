@@ -105,43 +105,22 @@ struct Args {
     /// `NAME=VALUE` in the GPU process's environment. Repeatable; it gets nothing else.
     #[arg(long = "gpu-env")]
     gpu_env: Vec<String>,
-    /// System user the locker runs as.
+    /// System user the shell (lock screen, menu, prompts, notifications) runs as.
     #[arg(long)]
-    locker_user: String,
-    /// The locker's command line, whitespace-separated.
+    shell_user: String,
+    /// The shell's command line, whitespace-separated (`drv-shell`).
     #[arg(long)]
-    locker_exec: String,
-    /// An entry under `/run` the locker sees (its `/run` holds nothing else). Repeatable.
-    #[arg(long = "locker-expose")]
-    locker_expose: Vec<PathBuf>,
-    /// `NAME=VALUE` in the locker's environment. Repeatable; it gets nothing else.
-    #[arg(long = "locker-env")]
-    locker_env: Vec<String>,
-    /// System user the menu runs as.
-    #[arg(long)]
-    menu_user: String,
-    /// The menu's command line, whitespace-separated (`drv-menu <program> --dmenu`).
-    #[arg(long)]
-    menu_exec: String,
-    /// An entry under `/run` the menu sees (its `/run` holds nothing else). Repeatable.
-    #[arg(long = "menu-expose")]
-    menu_expose: Vec<PathBuf>,
-    /// `NAME=VALUE` in the menu's environment. Repeatable; it gets nothing else.
-    #[arg(long = "menu-env")]
-    menu_env: Vec<String>,
-    /// System user the notification daemon runs as.
-    #[arg(long)]
-    notifier_user: String,
-    /// The notification daemon's command line, whitespace-separated (`mako`). Its Wayland
-    /// connection is its only fd, so fd 3: `WAYLAND_SOCKET=3` in its environment reaches it.
-    #[arg(long)]
-    notifier_exec: String,
-    /// An entry under `/run` the notification daemon sees. Repeatable.
-    #[arg(long = "notifier-expose")]
-    notifier_expose: Vec<PathBuf>,
-    /// `NAME=VALUE` in the notification daemon's environment. Repeatable; it gets nothing else.
-    #[arg(long = "notifier-env")]
-    notifier_env: Vec<String>,
+    shell_exec: String,
+    /// An entry under `/run` the shell sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "shell-expose")]
+    shell_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the shell's environment. Repeatable; it gets nothing else.
+    #[arg(long = "shell-env")]
+    shell_env: Vec<String>,
+    /// The shell's notification socket, world-connectable: every connection is keyed on the
+    /// peer UID.
+    #[arg(long, default_value = "/run/drv-shell/notify.sock")]
+    notify_socket: PathBuf,
     /// System user the ssh agent runs as.
     #[arg(long)]
     agent_user: String,
@@ -170,40 +149,43 @@ struct Args {
     /// `NAME=VALUE` in the media keys service's environment. Repeatable; it gets nothing else.
     #[arg(long = "keys-env")]
     keys_env: Vec<String>,
-    /// System user the portal (file chooser and documents mount) runs as.
+    /// System user drv-files (file chooser and documents mount) runs as.
     #[arg(long)]
-    portal_user: String,
-    /// The portal's command line, whitespace-separated (`drv-portal --files DIR`).
+    files_user: String,
+    /// drv-files' command line, whitespace-separated (`drv-files --files DIR`).
     #[arg(long)]
-    portal_exec: String,
-    /// An entry under `/run` the portal sees (its `/run` holds nothing else). Repeatable.
-    #[arg(long = "portal-expose")]
-    portal_expose: Vec<PathBuf>,
-    /// `NAME=VALUE` in the portal's environment. Repeatable; it gets nothing else.
-    #[arg(long = "portal-env")]
-    portal_env: Vec<String>,
-    /// `PATH:MODE` (octal): a directory the portal owns (the person's files), created before
+    files_exec: String,
+    /// An entry under `/run` drv-files sees (its `/run` holds nothing else). Repeatable.
+    #[arg(long = "files-expose")]
+    files_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in drv-files' environment. Repeatable; it gets nothing else.
+    #[arg(long = "files-env")]
+    files_env: Vec<String>,
+    /// `PATH:MODE` (octal): a directory drv-files owns (the person's files), created before
     /// it starts and in its root.
-    #[arg(long = "portal-dir")]
-    portal_dirs: Vec<String>,
-    /// Where the documents mount goes: the portal serves it, apps see their files under it.
+    #[arg(long = "files-dir")]
+    files_dirs: Vec<String>,
+    /// Where the documents mount goes: drv-files serves it, apps see their files under it.
     #[arg(long, default_value = "/run/drv-doc")]
     docs: PathBuf,
-    /// System user the bridge (desktop services for apps) runs as.
+    /// drv-files' socket, world-connectable: every connection is keyed on the peer UID.
+    #[arg(long, default_value = "/run/drv-files/files.sock")]
+    files_socket: PathBuf,
+    /// System user drv-cast (screencasts, cameras, microphones) runs as.
     #[arg(long)]
-    bridge_user: String,
-    /// The bridge's command line, whitespace-separated (`drv-bridge serve`).
+    cast_user: String,
+    /// drv-cast's command line, whitespace-separated (`drv-cast`).
     #[arg(long)]
-    bridge_exec: String,
-    /// An entry under `/run` the bridge sees (its `/run` holds nothing else). Repeatable.
-    #[arg(long = "bridge-expose")]
-    bridge_expose: Vec<PathBuf>,
-    /// `NAME=VALUE` in the bridge's environment. Repeatable; it gets nothing else.
-    #[arg(long = "bridge-env")]
-    bridge_env: Vec<String>,
-    /// The bridge's socket, world-connectable: every connection is keyed on the peer UID.
-    #[arg(long, default_value = "/run/drv-bridge/bridge.sock")]
-    bridge_socket: PathBuf,
+    cast_exec: String,
+    /// An entry under `/run` drv-cast sees (PipeWire's sockets). Repeatable.
+    #[arg(long = "cast-expose")]
+    cast_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in drv-cast's environment. Repeatable; it gets nothing else.
+    #[arg(long = "cast-env")]
+    cast_env: Vec<String>,
+    /// drv-cast's socket, world-connectable: every connection is keyed on the peer UID.
+    #[arg(long, default_value = "/run/drv-cast/cast.sock")]
+    cast_socket: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -232,15 +214,13 @@ struct Set {
     authd: Service,
     gpu: Service,
     compositor: Service,
-    locker: Service,
-    menu: Service,
-    portal: Service,
-    notifier: Service,
-    agent: Service,
-    keys: Service,
+    files: Service,
     forker: Service,
     appd: Service,
-    bridge: Service,
+    shell: Service,
+    cast: Service,
+    agent: Service,
+    keys: Service,
 }
 
 fn supervise(args: Args) -> Result<(), String> {
@@ -281,41 +261,32 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &args.compositor_expose,
         )?,
-        locker: service(
-            "locker",
-            &args.locker_user,
-            &args.locker_exec,
-            &args.locker_env,
+        shell: service(
+            "drv-shell",
+            &args.shell_user,
+            &args.shell_exec,
+            &args.shell_env,
             &[],
             &[],
-            &args.locker_expose,
+            &args.shell_expose,
         )?,
-        menu: service(
-            "drv-menu",
-            &args.menu_user,
-            &args.menu_exec,
-            &args.menu_env,
+        files: service(
+            "drv-files",
+            &args.files_user,
+            &args.files_exec,
+            &args.files_env,
+            &args.files_dirs,
             &[],
-            &[],
-            &args.menu_expose,
+            &args.files_expose,
         )?,
-        portal: service(
-            "drv-portal",
-            &args.portal_user,
-            &args.portal_exec,
-            &args.portal_env,
-            &args.portal_dirs,
-            &[],
-            &args.portal_expose,
-        )?,
-        notifier: service(
-            "drv-notifier",
-            &args.notifier_user,
-            &args.notifier_exec,
-            &args.notifier_env,
+        cast: service(
+            "drv-cast",
+            &args.cast_user,
+            &args.cast_exec,
+            &args.cast_env,
             &[],
             &[],
-            &args.notifier_expose,
+            &args.cast_expose,
         )?,
         agent: service(
             "drv-agent",
@@ -353,15 +324,6 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &args.appd_expose,
         )?,
-        bridge: service(
-            "drv-bridge",
-            &args.bridge_user,
-            &args.bridge_exec,
-            &args.bridge_env,
-            &[],
-            &[],
-            &args.bridge_expose,
-        )?,
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switches stay ours. That chown was the only one: CHOWN goes, for good.
@@ -369,8 +331,12 @@ fn supervise(args: Args) -> Result<(), String> {
     drv_os::creds::drop_for_good(CapabilitySet::CHOWN)?;
 
     let listener = listen(&args.socket)?;
-    // Datagrams with fds: the shim and the server speak `drv_bridge::wire`, not a stream.
-    let bridge_listener = listen_seqpacket(&args.bridge_socket)?;
+    // Datagrams with fds: the apps' shims speak each service's `wire`, not a stream.
+    let doors = Doors {
+        files: listen_seqpacket(&args.files_socket)?,
+        cast: listen_seqpacket(&args.cast_socket)?,
+        notify: listen_seqpacket(&args.notify_socket)?,
+    };
 
     // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
     // which would leave the console unusable. systemd's start limit takes it from here.
@@ -378,7 +344,7 @@ fn supervise(args: Args) -> Result<(), String> {
     const WINDOW: Duration = Duration::from_secs(60);
     let mut deaths: Vec<Instant> = Vec::new();
     loop {
-        match start_set(&set, &cgroups, &listener, &bridge_listener, &args.docs) {
+        match start_set(&set, &cgroups, &listener, &doors, &args.docs) {
             Ok(children) => {
                 let gone = wait_first(&children);
                 drv_os::say!("drv-supervisor: {gone} exited; restarting the set");
@@ -412,6 +378,14 @@ fn listen(path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
+/// The app-facing sockets of the services, bound here so an app started early waits in a
+/// backlog instead of finding no socket.
+struct Doors {
+    files: UnixListener,
+    cast: UnixListener,
+    notify: UnixListener,
+}
+
 /// Like `listen`, a `SOCK_SEQPACKET` listener.
 fn listen_seqpacket(path: &Path) -> Result<UnixListener, String> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
@@ -434,9 +408,9 @@ fn listen_seqpacket(path: &Path) -> Result<UnixListener, String> {
     Ok(UnixListener::from(sock))
 }
 
-/// The documents mount, fresh for this set: a FUSE connection whose serving end goes to the
-/// portal as fd `fuse`. `allow_other` because the apps are the readers; who may see what is
-/// the portal's check, per request, by the caller's UID. What the last set served is gone
+/// The documents mount, fresh for this set: a FUSE connection whose serving end goes to
+/// drv-files as fd `fuse`. `allow_other` because the apps are the readers; who may see what
+/// is drv-files' check, per request, by the caller's UID. What the last set served is gone
 /// with it, like the apps that held it.
 fn mount_docs(at: &Path, uid: u32, gid: u32) -> Result<OwnedFd, String> {
     let target = CString::new(at.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -478,22 +452,25 @@ struct Links {
     compositor_seat: (OwnedFd, OwnedFd),
     compositor_auth: (OwnedFd, OwnedFd),
     compositor_gpu: (OwnedFd, OwnedFd),
-    compositor_locker: (OwnedFd, OwnedFd),
     compositor_appd: (OwnedFd, OwnedFd),
+    /// The compositor's poke line to the shell: a byte per `show-launcher`.
     compositor_menu: (OwnedFd, OwnedFd),
     /// The compositor's key line to drv-keys: a line per media key.
     compositor_keys: (OwnedFd, OwnedFd),
-    menu_client: (OwnedFd, OwnedFd),
-    menu_appd: (OwnedFd, OwnedFd),
-    portal_client: (OwnedFd, OwnedFd),
-    notifier_client: (OwnedFd, OwnedFd),
-    compositor_portal: (OwnedFd, OwnedFd),
-    bridge_portal: (OwnedFd, OwnedFd),
-    /// The ssh agent's line to the portal: the authenticator's PIN and touch prompts.
-    agent_portal: (OwnedFd, OwnedFd),
-    /// The bridge's launch channel: the OpenURI portal starts the URI's handler.
-    bridge_appd: (OwnedFd, OwnedFd),
-    locker_auth: (OwnedFd, OwnedFd),
+    /// The cast line: drv-cast starts and stops what the person consented to.
+    compositor_cast: (OwnedFd, OwnedFd),
+    /// The shell's Wayland connection: session-lock and layer-shell.
+    shell_client: (OwnedFd, OwnedFd),
+    /// The shell's launch channel: the menu starts apps.
+    shell_appd: (OwnedFd, OwnedFd),
+    /// The shell's line to drv-authd: the lock screen's PIN goes there.
+    shell_auth: (OwnedFd, OwnedFd),
+    /// drv-cast asks the person at the shell: screen picks, device consent.
+    cast_shell: (OwnedFd, OwnedFd),
+    /// The ssh agent asks the person at the shell: the authenticator's PIN and touch.
+    agent_shell: (OwnedFd, OwnedFd),
+    /// drv-files' Wayland connection: layer-shell for the chooser.
+    files_client: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
 }
 
@@ -505,19 +482,16 @@ impl Links {
             compositor_seat: seq()?,
             compositor_auth: seq()?,
             compositor_gpu: stream()?,
-            compositor_locker: stream()?,
             compositor_appd: stream()?,
             compositor_menu: stream()?,
             compositor_keys: stream()?,
-            menu_client: stream()?,
-            menu_appd: stream()?,
-            portal_client: stream()?,
-            notifier_client: stream()?,
-            bridge_appd: stream()?,
-            compositor_portal: seq()?,
-            bridge_portal: seq()?,
-            agent_portal: seq()?,
-            locker_auth: seq()?,
+            compositor_cast: seq()?,
+            shell_client: stream()?,
+            shell_appd: stream()?,
+            shell_auth: seq()?,
+            cast_shell: seq()?,
+            agent_shell: seq()?,
+            files_client: stream()?,
             appd_forker: seq()?,
         })
     }
@@ -530,16 +504,16 @@ fn start_set(
     set: &Set,
     cgroups: &Cgroups,
     listener: &UnixListener,
-    bridge_listener: &UnixListener,
+    doors: &Doors,
     docs: &Path,
 ) -> Result<Group, String> {
     let l = Links::make()?;
-    let fuse = mount_docs(docs, set.portal.uid, set.portal.gid)?;
+    let fuse = mount_docs(docs, set.files.uid, set.files.gid)?;
     let members: [(
         &'static str,
         &Service,
         Vec<(&str, std::os::fd::BorrowedFd<'_>)>,
-    ); 13] = [
+    ); 11] = [
         (
             "drv-seatd",
             &set.seatd,
@@ -550,7 +524,7 @@ fn start_set(
             &set.authd,
             vec![
                 ("compositor", l.compositor_auth.1.as_fd()),
-                ("locker", l.locker_auth.1.as_fd()),
+                ("locker", l.shell_auth.1.as_fd()),
             ],
         ),
         (
@@ -565,61 +539,27 @@ fn start_set(
                 ("seat", l.compositor_seat.0.as_fd()),
                 ("auth", l.compositor_auth.0.as_fd()),
                 ("gpu", l.compositor_gpu.0.as_fd()),
-                ("locker", l.compositor_locker.0.as_fd()),
                 ("appd", l.compositor_appd.0.as_fd()),
                 ("menu", l.compositor_menu.0.as_fd()),
                 ("keys", l.compositor_keys.0.as_fd()),
-                ("menu-client", l.menu_client.0.as_fd()),
-                ("portal-client", l.portal_client.0.as_fd()),
-                ("notifier-client", l.notifier_client.0.as_fd()),
-                ("portal", l.compositor_portal.0.as_fd()),
+                ("shell-client", l.shell_client.0.as_fd()),
+                ("files-client", l.files_client.0.as_fd()),
+                ("cast", l.compositor_cast.0.as_fd()),
             ],
         ),
+        // drv-files serves the documents mount: anything that touches /run/drv-doc (the
+        // forker, building an app's root) blocks until it answers, so it comes first.
         (
-            "locker",
-            &set.locker,
+            "drv-files",
+            &set.files,
             vec![
-                ("compositor", l.compositor_locker.1.as_fd()),
-                ("auth", l.locker_auth.0.as_fd()),
-            ],
-        ),
-        (
-            "drv-menu",
-            &set.menu,
-            vec![
-                ("compositor", l.compositor_menu.1.as_fd()),
-                ("wayland", l.menu_client.1.as_fd()),
-                ("appd", l.menu_appd.0.as_fd()),
-            ],
-        ),
-        (
-            "drv-portal",
-            &set.portal,
-            vec![
-                ("wayland", l.portal_client.1.as_fd()),
-                ("compositor", l.compositor_portal.1.as_fd()),
-                ("bridge", l.bridge_portal.1.as_fd()),
-                ("agent", l.agent_portal.1.as_fd()),
+                ("wayland", l.files_client.1.as_fd()),
                 ("fuse", fuse.as_fd()),
+                ("listener", doors.files.as_fd()),
             ],
         ),
-        (
-            "drv-notifier",
-            &set.notifier,
-            vec![("wayland", l.notifier_client.1.as_fd())],
-        ),
-        // Its door is a socket in its directory, and the uid check is its own; the wire is
-        // for the person's PIN and touch, asked at the portal.
-        (
-            "drv-agent",
-            &set.agent,
-            vec![("portal", l.agent_portal.0.as_fd())],
-        ),
-        (
-            "drv-keys",
-            &set.keys,
-            vec![("compositor", l.compositor_keys.1.as_fd())],
-        ),
+        // The forker and drv-appd before the services that ask drv-appd who their callers
+        // are.
         (
             "drv-forker",
             &set.forker,
@@ -632,18 +572,42 @@ fn start_set(
                 ("listener", listener.as_fd()),
                 ("channel", l.appd_forker.0.as_fd()),
                 ("compositor", l.compositor_appd.1.as_fd()),
-                ("menu", l.menu_appd.1.as_fd()),
-                ("bridge", l.bridge_appd.1.as_fd()),
+                ("shell", l.shell_appd.1.as_fd()),
             ],
         ),
         (
-            "drv-bridge",
-            &set.bridge,
+            "drv-shell",
+            &set.shell,
             vec![
-                ("listener", bridge_listener.as_fd()),
-                ("portal", l.bridge_portal.0.as_fd()),
-                ("appd", l.bridge_appd.0.as_fd()),
+                ("wayland", l.shell_client.1.as_fd()),
+                ("auth", l.shell_auth.0.as_fd()),
+                ("appd", l.shell_appd.0.as_fd()),
+                ("poke", l.compositor_menu.1.as_fd()),
+                ("cast", l.cast_shell.1.as_fd()),
+                ("agent", l.agent_shell.1.as_fd()),
+                ("listener", doors.notify.as_fd()),
             ],
+        ),
+        (
+            "drv-cast",
+            &set.cast,
+            vec![
+                ("compositor", l.compositor_cast.1.as_fd()),
+                ("shell", l.cast_shell.0.as_fd()),
+                ("listener", doors.cast.as_fd()),
+            ],
+        ),
+        // Its door is a socket in its directory, and the uid check is its own; the wire is
+        // for the person's PIN and touch, asked at the shell.
+        (
+            "drv-agent",
+            &set.agent,
+            vec![("shell", l.agent_shell.0.as_fd())],
+        ),
+        (
+            "drv-keys",
+            &set.keys,
+            vec![("compositor", l.compositor_keys.1.as_fd())],
         ),
     ];
     let mut children: Group = Vec::new();

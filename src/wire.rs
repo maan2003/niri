@@ -14,22 +14,19 @@ static FDS: Mutex<Option<Fds>> = Mutex::new(None);
 pub enum Peer {
     /// Our connection to drv-authd: unlocks arrive on it.
     Auth,
-    /// The locker's Wayland connection.
-    Locker,
     /// Our launch channel to drv-appd.
     Appd,
-    /// The poke line to drv-menu: a byte per `show-launcher`.
+    /// The poke line to drv-shell: a byte per `show-launcher`.
     Menu,
     /// The key line to drv-keys: a line per media key.
     Keys,
-    /// drv-menu's Wayland connection.
-    MenuClient,
-    /// drv-portal's Wayland connection: a layer-shell client for its dialogs.
-    PortalClient,
-    /// The notification daemon's Wayland connection: a layer-shell client.
-    NotifierClient,
-    /// The cast line to drv-portal: it starts and stops screencasts the person consented to.
-    Portal,
+    /// drv-shell's Wayland connection: the lock screen, and layer-shell for the menu, the
+    /// prompts and the notifications.
+    ShellClient,
+    /// drv-files' Wayland connection: a layer-shell client for the file chooser.
+    FilesClient,
+    /// The cast line to drv-cast: it starts and stops screencasts the person consented to.
+    Cast,
 }
 
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
@@ -79,14 +76,12 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
     };
     for (peer, name, kind) in [
         (Peer::Auth, "auth", Kind::SeqPacket),
-        (Peer::Locker, "locker", Kind::Stream),
         (Peer::Appd, "appd", Kind::Stream),
         (Peer::Menu, "menu", Kind::Stream),
         (Peer::Keys, "keys", Kind::Stream),
-        (Peer::MenuClient, "menu-client", Kind::Stream),
-        (Peer::PortalClient, "portal-client", Kind::Stream),
-        (Peer::NotifierClient, "notifier-client", Kind::Stream),
-        (Peer::Portal, "portal", Kind::SeqPacket),
+        (Peer::ShellClient, "shell-client", Kind::Stream),
+        (Peer::FilesClient, "files-client", Kind::Stream),
+        (Peer::Cast, "cast", Kind::SeqPacket),
     ] {
         match fds.socket(name, kind) {
             Ok(fd) => out.push((peer, fd)),

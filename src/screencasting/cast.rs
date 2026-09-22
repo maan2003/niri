@@ -31,7 +31,7 @@ pub struct Cast {
     pub dynamic_target: bool,
     /// Effective cursor mode (the GPU may downgrade metadata to embedded).
     pub cursor_mode: CursorMode,
-    /// drv-portal's id for this cast.
+    /// drv-cast's id for this cast.
     pub portal_cast: u64,
     pub node_id: Option<u32>,
     /// Presentation time of the last frame the GPU actually sent.

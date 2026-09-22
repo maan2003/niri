@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Failure drills against the booted dev VM, after nix/smoke.sh: kills each member of the set
 # with SIGKILL and checks that the supervisor restarts the whole set, that the running apps
-# die with it, and that the desktop comes back (unlock, a notification through the bridge).
+# die with it, and that the desktop comes back (unlock, a notification at the shell).
 # Then kills an app and checks that the set does not restart. Exit code: failures.
 set -uo pipefail
 . "$(dirname "$0")/vm-lib.sh"
-MEMBERS="compositor-gpu compositor drv-seatd drv-authd locker drv-menu drv-portal drv-notifier drv-forker drv-appd drv-bridge"
+MEMBERS="compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-forker drv-appd"
 
 wait_ssh
 restarts=$($SSH "journalctl -b -o cat --no-pager" | grep -c 'restarting the set')
@@ -32,7 +32,7 @@ for m in $MEMBERS; do
   key 1 2 3 4 ret; sleep 2
   expect_soon "unlocked again" "PIN accepted; unlocking" 10
   menu noti; sleep 3
-  expect_soon "a notification went through" 'notify-test: Notify \{' 10
+  expect_soon "a notification went through" 'drv-shell: notify-test \(uid 100007\) notifies' 10
 done
 
 echo "== kill an app"

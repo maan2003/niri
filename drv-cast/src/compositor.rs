@@ -1,13 +1,13 @@
-//! drv-portal's line to the compositor (the supervisor's `compositor`/`portal` pair, a
-//! `SOCK_SEQPACKET`, postcard via `drv_policy::seq`). The portal starts and stops casts
-//! by its own ids after the person has consented; the compositor tells it the PipeWire node
-//! and when a cast ends. The compositor trusts the line: only the portal holds it.
+//! drv-cast's line to the compositor (the supervisor's `compositor`/`cast` pair, a
+//! `SOCK_SEQPACKET`, postcard via `drv_policy::seq`). drv-cast starts and stops casts by
+//! its own ids after the person has consented; the compositor tells it the PipeWire node
+//! and when a cast ends. The compositor trusts the line: only drv-cast holds it.
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::protocol::{Cursor, Source};
+pub use crate::wire::{Cursor, Source};
 
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {
@@ -50,7 +50,7 @@ pub enum ToCompositor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ToPortal {
+pub enum FromCompositor {
     Hello { version: u32 },
     Outputs(Vec<Output>),
     Windows(Vec<Window>),

@@ -49,7 +49,6 @@
             root = ./.;
             fileset = lib.fileset.unions [
               ./niri-config
-              ./drv-bridge
               ./drv-supervisor
               ./drv-appd
               ./drv-forker
@@ -59,9 +58,10 @@
               ./drv-policy
               ./drv-seat
             ./drv-auth
-            ./drv-lock
-            ./drv-menu
-            ./drv-portal
+            ./drv-shell
+            ./drv-files
+            ./drv-cast
+            ./drv-dbus-shim
             ./drv-ui
             ./drv-agent
             ./drv-keys
@@ -106,17 +106,17 @@
             "-p"
             "drv-init"
             "-p"
-            "drv-bridge"
-            "-p"
             "drv-seat"
             "-p"
             "drv-auth"
             "-p"
-            "drv-lock"
+            "drv-shell"
             "-p"
-            "drv-menu"
+            "drv-files"
             "-p"
-            "drv-portal"
+            "drv-cast"
+            "-p"
+            "drv-dbus-shim"
             "-p"
             "drv-agent"
             "-p"
@@ -152,10 +152,10 @@
             ++ lib.optional withDinit "dinit"
             ++ lib.optional withScreencastSupport "xdp-gnome-screencast"
             ++ lib.optional withSystemd "systemd"
-            # No default features below applies to every package: drv-portal's binary is
-            # behind its `service` feature (the compositor and the bridge want only its
-            # protocols).
-            ++ [ "drv-portal/service" ];
+            # No default features below applies to every package: the services' binaries
+            # are behind their `service` features (the compositor and the shim want only
+            # their wires).
+            ++ [ "drv-shell/service" "drv-files/service" "drv-cast/service" ];
           buildNoDefaultFeatures = true;
 
           # ever since this commit:
