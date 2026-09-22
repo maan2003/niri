@@ -28,7 +28,12 @@ let
     "--runtime-base /run/drv-apps"
     "--state-base /var/lib/drv-apps"
     "--host-views ${hostViews}"
+    # The host's resolv.conf for networked apps: under systemd-resolved it is a symlink into
+    # /run/systemd/resolve, which the forker's /run must hold (below).
+    "--resolv ${hostResolv}"
   ]);
+  resolved = config.services.resolved.enable;
+  hostResolv = if resolved then "/run/systemd/resolve/stub-resolv.conf" else "/etc/resolv.conf";
   hostViews = "/run/drv-host";
   # The ssh agent's door: in every app's root, answering only the UIDs with the `agent` grant.
   agentSocket = "/run/drv-agent/agent";
@@ -623,7 +628,7 @@ in
         ] ++ map (c: "--forker-cap ${c}") [ "setuid" "setgid" "setpcap" "sys_admin" ]
           # Every member of the set gets the apps' sandbox (drv_os::sandbox): its /run holds
           # only what is listed for it. The forker's must hold what it binds for the apps.
-          ++ map (p: "--forker-expose ${p}") appRun
+          ++ map (p: "--forker-expose ${p}") (appRun ++ lib.optional resolved "/run/systemd/resolve")
           ++ map (p: "--seatd-expose ${p}") [ "/run/udev" ]
           # udev: libinput initialises the evdev devices seatd hands over from udev's database.
           ++ map (p: "--compositor-expose ${p}") [ "/run/udev" "/run/drv-compositor" "/run/drv-wayland" "/run/drv" "/run/drv-session" "/run/pipewire" ]
