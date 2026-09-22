@@ -2,6 +2,12 @@
 animations { off; }
 hotkey-overlay { skip-at-startup; }
 xwayland-satellite { off; }
+// Remote pointer entry must not toggle the overview.
+gestures {
+    hot-corners { off; }
+}
+prefer-no-csd
+cursor { xcursor-theme "Adwaita"; }
 layout {
     gaps 0
     default-column-width { proportion 1.0; }
