@@ -366,6 +366,13 @@ impl Tty {
         // rendering device to be known, whatever the order udev lists them in.
         let pending = mem::take(&mut self.pending_devices);
         self.register_devices(niri, pending);
+
+        // The desktop starts in the background: with the outputs up, leave the screen to the
+        // host's own VT (a getty, greetd) until someone switches over.
+        if let Some(vt) = std::env::var("DRV_HOME_VT").ok().and_then(|vt| vt.parse().ok()) {
+            debug!("leaving the screen to VT {vt}");
+            self.change_vt(vt);
+        }
     }
 
     /// Registers devices the GPU process accepted, then scans their connectors.

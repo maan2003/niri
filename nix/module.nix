@@ -202,6 +202,12 @@ in
       default = 7;
       description = "The VT the desktop runs on; keep it above logind's autovt range (6).";
     };
+    homeVt = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      example = 1;
+      description = "Once its outputs are up, the compositor switches to this VT: the desktop starts in the background and the host's own session (a getty, greetd) keeps the screen until Ctrl-Alt-F<vt>.";
+    };
     idleTimeout = lib.mkOption {
       type = lib.types.int;
       default = 300;
@@ -495,7 +501,8 @@ in
     boot.kernelParams = lib.mkIf cfg.resumePatch [ "drm_kms_helper.blank_on_resume=1" ];
 
     environment.etc."drv/config.kdl".text = cfg.config;
-    environment.systemPackages = [ cfg.package ];
+    # Low priority: a stock niri may be installed next to it for a session of the host's own.
+    environment.systemPackages = [ (lib.lowPrio cfg.package) ];
 
     # The services' bus: the compositor, the bridge and the notification daemon, each its own
     # UID. Sandboxed apps never see it.
@@ -635,6 +642,10 @@ in
           "--authd-dir /var/lib/drv-auth:0700"
           "--compositor-user drv-compositor"
           "--compositor-exec '${cfg.package}/bin/niri -c /etc/drv/config.kdl'"
+        ] ++ lib.optionals (cfg.homeVt != null) [
+          # With its outputs up, the compositor switches away: the desktop starts in the background.
+          "--compositor-env DRV_HOME_VT=${toString cfg.homeVt}"
+        ] ++ [
           # Apps as other UIDs must traverse the socket directory.
           "--compositor-dir /run/drv-compositor:0711"
           "--compositor-dir /run/drv-wayland:0711"

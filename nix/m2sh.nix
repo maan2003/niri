@@ -1,5 +1,5 @@
 # The m2sh host's desktop (an Apple M2 Air on Asahi): the set from nix/module.nix and the
-# person's apps as manifests. The nixos repo's hosts/m2sh.nix imports this in place of greetd
+# person's apps as manifests. The nixos repo's hosts/m2sh.nix imports this next to greetd
 # and the Home Manager desktop, with `services.drv.package = pkgs.niri-bin` (the binaries
 # come prebuilt: nothing compiles here). Enrol the lock PIN once, as root:
 # `drv-authd set-pin --state-dir /var/lib/drv-auth`. Load the authenticator's ssh keys from
@@ -27,10 +27,14 @@ in
 {
   environment.etc."brave/policies/managed/drv.json".text = builtins.toJSON policies;
   fonts.packages = [ pkgs.ia-fonts ];
-  # The set's greeter is drv-lock; PipeWire is the module's system-wide one, with a
-  # PulseAudio server per audio app rather than one for the host.
-  services.greetd.enable = lib.mkForce false;
-  services.pipewire.pulse.enable = lib.mkForce false;
+  # Next to the host's own session (greetd on VT 1), which keeps the screen at boot;
+  # Ctrl-Alt-F7 and Ctrl-Alt-F1 switch. PipeWire is the module's system-wide one; the host's
+  # session keeps a PulseAudio server (the module has one per audio app), at /run/pulse for
+  # members of group pipewire.
+  services.drv.homeVt = 1;
+  services.pipewire.pulse.enable = lib.mkForce true;
+  environment.sessionVariables.PULSE_SERVER = "unix:/run/pulse/native";
+  systemd.user.tmpfiles.rules = [ "L %t/pulse - - - - /run/pulse" ];
 
   services.drv = {
     enable = true;
