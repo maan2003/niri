@@ -11,7 +11,7 @@ index e552a78339..92d4e10dc7 100644
        postFixup = (old.postFixup or "") + ''
          wrapProgram $out/bin/rho-gui --set-default RHO_NOTCH 290x56
 diff --git a/config/system/niri-builder/default.nix b/config/system/niri-builder/default.nix
-index 18cc4e601d..91e1f810e3 100644
+index 18cc4e601d..74466bfa46 100644
 --- a/config/system/niri-builder/default.nix
 +++ b/config/system/niri-builder/default.nix
 @@ -64,7 +64,7 @@ let
@@ -34,9 +34,9 @@ index 18cc4e601d..91e1f810e3 100644
        cargo build --release --locked --target aarch64-unknown-linux-gnu \
 -        --no-default-features --features dbus,systemd,xdp-gnome-screencast
 +        --no-default-features \
-+        --features niri/dbus,niri/systemd,niri/xdp-gnome-screencast,drv-portal/service \
-+        -p niri -p drv-supervisor -p drv-appd -p drv-forker -p drv-init -p drv-bridge \
-+        -p drv-seat -p drv-auth -p drv-lock -p drv-menu -p drv-portal -p drv-agent -p drv-keys
++        --features niri/dbus,niri/systemd,niri/xdp-gnome-screencast,drv-shell/service,drv-files/service,drv-cast/service \
++        -p niri -p drv-supervisor -p drv-appd -p drv-forker -p drv-init -p drv-dbus-shim \
++        -p drv-seat -p drv-auth -p drv-shell -p drv-files -p drv-cast -p drv-agent -p drv-keys
        build_seconds=$((SECONDS - build_start))
  
        printf '%s\t%s\t%s\n' \
@@ -56,8 +56,8 @@ index 18cc4e601d..91e1f810e3 100644
            --add-gnu-debuglink="$debug_file" "$stage/bin/niri"
 +        # By name, not by glob: the target directory keeps binaries of crates that no
 +        # longer exist.
-+        for b in drv-supervisor drv-appd drv-forker drv-init drv-bridge drv-seatd drv-authd \
-+                 drv-lock drv-menu drv-portal drv-agent drv-keys chooser-probe cast-probe; do
++        for b in drv-supervisor drv-appd drv-forker drv-init drv-dbus-shim drv-seatd drv-authd \
++                 drv-shell drv-files drv-cast drv-agent drv-keys chooser-probe cast-probe; do
 +          llvm-objcopy --strip-debug "$binaries/$b" "$stage/bin/$b"
 +          chmod 0755 "$stage/bin/$b"
 +        done
@@ -78,10 +78,10 @@ index c11bb91e2b..35a5bd7765 100644
        url = "sourcehut:~maan2003/ws-mgr";
        flake = false;
 diff --git a/hosts/m2sh.nix b/hosts/m2sh.nix
-index f400c3329a..2ac69ad177 100644
+index f400c3329a..7d8b888ecf 100644
 --- a/hosts/m2sh.nix
 +++ b/hosts/m2sh.nix
-@@ -40,9 +40,13 @@ in
+@@ -40,9 +40,16 @@ in
  {
    system.stateVersion = "24.05";
    # The compositor comes prebuilt from niri-builder (pkgs/niri-bin.nix) so this
@@ -93,12 +93,15 @@ index f400c3329a..2ac69ad177 100644
 +  # desktop's (niri plus its services) runs on VT 7, in the background at boot.
 +  nixpkgs.overlays = [ (final: prev: { niri = final.niri-bin-stock; }) ];
 +  services.drv.package = pkgs.niri-bin;
-+  # The system-wide PipeWire (and its PulseAudio server) of the drv module.
++  # The system-wide PipeWire (and its PulseAudio server) of the drv module. Its access
++  # script needs WirePlumber's PermissionManager (0.5.15), which stable does not have yet.
 +  users.users.${config.users.mainUser}.extraGroups = [ "pipewire" ];
++  services.pipewire.package = pkgs.pkgs-unstable.pipewire;
++  services.pipewire.wireplumber.package = pkgs.pkgs-unstable.wireplumber;
    system.replaceDependencies.replacements =
      securityReplacements pkgs
      ++ securityReplacements pkgs.pkgs-unstable
-@@ -61,6 +65,10 @@ in
+@@ -61,6 +68,10 @@ in
      # ../config/system/network/ivpn.nix
      ../config/system/asahi-sound.nix
      ../config/system/niri.nix
@@ -110,18 +113,19 @@ index f400c3329a..2ac69ad177 100644
      ../config/system/zram.nix
      # ../config/system/fs/encrypted-swap.nix
 diff --git a/pkgs/niri-bin.nix b/pkgs/niri-bin.nix
-index 68aa9c349b..ea42d06301 100644
+index 68aa9c349b..2a2ef3bd2a 100644
 --- a/pkgs/niri-bin.nix
 +++ b/pkgs/niri-bin.nix
-@@ -19,14 +19,24 @@
+@@ -19,14 +19,34 @@
    seatd,
    systemd,
    wayland,
 +  fuse3,
 +  # Copy version and hash from the pin printed by `niri-build release`
 +  # (see tasks/releasing-niri.md). The url is templated from the version.
-+  version ? "20260922-g0fa3daeb15b9",
-+  hash ? "sha256-S97AljZJ8PIQugm/FZ4rlpjNkj/joMwAbc0AOJDGegs=",
++  # 20260922-g9e299efdfc93 / sha256-cbYa8QynhGFRLgrYwwG8qFWKGffAm/zvIBnhfk3KskI= to roll back
++  version ? "20260922-gfd80129685d6",
++  hash ? "sha256-NWjJ18hFLqwR7m0qQH9NDQp9NhXvvuUDXZNFZimN7Cc=",
  }:
  
  stdenv.mkDerivation (finalAttrs: {
@@ -131,6 +135,15 @@ index 68aa9c349b..ea42d06301 100644
 -  version = "20260917-g9fa3ca81b598";
 +  inherit version;
    # Rollbacks (swap version and hash):
++  #   the portal and the bridge still in one piece (drv-portal, drv-bridge, drv-lock, drv-menu, mako):
++  #     version = "20260922-g9e299efdfc93";
++  #     hash = "sha256-cbYa8QynhGFRLgrYwwG8qFWKGffAm/zvIBnhfk3KskI=";
++  #   set-pin as root left a root-owned pin file (chown -R drv-auth:drv-auth /var/lib/drv-auth):
++  #     version = "20260922-g3e6684f449e5";
++  #     hash = "sha256-kdWyzcZ9Ab9lkkpC7g/Rb5sFQwyqlYcHGqNCZeCmgek=";
++  #   beside greetd, but the set restarted forever when the compositor failed to start:
++  #     version = "20260922-g0fa3daeb15b9";
++  #     hash = "sha256-S97AljZJ8PIQugm/FZ4rlpjNkj/joMwAbc0AOJDGegs=";
 +  #   the drv desktop before it could sit beside greetd (no services.drv.homeVt):
 +  #     version = "20260922-g5e6dca59ec06";
 +  #     hash = "sha256-XAGcXmJvCgpiLtCy7Kx6Az8Z+MY0H+Stny5v4z1LFVM=";
@@ -141,7 +154,7 @@ index 68aa9c349b..ea42d06301 100644
    #   self-sealing GPU process, still with NIRI_GPU_THREAD (protocol v15):
    #     version = "20260917-g8fe2bae74aa8";
    #     hash = "sha256-x0nLn4q44VI8h6OVOwQWw1iLwAqBZtqJpYEJNsVVKfI=";
-@@ -53,7 +63,7 @@ stdenv.mkDerivation (finalAttrs: {
+@@ -53,7 +73,7 @@ stdenv.mkDerivation (finalAttrs: {
  
    src = fetchurl {
      url = "https://pub-c02578899b644007b0b5aae08b7e73b3.r2.dev/niri/${finalAttrs.version}/aarch64-linux/niri_${finalAttrs.version}_arm64.tar.zst";
@@ -150,25 +163,34 @@ index 68aa9c349b..ea42d06301 100644
    };
  
    sourceRoot = ".";
-@@ -92,6 +102,7 @@ stdenv.mkDerivation (finalAttrs: {
+@@ -92,6 +112,7 @@ stdenv.mkDerivation (finalAttrs: {
      seatd
      systemd # Includes libudev
      wayland # For libwayland-client
-+    fuse3 # drv-portal's documents mount
++    fuse3 # drv-files' documents mount
    ];
  
    postPatch = ''
-@@ -102,7 +113,9 @@ stdenv.mkDerivation (finalAttrs: {
+@@ -102,10 +123,17 @@ stdenv.mkDerivation (finalAttrs: {
  
    installPhase = ''
      runHook preInstall
 -    install -Dm0755 bin/niri -t $out/bin
 +    # niri and the desktop's services (drv-supervisor, drv-appd, drv-forker, drv-init,
-+    # drv-bridge, drv-seatd, drv-authd, drv-lock, drv-menu, drv-portal, drv-agent, drv-keys).
++    # drv-dbus-shim, drv-seatd, drv-authd, drv-shell, drv-files, drv-cast, drv-agent, drv-keys).
++    # drv-trampoline is a leftover of an older build that the builder's glob picked up.
++    rm -f bin/drv-trampoline
 +    install -Dm0755 bin/* -t $out/bin
      install -Dm0644 resources/README.md resources/default-config.kdl -t $doc/share/doc/niri
      install -Dm0644 resources/niri.desktop -t $out/share/wayland-sessions
-     install -Dm0644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
+-    install -Dm0644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
++    # The drv desktop's builds (rho/policy) ship no portal config: the set has its own portal.
++    if [ -f resources/niri-portals.conf ]; then
++      install -Dm0644 resources/niri-portals.conf -t $out/share/xdg-desktop-portal
++    fi
+     install -Dm0755 resources/niri-session -t $out/bin
+     install -Dm0644 resources/niri{-shutdown.target,.service} -t $out/lib/systemd/user
+     runHook postInstall
 diff --git a/pkgs/overlay.nix b/pkgs/overlay.nix
 index 30b4267dcf..5e758ce242 100644
 --- a/pkgs/overlay.nix
