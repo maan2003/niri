@@ -33,7 +33,7 @@ uid UID UID UID UID gid UID UID UID UID groups UID
 caps inh 0000000000000000 prm 0000000000000000 eff 0000000000000000 bnd 0000000000000000 amb 0000000000000000
 securebits 0xfef noroot noroot_locked no_setuid_fixup no_setuid_fixup_locked keep_caps_locked no_cap_ambient_raise no_cap_ambient_raise_locked exec_restrict_file exec_restrict_file_locked exec_deny_interactive exec_deny_interactive_locked
 user_ns host
-landlock layers 1 rules 395
+landlock layers 1 rules 396
 landlock layer 0 handles fs execute,write_file,read_file,read_dir,remove_dir,remove_file,make_char,make_dir,make_reg,make_sock,make_fifo,make_block,make_sym,refer,truncate,ioctl_dev net 0x0 scope 0x3
 no_new_privs 1
 seccomp mode 2 filters 2
