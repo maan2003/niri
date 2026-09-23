@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "drv-nixos": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790165902,
+        "narHash": "sha256-/UHA04UpTsaFfxPwXQI3jlnwHcsCcFqa/+kLxHL5mnw=",
+        "ref": "master",
+        "rev": "ab23fa90a67da1e6061291c995bfbfe791f438b0",
+        "revCount": 3276,
+        "type": "git",
+        "url": "https://git.sr.ht/~maan2003/nixos"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "https://git.sr.ht/~maan2003/nixos"
+      }
+    },
     "microvm": {
       "inputs": {
         "nixpkgs": [
@@ -39,6 +56,7 @@
     },
     "root": {
       "inputs": {
+        "drv-nixos": "drv-nixos",
         "microvm": "microvm",
         "nixpkgs": "nixpkgs"
       }

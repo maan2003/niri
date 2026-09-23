@@ -1,4 +1,4 @@
-# The development guest for the multi-UID stack: the desktop from nix/module.nix, the probe
+# The development guest for the multi-UID stack: the desktop from the nixos repo's module, the probe
 # apps, an ssh admin, the dev PIN and a test camera. Not a test: run it, drive it, read the
 # evidence. The machine around it is nix/dev-vm.nix (QEMU, x86_64) or nix/m2-vm.nix (crosvm
 # on an Apple M2 with the GPU passed through as a virtio-gpu native context).
@@ -93,8 +93,8 @@ let
   };
 in
 {
-  imports = [ (import ./module.nix { inherit niri; }) ];
-
+  # The module itself (services.drv) comes from the nixos repo, imported by flake.nix.
+  services.drv.package = niri;
 
   services.openssh.enable = true;
   # Something for the chooser to show.

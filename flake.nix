@@ -8,14 +8,22 @@
     url = "github:astro/microvm.nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  # The NixOS module of the desktop (`services.drv`) lives in the nixos repo, which takes the
+  # binaries prebuilt and knows nothing of this flake; the development VMs import it from there.
+  inputs.drv-nixos = {
+    url = "git+https://git.sr.ht/~maan2003/nixos?ref=master";
+    flake = false;
+  };
 
   outputs =
     {
       self,
       nixpkgs,
       microvm,
+      drv-nixos,
     }:
     let
+      drv-module = "${drv-nixos}/config/system/drv/module.nix";
       revision = self.shortRev or self.dirtyShortRev or "unknown";
       niri-package =
         {
@@ -305,6 +313,7 @@
             (lib.nixosSystem {
               inherit system;
               modules = [
+                drv-module
                 (import ./nix/dev-vm.nix {
                   niri = self.packages.${system}.niri-debug.overrideAttrs (_: {
                     # Tests need an EGL display; the VM only needs the binaries.
@@ -330,6 +339,7 @@
               inherit system;
               modules = [
                 microvm.nixosModules.microvm
+                drv-module
                 (import ./nix/m2-vm.nix { niri = nixpkgsFor.${system}.callPackage ./nix/m2-prebuilt.nix { }; })
               ];
             }).config.microvm.declaredRunner;
@@ -339,16 +349,5 @@
       overlays.default = final: _: {
         niri = final.callPackage niri-package { };
       };
-
-      # The m2sh host's desktop on top of it: its apps as manifests (nix/m2sh.nix).
-      nixosModules.m2sh = import ./nix/m2sh.nix;
-      # `services.drv`: the multi-UID desktop from one app list (nix/module.nix).
-      nixosModules.default =
-        { pkgs, ... }:
-        {
-          imports = [
-            (import ./nix/module.nix { niri = self.packages.${pkgs.stdenv.hostPlatform.system}.niri; })
-          ];
-        };
     };
 }
