@@ -88,6 +88,14 @@ impl CompositorHandler for State {
 
                     window.on_commit();
 
+                    // The host workspace's terminal goes to the overlay, not the layout.
+                    if crate::niri::is_host_surface(surface) {
+                        self.niri.host.add(window);
+                        self.update_keyboard_focus();
+                        self.niri.queue_redraw_all();
+                        return;
+                    }
+
                     let toplevel = window.toplevel().expect("no X11 support");
 
                     let (
@@ -255,6 +263,20 @@ impl CompositorHandler for State {
                     let toplevel = unmapped.window.toplevel().expect("no x11 support").clone();
                     self.queue_initial_configure(toplevel);
                 }
+                return;
+            }
+
+            // A host workspace window: no layout, no animations; unmapping starts it over.
+            if let Some(window) = self.niri.host.find(surface).cloned() {
+                window.on_commit();
+                if !is_mapped(surface) {
+                    self.niri.host.remove(surface);
+                    self.niri
+                        .unmapped_windows
+                        .insert(surface.clone(), Unmapped::new(window));
+                    self.update_keyboard_focus();
+                }
+                self.niri.queue_redraw_all();
                 return;
             }
 

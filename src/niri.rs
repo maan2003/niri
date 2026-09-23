@@ -137,6 +137,7 @@ use crate::handlers::image_copy_capture::{
     self as image_copy_capture_impl, CaptureBuffer, ImageCopyCursorSession, ImageCopySession,
 };
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
+use crate::host::HostOverlay;
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
 use crate::input::scroll_tracker::ScrollTracker;
@@ -472,6 +473,8 @@ pub struct Niri {
     pub hotkey_overlay: HotkeyOverlay,
     pub cast_indicator: CastIndicator,
     pub exit_confirm_dialog: ExitConfirmDialog,
+    /// The host workspace's windows, drawn over everything but the lock when toggled.
+    pub host: HostOverlay,
 
     pub window_mru_ui: WindowMruUi,
     pub pending_mru_commit: Option<PendingMruCommit>,
@@ -605,6 +608,8 @@ pub enum KeyboardFocus {
     Layout { surface: Option<WlSurface> },
     LayerShell { surface: WlSurface },
     LockScreen { surface: Option<WlSurface> },
+    /// The host workspace's terminal, shown over the layout.
+    Host { surface: WlSurface },
     ScreenshotUi,
     ExitConfirmDialog,
     Overview,
@@ -753,6 +758,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface.as_ref(),
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface.as_ref(),
+            KeyboardFocus::Host { surface } => Some(surface),
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
@@ -765,6 +771,7 @@ impl KeyboardFocus {
             KeyboardFocus::Layout { surface } => surface,
             KeyboardFocus::LayerShell { surface } => Some(surface),
             KeyboardFocus::LockScreen { surface } => surface,
+            KeyboardFocus::Host { surface } => Some(surface),
             KeyboardFocus::ScreenshotUi => None,
             KeyboardFocus::ExitConfirmDialog => None,
             KeyboardFocus::Overview => None,
@@ -1340,6 +1347,8 @@ impl State {
             KeyboardFocus::LockScreen {
                 surface: self.niri.lock_surface_focus(),
             }
+        } else if let Some(surface) = self.niri.host.focus() {
+            KeyboardFocus::Host { surface }
         } else if self.niri.screenshot_ui.is_open() {
             KeyboardFocus::ScreenshotUi
         } else if self.niri.window_mru_ui.is_open() {
@@ -3089,6 +3098,7 @@ impl Niri {
             hotkey_overlay,
             cast_indicator,
             exit_confirm_dialog,
+            host: HostOverlay::default(),
 
             window_mru_ui,
             pending_mru_commit: None,
@@ -3568,6 +3578,7 @@ impl Niri {
                 configure_lock_surface(lock_surface, output);
             }
         }
+        self.host.configure_all(output);
 
         // If the output size changed with an open screenshot UI, close the screenshot UI.
         if let Some((old_size, old_scale, old_transform)) = self.screenshot_ui.output_size(output) {
@@ -3884,6 +3895,27 @@ impl Niri {
                 )
             });
 
+            return rv;
+        }
+
+        if let Some(window) = self.host.shown() {
+            // The host workspace covers the output like the lock surface does.
+            rv.surface = window
+                .toplevel()
+                .and_then(|toplevel| {
+                    under_from_surface_tree(
+                        toplevel.wl_surface(),
+                        pos_within_output,
+                        (0, 0),
+                        WindowSurfaceType::ALL,
+                    )
+                })
+                .map(|(surface, pos_within_output)| {
+                    (
+                        surface,
+                        (pos_within_output + output_pos_in_global_space).to_f64(),
+                    )
+                });
             return rv;
         }
 
@@ -4549,6 +4581,7 @@ impl Niri {
             // FIXME: when going into the screenshot UI from a layer-shell focus, and then back to
             // layer-shell, the layout will briefly draw as active, despite never having focus.
             KeyboardFocus::LockScreen { .. } => true,
+            KeyboardFocus::Host { .. } => true,
             KeyboardFocus::ScreenshotUi => true,
             KeyboardFocus::ExitConfirmDialog => true,
             KeyboardFocus::Overview => true,
@@ -4847,6 +4880,21 @@ impl Niri {
             Kind::Unspecified,
         )
         .into();
+
+        // The host workspace, toggled: its terminal over everything, the layout hidden.
+        if let Some(toplevel) = self.host.shown().and_then(|w| w.toplevel()) {
+            push_elements_from_surface_tree(
+                ctx.renderer,
+                toplevel.wl_surface(),
+                Point::new(0, 0),
+                output_scale,
+                1.,
+                Kind::ScanoutCandidate,
+                &mut |elem| push(elem.into()),
+            );
+            push(backdrop);
+            return;
+        }
 
         // If the screenshot UI is open, draw it.
         if self.screenshot_ui.is_open() {
@@ -5505,6 +5553,25 @@ impl Niri {
                 |_, _, _| true,
             );
         }
+
+        if let Some(toplevel) = self.host.shown().and_then(|w| w.toplevel()) {
+            with_surface_tree_downward(
+                toplevel.wl_surface(),
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                |surface, states, _| {
+                    update_surface_primary_scanout_output(
+                        surface,
+                        output,
+                        states,
+                        None,
+                        render_element_states,
+                        default_primary_scanout_output_compare,
+                    );
+                },
+                |_, _, _| true,
+            );
+        }
     }
 
     pub fn send_frame_callbacks(&mut self, output: &Output) {
@@ -5576,6 +5643,17 @@ impl Niri {
             );
         }
 
+        // Hidden, the host workspace gets no frames: it waits like a window on another workspace.
+        if let Some(toplevel) = self.host.shown().and_then(|w| w.toplevel()) {
+            send_frames_surface_tree(
+                toplevel.wl_surface(),
+                output,
+                frame_callback_time,
+                FRAME_CALLBACK_THROTTLE,
+                should_send,
+            );
+        }
+
         if let Some(surface) = self.dnd_icon.as_ref().map(|icon| &icon.surface) {
             send_frames_surface_tree(
                 surface,
@@ -5637,6 +5715,16 @@ impl Niri {
             if let Some(surface) = &state.lock_surface {
                 send_frames_surface_tree(
                     surface.wl_surface(),
+                    output,
+                    frame_callback_time,
+                    FRAME_CALLBACK_THROTTLE,
+                    |_, _| None,
+                );
+            }
+
+            if let Some(toplevel) = self.host.shown().and_then(|w| w.toplevel()) {
+                send_frames_surface_tree(
+                    toplevel.wl_surface(),
                     output,
                     frame_callback_time,
                     FRAME_CALLBACK_THROTTLE,
@@ -5734,6 +5822,21 @@ impl Niri {
         if let Some(surface) = &self.output_state[output].lock_surface {
             take_presentation_feedback_surface_tree(
                 surface.wl_surface(),
+                &mut feedback,
+                surface_primary_scanout_output,
+                |surface, _| {
+                    surface_presentation_feedback_flags_from_states(
+                        surface,
+                        None,
+                        render_element_states,
+                    )
+                },
+            );
+        }
+
+        if let Some(toplevel) = self.host.shown().and_then(|w| w.toplevel()) {
+            take_presentation_feedback_surface_tree(
+                toplevel.wl_surface(),
                 &mut feedback,
                 surface_primary_scanout_output,
                 |surface, _| {
@@ -6780,6 +6883,7 @@ impl Niri {
         // camera on their behalf. Same switch as Super+Shift+Escape.
         self.stop_all_casts();
         self.screenshot_ui.close();
+        self.host.hide();
         self.cursor_manager
             .set_cursor_image(CursorImageStatus::default_named());
         self.cancel_mru();
@@ -7564,6 +7668,16 @@ fn serve_apps_listener(
         Ok(PostAction::Continue)
     })?;
     Ok(())
+}
+
+/// Whether `surface` belongs to the client drv-appd named `host`: the host workspace's
+/// terminal, whose windows are never in the layout (`crate::host`).
+pub fn is_host_surface(surface: &WlSurface) -> bool {
+    use smithay::reexports::wayland_server::Resource as _;
+    surface
+        .client()
+        .and_then(|c| c.get_data::<ClientState>().map(|d| d.policy.name == "host"))
+        .unwrap_or(false)
 }
 
 /// Global filter: the client's policy grants `global`, and it is not a security-context

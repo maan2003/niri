@@ -55,6 +55,8 @@ expect "PIN accepted" "PIN accepted; unlocking"
 echo "== host workspace"
 key ctrl-alt-f1; sleep 1
 vt=$($SSH cat /sys/class/tty/tty0/active); [ "$vt" = tty7 ] && echo "PASS Ctrl-Alt-F1 stays on the desktop ($vt)" || fail "Ctrl-Alt-F1 switched to $vt"
+# The overlay holds the keyboard while it is up: put it away before the menu steps.
+key ctrl-alt-f1; sleep 1
 
 echo "== media keys"
 mark; key volumeup; sleep 2

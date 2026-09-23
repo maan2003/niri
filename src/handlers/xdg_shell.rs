@@ -885,6 +885,12 @@ impl XdgShellHandler for State {
             return;
         }
 
+        if self.niri.host.remove(surface.wl_surface()).is_some() {
+            self.update_keyboard_focus();
+            self.niri.queue_redraw_all();
+            return;
+        }
+
         let win_out = self
             .niri
             .layout
@@ -1083,6 +1089,26 @@ impl State {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
+
+        // The host workspace's terminal: the output's size, fullscreen, never in the layout.
+        if crate::niri::is_host_surface(toplevel.wl_surface()) {
+            if let Some(output) = self.niri.layout.active_output() {
+                crate::host::configure_host_toplevel(toplevel, output);
+            }
+            unmapped.state = InitialConfigureState::Configured {
+                rules: ResolvedWindowRules::default(),
+                width: None,
+                height: None,
+                floating_width: None,
+                floating_height: None,
+                is_full_width: false,
+                output: None,
+                workspace_name: None,
+                is_pending_maximized: false,
+            };
+            toplevel.send_configure();
+            return;
+        }
 
         let config = self.niri.config.borrow();
         let rules = ResolvedWindowRules::compute(

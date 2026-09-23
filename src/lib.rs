@@ -12,6 +12,7 @@ pub mod dbus;
 pub mod frame_clock;
 pub mod gpu;
 pub mod handlers;
+pub mod host;
 pub mod input;
 pub mod ipc;
 pub mod layer;

@@ -916,6 +916,8 @@ pub enum Action {
     LockSession {},
     /// Show the app menu (drv-shell).
     ShowLauncher {},
+    /// Show or hide the host workspace (the person's own terminal) over everything.
+    ToggleHost {},
     /// Raise the default sink's volume (drv-keys).
     VolumeUp {},
     /// Lower the default sink's volume (drv-keys).

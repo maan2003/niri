@@ -2301,6 +2301,11 @@ impl State {
             Action::ShowLauncher => {
                 self.niri.show_launcher();
             }
+            Action::ToggleHost => {
+                self.niri.host.toggle();
+                self.update_keyboard_focus();
+                self.niri.queue_redraw_all();
+            }
             Action::VolumeUp => self.niri.press_key("volume up"),
             Action::VolumeDown => self.niri.press_key("volume down"),
             Action::VolumeMute => self.niri.press_key("volume mute"),
