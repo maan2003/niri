@@ -117,7 +117,8 @@ let
   # HOME defaults: a tree drv-init links into HOME entry by entry, given as such (Home
   # Manager's `home-files`, say) or built from the manifest's entries.
   hasFiles = app: app.files != { };
-  appFiles = name: app: if !builtins.isAttrs app.files then app.files else pkgs.runCommand "drv-files-${name}" { } (''
+  filesTree = files: !builtins.isAttrs files || lib.isDerivation files;
+  appFiles = name: app: if filesTree app.files then app.files else pkgs.runCommand "drv-files-${name}" { } (''
     mkdir "$out"
   '' + lib.concatStrings (lib.mapAttrsToList (path: value: ''
     mkdir -p "$out/$(dirname ${lib.escapeShellArg path})"
@@ -335,7 +336,8 @@ in
             description = "Runs nix as a client of the host's daemon: the daemon's socket in its root, the whole store readable, nix on its PATH.";
           };
           files = lib.mkOption {
-            type = lib.types.either (lib.types.attrsOf (lib.types.either lib.types.str lib.types.path)) lib.types.path;
+            # A derivation is an attribute set too: the tree types come first.
+            type = lib.types.oneOf [ lib.types.package lib.types.path (lib.types.attrsOf (lib.types.either lib.types.str lib.types.path)) ];
             default = { };
             description = "HOME defaults, linked from the store, read-only: path under HOME to its content (text or a path), or a whole tree (a Home Manager configuration's `home-files`).";
           };
