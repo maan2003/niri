@@ -10,7 +10,7 @@ if [ "${VM_BACKEND:-qemu}" = m2 ]; then
     [minus]=12 [backspace]=14 [tab]=15 [q]=16 [w]=17 [e]=18 [r]=19 [t]=20 [y]=21 [u]=22
     [i]=23 [o]=24 [p]=25 [ret]=28 [ctrl]=29 [a]=30 [s]=31 [d]=32 [f]=33 [g]=34 [h]=35
     [j]=36 [k]=37 [l]=38 [shift]=42 [z]=44 [x]=45 [c]=46 [v]=47 [b]=48 [n]=49 [m]=50
-    [spc]=57 [f1]=59 [up]=103 [left]=105 [right]=106 [down]=108
+    [spc]=57 [f1]=59 [grave_accent]=41 [up]=103 [left]=105 [right]=106 [down]=108
     # The M2 guest swaps Alt and Super (nix/m2-vm.nix: crosvm's keyboard has no Super key).
     [alt]=125 [meta_l]=56)
   # key NAME...: each name is a chord like meta_l-d; all of them go in one round trip.

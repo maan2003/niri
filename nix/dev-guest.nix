@@ -114,7 +114,7 @@ in
   fonts.enableDefaultPackages = true;
 
   # The ssh admin, and the host workspace's account: its terminal runs as her on the host's
-  # own root, over the desktop when Ctrl-Alt-F1 toggles it.
+  # own root, over the desktop when Mod+Grave toggles it.
   users.users.alice = {
     isNormalUser = true;
     uid = 1000;
@@ -144,7 +144,7 @@ in
         "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1+ -l 1.0\"; }" "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1-\"; }"
         "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle\"; }" "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle\"; }"
         "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"+10%\"; }" "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"10%-\"; }" ]
-      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"") "Mod+Shift+E { quit; }\n    Ctrl+Alt+F1 { toggle-host; }"
+      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"") "Mod+Shift+E { quit; }\n    Mod+Grave { toggle-host; }"
         "{ volume-up; }" "{ volume-down; }" "{ volume-mute; }" "{ mic-mute; }" "{ brightness-up; }" "{ brightness-down; }" ]
       (builtins.readFile ../resources/default-config.kdl);
     apps = {
