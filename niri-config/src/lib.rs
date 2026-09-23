@@ -1776,6 +1776,7 @@ mod tests {
                                     ),
                                 ),
                             ),
+                            app: None,
                             title: None,
                             is_active: None,
                             is_focused: None,
@@ -1789,6 +1790,7 @@ mod tests {
                     excludes: [
                         Match {
                             app_id: None,
+                            app: None,
                             title: Some(
                                 RegexEq(
                                     Regex(
@@ -1806,6 +1808,7 @@ mod tests {
                         },
                         Match {
                             app_id: None,
+                            app: None,
                             title: None,
                             is_active: Some(
                                 true,

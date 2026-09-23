@@ -81,6 +81,39 @@ pub fn user_ids(name: &str) -> Result<(u32, u32), String> {
     Ok((pwd.pw_uid, pwd.pw_gid))
 }
 
+/// `getpwnam_r`: a user's home directory and login shell, for the one member that runs as the
+/// person on the host's own root.
+pub fn user_home_shell(name: &str) -> Result<(String, String), String> {
+    let cname = CString::new(name).map_err(|_| format!("bad user name {name:?}"))?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; buf outlives the use of `pwd`.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "getpwnam {name:?}: {}",
+            io::Error::from_raw_os_error(rc)
+        ));
+    }
+    if result.is_null() {
+        return Err(format!("no such user {name:?}"));
+    }
+    // SAFETY: a found entry's strings point into `buf`, NUL-terminated.
+    let field = |p: *const libc::c_char| unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned();
+    Ok((field(pwd.pw_dir), field(pwd.pw_shell)))
+}
+
 /// Every group of a user (`getgrouplist`), for services that keep their supplementary groups.
 pub fn user_groups(name: &str, gid: u32) -> Result<Vec<u32>, String> {
     let cname = CString::new(name).map_err(|_| format!("bad user name {name:?}"))?;

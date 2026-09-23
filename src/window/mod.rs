@@ -431,6 +431,18 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
         }
     }
 
+    if let Some(app) = &m.app {
+        use smithay::reexports::wayland_server::Resource as _;
+        let name = window
+            .toplevel()
+            .wl_surface()
+            .client()
+            .and_then(|c| c.get_data::<crate::niri::ClientState>().map(|d| d.policy.name.clone()));
+        if name.as_deref() != Some(app.as_str()) {
+            return false;
+        }
+    }
+
     if let Some(title_re) = &m.title {
         let Some(title) = &role.title else {
             return false;

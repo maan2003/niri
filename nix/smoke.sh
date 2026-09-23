@@ -17,6 +17,8 @@ for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-c
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
+expect "the host workspace's terminal" "drv-supervisor: drv-host running as uid 1000"
+expect "attached on its own socket" "host workspace client attached"
 
 echo "== kernel state"
 for who in flower forker compositor; do
@@ -49,6 +51,10 @@ expect "and says so" 'drv-agent: refused uid 100002'
 echo "== unlock"
 mark; key 1 2 3 4 ret; sleep 2
 expect "PIN accepted" "PIN accepted; unlocking"
+
+echo "== host workspace"
+key ctrl-alt-f1; sleep 1
+vt=$($SSH cat /sys/class/tty/tty0/active); [ "$vt" = tty7 ] && echo "PASS Ctrl-Alt-F1 stays on the desktop ($vt)" || fail "Ctrl-Alt-F1 switched to $vt"
 
 echo "== media keys"
 mark; key volumeup; sleep 2

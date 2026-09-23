@@ -4658,7 +4658,14 @@ fn find_bind<'a>(
         _ => None,
     };
 
+    // A configured bind on the same key wins: with a home workspace in place of the host's
+    // VT, Ctrl+Alt+F1 goes there instead of switching away.
     if let Some(action) = hardcoded_action {
+        if let Some(raw) = raw {
+            if let Some(bind) = find_configured_bind(bindings, mod_key, Trigger::Keysym(raw), mods) {
+                return Some(bind);
+            }
+        }
         return Some(Bind {
             key: Key {
                 // Not entirely correct but it doesn't matter in how we currently use it.

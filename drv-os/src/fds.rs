@@ -145,6 +145,11 @@ impl Fds {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Whether `name` was handed over (for a peer that is only sometimes there).
+    pub fn has(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
 }
 
 fn check_unix(

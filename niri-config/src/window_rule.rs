@@ -125,6 +125,10 @@ impl MergeWith<PopupsRule> for ResolvedPopupsRules {
 pub struct Match {
     #[knuffel(property, str)]
     pub app_id: Option<RegexEq>,
+    /// The client's policy name (the app's name in the manifest; `host` for the host
+    /// workspace). Never client-supplied, unlike `app-id`.
+    #[knuffel(property)]
+    pub app: Option<String>,
     #[knuffel(property, str)]
     pub title: Option<RegexEq>,
     #[knuffel(property)]

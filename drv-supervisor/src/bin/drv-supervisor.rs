@@ -189,6 +189,21 @@ struct Args {
     /// drv-appd who each client is.
     #[arg(long, default_value = "/run/drv/wayland")]
     apps_socket: PathBuf,
+    /// The person's own account: the host workspace's terminal runs as it, on the host's own
+    /// root, with the person's real home. Without it there is no host workspace.
+    #[arg(long)]
+    host_user: Option<String>,
+    /// The host workspace's command line, whitespace-separated (a terminal).
+    #[arg(long)]
+    host_exec: Option<String>,
+    /// `NAME=VALUE` in the host workspace's environment (PATH and the like). Repeatable; it
+    /// gets HOME, USER, LOGNAME, SHELL and WAYLAND_DISPLAY from us and nothing else.
+    #[arg(long = "host-env")]
+    host_env: Vec<String>,
+    /// The host workspace's Wayland socket: mode 0600, owned by `host-user`. The compositor
+    /// takes every connection on it as the host workspace after checking the peer UID.
+    #[arg(long, default_value = "/run/drv/host.sock")]
+    host_socket: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -224,10 +239,20 @@ struct Set {
     cast: Service,
     agent: Service,
     keys: Service,
+    /// Not a member: started with the set, restarted alone when it exits, left alone when
+    /// the set restarts (its Wayland connection dies with the compositor, and it follows).
+    host: Option<Service>,
 }
 
 fn supervise(args: Args) -> Result<(), String> {
+    let host = host_service(&args)?;
+    let mut compositor_env = args.compositor_env.clone();
+    if let Some(host) = &host {
+        // The compositor admits this UID on the host socket and nobody else.
+        compositor_env.push(format!("DRV_HOST_UID={}", host.uid));
+    }
     let set = Set {
+        host,
         seatd: service(
             "drv-seatd",
             &args.seatd_user,
@@ -259,7 +284,7 @@ fn supervise(args: Args) -> Result<(), String> {
             "compositor",
             &args.compositor_user,
             &args.compositor_exec,
-            &args.compositor_env,
+            &compositor_env,
             &args.compositor_dirs,
             &[],
             &args.compositor_expose,
@@ -331,6 +356,10 @@ fn supervise(args: Args) -> Result<(), String> {
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switches stay ours. That chown was the only one: CHOWN goes, for good.
     let cgroups = Cgroups::create(set.forker.uid, set.forker.gid)?;
+    let host_listener = match &set.host {
+        Some(host) => Some(listen_owned(&args.host_socket, host.uid, host.gid)?),
+        None => None,
+    };
     drv_os::creds::drop_for_good(CapabilitySet::CHOWN)?;
 
     let listener = listen(&args.socket)?;
@@ -341,6 +370,7 @@ fn supervise(args: Args) -> Result<(), String> {
         notify: listen_seqpacket(&args.notify_socket)?,
         agent: listen(&args.agent_socket)?,
         apps: listen(&args.apps_socket)?,
+        host: host_listener,
     };
 
     // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
@@ -348,10 +378,20 @@ fn supervise(args: Args) -> Result<(), String> {
     const DEATHS: usize = 5;
     const WINDOW: Duration = Duration::from_secs(60);
     let mut deaths: Vec<Instant> = Vec::new();
+    let mut host = Host::default();
     loop {
         match start_set(&set, &cgroups, &listener, &doors, &args.docs) {
             Ok(children) => {
-                let gone = wait_first(&children);
+                host.start(&set, &cgroups);
+                let gone = loop {
+                    if let Some(gone) = wait_first(&children) {
+                        break gone;
+                    }
+                    // Not the set: the host workspace (or nothing we know of).
+                    host.reap();
+                    host.start(&set, &cgroups);
+                    thread::sleep(Duration::from_millis(200));
+                };
                 drv_os::say!("drv-supervisor: {gone} exited; restarting the set");
                 stop_set(&cgroups, children);
             }
@@ -368,6 +408,21 @@ fn supervise(args: Args) -> Result<(), String> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// The host workspace's socket: one UID's, mode 0600. Needs CAP_CHOWN, so before it goes;
+/// the mode first, while the socket is still ours (no CAP_FOWNER here).
+fn listen_owned(path: &Path, uid: u32, gid: u32) -> Result<UnixListener, String> {
+    let listener = listen(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    rustix::fs::chown(
+        path,
+        Some(rustix::process::Uid::from_raw(uid)),
+        Some(rustix::process::Gid::from_raw(gid)),
+    )
+    .map_err(|e| format!("chown {}: {e}", path.display()))?;
+    Ok(listener)
 }
 
 /// A world-connectable socket for a member that keys every connection on the peer UID.
@@ -392,6 +447,8 @@ struct Doors {
     notify: UnixListener,
     agent: UnixListener,
     apps: UnixListener,
+    /// The host workspace's, when there is one.
+    host: Option<UnixListener>,
 }
 
 /// Like `listen`, a `SOCK_SEQPACKET` listener.
@@ -554,7 +611,10 @@ fn start_set(
                 ("files-client", l.files_client.0.as_fd()),
                 ("cast", l.compositor_cast.0.as_fd()),
                 ("apps", doors.apps.as_fd()),
-            ],
+            ]
+            .into_iter()
+            .chain(doors.host.as_ref().map(|h| ("host", h.as_fd())))
+            .collect(),
         ),
         // drv-files serves the documents mount: anything that touches it (the forker,
         // cloning the doors for an app's root) blocks until it answers, so it comes first.
@@ -642,6 +702,58 @@ fn start_set(
     Ok(children)
 }
 
+/// The host workspace's terminal across its restarts. Never killed by us: the set's cgroup
+/// kill does not reach it, and the compositor going takes its Wayland connection, which a
+/// terminal exits on. Whatever is still alive is only waited for.
+#[derive(Default)]
+struct Host {
+    alive: Vec<Child>,
+    /// Starts within the window: a terminal that dies at once is not started forever.
+    starts: Vec<Instant>,
+}
+
+impl Host {
+    const STARTS: usize = 5;
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    /// Starts the terminal unless one is running (or it keeps dying).
+    fn start(&mut self, set: &Set, cgroups: &Cgroups) {
+        let Some(service) = &set.host else { return };
+        if !self.alive.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.starts.retain(|t| now.duration_since(*t) < Self::WINDOW);
+        if self.starts.len() >= Self::STARTS {
+            return;
+        }
+        self.starts.push(now);
+        match start_service(service, &[], &cgroups.set_procs) {
+            Ok(child) => {
+                drv_os::say!(
+                    "drv-supervisor: drv-host running as uid {}, pid {}",
+                    service.uid,
+                    child.id()
+                );
+                self.alive.push(child);
+            }
+            Err(err) => drv_os::say!("drv-supervisor: {err}"),
+        }
+    }
+
+    /// Reaps whichever terminals have exited.
+    fn reap(&mut self) {
+        self.alive.retain_mut(|child| match child.try_wait() {
+            Ok(Some(status)) => {
+                drv_os::say!("drv-supervisor: drv-host exited ({status})");
+                false
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        });
+    }
+}
+
 /// The apps first (one cgroup write), then every member of the set (one more), then the
 /// reaping.
 fn stop_set(cgroups: &Cgroups, children: Group) {
@@ -660,14 +772,15 @@ fn stop_set(cgroups: &Cgroups, children: Group) {
 /// how ("compositor-gpu (signal 9), compositor (exit status 1)"): a member's death takes
 /// its peers down within the same instant, and which exited first says nothing about who
 /// died first. The children are not reaped here (waiting on a `&Child` is not possible);
-/// `stop_set` reaps them all.
-fn wait_first(children: &Group) -> String {
+/// `stop_set` reaps them all. `None`: a child exited but no member of the set did (the host
+/// workspace's terminal, which the caller reaps).
+fn wait_first(children: &Group) -> Option<String> {
     use rustix::process::{waitid, WaitId, WaitIdOptions};
     loop {
         match waitid(WaitId::All, WaitIdOptions::EXITED | WaitIdOptions::NOWAIT) {
             Ok(_) => break,
             Err(rustix::io::Errno::INTR) => {}
-            Err(e) => return format!("? (waitid: {e})"),
+            Err(e) => return Some(format!("? (waitid: {e})")),
         }
     }
     // A moment for the cascade, so the report has the cause and not only its first victim.
@@ -679,9 +792,9 @@ fn wait_first(children: &Group) -> String {
         })
         .collect();
     if gone.is_empty() {
-        "? (lost)".to_owned()
+        None
     } else {
-        gone.join(", ")
+        Some(gone.join(", "))
     }
 }
 
@@ -766,5 +879,31 @@ fn service(
         // The media keys write the backlight; nobody else touches sysfs.
         writable_sys: name == "drv-keys",
         nix_daemon: name == "drv-forker",
+        host: false,
     })
+}
+
+/// The host workspace: the person's terminal as their own account, from `--host-user` and
+/// `--host-exec`. Its environment is the listed one plus what a login would give it and the
+/// socket the compositor serves it on.
+fn host_service(args: &Args) -> Result<Option<Service>, String> {
+    let (user, exec) = match (&args.host_user, &args.host_exec) {
+        (None, None) => return Ok(None),
+        (Some(user), Some(exec)) => (user, exec),
+        _ => return Err("--host-user and --host-exec go together".to_owned()),
+    };
+    let mut service = service("drv-host", user, exec, &args.host_env, &[], &[], &[])?;
+    let (home, shell) = drv_os::user_home_shell(user)?;
+    service.env.extend([
+        ("HOME".to_owned(), home),
+        ("USER".to_owned(), user.clone()),
+        ("LOGNAME".to_owned(), user.clone()),
+        ("SHELL".to_owned(), shell),
+        (
+            "WAYLAND_DISPLAY".to_owned(),
+            args.host_socket.to_string_lossy().into_owned(),
+        ),
+    ]);
+    service.host = true;
+    Ok(Some(service))
 }

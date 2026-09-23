@@ -113,10 +113,15 @@ in
   networking.firewall.enable = false;
   fonts.enableDefaultPackages = true;
 
-  # Only an ssh admin; nothing on the desktop runs as a human.
+  # The ssh admin, and the host workspace's account: its terminal runs as her on the host's
+  # own root, on the compositor's `host` workspace (Ctrl-Alt-F1).
   users.users.alice = {
     isNormalUser = true;
     uid = 1000;
+  };
+  services.drv.host = {
+    user = "alice";
+    exec = [ "${pkgs.weston}/bin/weston-terminal" ];
   };
 
   # Dev PIN 1234, enrolled once. Real installs run `drv-authd set-pin` by hand. As root
@@ -135,11 +140,11 @@ in
     # Mod+D shows the menu (drv-shell, a supervisor service) instead of spawning fuzzel; the
     # volume and brightness keys are drv-keys' actions instead of wpctl and brightnessctl.
     config = builtins.replaceStrings
-      [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\""
+      [ "// skip-at-startup" "{ spawn \"fuzzel\"; }" "// options \"grp:win_space_toggle,compose:ralt,ctrl:nocaps\"" "Mod+Shift+E { quit; }"
         "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1+ -l 1.0\"; }" "{ spawn-sh \"wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1-\"; }"
         "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle\"; }" "{ spawn-sh \"wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle\"; }"
         "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"+10%\"; }" "{ spawn \"brightnessctl\" \"--class=backlight\" \"set\" \"10%-\"; }" ]
-      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"")
+      [ "skip-at-startup" "{ show-launcher; }" (if xkbOptions == null then "" else "options \"${xkbOptions}\"") "Mod+Shift+E { quit; }\n    Ctrl+Alt+F1 { focus-workspace \"host\"; }"
         "{ volume-up; }" "{ volume-down; }" "{ volume-mute; }" "{ mic-mute; }" "{ brightness-up; }" "{ brightness-down; }" ]
       (builtins.readFile ../resources/default-config.kdl);
     apps = {
