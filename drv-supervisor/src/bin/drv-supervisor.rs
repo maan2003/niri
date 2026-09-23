@@ -197,13 +197,10 @@ struct Args {
     #[arg(long)]
     host_exec: Option<String>,
     /// `NAME=VALUE` in the host workspace's environment (PATH and the like). Repeatable; it
-    /// gets HOME, USER, LOGNAME, SHELL and WAYLAND_DISPLAY from us and nothing else.
+    /// gets HOME, USER, LOGNAME, SHELL and WAYLAND_DISPLAY (the apps' socket: drv-appd's
+    /// manifest names the UID `host`) from us and nothing else.
     #[arg(long = "host-env")]
     host_env: Vec<String>,
-    /// The host workspace's Wayland socket: mode 0600, owned by `host-user`. The compositor
-    /// takes every connection on it as the host workspace after checking the peer UID.
-    #[arg(long, default_value = "/run/drv/host.sock")]
-    host_socket: PathBuf,
 }
 
 fn main() -> ExitCode {
@@ -245,14 +242,8 @@ struct Set {
 }
 
 fn supervise(args: Args) -> Result<(), String> {
-    let host = host_service(&args)?;
-    let mut compositor_env = args.compositor_env.clone();
-    if let Some(host) = &host {
-        // The compositor admits this UID on the host socket and nobody else.
-        compositor_env.push(format!("DRV_HOST_UID={}", host.uid));
-    }
     let set = Set {
-        host,
+        host: host_service(&args)?,
         seatd: service(
             "drv-seatd",
             &args.seatd_user,
@@ -284,7 +275,7 @@ fn supervise(args: Args) -> Result<(), String> {
             "compositor",
             &args.compositor_user,
             &args.compositor_exec,
-            &compositor_env,
+            &args.compositor_env,
             &args.compositor_dirs,
             &[],
             &args.compositor_expose,
@@ -356,10 +347,6 @@ fn supervise(args: Args) -> Result<(), String> {
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switches stay ours. That chown was the only one: CHOWN goes, for good.
     let cgroups = Cgroups::create(set.forker.uid, set.forker.gid)?;
-    let host_listener = match &set.host {
-        Some(host) => Some(listen_owned(&args.host_socket, host.uid, host.gid)?),
-        None => None,
-    };
     drv_os::creds::drop_for_good(CapabilitySet::CHOWN)?;
 
     let listener = listen(&args.socket)?;
@@ -370,7 +357,6 @@ fn supervise(args: Args) -> Result<(), String> {
         notify: listen_seqpacket(&args.notify_socket)?,
         agent: listen(&args.agent_socket)?,
         apps: listen(&args.apps_socket)?,
-        host: host_listener,
     };
 
     // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
@@ -410,21 +396,6 @@ fn supervise(args: Args) -> Result<(), String> {
     }
 }
 
-/// The host workspace's socket: one UID's, mode 0600. Needs CAP_CHOWN, so before it goes;
-/// the mode first, while the socket is still ours (no CAP_FOWNER here).
-fn listen_owned(path: &Path, uid: u32, gid: u32) -> Result<UnixListener, String> {
-    let listener = listen(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod {}: {e}", path.display()))?;
-    rustix::fs::chown(
-        path,
-        Some(rustix::process::Uid::from_raw(uid)),
-        Some(rustix::process::Gid::from_raw(gid)),
-    )
-    .map_err(|e| format!("chown {}: {e}", path.display()))?;
-    Ok(listener)
-}
-
 /// A world-connectable socket for a member that keys every connection on the peer UID.
 fn listen(path: &Path) -> Result<UnixListener, String> {
     if let Some(parent) = path.parent() {
@@ -447,8 +418,6 @@ struct Doors {
     notify: UnixListener,
     agent: UnixListener,
     apps: UnixListener,
-    /// The host workspace's, when there is one.
-    host: Option<UnixListener>,
 }
 
 /// Like `listen`, a `SOCK_SEQPACKET` listener.
@@ -611,10 +580,7 @@ fn start_set(
                 ("files-client", l.files_client.0.as_fd()),
                 ("cast", l.compositor_cast.0.as_fd()),
                 ("apps", doors.apps.as_fd()),
-            ]
-            .into_iter()
-            .chain(doors.host.as_ref().map(|h| ("host", h.as_fd())))
-            .collect(),
+            ],
         ),
         // drv-files serves the documents mount: anything that touches it (the forker,
         // cloning the doors for an app's root) blocks until it answers, so it comes first.
@@ -885,7 +851,8 @@ fn service(
 
 /// The host workspace: the person's terminal as their own account, from `--host-user` and
 /// `--host-exec`. Its environment is the listed one plus what a login would give it and the
-/// socket the compositor serves it on.
+/// apps' Wayland socket, where the compositor learns from drv-appd's manifest that this UID
+/// is `host`.
 fn host_service(args: &Args) -> Result<Option<Service>, String> {
     let (user, exec) = match (&args.host_user, &args.host_exec) {
         (None, None) => return Ok(None),
@@ -901,7 +868,7 @@ fn host_service(args: &Args) -> Result<Option<Service>, String> {
         ("SHELL".to_owned(), shell),
         (
             "WAYLAND_DISPLAY".to_owned(),
-            args.host_socket.to_string_lossy().into_owned(),
+            args.apps_socket.to_string_lossy().into_owned(),
         ),
     ]);
     service.host = true;

@@ -2913,19 +2913,6 @@ impl Niri {
                 }
             });
 
-        // The host workspace's socket: the person's own account connects here (the
-        // supervisor made it theirs alone, and we check the UID again). Its clients get the
-        // `host` policy, never a lookup.
-        if let Some(listener) = crate::wire::take_host_listener() {
-            match env::var("DRV_HOST_UID").ok().and_then(|s| s.parse().ok()) {
-                Some(uid) => match serve_host_listener(&event_loop, listener, uid) {
-                    Ok(()) => info!("listening on the host workspace's socket for uid {uid}"),
-                    Err(err) => warn!("error serving the host socket: {err:?}"),
-                },
-                None => warn!("a host socket without DRV_HOST_UID; ignoring it"),
-            }
-        }
-
         // No IPC socket: a client that can act as the compositor would bypass every policy.
         // Launching goes to the identity daemon directly; everything else is Wayland.
         let ipc_server: Option<IpcServer> = None;
@@ -7021,31 +7008,6 @@ impl Niri {
         }
     }
 
-    /// A connection on the host workspace's socket (the peer UID already checked): the
-    /// person's own terminal, pinned to its workspace by the config's `match app="host"`.
-    pub fn insert_host_client(&mut self, client: UnixStream) {
-        let config = self.config.borrow();
-        let data = Arc::new(ClientState {
-            compositor_state: Default::default(),
-            can_view_decoration_globals: config.prefer_no_csd,
-            primary_selection_disabled: config.clipboard.disable_primary,
-            restricted: false,
-            credentials_unknown: false,
-            policy: Arc::new(AppPolicy {
-                name: "host".to_owned(),
-                gpu: true,
-                globals: Vec::new(),
-                grants: Vec::new(),
-                icon: None,
-                agent: false,
-            }),
-        });
-        match self.display_handle.insert_client(client, data) {
-            Ok(_) => info!("host workspace client attached"),
-            Err(err) => warn!("error inserting the host client: {err}"),
-        }
-    }
-
     /// The lock client released its lock. Without a lease from drv-authd we stay locked.
     pub fn unlock(&mut self) {
         info!("lock client released its lock");
@@ -7595,44 +7557,6 @@ fn serve_apps_listener(
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
                 Err(err) => {
                     warn!("error accepting on the apps socket: {err}");
-                    break;
-                }
-            }
-        }
-        Ok(PostAction::Continue)
-    })?;
-    Ok(())
-}
-
-/// The host workspace's listener: every connection must come from `uid` (the person's own
-/// account); any other peer is dropped. The client is the host workspace by where it
-/// connected, with the policy of an ordinary GPU app: the ordinary globals and the clipboard,
-/// nothing privileged.
-fn serve_host_listener(
-    event_loop: &LoopHandle<'static, State>,
-    listener: UnixListener,
-    uid: u32,
-) -> anyhow::Result<()> {
-    listener.set_nonblocking(true)?;
-    let source = Generic::new(listener, Interest::READ, Mode::Level);
-    event_loop.insert_source(source, move |_, listener, state| {
-        loop {
-            match listener.accept() {
-                Ok((client, _)) => {
-                    match rustix::net::sockopt::socket_peercred(&client) {
-                        Ok(cred) if cred.uid.as_raw() == uid => {
-                            state.niri.insert_host_client(client)
-                        }
-                        Ok(cred) => warn!(
-                            "uid {} on the host socket; dropped",
-                            cred.uid.as_raw()
-                        ),
-                        Err(err) => warn!("credentials on the host socket: {err}; dropped"),
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) => {
-                    warn!("error accepting on the host socket: {err}");
                     break;
                 }
             }

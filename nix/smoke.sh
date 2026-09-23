@@ -18,7 +18,7 @@ for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-c
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
 expect "the host workspace's terminal" "drv-supervisor: drv-host running as uid 1000"
-expect "attached on its own socket" "host workspace client attached"
+expect "named host by drv-appd" 'new client: policy "host"'
 
 echo "== kernel state"
 for who in flower forker compositor; do

@@ -39,15 +39,6 @@ pub fn take_apps_listener() -> Option<UnixListener> {
     APPS.lock().unwrap().take()
 }
 
-/// The host workspace's Wayland listener (`/run/drv/host.sock`, the person's own account's):
-/// present when the supervisor was given a host user.
-static HOST: Mutex<Option<UnixListener>> = Mutex::new(None);
-
-/// The host workspace's listener from the supervisor, once.
-pub fn take_host_listener() -> Option<UnixListener> {
-    HOST.lock().unwrap().take()
-}
-
 /// Whether the supervisor gave us fds at all. A malformed handoff is fatal.
 pub fn init() -> bool {
     match drv_os::fds::take() {
@@ -96,12 +87,6 @@ pub fn take() -> Vec<(Peer, OwnedFd)> {
     match fds.listener("apps") {
         Ok(listener) => *APPS.lock().unwrap() = Some(listener),
         Err(err) => warn!("fd \"apps\" from the supervisor: {err}"),
-    }
-    if fds.has("host") {
-        match fds.listener("host") {
-            Ok(listener) => *HOST.lock().unwrap() = Some(listener),
-            Err(err) => warn!("fd \"host\" from the supervisor: {err}"),
-        }
     }
     for (peer, name, kind) in [
         (Peer::Auth, "auth", Kind::SeqPacket),
