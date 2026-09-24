@@ -17,7 +17,7 @@ for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-c
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
-expect "the host workspace's terminal" "drv-supervisor: drv-host running as uid 1000"
+expect "the host workspace's terminal" "Started the host workspace's terminal"
 expect "named host by drv-appd" 'new client: policy "host"'
 
 echo "== kernel state"
@@ -55,6 +55,10 @@ expect "PIN accepted" "PIN accepted; unlocking"
 echo "== host workspace"
 mark; key meta_l-grave_accent; sleep 1
 vt=$($SSH cat /sys/class/tty/tty0/active); [ "$vt" = tty7 ] && echo "PASS Mod+Grave stays on the desktop ($vt)" || fail "Mod+Grave switched to $vt"
+# run0 in it: its terminal is a logind session, so polkit lets the agent register (the
+# password prompt then waits; ^C ends it).
+type_word run0; key spc; type_word true; key ret; sleep 2; key ctrl-c; sleep 1
+expect "run0 got as far as polkit's password prompt" "polkit-agent-helper-1.*pam_authenticate failed" 
 # The overlay holds the keyboard while it is up: put it away before the menu steps.
 key meta_l-grave_accent; sleep 1
 

@@ -46,10 +46,6 @@ pub struct Service {
     pub writable_sys: bool,
     /// Sees the nix daemon's socket directory (the forker: apps with `nix` get it from there).
     pub nix_daemon: bool,
-    /// The host workspace's terminal: runs as the person on the host's own root, no
-    /// namespaces, no root of its own, outside the set's cgroup (the set restarting does not
-    /// kill what the person was running). Only the user switch and the fds are ours.
-    pub host: bool,
 }
 
 /// A member's root, built in the child: what every member gets, plus its `expose` entries
@@ -275,12 +271,10 @@ pub fn start_service(
             // While CAP_SYS_ADMIN is still ours. Only an errno reaches the parent; the words
             // go to the journal from here.
             let child = || -> Result<(), String> {
-                if !s.host {
-                    // Into the set's cgroup, as us: one write to its cgroup.kill ends us all.
-                    std::fs::write(&set_procs, b"0")
-                        .map_err(|e| format!("{}: {e}", set_procs.display()))?;
-                    build_root(s)?;
-                }
+                // Into the set's cgroup, as us: one write to its cgroup.kill ends us all.
+                std::fs::write(&set_procs, b"0")
+                    .map_err(|e| format!("{}: {e}", set_procs.display()))?;
+                build_root(s)?;
                 let groups: Vec<Gid> = s.groups.iter().map(|g| Gid::from_raw(*g)).collect();
                 drv_os::creds::switch_to(
                     Uid::from_raw(s.uid),
@@ -288,10 +282,6 @@ pub fn start_service(
                     &groups,
                     s.caps,
                 )?;
-                if s.host {
-                    // The person's own processes: run0 and the like stay possible.
-                    return Ok(());
-                }
                 rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))
             };
             child().map_err(|e| {
