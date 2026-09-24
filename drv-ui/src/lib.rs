@@ -7,6 +7,7 @@ pub use pangocairo;
 pub use smithay_client_toolkit as sctk;
 pub use wayland_client;
 
+use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 
@@ -37,10 +38,19 @@ pub struct Ui {
     /// The surface of ours the keyboard is on, if any: a client with several surfaces
     /// (drv-shell) routes keys by it.
     pub focus: Option<wl_surface::WlSurface>,
+    /// Each surface's buffer scale, as the compositor last said (the output's, 2 on a HiDPI
+    /// screen): the buffer is that many pixels per logical unit, or text is blurry.
+    pub scales: HashMap<wl_surface::WlSurface, i32>,
 }
 
 impl Ui {
-    /// Paints a fresh buffer of `width` x `height` with `draw`, attaches it and commits.
+    /// The buffer scale for `surface`: 1 until the compositor says otherwise.
+    pub fn scale(&self, surface: &wl_surface::WlSurface) -> i32 {
+        self.scales.get(surface).copied().unwrap_or(1).max(1)
+    }
+
+    /// Paints a fresh buffer of `width` x `height` (logical units; the buffer has the
+    /// surface's scale) with `draw`, attaches it and commits.
     pub fn draw(
         &mut self,
         surface: &wl_surface::WlSurface,
@@ -48,13 +58,16 @@ impl Ui {
         height: u32,
         draw: impl FnOnce(&Painter),
     ) -> Result<(), String> {
-        let stride = width as i32 * 4;
+        let scale = self.scale(surface);
+        let (pw, ph) = (width * scale as u32, height * scale as u32);
+        let stride = pw as i32 * 4;
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+            .create_buffer(pw as i32, ph as i32, stride, wl_shm::Format::Argb8888)
             .map_err(|e| format!("buffer: {e}"))?;
-        paint(canvas, width, height, stride, draw)?;
-        surface.damage_buffer(0, 0, width as i32, height as i32);
+        paint(canvas, pw, ph, stride, scale, draw)?;
+        surface.set_buffer_scale(scale);
+        surface.damage_buffer(0, 0, pw as i32, ph as i32);
         buffer.attach_to(surface).map_err(|e| format!("attach: {e}"))?;
         surface.commit();
         Ok(())
@@ -68,6 +81,9 @@ pub trait Client: Sized + 'static {
     fn key(&mut self, _qh: &QueueHandle<Self>, _event: KeyEvent) {}
     fn new_output(&mut self, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
     fn output_gone(&mut self, _output: wl_output::WlOutput) {}
+    /// The compositor changed `surface`'s buffer scale (it entered a screen, say): draw it
+    /// again at the new scale.
+    fn scale_changed(&mut self, _qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface) {}
 }
 
 /// The connection, its globals, and an event loop already dispatching it.
@@ -121,6 +137,7 @@ macro_rules! ui {
                 pool,
                 keyboard: None,
                 focus: None,
+                scales: Default::default(),
             })
         })()
     }};
@@ -261,10 +278,15 @@ macro_rules! client {
             fn scale_factor_changed(
                 &mut self,
                 _: &$crate::wayland_client::Connection,
-                _: &$crate::wayland_client::QueueHandle<Self>,
-                _: &$crate::wayland_client::protocol::wl_surface::WlSurface,
-                _: i32,
+                qh: &$crate::wayland_client::QueueHandle<Self>,
+                surface: &$crate::wayland_client::protocol::wl_surface::WlSurface,
+                factor: i32,
             ) {
+                let ui = <Self as $crate::Client>::ui(self);
+                ui.scales.retain(|s, _| $crate::wayland_client::Proxy::is_alive(s));
+                if ui.scales.insert(surface.clone(), factor) != Some(factor) {
+                    <Self as $crate::Client>::scale_changed(self, qh, surface);
+                }
             }
             fn transform_changed(
                 &mut self,
@@ -399,22 +421,25 @@ impl Painter<'_> {
     }
 }
 
-/// Paints `canvas` (ARGB, `stride` bytes per row) through `draw`.
+/// Paints `canvas` (ARGB, `width` x `height` pixels, `stride` bytes per row) through `draw`,
+/// which sees `scale` pixels per unit: its coordinates and sizes are logical.
 pub fn paint(
     canvas: &mut [u8],
     width: u32,
     height: u32,
     stride: i32,
+    scale: i32,
     draw: impl FnOnce(&Painter),
 ) -> Result<(), String> {
     let mut surface = ImageSurface::create(Format::ARgb32, width as i32, height as i32)
         .map_err(|e| format!("cairo surface: {e}"))?;
     {
         let cr = Context::new(&surface).map_err(|e| format!("cairo context: {e}"))?;
+        cr.scale(scale as f64, scale as f64);
         draw(&Painter {
             cr: &cr,
-            width: width as f64,
-            height: height as f64,
+            width: width as f64 / scale as f64,
+            height: height as f64 / scale as f64,
         });
     }
     surface.flush();
@@ -432,7 +457,7 @@ pub fn paint(
 /// a scrap buffer, so that after [`seal`] they only need to read font files.
 pub fn warm_fonts() {
     let mut scrap = [0u8; 16];
-    let _ = paint(&mut scrap, 2, 2, 8, |p| {
+    let _ = paint(&mut scrap, 2, 2, 8, 1, |p| {
         p.text(0., 0., 10., "a", Align::Left, (1., 1., 1., 1.))
     });
 }

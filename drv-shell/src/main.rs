@@ -905,6 +905,25 @@ impl Client for App {
     fn output_gone(&mut self, output: wl_output::WlOutput) {
         self.lock.surfaces.remove(&output);
     }
+
+    fn scale_changed(&mut self, _qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface) {
+        let is = |s: &wl_surface::WlSurface| s == surface;
+        let lock_output = self
+            .lock
+            .surfaces
+            .iter()
+            .find(|(_, s)| is(s.surface.wl_surface()))
+            .map(|(o, _)| o.clone());
+        if let Some(output) = lock_output {
+            self.draw_lock(&output);
+        } else if self.dialog.as_ref().is_some_and(|d| is(d.layer.wl_surface())) {
+            self.draw_dialog();
+        } else if self.menu.layer.as_ref().is_some_and(|l| is(l.wl_surface())) {
+            self.draw_menu();
+        } else if self.notes.layer.as_ref().is_some_and(|l| is(l.wl_surface())) {
+            self.draw_notes();
+        }
+    }
 }
 
 impl SessionLockHandler for App {

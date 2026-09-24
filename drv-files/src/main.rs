@@ -31,6 +31,7 @@ use drv_ui::sctk::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
 };
+use drv_ui::wayland_client::protocol::wl_surface;
 use drv_ui::wayland_client::{Connection, QueueHandle};
 use drv_ui::{Align, Client, Painter, Ui};
 
@@ -382,6 +383,10 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
 impl Client for App {
     fn ui(&mut self) -> &mut Ui {
         &mut self.ui
+    }
+
+    fn scale_changed(&mut self, _qh: &QueueHandle<Self>, _surface: &wl_surface::WlSurface) {
+        self.draw();
     }
 
     fn key(&mut self, qh: &QueueHandle<Self>, event: KeyEvent) {
