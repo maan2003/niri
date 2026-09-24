@@ -879,7 +879,9 @@ impl Shim {
 
     fn notification(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         Ok(Ours::Reply(match member {
-            "GetCapabilities" => Message::method_return(hdr)?.build(&vec!["body"])?,
+            // "actions" is advertised though the shell shows none: Chromium will not use a
+            // server without it and draws its own notifications instead.
+            "GetCapabilities" => Message::method_return(hdr)?.build(&vec!["body", "actions"])?,
             "GetServerInformation" => Message::method_return(hdr)?.build(&(
                 "drv-dbus-shim",
                 "drv",
