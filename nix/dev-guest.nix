@@ -113,14 +113,13 @@ in
   networking.firewall.enable = false;
   fonts.enableDefaultPackages = true;
 
-  # The ssh admin, and the host workspace's account: its terminal runs as her on the host's
-  # own root, over the desktop when Mod+Grave toggles it.
+  # The ssh admin.
   users.users.alice = {
     isNormalUser = true;
     uid = 1000;
   };
   services.drv.host = {
-    user = "alice";
+    enable = true;
     exec = [ "${pkgs.weston}/bin/weston-terminal" ];
   };
 
