@@ -14,11 +14,14 @@ use crate::niri::State;
 pub struct Held {
     keys: BTreeSet<u32>,
     buttons: BTreeSet<u32>,
+    feedback_id: Option<u64>,
 }
 
 pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input) -> Result<()> {
     let time = crate::utils::get_monotonic_time().as_millis() as u32;
-    state.niri.notify_activity();
+    if !matches!(input, Input::Feedback(_)) {
+        state.niri.notify_activity();
+    }
     match input {
         Input::Move { x, y } => {
             let output = state
@@ -112,13 +115,18 @@ pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input
                 state.desktop_button(None, code, ButtonState::Released, time);
             }
         }
+        Input::Feedback(feedback) => {
+            quality.feedback(&mut held.feedback_id, feedback, std::time::Instant::now());
+            if feedback.recover {
+                super::video::request_recovery(state, quality)?;
+            }
+        }
         Input::Quality { bitrate, keyframe } => {
             quality
                 .bitrate
                 .store(bitrate.clamp(128_000, 20_000_000), Ordering::Release);
             if keyframe {
-                quality.keyframe.store(true, Ordering::Release);
-                state.niri.queue_redraw_all();
+                super::video::request_recovery(state, quality)?;
             }
         }
         Input::Text(text) => {
@@ -177,6 +185,9 @@ pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input
         }
     }
     Ok(())
+}
+pub fn disconnect(held: &Held, quality: &Quality) {
+    quality.remove_viewer(held.feedback_id);
 }
 fn key(state: &mut State, code: u32, down: bool, time: u32) {
     state.desktop_key(

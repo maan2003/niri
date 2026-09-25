@@ -272,6 +272,7 @@ pub fn start(state: &mut State, name: &str) -> Result<Socket> {
                     }
                     .await;
                     cleanup_loop.insert_idle(move |state| {
+                        input::disconnect(&cleanup_held.borrow(), &cleanup_quality);
                         let _ = input::apply(
                             state,
                             &mut cleanup_held.borrow_mut(),

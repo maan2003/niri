@@ -58,10 +58,10 @@ name = "niri"
 path = "src/main.rs"
 
 [dependencies]
-rho-desktop-proto = { git = "https://github.com/maan2003/rho", rev = "657b838de4158c801654064ba02b0b5a85c8f472" }
-rho-desktop-media = { git = "https://github.com/maan2003/rho", rev = "657b838de4158c801654064ba02b0b5a85c8f472", features = ["encoder"] }
+rho-desktop-proto = { git = "https://github.com/maan2003/rho", rev = "c016b8f55220cb6b9368c12e3d30bfb8c0057ad9" }
+rho-desktop-media = { git = "https://github.com/maan2003/rho", rev = "c016b8f55220cb6b9368c12e3d30bfb8c0057ad9", features = ["encoder"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"] }
-moq-net = { git = "https://github.com/maan2003/rho", rev = "657b838de4158c801654064ba02b0b5a85c8f472" }
+moq-net = { git = "https://github.com/maan2003/rho", rev = "c016b8f55220cb6b9368c12e3d30bfb8c0057ad9" }
 accesskit = { version = "0.21.0", optional = true }
 accesskit_unix = { version = "0.17.0", optional = true }
 anyhow.workspace = true
@@ -195,4 +195,4 @@ assets = [
 ]
 
 [patch.crates-io]
-kio = { git = "https://github.com/maan2003/rho", rev = "657b838de4158c801654064ba02b0b5a85c8f472" }
+kio = { git = "https://github.com/maan2003/rho", rev = "c016b8f55220cb6b9368c12e3d30bfb8c0057ad9" }
