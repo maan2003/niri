@@ -18,6 +18,8 @@ let
     <pre id=log style="color:#fff;font-size:30px"></pre>
     <script>
       const log = m => document.getElementById("log").textContent += m + "\\n";
+      // The smoke test drives it by key: s share, m mic, c camera.
+      document.onkeydown = e => ({ s: b, m: m, c: c }[e.key] || {}).onclick?.();
       b.onclick = async () => {
         try {
           const s = await navigator.mediaDevices.getDisplayMedia({ video: true });
@@ -188,13 +190,18 @@ in
           "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRtcPipeWireCamera"
           # Its log, for the camera: the portal dance happens in its video utility process.
           "--enable-logging=stderr" "--v=0" "--vmodule=camera_portal=2,pipewire_session=2,video_capture_device_factory_webrtc=2"
-          "file://${sharePage}"
+          "file:///share.html"
         ];
+        # The page: a URL is not a store path the closure would list, a link is.
+        links."/share.html" = "${sharePage}";
         gpu = true;
         network = true;
         audio = true;
         opens = [ "http" "https" ];
         state = [ ".config/chromium" ".cache/chromium" ];
+        # Its single-instance socket lives under TMPDIR; /tmp is of the run, so a second
+        # launch (OpenURI while it runs) has to find the first one's socket in its state.
+        env.TMPDIR = "/home/app/.cache/chromium";
         jit = true;
         userns = true;
       };

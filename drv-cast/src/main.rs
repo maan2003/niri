@@ -107,7 +107,7 @@ struct Consent {
 /// A question up at the shell.
 enum Asking {
     Pick { conn: u64, session: u64, screens: bool, windows: bool },
-    Device { uid: u32, device: Device, waiting: Vec<(u64, u64)> },
+    Device { uid: u32, device: Device },
 }
 
 struct Cast {
@@ -175,8 +175,7 @@ impl Cast {
             Event::Compositor(msg) => self.on_compositor(msg),
             Event::Shell(resp) => self.on_shell(resp),
             Event::PwAsked { uid, device } => match self.door.who(uid) {
-                Ok(policy) if device == Device::Camera && policy.camera => self.grant_device(uid, device, Vec::new()),
-                Ok(policy) => self.ask_device(policy.name.clone(), uid, device, None),
+                Ok(policy) => self.ask_device(policy.name.clone(), uid, device),
                 Err(err) => {
                     drv_os::say!("drv-cast: uid {uid} asks for the {}: {err}", device_name(device));
                     self.pw.answered(uid, device);
@@ -243,37 +242,22 @@ impl Cast {
                 self.remote(conn, req, RemoteFor::Session(session), vec![node], format!("node:{node}"), app);
             }
             ToCast::CastClose { session } => self.close_session(conn, session, false),
-            ToCast::Camera { req } => {
-                if self.has(uid, Device::Camera) {
-                    return self.send(conn, FromCast::Granted { req }, &[]);
-                }
-                if self.standing(uid, Device::Camera) {
-                    self.grant_device(uid, Device::Camera, vec![(conn, req)]);
-                    return;
-                }
-                self.ask_device(app, uid, Device::Camera, Some((conn, req)));
-            }
+            // No question here: the remote sees the cameras (Chromium lists them at the first
+            // page that asks), and WirePlumber asks the person when a stream is to be linked
+            // to one, as for the microphone (`request:<uid>:camera`).
             ToCast::CameraRemote { req } => {
-                if !self.has(uid, Device::Camera) {
-                    return self.fail(conn, req, "the camera was not allowed");
-                }
                 let cameras = self.pw.cameras();
-                self.remote(conn, req, RemoteFor::Camera, cameras, "camera".to_owned(), app);
+                self.remote(conn, req, RemoteFor::Camera, cameras, format!("camera:{uid}"), app);
             }
             ToCast::CameraPresent { req } => {
                 let present = !self.pw.cameras().is_empty();
                 self.send(conn, FromCast::Present { req, present }, &[]);
             }
             ToCast::Cancel { req } => {
-                // A cast waiting on the person, or a camera question.
+                // A cast waiting on the person.
                 let session = c.sessions.iter().find(|(_, s)| s.req == req && s.ask.is_some()).map(|(k, _)| *k);
                 if let Some(session) = session {
-                    return self.close_session(conn, session, false);
-                }
-                for asking in self.asks.values_mut() {
-                    if let Asking::Device { waiting, .. } = asking {
-                        waiting.retain(|w| *w != (conn, req));
-                    }
+                    self.close_session(conn, session, false);
                 }
             }
         }
@@ -325,11 +309,6 @@ impl Cast {
             self.close_session(conn, session, false);
         }
         self.conns.remove(&conn);
-        for asking in self.asks.values_mut() {
-            if let Asking::Device { waiting, .. } = asking {
-                waiting.retain(|(k, _)| *k != conn);
-            }
-        }
         if !self.conns.values().any(|c| c.uid == uid) {
             self.consents.retain(|_, k| k.uid != uid);
             self.forget_devices(uid);
@@ -518,13 +497,10 @@ impl Cast {
                     self.send(conn, FromCast::Cancelled { req }, &[]);
                 }
             }
-            (Asking::Device { uid, device, waiting }, Response::Yes { .. }) => self.grant_device(uid, device, waiting),
-            (Asking::Device { uid, device, waiting }, _) => {
+            (Asking::Device { uid, device }, Response::Yes { .. }) => self.grant_device(uid, device),
+            (Asking::Device { uid, device }, _) => {
                 drv_os::say!("drv-cast: uid {uid} may not use the {}", device_name(device));
                 self.pw.answered(uid, device);
-                for (conn, req) in waiting {
-                    self.send(conn, FromCast::Cancelled { req }, &[]);
-                }
             }
         }
     }
@@ -535,15 +511,9 @@ impl Cast {
         self.devices.get(&uid).is_some_and(|(_, d)| d.contains(&device))
     }
 
-    /// The manifest grants the device for good (`camera`): no question, the grant is
-    /// written on the first request of the run, like an answer of yes.
-    fn standing(&self, uid: u32, device: Device) -> bool {
-        device == Device::Camera && self.door.who(uid).is_ok_and(|p| p.camera)
-    }
-
-    /// The person said yes (or the manifest did): the grant is written where WirePlumber
-    /// reads it, shown, and everyone waiting hears `Granted`.
-    fn grant_device(&mut self, uid: u32, device: Device, waiting: Vec<(u64, u64)>) {
+    /// The person said yes: the grant is written where WirePlumber reads it (the waiting
+    /// stream links), and shown.
+    fn grant_device(&mut self, uid: u32, device: Device) {
         let app = self.conns.values().find(|c| c.uid == uid).map(|c| c.app.clone());
         let app = app.or_else(|| self.door.who(uid).ok().map(|p| p.name.clone())).unwrap_or_else(|| format!("uid {uid}"));
         drv_os::say!("drv-cast: {app} (uid {uid}) may use the {}", device_name(device));
@@ -554,31 +524,21 @@ impl Cast {
         self.pw.write(uid, entry.1.iter().copied());
         self.pw.answered(uid, device);
         self.show_devices();
-        for (conn, req) in waiting {
-            self.send(conn, FromCast::Granted { req }, &[]);
-        }
     }
 
-    /// One question per uid and device at a time; `waiter` hears the answer.
-    fn ask_device(&mut self, app: String, uid: u32, device: Device, waiter: Option<(u64, u64)>) {
+    /// One question per uid and device at a time.
+    fn ask_device(&mut self, app: String, uid: u32, device: Device) {
         if self.has(uid, device) {
             // Told again, for a request that came before the grant was written.
             self.pw.answered(uid, device);
-            if let Some((conn, req)) = waiter {
-                self.send(conn, FromCast::Granted { req }, &[]);
-            }
             return;
         }
-        let up = self.asks.iter_mut().find_map(|(_, a)| match a {
-            Asking::Device { uid: u, device: d, waiting } if *u == uid && *d == device => Some(waiting),
-            _ => None,
-        });
-        if let Some(waiting) = up {
-            waiting.extend(waiter);
+        let up = self.asks.values().any(|a| matches!(a, Asking::Device { uid: u, device: d } if *u == uid && *d == device));
+        if up {
             return;
         }
         let id = self.id();
-        self.asks.insert(id, Asking::Device { uid, device, waiting: waiter.into_iter().collect() });
+        self.asks.insert(id, Asking::Device { uid, device });
         self.ask(Request::Confirm {
             id,
             app,

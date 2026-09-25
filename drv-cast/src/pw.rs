@@ -111,7 +111,8 @@ impl Pw {
     }
 
     /// A remote went out as PipeWire client `client`: its streams may reach `what` only
-    /// ("camera", or "node:<id>"), which WirePlumber enforces. Back once that is in.
+    /// ("camera:<uid>", the cameras under the app's grant, or "node:<id>"), which
+    /// WirePlumber enforces. Back once that is in.
     pub fn mark(&self, client: u32, what: &str) -> anyhow::Result<()> {
         let (done, back) = mpsc::channel();
         self.send(Cmd::Mark { client, what: what.to_owned(), done });
@@ -352,7 +353,8 @@ fn remote(nodes: &[u32]) -> anyhow::Result<(OwnedFd, u32)> {
     anyhow::ensure!(!client.is_null(), "PipeWire gave no client");
     let rwx = PermissionFlags::R | PermissionFlags::W | PermissionFlags::X;
     let mut perms = vec![Permission::new(PW_ID_CORE, rwx), Permission::new(factory.get(), PermissionFlags::R)];
-    perms.extend(nodes.iter().map(|node| Permission::new(*node, rwx)));
+    // The nodes: seen and read (their formats), not changed; linking is WirePlumber's.
+    perms.extend(nodes.iter().map(|node| Permission::new(*node, PermissionFlags::R | PermissionFlags::X)));
     perms.push(Permission::new(pipewire::sys::PW_ID_ANY, PermissionFlags::empty()));
     // SAFETY: a live client proxy, and the array is `pw_permission` in memory.
     unsafe {

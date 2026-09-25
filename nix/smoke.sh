@@ -113,6 +113,20 @@ expect "session locked" 'locking session'
 key 1 2 3 4 ret; sleep 2
 expect "unlocked again" 'PIN accepted; unlocking'
 
+echo "== camera"
+# Chromium asks the portal for the cameras when the page enumerates devices (at start):
+# no question for that; the question comes when the page captures (its camera button).
+mark; menu chro
+expect_soon "chromium launched" 'launched "chromium" as uid 100005'
+sleep 12
+out=$(journal | grep -E 'chromium \(uid 100005\) may use the camera|drv-cast: chromium.*camera' | head -2)
+[ -z "$out" ] && echo "PASS no camera question at start" || fail "asked at start: $out"
+key c; sleep 4                 # the page's camera button: getUserMedia
+key ret; sleep 4               # allow
+expect "camera granted on capture" 'drv-cast: chromium \(uid 100005\) may use the camera'
+key meta_l-shift-esc; sleep 3
+expect "revoke took the camera" 'drv-cast: chromium \(uid 100005\) loses the camera'
+
 echo "== OpenURI"
 $SSH rm -f /var/lib/drv-apps/100011/out/open.txt
 mark; menu open; sleep 6

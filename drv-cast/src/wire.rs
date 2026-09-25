@@ -47,13 +47,11 @@ pub enum ToCast {
     CastRemote { req: u64, session: u64 },
     /// The session is over: the cast stops, its remotes are cut. No answer.
     CastClose { session: u64 },
-    /// May the app use the camera? `Granted` or `Cancelled`; asked once per run.
-    Camera { req: u64 },
     /// A PipeWire connection that sees the cameras: `Remote` or `Failed`.
     CameraRemote { req: u64 },
     /// Is there a camera at all? `Present`.
     CameraPresent { req: u64 },
-    /// Withdraw a `Cast` or `Camera` still waiting on the person. No answer.
+    /// Withdraw a `Cast` still waiting on the person. No answer.
     Cancel { req: u64 },
 }
 
@@ -73,7 +71,6 @@ pub enum FromCast {
     CastClosed { session: u64 },
     /// One fd rides along.
     Remote { req: u64 },
-    Granted { req: u64 },
     Present { req: u64, present: bool },
     /// The person said no, or the request was withdrawn.
     Cancelled { req: u64 },
@@ -86,7 +83,6 @@ impl FromCast {
         match self {
             FromCast::Cast { req, .. }
             | FromCast::Remote { req }
-            | FromCast::Granted { req }
             | FromCast::Present { req, .. }
             | FromCast::Cancelled { req }
             | FromCast::Failed { req, .. } => Some(*req),

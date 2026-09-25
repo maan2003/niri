@@ -7079,7 +7079,6 @@ impl Niri {
                 grants: Vec::new(),
                 icon: None,
                 agent: false,
-                camera: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
@@ -7105,7 +7104,6 @@ impl Niri {
                 grants: Vec::new(),
                 icon: None,
                 agent: false,
-                camera: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {

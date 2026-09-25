@@ -270,8 +270,6 @@ struct State {
     handles: HashMap<String, (Where, u64)>,
     /// Sessions by their path.
     sessions: HashMap<String, Session>,
-    /// The camera was allowed this run.
-    camera: bool,
 }
 
 struct Paths {
@@ -800,43 +798,22 @@ impl Shim {
         Ok(Ours::Done)
     }
 
-    /// `org.freedesktop.portal.Camera`: the person is asked once per run of the app, and
-    /// the remote sees every camera, for as long as the consent stands.
+    /// `org.freedesktop.portal.Camera`: no question here. Chromium asks for access to list
+    /// the cameras at the first page that enumerates devices, so access is granted and the
+    /// remote sees every camera; the person is asked when a stream is to be linked to one
+    /// (WirePlumber's gate, as for the microphone), which is when a page captures.
     fn camera(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         match member {
             "AccessCamera" => {
                 let caller = caller_of(hdr)?;
                 let (options,): (HashMap<String, OwnedValue>,) = msg.body().deserialize()?;
-                let cast = self.cast()?;
                 let handle = handle_for(msg, &caller, &options, "handle_token");
                 // The reply first, then the signal: the spec's order.
                 self.bus.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
-                if self.state.lock().unwrap().camera {
-                    self.respond(&handle, &caller, 0, HashMap::new())?;
-                    return Ok(Ours::Done);
-                }
-                let req = self.next();
-                let shim = self.clone();
-                cast.ask(req, &ToCast::Camera { req }, move |answer, _| {
-                    let code = match answer {
-                        FromCast::Granted { .. } => {
-                            shim.state.lock().unwrap().camera = true;
-                            0
-                        }
-                        FromCast::Cancelled { .. } => 1,
-                        other => {
-                            drv_os::say!("drv-dbus-shim: camera: {other:?}");
-                            2
-                        }
-                    };
-                    if let Err(err) = shim.respond(&handle, &caller, code, HashMap::new()) {
-                        drv_os::say!("drv-dbus-shim: camera response: {err}");
-                    }
-                })?;
+                self.respond(&handle, &caller, 0, HashMap::new())?;
                 Ok(Ours::Done)
             }
             "OpenPipeWireRemote" => {
-                anyhow::ensure!(self.state.lock().unwrap().camera, "the camera was not allowed");
                 let req = self.next();
                 self.remote(msg, req, ToCast::CameraRemote { req })
             }
