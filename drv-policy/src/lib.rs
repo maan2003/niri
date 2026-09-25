@@ -117,6 +117,10 @@ pub struct AppPolicy {
     /// May use the ssh agent (drv-agent checks it on every connection).
     #[serde(default)]
     pub agent: bool,
+    /// May use the cameras without being asked: drv-cast grants the run's first request
+    /// itself (the indicator shows as for any grant; Mod+Shift+Esc still revokes).
+    #[serde(default)]
+    pub camera: bool,
 }
 
 impl AppPolicy {
@@ -129,6 +133,7 @@ impl AppPolicy {
             grants: Vec::new(),
             icon: None,
             agent: false,
+            camera: false,
         }
     }
 
@@ -141,6 +146,7 @@ impl AppPolicy {
             grants: vec![Grant::Lookup],
             icon: None,
             agent: true,
+            camera: true,
         }
     }
 

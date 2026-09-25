@@ -74,6 +74,9 @@ pub struct AppConfig {
     /// May use the ssh agent; drv-agent asks on every connection.
     #[serde(default)]
     pub agent: bool,
+    /// May use the cameras without being asked (drv-cast grants the run's first request).
+    #[serde(default)]
+    pub camera: bool,
     /// Extra environment for this app only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -104,6 +107,7 @@ impl AppConfig {
             grants: self.grants.clone(),
             icon: self.icon.clone(),
             agent: self.agent,
+            camera: self.camera,
         }
     }
 }

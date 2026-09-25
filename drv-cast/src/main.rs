@@ -175,6 +175,7 @@ impl Cast {
             Event::Compositor(msg) => self.on_compositor(msg),
             Event::Shell(resp) => self.on_shell(resp),
             Event::PwAsked { uid, device } => match self.door.who(uid) {
+                Ok(policy) if device == Device::Camera && policy.camera => self.grant_device(uid, device, Vec::new()),
                 Ok(policy) => self.ask_device(policy.name.clone(), uid, device, None),
                 Err(err) => {
                     drv_os::say!("drv-cast: uid {uid} asks for the {}: {err}", device_name(device));
@@ -245,6 +246,10 @@ impl Cast {
             ToCast::Camera { req } => {
                 if self.has(uid, Device::Camera) {
                     return self.send(conn, FromCast::Granted { req }, &[]);
+                }
+                if self.standing(uid, Device::Camera) {
+                    self.grant_device(uid, Device::Camera, vec![(conn, req)]);
+                    return;
                 }
                 self.ask_device(app, uid, Device::Camera, Some((conn, req)));
             }
@@ -513,21 +518,7 @@ impl Cast {
                     self.send(conn, FromCast::Cancelled { req }, &[]);
                 }
             }
-            (Asking::Device { uid, device, waiting }, Response::Yes { .. }) => {
-                let app = self.conns.values().find(|c| c.uid == uid).map(|c| c.app.clone());
-                let app = app.or_else(|| self.door.who(uid).ok().map(|p| p.name.clone())).unwrap_or_else(|| format!("uid {uid}"));
-                drv_os::say!("drv-cast: {app} (uid {uid}) may use the {}", device_name(device));
-                let entry = self.devices.entry(uid).or_insert_with(|| (app, Vec::new()));
-                if !entry.1.contains(&device) {
-                    entry.1.push(device);
-                }
-                self.pw.write(uid, entry.1.iter().copied());
-                self.pw.answered(uid, device);
-                self.show_devices();
-                for (conn, req) in waiting {
-                    self.send(conn, FromCast::Granted { req }, &[]);
-                }
-            }
+            (Asking::Device { uid, device, waiting }, Response::Yes { .. }) => self.grant_device(uid, device, waiting),
             (Asking::Device { uid, device, waiting }, _) => {
                 drv_os::say!("drv-cast: uid {uid} may not use the {}", device_name(device));
                 self.pw.answered(uid, device);
@@ -542,6 +533,30 @@ impl Cast {
 
     fn has(&self, uid: u32, device: Device) -> bool {
         self.devices.get(&uid).is_some_and(|(_, d)| d.contains(&device))
+    }
+
+    /// The manifest grants the device for good (`camera`): no question, the grant is
+    /// written on the first request of the run, like an answer of yes.
+    fn standing(&self, uid: u32, device: Device) -> bool {
+        device == Device::Camera && self.door.who(uid).is_ok_and(|p| p.camera)
+    }
+
+    /// The person said yes (or the manifest did): the grant is written where WirePlumber
+    /// reads it, shown, and everyone waiting hears `Granted`.
+    fn grant_device(&mut self, uid: u32, device: Device, waiting: Vec<(u64, u64)>) {
+        let app = self.conns.values().find(|c| c.uid == uid).map(|c| c.app.clone());
+        let app = app.or_else(|| self.door.who(uid).ok().map(|p| p.name.clone())).unwrap_or_else(|| format!("uid {uid}"));
+        drv_os::say!("drv-cast: {app} (uid {uid}) may use the {}", device_name(device));
+        let entry = self.devices.entry(uid).or_insert_with(|| (app, Vec::new()));
+        if !entry.1.contains(&device) {
+            entry.1.push(device);
+        }
+        self.pw.write(uid, entry.1.iter().copied());
+        self.pw.answered(uid, device);
+        self.show_devices();
+        for (conn, req) in waiting {
+            self.send(conn, FromCast::Granted { req }, &[]);
+        }
     }
 
     /// One question per uid and device at a time; `waiter` hears the answer.
