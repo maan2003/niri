@@ -79,6 +79,34 @@ pub fn set_attrs(mount: &impl AsFd, attrs: MountAttrFlags, recursive: bool) -> i
     Ok(())
 }
 
+/// `mount` (a detached clone, not yet attached) shown through `userns`'s mapping: a file the
+/// filesystem says belongs to an id the namespace maps appears as the id it maps to, and
+/// writes go the other way. The person's directory, owned by drv-files, becomes the app's
+/// own inside its root and stays drv-files' on disk.
+pub fn set_idmap(mount: &impl AsFd, userns: &impl AsFd) -> io::Result<()> {
+    let attr = MountAttr {
+        attr_set: MountAttrFlags::MOUNT_ATTR_IDMAP.bits() as u64,
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: userns.as_fd().as_raw_fd() as u64,
+    };
+    // SAFETY: attr outlives the call; size is the struct's.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOUNT_SETATTR,
+            mount.as_fd().as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            &attr as *const MountAttr,
+            std::mem::size_of::<MountAttr>(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `what` (a detached mount) onto `path`, which must exist.
 pub fn attach(what: OwnedFd, path: &Path) -> io::Result<()> {
     Ok(move_mount(

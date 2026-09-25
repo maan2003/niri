@@ -33,6 +33,9 @@ pub struct Service {
     /// `(path, mode)`: directories it owns (tmpfiles rules), checked before each start and in its
     /// root.
     pub dirs: Vec<(PathBuf, u32)>,
+    /// Directories of another member's it sees in its root, unchecked here (the forker: the
+    /// person's files, drv-files', so it can idmap an app's `folders` from there).
+    pub binds: Vec<PathBuf>,
     /// Capabilities a non-root service keeps (ambient, so they survive the exec): its whole
     /// bounding set, so nothing it runs can have more.
     pub caps: CapabilitySet,
@@ -117,7 +120,7 @@ fn build_root(service: &Service) -> Result<(), String> {
             mounts.push((path.clone(), clone(path, rw_noexec)?));
         }
     }
-    for (dir, _) in &service.dirs {
+    for dir in service.dirs.iter().map(|(d, _)| d).chain(&service.binds) {
         if !service.expose.contains(dir) {
             mounts.push((dir.clone(), clone(dir, rw_noexec)?));
         }

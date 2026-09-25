@@ -25,6 +25,8 @@ use drv_os::landlock::{self, Ruleset};
 const HOME_RUN: &str = "/home/app";
 /// What persists, mounted by the forker: `/var/lib/drv-apps/<uid>` on the host.
 const STATE: &str = "/state";
+/// Where the forker put the person's folders the app was given.
+const FILES: &str = "/files";
 /// `XDG_RUNTIME_DIR`: of the run, like `/tmp`.
 const RUNTIME: &str = "/run/app";
 /// The doors, bound read-only by the forker, and the documents mount inside, which the app
@@ -49,6 +51,13 @@ struct Args {
     /// A store path: HOME defaults, linked into HOME entry by entry.
     #[arg(long)]
     files: Option<PathBuf>,
+    /// A folder of the person's files the forker mounted at `/files/<name>`: linked from
+    /// `~/<name>`. Repeatable.
+    #[arg(long = "folder")]
+    folders: Vec<PathBuf>,
+    /// A daemon: started again when it exits, until this init is told to stop.
+    #[arg(long)]
+    restart: bool,
     /// `run`: HOME is /home/app, of the run. `persist`: HOME is /state, the app's whole home
     /// persists.
     #[arg(long, default_value = "run")]
@@ -158,25 +167,32 @@ fn run(args: Args) -> Result<Infallible, String> {
     if let Some(files) = &args.files {
         link_tree(files, files, &home)?;
     }
+    for name in &args.folders {
+        link(&Path::new(FILES).join(name), &home.join(name))?;
+    }
     // 5. The rules, on this process and so on the app: what it may open, which syscalls it
     // may not make, no writable and executable memory. no_new_privs is the forker's doing.
     restrict(&args, persist)?;
-    // SAFETY: single-threaded; the child only execs or exits.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return Err(format!("fork: {}", io::Error::last_os_error()));
-    }
-    if pid == 0 {
-        let err = Command::new(&args.argv[0])
-            .args(&args.argv[1..])
-            .env("HOME", &home)
-            .env("XDG_RUNTIME_DIR", RUNTIME)
-            .current_dir(&home)
-            .exec();
-        drv_os::say!("drv-init: exec {}: {err}", args.argv[0]);
-        std::process::exit(126);
-    }
-    init(pid)
+    let spawn = move || -> Result<libc::pid_t, String> {
+        // SAFETY: single-threaded; the child only execs or exits.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(format!("fork: {}", io::Error::last_os_error()));
+        }
+        if pid == 0 {
+            let err = Command::new(&args.argv[0])
+                .args(&args.argv[1..])
+                .env("HOME", &home)
+                .env("XDG_RUNTIME_DIR", RUNTIME)
+                .current_dir(&home)
+                .exec();
+            drv_os::say!("drv-init: exec {}: {err}", args.argv[0]);
+            std::process::exit(126);
+        }
+        Ok(pid)
+    };
+    let pid = spawn()?;
+    init(pid, if args.restart { Some(spawn) } else { None })
 }
 
 /// The app's Landlock domain (read and execute on its closure, or on the whole store with
@@ -219,6 +235,9 @@ fn restrict(args: &Args, persist: bool) -> Result<(), String> {
     for path in ["/tmp", "/etc", RUNTIME, STATE] {
         allow(path, all)?;
     }
+    if !args.folders.is_empty() {
+        allow(FILES, all)?;
+    }
     if !persist {
         allow("/home", all)?;
     }
@@ -235,11 +254,19 @@ fn restrict(args: &Args, persist: bool) -> Result<(), String> {
 /// PID 1 of the app's namespace: reaps whatever gets orphaned, passes the signals it is sent
 /// on to the app, and ends when the app does, with its status. A PID 1 cannot be killed by a
 /// signal from inside its namespace, its own included, so a signal death of the app becomes
-/// exit status 128 + signal here.
-fn init(app: libc::pid_t) -> ! {
-    use std::sync::atomic::{AtomicI32, Ordering};
+/// exit status 128 + signal here. With `restart` (a daemon), the app is started again two
+/// seconds after it ends, unless a signal to stop came in first.
+fn init(app: libc::pid_t, restart: Option<impl Fn() -> Result<libc::pid_t, String>>) -> ! {
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     static APP: AtomicI32 = AtomicI32::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
     extern "C" fn forward(sig: libc::c_int) {
+        if matches!(
+            sig,
+            libc::SIGTERM | libc::SIGINT | libc::SIGHUP | libc::SIGQUIT
+        ) {
+            STOP.store(true, Ordering::Relaxed);
+        }
         let pid = APP.load(Ordering::Relaxed);
         if pid > 0 {
             // SAFETY: async-signal-safe.
@@ -263,7 +290,7 @@ fn init(app: libc::pid_t) -> ! {
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
-    let app = rustix::process::Pid::from_raw(app);
+    let mut app = rustix::process::Pid::from_raw(app);
     loop {
         match rustix::process::waitpid(None, rustix::process::WaitOptions::empty()) {
             Ok(Some((pid, status))) if Some(pid) == app => {
@@ -272,7 +299,27 @@ fn init(app: libc::pid_t) -> ! {
                     (_, Some(sig)) => 128 + sig,
                     _ => 1,
                 };
-                std::process::exit(code);
+                let Some(spawn) = &restart else {
+                    std::process::exit(code)
+                };
+                if STOP.load(Ordering::Relaxed) {
+                    std::process::exit(code);
+                }
+                drv_os::say!("drv-init: the app exited ({code}); starting it again in 2s");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if STOP.load(Ordering::Relaxed) {
+                    std::process::exit(code);
+                }
+                match spawn() {
+                    Ok(pid) => {
+                        APP.store(pid, Ordering::Relaxed);
+                        app = rustix::process::Pid::from_raw(pid);
+                    }
+                    Err(err) => {
+                        drv_os::say!("drv-init: {err}");
+                        std::process::exit(code);
+                    }
+                }
             }
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => {}

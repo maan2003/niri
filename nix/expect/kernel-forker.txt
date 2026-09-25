@@ -26,14 +26,15 @@ mount /sys/kernel/security ro,nosuid,nodev,noexec securityfs root=/ rw
 mount /sys/kernel/tracing ro,nosuid,nodev,noexec tracefs root=/ rw
 mount /tmp rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=910,gid=910
 mount /var/lib/drv-apps rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps rw
+mount /var/lib/drv-files rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-files rw
 Uid: UID UID UID UID
 Gid: UID UID UID UID
 Groups: UID
-CapInh: 00000000002001c0
-CapPrm: 00000000002001c0
-CapEff: 00000000002001c0
-CapBnd: 00000000002001c0
-CapAmb: 00000000002001c0
+CapInh: 00000000002001c4
+CapPrm: 00000000002001c4
+CapEff: 00000000002001c4
+CapBnd: 00000000002001c4
+CapAmb: 00000000002001c4
 NoNewPrivs: 1
 Seccomp: 0
 ns mnt own
@@ -47,7 +48,7 @@ ns time host
 0::/system.slice/drv-supervisor.service/set
 task drv-forker parent drv-supervisor
 uid UID UID UID UID gid UID UID UID UID groups UID
-caps inh 00000000002001c0 prm 00000000002001c0 eff 00000000002001c0 bnd 00000000002001c0 amb 00000000002001c0
+caps inh 00000000002001c4 prm 00000000002001c4 eff 00000000002001c4 bnd 00000000002001c4 amb 00000000002001c4
 securebits 0x0
 user_ns host
 landlock none

@@ -32,6 +32,10 @@ pub struct Launch {
     /// The nix daemon's socket directory, at its own path.
     #[serde(default)]
     pub nix: bool,
+    /// Directories of the person's files (relative to the forker's folders base), each an
+    /// idmapped bind at `/files/<name>` in the root: the app's own inside, drv-files' on disk.
+    #[serde(default)]
+    pub folders: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

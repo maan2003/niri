@@ -43,6 +43,11 @@ file_has "defaults linked from the store" $H/home.txt '^/nix/store/.*-drv-files-
 file_has "and readable through the closure" $H/home.txt '^hello from the store$'
 file_has "store not listable beyond the closure" $H/store.txt 'Permission denied'
 file_has "the ssh agent answers the grant" $H/agent.txt 'The agent has no identities'
+file_has "the person's folder is linked from HOME" $H/folder.txt '^/files/Shared$'
+file_has "and is the app's own inside" $H/folder.txt '^100001 100001 700$'
+file_has "including what it writes there" $H/folder.txt '^100001 100001 644$'
+owner=$($SSH "stat -c '%U %G' /var/lib/drv-files/Shared/hello.txt" 2>&1); [ "$owner" = "drv-files drv-files" ] && echo "PASS but drv-files' on disk" || fail "on disk the file is $owner"
+expect "a daemon that exited is started again" 'drv-init: the app exited \(3\); starting it again in 2s'
 G=/var/lib/drv-apps/100002/out
 for _ in $(seq 1 30); do $SSH test -e $G/done && break; sleep 1; done
 $SSH grep -q 'no identities' $G/agent.txt && fail "the agent answered an app without the grant" || echo "PASS the agent's door is shut without the grant"

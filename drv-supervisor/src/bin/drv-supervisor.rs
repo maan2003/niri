@@ -227,7 +227,7 @@ struct Set {
 }
 
 fn supervise(args: Args) -> Result<(), String> {
-    let set = Set {
+    let mut set = Set {
         seatd: service(
             "drv-seatd",
             &args.seatd_user,
@@ -330,6 +330,9 @@ fn supervise(args: Args) -> Result<(), String> {
     };
     // The apps' cgroups live under ours; the subtree is the forker's across restarts, the
     // kill switches stay ours. That chown was the only one: CHOWN goes, for good.
+    // The forker sees the person's files (drv-files' tree): an app's `folders` are idmapped
+    // binds of subdirectories of it.
+    set.forker.binds = set.files.dirs.iter().map(|(d, _)| d.clone()).collect();
     let cgroups = Cgroups::create(set.forker.uid, set.forker.gid)?;
     drv_os::creds::drop_for_good(CapabilitySet::CHOWN)?;
 
@@ -757,6 +760,7 @@ fn service(
         argv: exec.split_whitespace().map(String::from).collect(),
         env,
         dirs,
+        binds: Vec::new(),
         caps: capset,
         expose: expose.to_vec(),
         // Only the forker keeps the network: apps with `network` get it from the forker's

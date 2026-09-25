@@ -90,6 +90,9 @@ pub struct AppConfig {
     /// Runs nix: the daemon's socket in its root (and, from drv-init, the whole store).
     #[serde(default)]
     pub nix: bool,
+    /// Folders of the person's files the app has as its own (`~/<name>`), drv-files' on disk.
+    #[serde(default)]
+    pub folders: Vec<String>,
 }
 
 impl AppConfig {
@@ -218,7 +221,10 @@ impl Appd {
             .find(|a| a.opens.contains(&scheme))
             .ok_or_else(|| format!("no app opens {scheme}: URIs"))?;
         let uid = self.start(app, Some(uri))?;
-        drv_os::say!("drv-appd: {:?} (uid {uid}) opens {uri:?} for {who}", app.name);
+        drv_os::say!(
+            "drv-appd: {:?} (uid {uid}) opens {uri:?} for {who}",
+            app.name
+        );
         Ok(uid)
     }
 
@@ -271,6 +277,7 @@ impl Appd {
             network: app.network,
             gpu: app.gpu,
             nix: app.nix,
+            folders: app.folders.clone(),
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)
@@ -510,7 +517,10 @@ mod tests {
             assert!(launcher.open(5, bad).is_err(), "{bad}");
         }
         // The public socket: an app may open, a uid that is no app may not.
-        assert!(id.open(5, "https://example.com").unwrap_err().contains("not an app"));
+        assert!(id
+            .open(5, "https://example.com")
+            .unwrap_err()
+            .contains("not an app"));
         assert_eq!(recorder.0.lock().unwrap().len(), 1);
         assert_eq!(id.open(100042, "https://example.com"), Ok(100042));
         assert_eq!(recorder.0.lock().unwrap().len(), 2);

@@ -3,7 +3,8 @@
 //! before looking at it: the parent only receives bytes, forks and reaps. The child does what
 //! takes privilege and nothing else (ARCH-app-policy, "Launching"; DESIGN-app-namespace): a
 //! mount namespace with a root tmpfs the app owns, the few mounts into it (the store, the
-//! device and sysfs views, proc, the doors, the app's state), the cgroup, the UID switch, and
+//! device and sysfs views, proc, the doors, the app's state, the person's folders it is given),
+//! the cgroup, the UID switch, and
 //! the exec of drv-init, which as the app makes the rest of the root and restricts itself.
 //! No config files, no policy, no idea what an "app" is beyond the request type: drv-appd is
 //! the brain; a bug here is reachable only through it. Zygote on Android has the same shape.
@@ -26,14 +27,18 @@ use rustix::process::Pid;
 use rustix::thread::CapabilitySet;
 
 /// What forking an app takes: the namespace and its mounts (SYS_ADMIN), the UID switch
-/// (SETUID, SETGID) and locking the securebits and emptying the bounding set (SETPCAP).
+/// (SETUID, SETGID), locking the securebits and emptying the bounding set (SETPCAP), and
+/// the walk into the person's folders, drv-files' and 0700 (DAC_READ_SEARCH).
 const NEEDED: CapabilitySet = CapabilitySet::SYS_ADMIN
     .union(CapabilitySet::SETUID)
     .union(CapabilitySet::SETGID)
-    .union(CapabilitySet::SETPCAP);
+    .union(CapabilitySet::SETPCAP)
+    .union(CapabilitySet::DAC_READ_SEARCH);
 
 /// The app's persistent directory, the one mount made for its UID.
 const STATE: &str = "/state";
+/// Where the person's folders an app is given go, one idmapped bind each.
+const FILES: &str = "/files";
 /// The root tmpfs's size: `/tmp`, `/etc`, a HOME of the run and the runtime directory
 /// share it. What persists is on `/state`.
 const ROOT_SIZE: &str = "1g";
@@ -69,6 +74,10 @@ struct Args {
     /// The host's resolv.conf, handed to drv-init as fd `resolv` for a networked app.
     #[arg(long, default_value = "/etc/resolv.conf")]
     resolv: PathBuf,
+    /// The person's files (drv-files' tree): a folder of it named in the request is bound
+    /// into the app's root idmapped, the tree's owner appearing as the app.
+    #[arg(long, default_value = "/var/lib/drv-files")]
+    folders_base: PathBuf,
 }
 
 struct Forker {
@@ -197,7 +206,7 @@ impl Forker {
         )
         .ok();
 
-        // 2. The request. Until the switch, only uid, network, gpu and nix are read.
+        // 2. The request. Until the switch, only uid, network, gpu, nix and folders are read.
         let Request::Launch(launch): Request =
             seq::decode(bytes).map_err(|e| format!("request: {e}"))?;
         let uid = launch.uid;
@@ -209,6 +218,33 @@ impl Forker {
         if launch.argv.is_empty() {
             return Err("empty argv".into());
         }
+        // The person's folders, cloned from the host now (nothing can be after the unshare)
+        // and idmapped: the tree's owner (drv-files, read off the base directory) is the app
+        // inside. One namespace holds the mapping for all of them.
+        let folders = if launch.folders.is_empty() {
+            Vec::new()
+        } else {
+            let base = rustix::fs::stat(&self.args.folders_base)
+                .map_err(|e| format!("{}: {e}", self.args.folders_base.display()))?;
+            let userns = drv_os::userns::map((base.st_uid, base.st_gid), (uid, uid))
+                .map_err(|e| format!("folders' user namespace: {e}"))?;
+            let mut clones = Vec::with_capacity(launch.folders.len());
+            for name in &launch.folders {
+                let rel = Path::new(name);
+                if rel.is_absolute()
+                    || rel
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(format!("folder {name:?}: not a plain relative path"));
+                }
+                let fd = clone(&self.args.folders_base.join(rel), rw_noexec)?;
+                drv_os::mounts::set_idmap(&fd, &userns)
+                    .map_err(|e| format!("folder {name:?}: idmap: {e}"))?;
+                clones.push((name.clone(), fd));
+            }
+            clones
+        };
 
         // 3. Privilege we will never need again goes, then a mount namespace of our own,
         // emptied, with the host's network only if asked.
@@ -297,7 +333,11 @@ impl Forker {
             }
             let state = clone_tree(&state_base, Path::new(&uid_s), rw_noexec)
                 .map_err(|e| format!("state/{uid}: {e}"))?;
-            mount(state, STATE)
+            mount(state, STATE)?;
+            for (name, fd) in folders {
+                mount(fd, &format!("{FILES}/{name}"))?;
+            }
+            Ok(())
         })();
         rustix::thread::set_thread_res_uid(own_uid, own_uid, own_uid)
             .map_err(|e| format!("euid back: {e}"))?;

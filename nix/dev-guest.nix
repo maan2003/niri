@@ -79,6 +79,11 @@ let
     SSH_AUTH_SOCK=''${SSH_AUTH_SOCK:-/run/drv/agent} ${pkgs.openssh}/bin/ssh-add -l > agent.txt 2>&1 || echo "rc: $?" >> agent.txt
     ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
+    # The person's folder, if this app has one: writable, and ours by uid inside.
+    if [ -d "$HOME/Shared" ]; then
+      echo "from uid $(${pkgs.coreutils}/bin/id -u)" > "$HOME/Shared/hello.txt"
+      { ${pkgs.coreutils}/bin/readlink "$HOME/Shared"; ${pkgs.coreutils}/bin/stat -L -c '%u %g %a' "$HOME/Shared" "$HOME/Shared/hello.txt"; } > folder.txt 2>&1
+    fi
     ${pkgs.coreutils}/bin/touch done
   '';
   # The kernel's account of a task, for nix/kernel-state.sh: an out-of-tree module built
@@ -160,6 +165,16 @@ in
         agent = true;
         packages = [ pkgs.openssh ];
         files = { ".config/hello/greeting" = "hello from the store"; };
+        # A folder of the person's files, its own inside (the probe writes into it).
+        folders = [ "Shared" ];
+      };
+      # A daemon that dies once: drv-init starts it again, then it stays.
+      restart-test = {
+        uid = 100013; autostart = true; menu = false; restart = true; state = [ "out" ]; folders = [ "Shared" ];
+        exec = [ "${pkgs.writeShellScript "restart-test" ''
+          if [ -e "$HOME/out/ran" ]; then exec ${pkgs.coreutils}/bin/sleep infinity; fi
+          ${pkgs.coreutils}/bin/touch "$HOME/out/ran"; exit 3
+        ''}" ];
       };
       gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; autostart = true; menu = false; state = [ "out" ]; packages = [ pkgs.openssh ]; };
       flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };

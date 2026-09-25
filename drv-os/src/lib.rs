@@ -7,6 +7,7 @@ pub mod landlock;
 pub mod mounts;
 pub mod root;
 pub mod seccomp;
+pub mod userns;
 
 use std::ffi::CString;
 use std::io;
