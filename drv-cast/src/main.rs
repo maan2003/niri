@@ -55,13 +55,8 @@ pub enum Event {
     PwAsked { uid: u32, device: Device },
     /// The last PipeWire connection of `uid` is gone.
     PwClientsGone { uid: u32 },
-    /// A remote made for an app on its own thread.
-    Remote { conn: u64, req: u64, for_what: RemoteFor, result: anyhow::Result<(OwnedFd, u32)> },
-}
-
-pub enum RemoteFor {
-    Session(u64),
-    Camera,
+    /// A remote made for an app's cast on its own thread.
+    Remote { conn: u64, req: u64, session: u64, result: anyhow::Result<(OwnedFd, u32)> },
 }
 
 struct Conn {
@@ -127,8 +122,6 @@ struct Cast {
     consents: HashMap<String, Consent>,
     /// Devices the person allowed, by uid: the app's name and the devices.
     devices: HashMap<u32, (String, Vec<Device>)>,
-    /// Camera remotes handed out, by uid: their PipeWire clients.
-    camera_remotes: HashMap<u32, Vec<u32>>,
     next_token: u64,
 }
 
@@ -182,18 +175,15 @@ impl Cast {
                 }
             },
             Event::PwClientsGone { uid } => self.forget_devices(uid),
-            Event::Remote { conn, req, for_what, result } => match result {
+            Event::Remote { conn, req, session, result } => match result {
                 Ok((fd, client)) => {
                     let Some(c) = self.conns.get_mut(&conn) else {
                         // Gone meanwhile: the connection is cut with the fd.
                         return self.pw.drop_client(client);
                     };
-                    match for_what {
-                        RemoteFor::Session(session) => match c.sessions.get_mut(&session) {
-                            Some(s) => s.remotes.push(client),
-                            None => return self.pw.drop_client(client),
-                        },
-                        RemoteFor::Camera => self.camera_remotes.entry(c.uid).or_default().push(client),
+                    match c.sessions.get_mut(&session) {
+                        Some(s) => s.remotes.push(client),
+                        None => return self.pw.drop_client(client),
                     }
                     self.send(conn, FromCast::Remote { req }, &[fd.as_fd()]);
                 }
@@ -239,16 +229,9 @@ impl Cast {
                 let Some(node) = node else {
                     return self.fail(conn, req, "the session is not streaming");
                 };
-                self.remote(conn, req, RemoteFor::Session(session), vec![node], format!("node:{node}"), app);
+                self.remote(conn, req, session, vec![node], format!("node:{node}"), app);
             }
             ToCast::CastClose { session } => self.close_session(conn, session, false),
-            // No question here: the remote sees the cameras (Chromium lists them at the first
-            // page that asks), and WirePlumber asks the person when a stream is to be linked
-            // to one, as for the microphone (`request:<uid>:camera`).
-            ToCast::CameraRemote { req } => {
-                let cameras = self.pw.cameras();
-                self.remote(conn, req, RemoteFor::Camera, cameras, format!("camera:{uid}"), app);
-            }
             ToCast::CameraPresent { req } => {
                 let present = !self.pw.cameras().is_empty();
                 self.send(conn, FromCast::Present { req, present }, &[]);
@@ -263,15 +246,17 @@ impl Cast {
         }
     }
 
-    /// A remote for the app, made on its own thread (PipeWire round trips), back as an event.
-    fn remote(&self, conn: u64, req: u64, for_what: RemoteFor, nodes: Vec<u32>, mark: String, app: String) {
+    /// A remote for the app's cast, made on its own thread (PipeWire round trips), back as
+    /// an event. (Cameras need none: the app's own PipeWire connection sees them, and the
+    /// shim hands out one of those.)
+    fn remote(&self, conn: u64, req: u64, session: u64, nodes: Vec<u32>, mark: String, app: String) {
         let (pw, events) = (self.pw.clone(), self.events.clone());
         thread::spawn(move || {
             let result = pw::remote_twice(&nodes, &app).and_then(|(fd, client)| {
                 pw.mark(client, &mark)?;
                 Ok((fd, client))
             });
-            let _ = events.send(Event::Remote { conn, req, for_what, result });
+            let _ = events.send(Event::Remote { conn, req, session, result });
         });
     }
 
@@ -441,9 +426,6 @@ impl Cast {
                         }
                     }
                     self.pw.write(uid, std::iter::empty());
-                    for client in self.camera_remotes.remove(&uid).unwrap_or_default() {
-                        self.pw.drop_client(client);
-                    }
                 }
                 self.show_devices();
             }
@@ -549,7 +531,7 @@ impl Cast {
     }
 
     /// The uid is gone (its last connection, its last PipeWire client): its grants end, its
-    /// questions come down, its camera remotes are cut.
+    /// questions come down.
     fn forget_devices(&mut self, uid: u32) {
         if let Some((app, devices)) = self.devices.remove(&uid) {
             for device in devices {
@@ -566,9 +548,6 @@ impl Cast {
         for id in asks {
             self.asks.remove(&id);
             self.ask(Request::Cancel { id });
-        }
-        for client in self.camera_remotes.remove(&uid).unwrap_or_default() {
-            self.pw.drop_client(client);
         }
         self.pw.forget(uid);
     }
@@ -707,7 +686,6 @@ fn run() -> Result<(), String> {
         casts: HashMap::new(),
         consents: HashMap::new(),
         devices: HashMap::new(),
-        camera_remotes: HashMap::new(),
         next_token: 0,
     };
     drv_os::say!("drv-cast: serving");

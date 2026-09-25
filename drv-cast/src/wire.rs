@@ -47,8 +47,6 @@ pub enum ToCast {
     CastRemote { req: u64, session: u64 },
     /// The session is over: the cast stops, its remotes are cut. No answer.
     CastClose { session: u64 },
-    /// A PipeWire connection that sees the cameras: `Remote` or `Failed`.
-    CameraRemote { req: u64 },
     /// Is there a camera at all? `Present`.
     CameraPresent { req: u64 },
     /// Withdraw a `Cast` still waiting on the person. No answer.

@@ -111,8 +111,7 @@ impl Pw {
     }
 
     /// A remote went out as PipeWire client `client`: its streams may reach `what` only
-    /// ("camera:<uid>", the cameras under the app's grant, or "node:<id>"), which
-    /// WirePlumber enforces. Back once that is in.
+    /// ("node:<id>"), which WirePlumber enforces. Back once that is in.
     pub fn mark(&self, client: u32, what: &str) -> anyhow::Result<()> {
         let (done, back) = mpsc::channel();
         self.send(Cmd::Mark { client, what: what.to_owned(), done });

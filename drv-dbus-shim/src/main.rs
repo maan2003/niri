@@ -799,9 +799,10 @@ impl Shim {
     }
 
     /// `org.freedesktop.portal.Camera`: no question here. Chromium asks for access to list
-    /// the cameras at the first page that enumerates devices, so access is granted and the
-    /// remote sees every camera; the person is asked when a stream is to be linked to one
-    /// (WirePlumber's gate, as for the microphone), which is when a page captures.
+    /// the cameras at the first page that enumerates devices, so access is granted, and the
+    /// remote is a connection of the app's own to the apps' PipeWire socket (one that lists
+    /// the cameras like any source); the person is asked when a stream is to be linked to
+    /// one (WirePlumber's gate, as for the microphone), which is when a page captures.
     fn camera(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
         match member {
             "AccessCamera" => {
@@ -814,8 +815,11 @@ impl Shim {
                 Ok(Ours::Done)
             }
             "OpenPipeWireRemote" => {
-                let req = self.next();
-                self.remote(msg, req, ToCast::CameraRemote { req })
+                // The apps' socket, as the app itself would connect: the daemon tags the
+                // connection with this uid. Without `audio` there is none.
+                let path = std::env::var_os("PIPEWIRE_REMOTE").context("no PipeWire here: the app has no audio")?;
+                let sock = std::os::unix::net::UnixStream::connect(&path).with_context(|| format!("connecting to {}", Path::new(&path).display()))?;
+                Ok(Ours::Reply(Message::method_return(hdr)?.build(&zbus::zvariant::Fd::from(OwnedFd::from(sock)))?))
             }
             other => bail!("no {other} on {CAMERA}"),
         }
