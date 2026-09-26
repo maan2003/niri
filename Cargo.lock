@@ -2418,7 +2418,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "kio"
 version = "0.5.9"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "loom",
  "smallvec",
@@ -2757,7 +2757,7 @@ dependencies = [
 [[package]]
 name = "moq-net"
 version = "0.2.22"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -2777,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "moq-pattern"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "serde",
 ]
@@ -2785,7 +2785,7 @@ dependencies = [
 [[package]]
 name = "moq-sock"
 version = "0.0.1"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "core_affinity",
  "libc",
@@ -2798,7 +2798,7 @@ dependencies = [
 [[package]]
 name = "moq-tokio"
 version = "0.19.11"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "bytes",
  "futures",
@@ -3974,7 +3974,7 @@ checksum = "caf4aa5b0f434c91fe5c7f1ecb6a5ece2130b02ad2a590589dda5146df959001"
 [[package]]
 name = "rho-desktop-media"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3989,7 +3989,7 @@ dependencies = [
 [[package]]
 name = "rho-desktop-proto"
 version = "0.1.0"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "serde",
  "serde_json",
@@ -4413,7 +4413,7 @@ dependencies = [
 [[package]]
 name = "shiguredo_libvpx"
 version = "2026.2.0-canary.1"
-source = "git+https://github.com/maan2003/rho?rev=c016b8f55220cb6b9368c12e3d30bfb8c0057ad9#c016b8f55220cb6b9368c12e3d30bfb8c0057ad9"
+source = "git+https://github.com/maan2003/rho?rev=637d639d2dc3e9d1a85837ef87366ea2867c12b6#637d639d2dc3e9d1a85837ef87366ea2867c12b6"
 dependencies = [
  "bindgen",
  "pkg-config",
