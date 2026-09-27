@@ -103,6 +103,21 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| e.to_string())
             .and_then(|_| fs::metadata(&path).map(|m| m.len()).map_err(|e| e.to_string()));
         out += &format!("wrote {path}, length now {r:?}\n");
+        // A download's way (Chromium): the data goes to a scratch file next to the target,
+        // which is renamed onto it at the end.
+        let scratch = format!("{path}.crdownload");
+        let staged = fs::write(&scratch, "staged next to the document\n")
+            .and_then(|()| fs::rename(&scratch, &path))
+            .and_then(|()| fs::read_to_string(&path))
+            .map_err(|e| e.to_string());
+        out += &format!("renamed a scratch file onto it, it reads {staged:?}\n");
+        let dir = std::path::Path::new(&path).parent().context("no directory")?;
+        let listing = fs::read_dir(dir)
+            .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect::<Vec<_>>())
+            .map_err(|e| e.to_string());
+        out += &format!("the directory then lists {listing:?}\n");
+        let unlink = fs::remove_file(&path).map_err(|e| e.to_string());
+        out += &format!("removing the document: {unlink:?}\n");
     }
     fs::write(&result, &out)?;
     Ok(())

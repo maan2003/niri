@@ -17,7 +17,7 @@ drv-policy = { version = "26.4.0", path = "../drv-policy" }
 drv-ui = { version = "26.4.0", path = "../drv-ui", optional = true }
 fuser = { version = "0.18", default-features = false, optional = true }
 libc = { version = "0.2", optional = true }
-rustix = { version = "1.1.4", features = ["net"], optional = true }
+rustix = { version = "1.1.4", features = ["fs", "net"], optional = true }
 serde.workspace = true
 
 [[bin]]

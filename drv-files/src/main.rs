@@ -299,8 +299,16 @@ impl App {
                 return;
             }
         };
+        let dir = match File::open(self.files.join(&d.dir)) {
+            Ok(dir) => dir,
+            Err(err) => {
+                d.note = Some(format!("{}: {err}", d.dir.display()));
+                self.draw();
+                return;
+            }
+        };
         let (req, uid, app) = (d.req.req, d.req.uid, d.req.app.clone());
-        let id = self.grants.lock().unwrap().add(Grant { uid, name: name.clone(), file, write });
+        let id = self.grants.lock().unwrap().add(Grant { uid, name: name.clone(), file, write, dir });
         let doc = self.docs.join(id.to_string()).join(&name);
         drv_os::say!(
             "drv-files: {app} (uid {uid}) gets {} as {}{}",

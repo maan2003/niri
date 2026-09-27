@@ -88,6 +88,9 @@ R=/var/lib/drv-apps/100008/out/result.txt
 file_has "read the picked file" $R 'read /run/drv/doc/[0-9]+/todo.txt: Ok\("build the portal\\n"\)'
 file_has "read-only pick" $R 'open it for writing: Err'
 file_has "saved a copy" $R 'wrote /run/drv/doc/[0-9]+/result copy.txt, length now Ok\('
+file_has "a scratch file renamed onto it" $R 'renamed a scratch file onto it, it reads Ok\("staged next to the document\\n"\)'
+file_has "the scratch name is gone" $R 'the directory then lists Ok\(\["result copy.txt"\]\)'
+file_has "the document cannot be removed" $R 'removing the document: Err'
 expect "drv-files granted it" 'drv-files: chooser-test \(uid 100008\) gets /var/lib/drv-files/notes/todo.txt'
 
 echo "== screen cast"
