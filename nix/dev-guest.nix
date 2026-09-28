@@ -62,6 +62,27 @@ let
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"
   '';
+  # An sshd of the app's own uid, as rho runs one (m2sh.nix): the app logs into itself over
+  # the loopback and records what a session sees.
+  sshTest = pkgs.writeShellScript "ssh-test" ''
+    cd "$HOME/out"
+    ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f host_ed25519
+    ${pkgs.openssh}/bin/ssh-keygen -q -t ed25519 -N "" -f client_ed25519
+    printf '%s\n' "AddressFamily inet" "ListenAddress 127.0.0.1" "Port 2222" "HostKey $HOME/out/host_ed25519" \
+      "PidFile none" "UsePAM no" "PasswordAuthentication no" "KbdInteractiveAuthentication no" \
+      "AuthenticationMethods publickey" "AuthorizedKeysFile $HOME/out/client_ed25519.pub" "StrictModes no" \
+      "PermitUserEnvironment yes" > sshd_config
+    ${pkgs.coreutils}/bin/mkdir -p "$HOME/.ssh"
+    ${pkgs.coreutils}/bin/env | ${pkgs.gnugrep}/bin/grep -E '^[A-Za-z][A-Za-z0-9_]*=' > "$HOME/.ssh/environment"
+    ${pkgs.openssh}/bin/sshd -D -e -f sshd_config 2> sshd.log &
+    for _ in $(${pkgs.coreutils}/bin/seq 50); do
+      ${pkgs.openssh}/bin/ssh -p 2222 -i client_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        app-ssh-test@127.0.0.1 '${pkgs.coreutils}/bin/id; echo NIX_REMOTE=$NIX_REMOTE; nix --extra-experimental-features nix-command store info 2>&1' > session.txt 2> ssh.log && break
+      ${pkgs.coreutils}/bin/sleep 0.2
+    done
+    ${pkgs.coreutils}/bin/touch done
+    exec ${pkgs.coreutils}/bin/sleep infinity
+  '';
   # Results go to $HOME/out, the one directory the probe apps declare as state.
   probe = pkgs.writeShellScript "probe" ''
     cd "$HOME/out"
@@ -222,6 +243,10 @@ in
       # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
       open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
+      ssh-test = {
+        uid = 100014; autostart = true; menu = false; network = true; nix = true; state = [ "out" ];
+        shell = "${pkgs.bashInteractive}/bin/bash"; exec = [ "${sshTest}" ];
+      };
       # A terminal: a pty of its own.
       terminal = { uid = 100012; exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ]; gpu = true; packages = [ pkgs.fish pkgs.coreutils ]; };
     };

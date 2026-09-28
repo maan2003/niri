@@ -24,6 +24,12 @@ echo "== kernel state"
 for who in flower forker compositor; do
   if out=$(bash "$(dirname "$0")/kernel-state.sh" $who 2>&1); then echo "PASS $out"; else echo "FAIL kernel state of $who:"; echo "$out" | head -30; fails=$((fails + 1)); fi
 done
+echo "== an sshd of the app's own (the ssh-test probe)"
+S=/var/lib/drv-apps/100014/out
+for _ in $(seq 1 30); do $SSH test -e $S/done && break; sleep 1; done
+file_has "the app logs into itself" $S/session.txt '^uid=100014\(app-ssh-test\)'
+file_has "the session has the app's environment" $S/session.txt '^NIX_REMOTE=daemon$'
+file_has "and the daemon answers it" $S/session.txt '^Version:'
 echo "== an app's view (the hello probe)"
 H=/var/lib/drv-apps/100001/out
 for _ in $(seq 1 30); do $SSH test -e $H/done && break; sleep 1; done
