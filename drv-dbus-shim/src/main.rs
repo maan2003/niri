@@ -3,7 +3,7 @@
 //! `org.freedesktop.Notifications`), answers what it can itself (settings, versions) and
 //! turns the rest into the set's own wires: files to drv-files, screens and cameras to
 //! drv-cast, notifications to drv-shell, URIs to drv-appd, WebAuthn (linux-credentials'
-//! portal API, `xyz.iinuwa.credentialsd.Credentials`) to drv-agent's FIDO door. Each of those keys the
+//! portal API, `xyz.iinuwa.credentialsd.Credentials`) to drv-fido's door. Each of those keys the
 //! connection on this uid; the shim is compatibility, never a boundary. Whatever an app
 //! does to this process, it gains only the ability to speak those wires directly, which it
 //! could anyway. D-Bus ends here.
@@ -17,9 +17,9 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context as _, bail};
 use clap::Parser;
-use drv_agent::fido::{Reply as FidoReply, Request as FidoRequest};
 use drv_cast::wire::{Cursor, FromCast, Source, ToCast};
 use drv_dbus_shim::{sender_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH};
+use drv_fido::wire::{Reply as FidoReply, Request as FidoRequest};
 use drv_files::wire::{FromFiles, Kind as Chooser, ToFiles};
 use drv_policy::PolicyClient;
 use drv_policy::seq;
@@ -74,8 +74,8 @@ struct Args {
     /// drv-appd's public socket, for OpenURI.
     #[arg(long, env = "DRV_APPD_SOCKET", default_value = "/run/drv/appd.sock")]
     appd: PathBuf,
-    /// drv-agent's FIDO door.
-    #[arg(long, default_value = drv_agent::fido::SOCKET)]
+    /// drv-fido's door.
+    #[arg(long, default_value = drv_fido::wire::SOCKET)]
     fido: PathBuf,
     /// The app, run once the names are owned.
     #[arg(trailing_var_arg = true, required = true)]
@@ -839,7 +839,7 @@ impl Shim {
     }
 
     /// linux-credentials' `CreateCredential` and `GetCredential`: the origin and the WebAuthn
-    /// JSON go to drv-agent's FIDO door as they are, one connection per ceremony, on a
+    /// JSON go to drv-fido's door as they are, one connection per ceremony, on a
     /// thread: the answer waits on the person and the key. The door decides (the manifest's
     /// origins, the relying party); `claimed_app_id`, the parent window and the activation
     /// token mean nothing here, the door knows the uid.

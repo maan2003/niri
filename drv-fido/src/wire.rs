@@ -1,4 +1,4 @@
-//! The FIDO door (`/run/drv/fido`, a `SOCK_SEQPACKET` socket in every app's root): one
+//! The FIDO door's wire (`/run/drv/fido`, a `SOCK_SEQPACKET` socket in every app's root): one
 //! WebAuthn ceremony per connection, for the UIDs whose manifest record lists the origin
 //! under `fido`. One datagram each way. The request and the answer carry the JSON of the
 //! linux-credentials portal (WebAuthn's `PublicKeyCredential*OptionsJSON` in, a

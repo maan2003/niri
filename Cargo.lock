@@ -1490,11 +1490,7 @@ dependencies = [
  "drv-os",
  "drv-policy",
  "drv-shell",
- "libwebauthn",
  "rustix 1.1.4",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -1545,8 +1541,8 @@ version = "26.4.0"
 dependencies = [
  "anyhow",
  "clap",
- "drv-agent",
  "drv-cast",
+ "drv-fido",
  "drv-files",
  "drv-os",
  "drv-policy",
@@ -1555,6 +1551,19 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "zbus",
+]
+
+[[package]]
+name = "drv-fido"
+version = "26.4.0"
+dependencies = [
+ "drv-os",
+ "drv-policy",
+ "drv-shell",
+ "libwebauthn",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

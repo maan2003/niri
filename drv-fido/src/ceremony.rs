@@ -1,8 +1,8 @@
 //! The FIDO door: WebAuthn ceremonies (a credential made, an assertion signed) on the
 //! authenticator plugged in, for the apps whose manifest lists the origin they claim. The
-//! wire is [`drv_agent::fido`]. libwebauthn (linux-credentials') speaks CTAP2 to the hidraw
+//! wire is [`drv_fido::wire`]. libwebauthn (linux-credentials') speaks CTAP2 to the hidraw
 //! nodes udev gave our group; the person's part (a touch, a PIN) is asked at the shell, as
-//! ssh-agent's is. One ceremony at a time: there is one key, and one person.
+//! the ssh agent's is. One ceremony at a time: there is one key, and one person.
 //!
 //! An app's origin is `app:<id>` (`app:dev.rho.Gui`). WebAuthn has no such origin, so it
 //! stands in as `https://` of the id's labels reversed and lowercased (`gui.rho.dev`), and
@@ -13,9 +13,10 @@
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 
-use drv_agent::fido::{Reply, Request};
+use drv_fido::wire::{Reply, Request};
 use drv_policy::door::Door as Appd;
 use drv_policy::{AppPolicy, seq};
+use drv_shell::ask::Client as Shell;
 use libwebauthn::UvUpdate;
 use libwebauthn::ops::webauthn::idl::origin::{Origin, RequestOrigin};
 use libwebauthn::ops::webauthn::{
@@ -28,8 +29,6 @@ use libwebauthn::webauthn::WebAuthn as _;
 use libwebauthn::webauthn::error::WebAuthnError;
 use tokio::sync::broadcast;
 
-use crate::Shell;
-
 /// Accepts forever on the door. Each connection is one request, answered when its ceremony
 /// ends; ceremonies queue on `one`.
 pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std::io::Result<()> {
@@ -40,11 +39,11 @@ pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std:
             .build()?,
     );
     let one = Arc::new(Mutex::new(()));
-    appd.serve(listener, "drv-agent: fido", move |sock, uid, policy| {
+    appd.serve(listener, "drv-fido", move |sock, uid, policy| {
         let request: Request = match seq::recv(&sock) {
             Ok((request, _)) => request,
             Err(err) => {
-                drv_os::say!("drv-agent: fido: {} (uid {uid}): {err}", policy.name);
+                drv_os::say!("drv-fido: {} (uid {uid}): {err}", policy.name);
                 return;
             }
         };
@@ -55,15 +54,12 @@ pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std:
         let reply = match outcome {
             Ok(json) => Reply::Credential { json },
             Err(reason) => {
-                drv_os::say!("drv-agent: fido: {} (uid {uid}): {reason}", policy.name);
+                drv_os::say!("drv-fido: {} (uid {uid}): {reason}", policy.name);
                 Reply::Failed { reason }
             }
         };
         if let Err(err) = seq::send(&sock, &reply, &[]) {
-            drv_os::say!(
-                "drv-agent: fido: {} (uid {uid}): answering: {err}",
-                policy.name
-            );
+            drv_os::say!("drv-fido: {} (uid {uid}): answering: {err}", policy.name);
         }
     })
 }
@@ -236,19 +232,19 @@ async fn prompt(
                 match answer {
                     Ok(Ok(Some(typed))) => {
                         if let Err(err) = pin.send_pin(&typed) {
-                            drv_os::say!("drv-agent: fido: the PIN: {err}");
+                            drv_os::say!("drv-fido: the PIN: {err}");
                         }
                     }
                     // Nothing sent: the operation waits out its timeout and fails.
                     Ok(Ok(None)) => {
-                        drv_os::say!("drv-agent: fido: {app} (uid {uid}): the PIN was refused")
+                        drv_os::say!("drv-fido: {app} (uid {uid}): the PIN was refused")
                     }
-                    Ok(Err(err)) => drv_os::say!("drv-agent: fido: {err}"),
-                    Err(err) => drv_os::say!("drv-agent: fido: {err}"),
+                    Ok(Err(err)) => drv_os::say!("drv-fido: {err}"),
+                    Err(err) => drv_os::say!("drv-fido: {err}"),
                 }
             }
             Ok(UvUpdate::PinNotSet(_)) => {
-                drv_os::say!("drv-agent: fido: {app} (uid {uid}): the security key has no PIN")
+                drv_os::say!("drv-fido: {app} (uid {uid}): the security key has no PIN")
             }
             Ok(UvUpdate::UvRetry { .. }) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => {}

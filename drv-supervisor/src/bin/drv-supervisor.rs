@@ -130,15 +130,28 @@ struct Args {
     /// The agent's door, world-connectable: the agent asks drv-appd about every peer UID.
     #[arg(long, default_value = "/run/drv/agent")]
     agent_socket: PathBuf,
-    /// The agent's FIDO door (`SOCK_SEQPACKET`), the same way.
-    #[arg(long, default_value = "/run/drv/fido")]
-    fido_socket: PathBuf,
     /// An entry under `/run` the agent sees (udev's database, for the authenticators). Repeatable.
     #[arg(long = "agent-expose")]
     agent_expose: Vec<PathBuf>,
     /// `NAME=VALUE` in the agent's environment. Repeatable; it gets nothing else.
     #[arg(long = "agent-env")]
     agent_env: Vec<String>,
+    /// System user the FIDO door runs as.
+    #[arg(long)]
+    fido_user: String,
+    /// The FIDO door's command line, whitespace-separated (`drv-fido`).
+    #[arg(long)]
+    fido_exec: String,
+    /// The FIDO door (`SOCK_SEQPACKET`), world-connectable: it asks drv-appd about every peer UID.
+    #[arg(long, default_value = "/run/drv/fido")]
+    fido_socket: PathBuf,
+    /// An entry under `/run` the FIDO door sees (udev's database, for the authenticators).
+    /// Repeatable.
+    #[arg(long = "fido-expose")]
+    fido_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in the FIDO door's environment. Repeatable; it gets nothing else.
+    #[arg(long = "fido-env")]
+    fido_env: Vec<String>,
     /// System user the media keys service runs as (groups pipewire and video).
     #[arg(long)]
     keys_user: String,
@@ -226,6 +239,7 @@ struct Set {
     shell: Service,
     cast: Service,
     agent: Service,
+    fido: Service,
     keys: Service,
 }
 
@@ -302,6 +316,15 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &[],
             &args.agent_expose,
+        )?,
+        fido: service(
+            "drv-fido",
+            &args.fido_user,
+            &args.fido_exec,
+            &args.fido_env,
+            &[],
+            &[],
+            &args.fido_expose,
         )?,
         keys: service(
             "drv-keys",
@@ -485,6 +508,8 @@ struct Links {
     cast_shell: (OwnedFd, OwnedFd),
     /// The ssh agent asks the person at the shell: the authenticator's PIN and touch.
     agent_shell: (OwnedFd, OwnedFd),
+    /// The FIDO door asks the same way.
+    fido_shell: (OwnedFd, OwnedFd),
     /// drv-files' Wayland connection: layer-shell for the chooser.
     files_client: (OwnedFd, OwnedFd),
     appd_forker: (OwnedFd, OwnedFd),
@@ -507,6 +532,7 @@ impl Links {
             shell_auth: seq()?,
             cast_shell: seq()?,
             agent_shell: seq()?,
+            fido_shell: seq()?,
             files_client: stream()?,
             appd_forker: seq()?,
         })
@@ -529,7 +555,7 @@ fn start_set(
         &'static str,
         &Service,
         Vec<(&str, std::os::fd::BorrowedFd<'_>)>,
-    ); 11] = [
+    ); 12] = [
         (
             "drv-seatd",
             &set.seatd,
@@ -602,6 +628,7 @@ fn start_set(
                 ("poke", l.compositor_menu.1.as_fd()),
                 ("cast", l.cast_shell.1.as_fd()),
                 ("agent", l.agent_shell.1.as_fd()),
+                ("fido", l.fido_shell.1.as_fd()),
                 ("listener", doors.notify.as_fd()),
             ],
         ),
@@ -614,15 +641,22 @@ fn start_set(
                 ("listener", doors.cast.as_fd()),
             ],
         ),
-        // Its door's uid check is its own; the wire is for the person's PIN and touch,
-        // asked at the shell.
+        // Their doors' uid checks are their own; the wires are for the person's PIN and
+        // touch, asked at the shell.
         (
             "drv-agent",
             &set.agent,
             vec![
                 ("shell", l.agent_shell.0.as_fd()),
                 ("listener", doors.agent.as_fd()),
-                ("fido", doors.fido.as_fd()),
+            ],
+        ),
+        (
+            "drv-fido",
+            &set.fido,
+            vec![
+                ("shell", l.fido_shell.0.as_fd()),
+                ("listener", doors.fido.as_fd()),
             ],
         ),
         (

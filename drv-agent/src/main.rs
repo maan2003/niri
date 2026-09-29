@@ -10,27 +10,19 @@
 //! person at the shell (fd `shell`) and loads the resident keys with `ssh-add -K` itself.
 //! ssh-agent's own prompts while signing (the PIN of a verify-required key, a touch) come
 //! the same way: we are its askpass, reaching the door over a socket in our `/tmp`.
-//!
-//! A second door, `/run/drv/fido`, is WebAuthn on the same authenticators for the apps
-//! whose manifest lists the origins they may claim (`ceremony`).
+//! WebAuthn on the same authenticators is drv-fido's door, a process of its own.
 
-mod ceremony;
-
-use std::collections::HashMap;
 use std::io::{self, BufRead as _, Read as _, Write as _};
-use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use drv_os::fds::Kind;
-use drv_policy::seq;
 use drv_policy::door::{self, Door as Appd};
-use drv_shell::ask::{Request, Response, VERSION};
+use drv_shell::ask::Client as Shell;
 
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
@@ -100,9 +92,6 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
     // set started: an app started meanwhile waits in the backlog instead of finding no
     // socket. The door is the uid check below, not a mode: apps of any uid may connect.
     let listener = fds.listener("listener").map_err(|e| e.to_string())?;
-    let fido = fds
-        .listener_of("fido", Kind::SeqPacket)
-        .map_err(|e| e.to_string())?;
     let appd = Arc::new(Appd::open().map_err(|e| format!("drv-appd: {e}"))?);
     let _ = std::fs::remove_file(ASKPASS);
     let askpass = UnixListener::bind(ASKPASS).map_err(|e| format!("{ASKPASS}: {e}"))?;
@@ -128,16 +117,7 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let shell = Shell::start(shell)?;
-    {
-        let (appd, shell) = (appd.clone(), shell.clone());
-        std::thread::spawn(move || {
-            if let Err(err) = ceremony::serve(fido, appd, shell) {
-                drv_os::say!("drv-agent: fido: {err}");
-                process::exit(1);
-            }
-        });
-    }
+    let shell = Shell::start(shell, "drv-agent")?;
     drv_os::say!("drv-agent: serving the doors");
     let door = Arc::new(Door {
         private: private.to_owned(),
@@ -184,137 +164,6 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
         });
     }
     Ok(())
-}
-
-/// Our line to the shell: requests under ids of our own, answers back on a thread to
-/// whoever waits for that id.
-pub(crate) struct Shell {
-    out: Mutex<OwnedFd>,
-    waiting: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
-    next: AtomicU64,
-}
-
-impl Shell {
-    fn start(sock: OwnedFd) -> Result<Arc<Self>, String> {
-        seq::send(&sock, &Request::Hello { version: VERSION }, &[])
-            .map_err(|e| format!("hello to the shell: {e}"))?;
-        let (hello, _) =
-            seq::recv::<Response>(&sock).map_err(|e| format!("hello from the shell: {e}"))?;
-        match hello {
-            Response::Hello { version } if version == VERSION => {}
-            Response::Hello { version } => {
-                drv_os::say!("drv-agent: the shell speaks version {version}, we speak {VERSION}");
-            }
-            _ => return Err("no hello from the shell".to_owned()),
-        }
-        let reader = sock.try_clone().map_err(|e| format!("dup: {e}"))?;
-        let shell = Arc::new(Self {
-            out: Mutex::new(sock),
-            waiting: Mutex::default(),
-            next: AtomicU64::new(1),
-        });
-        let dispatcher = shell.clone();
-        std::thread::spawn(move || {
-            loop {
-                match seq::recv::<Response>(&reader) {
-                    Ok((resp, _)) => dispatcher.dispatch(resp),
-                    Err(err) => {
-                        drv_os::say!("drv-agent: the shell: {err}");
-                        process::exit(1);
-                    }
-                }
-            }
-        });
-        Ok(shell)
-    }
-
-    fn dispatch(&self, resp: Response) {
-        let id = match &resp {
-            Response::Secret { id, .. }
-            | Response::Cancelled { id }
-            | Response::Yes { id }
-            | Response::Picked { id, .. } => *id,
-            Response::Hello { .. } => return,
-        };
-        let waiter = self.waiting.lock().unwrap().remove(&id);
-        if let Some(tx) = waiter {
-            let _ = tx.send(resp);
-        }
-    }
-
-    fn send(&self, req: &Request) -> Result<(), String> {
-        seq::send(&*self.out.lock().unwrap(), req, &[]).map_err(|e| format!("the shell: {e}"))
-    }
-
-    /// A request under a fresh id, and where its answer arrives.
-    fn ask(
-        &self,
-        make: impl FnOnce(u64) -> Request,
-    ) -> Result<(u64, mpsc::Receiver<Response>), String> {
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        self.waiting.lock().unwrap().insert(id, tx);
-        if let Err(err) = self.send(&make(id)) {
-            self.waiting.lock().unwrap().remove(&id);
-            return Err(err);
-        }
-        Ok((id, rx))
-    }
-
-    /// The PIN the person typed, or None if they refused.
-    pub(crate) fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
-        let (app, prompt) = (app.to_owned(), prompt.to_owned());
-        let (_, rx) = self.ask(|id| Request::Secret {
-            id,
-            app,
-            uid,
-            what: "use your security key".to_owned(),
-            prompt,
-        })?;
-        match rx.recv() {
-            Ok(Response::Secret { secret, .. }) => Ok(Some(secret)),
-            Ok(Response::Cancelled { .. }) => Ok(None),
-            Ok(_) => Err("the shell answered something else".to_owned()),
-            Err(_) => Err("the shell is gone".to_owned()),
-        }
-    }
-
-    /// A touch prompt, up until what this returns is dropped.
-    pub(crate) fn touch(
-        self: &Arc<Self>,
-        app: &str,
-        uid: u32,
-        prompt: &str,
-    ) -> Result<Touching, String> {
-        let (app, prompt) = (app.to_owned(), prompt.to_owned());
-        let (id, rx) = self.ask(|id| Request::Touch {
-            id,
-            app,
-            uid,
-            what: "use your security key".to_owned(),
-            prompt,
-        })?;
-        Ok(Touching {
-            shell: self.clone(),
-            id,
-            _rx: rx,
-        })
-    }
-}
-
-pub(crate) struct Touching {
-    shell: Arc<Shell>,
-    id: u64,
-    _rx: mpsc::Receiver<Response>,
-}
-
-impl Drop for Touching {
-    fn drop(&mut self) {
-        self.shell.waiting.lock().unwrap().remove(&self.id);
-        if let Err(err) = self.shell.send(&Request::Cancel { id: self.id }) {
-            drv_os::say!("drv-agent: {err}");
-        }
-    }
 }
 
 struct Door {

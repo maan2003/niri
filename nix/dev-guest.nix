@@ -168,10 +168,10 @@ in
   services.drv.package = niri;
 
   services.openssh.enable = true;
-  # The emulated CanoKey (nix/dev-vm.nix) is drv-agent's like a YubiKey (the module's rule
+  # The emulated CanoKey (nix/dev-vm.nix) is drv-fido's like a YubiKey (the module's rule
   # names Yubico's vendor id only).
   services.udev.extraRules = ''
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="42d4", GROUP="drv-agent", MODE="0660"
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="42d4", GROUP="drv-fido", MODE="0660"
   '';
   # Something for the chooser to show.
   systemd.tmpfiles.rules = [

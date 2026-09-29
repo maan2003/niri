@@ -13,7 +13,7 @@
     diskSize = 4096;
     graphics = true;
     # QEMU with CanoKey: an emulated FIDO2 security key (canokey-core; user presence is not
-    # asked, as over NFC), for drv-agent's FIDO door. Its state lives beside the disk image.
+    # asked, as over NFC), for drv-fido's door. Its state lives beside the disk image.
     qemu.package = pkgs.qemu_kvm.override { canokeySupport = true; };
     qemu.options = [
       # Only a virgl GPU (the default VGA has no render node), an absolute pointer so host

@@ -13,7 +13,7 @@ echo "== waiting for ssh"
 wait_ssh
 
 echo "== the set"
-for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-agent drv-keys drv-forker drv-appd; do
+for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-agent drv-fido drv-keys drv-forker drv-appd; do
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
@@ -30,7 +30,7 @@ for _ in $(seq 1 30); do $SSH test -e $F/done && break; sleep 1; done
 file_has "the app's own origin makes a credential on the emulated key" $F/fido.txt '^created: hmac-secret true, credential id of [0-9]+ chars$'
 file_has "and its hmac-secret is the credential's" $F/fido.txt '^hmac-secret: the same salt agrees, 32 bytes; another salt differs$'
 file_has "another origin is refused at the door" $F/fido.txt '^other origin: .*"error".*"app:dev.rho.Gui is not an origin of this app"'
-expect "and logged there" 'drv-agent: fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
+expect "and logged there" 'drv-fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
 
 echo "== unlock"
 mark; key 1 2 3 4 ret; sleep 2

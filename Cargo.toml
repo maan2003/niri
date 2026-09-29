@@ -16,6 +16,7 @@ members = [
     "drv-init",
     "drv-os",
     "drv-agent",
+    "drv-fido",
     "drv-keys",
     "niri-visual-tests",
 ]

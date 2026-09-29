@@ -9,6 +9,8 @@ description = "The desktop's own surfaces: the lock screen, the app menu, the pe
 default = ["service"]
 # The binary and its UI; off for crates that want only the protocols.
 service = ["dep:drv-auth", "dep:drv-os", "dep:drv-ui", "dep:rustix", "dep:zeroize"]
+# `ask::Client`, for the services that ask over a thread rather than an event loop.
+client = ["dep:drv-os"]
 
 [dependencies]
 drv-auth = { version = "26.4.0", path = "../drv-auth", optional = true }

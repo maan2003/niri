@@ -11,7 +11,7 @@ git log --oneline -1
 cargo build --release --locked --target aarch64-unknown-linux-gnu --no-default-features \
   --features drv-shell/service --features drv-files/service --features drv-cast/service \
   -p drv-supervisor -p drv-appd -p drv-forker -p drv-init -p drv-dbus-shim -p drv-seat -p drv-auth \
-  -p drv-shell -p drv-files -p drv-cast -p drv-agent -p drv-keys 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Checking)'
+  -p drv-shell -p drv-files -p drv-cast -p drv-agent -p drv-fido -p drv-keys 2>&1 | grep -vE '^\s+(Compiling|Downloaded|Downloading|Checking)'
 out=${OUT:-$state/drv-out}
 rm -rf "$out"; mkdir -p "$out/bin"
 # Debug info stays here (target/); the copies that travel to the M2 keep their symbol table

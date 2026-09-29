@@ -72,6 +72,7 @@
             ./drv-dbus-shim
             ./drv-ui
             ./drv-agent
+            ./drv-fido
             ./drv-keys
               ./niri-visual-tests
               ./resources
@@ -129,6 +130,8 @@
             "-p"
             "drv-agent"
             "-p"
+            "drv-fido"
+            "-p"
             "drv-keys"
           ];
 
@@ -164,7 +167,7 @@
             # No default features below applies to every package: the services' binaries
             # are behind their `service` features (the compositor and the shim want only
             # their wires).
-            ++ [ "drv-shell/service" "drv-files/service" "drv-cast/service" "drv-agent/service" ];
+            ++ [ "drv-shell/service" "drv-files/service" "drv-cast/service" "drv-fido/service" ];
           buildNoDefaultFeatures = true;
 
           # ever since this commit:

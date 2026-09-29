@@ -39,3 +39,152 @@ pub enum Response {
     /// The person said no.
     Cancelled { id: u64 },
 }
+
+#[cfg(feature = "client")]
+mod client {
+    use std::collections::HashMap;
+    use std::os::fd::OwnedFd;
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use drv_policy::seq;
+
+    use super::{Request, Response, VERSION};
+
+    /// A service's line to the shell: requests under ids of our own, answers back on a thread
+    /// to whoever waits for that id. The shell gone ends the process: nothing works without it.
+    pub struct Client {
+        who: &'static str,
+        out: Mutex<OwnedFd>,
+        waiting: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
+        next: AtomicU64,
+    }
+
+    impl Client {
+        /// Hello over the wire, then a thread that hands answers to whoever waits. `who` is us in the log.
+        pub fn start(sock: OwnedFd, who: &'static str) -> Result<Arc<Self>, String> {
+            seq::send(&sock, &Request::Hello { version: VERSION }, &[])
+                .map_err(|e| format!("hello to the shell: {e}"))?;
+            let (hello, _) =
+                seq::recv::<Response>(&sock).map_err(|e| format!("hello from the shell: {e}"))?;
+            match hello {
+                Response::Hello { version } if version == VERSION => {}
+                Response::Hello { version } => {
+                    drv_os::say!("{who}: the shell speaks version {version}, we speak {VERSION}");
+                }
+                _ => return Err("no hello from the shell".to_owned()),
+            }
+            let reader = sock.try_clone().map_err(|e| format!("dup: {e}"))?;
+            let shell = Arc::new(Self {
+                who,
+                out: Mutex::new(sock),
+                waiting: Mutex::default(),
+                next: AtomicU64::new(1),
+            });
+            let dispatcher = shell.clone();
+            std::thread::spawn(move || {
+                loop {
+                    match seq::recv::<Response>(&reader) {
+                        Ok((resp, _)) => dispatcher.dispatch(resp),
+                        Err(err) => {
+                            drv_os::say!("{who}: the shell: {err}");
+                            process::exit(1);
+                        }
+                    }
+                }
+            });
+            Ok(shell)
+        }
+
+        fn dispatch(&self, resp: Response) {
+            let id = match &resp {
+                Response::Secret { id, .. }
+                | Response::Cancelled { id }
+                | Response::Yes { id }
+                | Response::Picked { id, .. } => *id,
+                Response::Hello { .. } => return,
+            };
+            let waiter = self.waiting.lock().unwrap().remove(&id);
+            if let Some(tx) = waiter {
+                let _ = tx.send(resp);
+            }
+        }
+
+        fn send(&self, req: &Request) -> Result<(), String> {
+            seq::send(&*self.out.lock().unwrap(), req, &[]).map_err(|e| format!("the shell: {e}"))
+        }
+
+        /// A request under a fresh id, and where its answer arrives.
+        fn ask(
+            &self,
+            make: impl FnOnce(u64) -> Request,
+        ) -> Result<(u64, mpsc::Receiver<Response>), String> {
+            let id = self.next.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = mpsc::channel();
+            self.waiting.lock().unwrap().insert(id, tx);
+            if let Err(err) = self.send(&make(id)) {
+                self.waiting.lock().unwrap().remove(&id);
+                return Err(err);
+            }
+            Ok((id, rx))
+        }
+
+        /// The PIN the person typed, or None if they refused.
+        pub fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
+            let (app, prompt) = (app.to_owned(), prompt.to_owned());
+            let (_, rx) = self.ask(|id| Request::Secret {
+                id,
+                app,
+                uid,
+                what: "use your security key".to_owned(),
+                prompt,
+            })?;
+            match rx.recv() {
+                Ok(Response::Secret { secret, .. }) => Ok(Some(secret)),
+                Ok(Response::Cancelled { .. }) => Ok(None),
+                Ok(_) => Err("the shell answered something else".to_owned()),
+                Err(_) => Err("the shell is gone".to_owned()),
+            }
+        }
+
+        /// A touch prompt, up until what this returns is dropped.
+        pub fn touch(
+            self: &Arc<Self>,
+            app: &str,
+            uid: u32,
+            prompt: &str,
+        ) -> Result<Touching, String> {
+            let (app, prompt) = (app.to_owned(), prompt.to_owned());
+            let (id, rx) = self.ask(|id| Request::Touch {
+                id,
+                app,
+                uid,
+                what: "use your security key".to_owned(),
+                prompt,
+            })?;
+            Ok(Touching {
+                shell: self.clone(),
+                id,
+                _rx: rx,
+            })
+        }
+    }
+
+    pub struct Touching {
+        shell: Arc<Client>,
+        id: u64,
+        _rx: mpsc::Receiver<Response>,
+    }
+
+    impl Drop for Touching {
+        fn drop(&mut self) {
+            self.shell.waiting.lock().unwrap().remove(&self.id);
+            if let Err(err) = self.shell.send(&Request::Cancel { id: self.id }) {
+                drv_os::say!("{}: {err}", self.shell.who);
+            }
+        }
+    }
+}
+#[cfg(feature = "client")]
+pub use client::{Client, Touching};

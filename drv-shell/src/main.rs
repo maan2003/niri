@@ -5,7 +5,7 @@
 //! compositor; the compositor alone decides when the session is locked, and a dead shell
 //! leaves it locked and black. The app menu: the compositor pokes fd `poke` on
 //! `show-launcher`, the pick goes down the launch channel (fd `appd`) as a name. The
-//! person's prompts: drv-cast (fd `cast`) and drv-agent (fd `agent`) ask over
+//! person's prompts: drv-cast (fd `cast`), drv-agent (fd `agent`) and drv-fido (fd `fido`) ask over
 //! `drv_shell::ask`; the shell shows what it is told, one dialog at a time, none while
 //! locked. Notifications: apps connect to fd `listener` (`drv_shell::notify`), each keyed
 //! on its uid and drv-appd's word for it; the text is shown under the manifest name.
@@ -116,6 +116,7 @@ impl Menu {
 enum Wire {
     Cast,
     Agent,
+    Fido,
 }
 
 impl Wire {
@@ -123,6 +124,7 @@ impl Wire {
         match self {
             Wire::Cast => "drv-cast",
             Wire::Agent => "drv-agent",
+            Wire::Fido => "drv-fido",
         }
     }
 }
@@ -223,6 +225,7 @@ struct App {
     menu: Menu,
     cast: OwnedFd,
     agent: OwnedFd,
+    fido: OwnedFd,
     queue: VecDeque<Pending>,
     dialog: Option<Dialog>,
     notes: Notes,
@@ -239,6 +242,7 @@ impl App {
         match wire {
             Wire::Cast => &self.cast,
             Wire::Agent => &self.agent,
+            Wire::Fido => &self.fido,
         }
     }
 
@@ -1077,6 +1081,7 @@ fn run() -> Result<(), String> {
     let poke = fds.socket("poke", Kind::Stream).map_err(|e| e.to_string())?;
     let cast = fds.socket("cast", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let agent = fds.socket("agent", Kind::SeqPacket).map_err(|e| e.to_string())?;
+    let fido = fds.socket("fido", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let listener = fds.listener_of("listener", Kind::SeqPacket).map_err(|e| e.to_string())?;
     let appd = PolicyClient::from_stream(UnixStream::from(appd))
         .map_err(|e| format!("the launch channel: {e}"))?;
@@ -1092,6 +1097,7 @@ fn run() -> Result<(), String> {
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|e| format!("layer shell: {e}"))?;
     let cast_out = cast.try_clone().map_err(|e| format!("dup: {e}"))?;
     let agent_out = agent.try_clone().map_err(|e| format!("dup: {e}"))?;
+    let fido_out = fido.try_clone().map_err(|e| format!("dup: {e}"))?;
     let mut app = App {
         lock: Lock {
             state: SessionLockState::new(&globals, &qh),
@@ -1115,6 +1121,7 @@ fn run() -> Result<(), String> {
         },
         cast: cast_out,
         agent: agent_out,
+        fido: fido_out,
         queue: VecDeque::new(),
         dialog: None,
         notes: Notes {
@@ -1148,7 +1155,7 @@ fn run() -> Result<(), String> {
             },
         )
         .map_err(|e| format!("event loop: {e}"))?;
-    for (wire, sock) in [(Wire::Cast, cast), (Wire::Agent, agent)] {
+    for (wire, sock) in [(Wire::Cast, cast), (Wire::Agent, agent), (Wire::Fido, fido)] {
         let wire_qh = qh.clone();
         event_loop
             .handle()
