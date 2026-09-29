@@ -24,6 +24,26 @@ echo "== kernel state"
 for who in flower forker compositor; do
   if out=$(bash "$(dirname "$0")/kernel-state.sh" $who 2>&1); then echo "PASS $out"; else echo "FAIL kernel state of $who:"; echo "$out" | head -30; fails=$((fails + 1)); fi
 done
+echo "== the FIDO door (the fido-test probe)"
+F=/var/lib/drv-apps/100015/out
+for _ in $(seq 1 30); do $SSH test -e $F/done && break; sleep 1; done
+file_has "the app's own origin makes a credential on the emulated key" $F/fido.txt '^created: hmac-secret true, credential id of [0-9]+ chars$'
+file_has "and its hmac-secret is the credential's" $F/fido.txt '^hmac-secret: the same salt agrees, 32 bytes; another salt differs$'
+file_has "another origin is refused at the door" $F/fido.txt '^other origin: .*"error".*"app:dev.rho.Gui is not an origin of this app"'
+expect "and logged there" 'drv-agent: fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
+
+echo "== unlock"
+mark; key 1 2 3 4 ret; sleep 2
+expect "PIN accepted" "PIN accepted; unlocking"
+# The hello probe's `ssh-add -l` with a key plugged in (the emulated one) had the ssh agent
+# ask the shell for its PIN; the shell kept it for the unlock and puts it up now, in front
+# of every later dialog: refuse it.
+key esc; sleep 1
+expect "the ssh agent's PIN ask waited for the unlock and is refused" 'drv-shell: hello \(uid 100001\): refused to use your security key'
+expect "and the agent hears so" 'drv-agent: hello \(uid 100001\): the PIN was refused'
+
+# The boot-time probes: their lines are older than the unlock's mark.
+since="1970-01-01"
 echo "== an sshd of the app's own (the ssh-test probe)"
 S=/var/lib/drv-apps/100014/out
 for _ in $(seq 1 30); do $SSH test -e $S/done && break; sleep 1; done
@@ -58,17 +78,6 @@ G=/var/lib/drv-apps/100002/out
 for _ in $(seq 1 30); do $SSH test -e $G/done && break; sleep 1; done
 $SSH grep -q 'no identities' $G/agent.txt && fail "the agent answered an app without the grant" || echo "PASS the agent's door is shut without the grant"
 expect "and says so" 'drv-agent: refused uid 100002'
-
-echo "== the FIDO door (the fido-test probe)"
-F=/var/lib/drv-apps/100015/out
-for _ in $(seq 1 30); do $SSH test -e $F/done && break; sleep 1; done
-file_has "the app's own origin reaches drv-agent" $F/fido.txt '^own origin: .*2 1 "error" s "no security key is plugged in"$'
-file_has "another origin is refused at the door" $F/fido.txt '^other origin: .*2 1 "error" s "app:dev.rho.Gui is not an origin of this app"$'
-expect "and logged there" 'drv-agent: fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
-
-echo "== unlock"
-mark; key 1 2 3 4 ret; sleep 2
-expect "PIN accepted" "PIN accepted; unlocking"
 
 echo "== host workspace"
 mark; key meta_l-grave_accent; sleep 1

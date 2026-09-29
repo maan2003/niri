@@ -59,21 +59,48 @@ let
       echo "not a uri: $(open '-https://example.com')"
     } > "$HOME/out/open.txt"
   '';
-  # The FIDO door through the shim, as linux-credentials' portal API: a GetCredential for the
-  # app's own origin reaches drv-agent (no key in the VM: it says so), one for another origin
+  # The FIDO door through the shim, as linux-credentials' portal API, on the VM's emulated
+  # CanoKey (nix/dev-vm.nix): a credential made with hmac-secret (`hmacCreateSecret`, the
+  # extension libwebauthn serves without asking a PIN; PRF it upgrades to UV required) for
+  # the app's own origin, then two assertions with the same salt must agree (32 bytes: the
+  # identity rho derives) and one with another salt must not; the same for another origin
   # is refused by the door.
   fidoTest = pkgs.writeShellScript "fido-test" ''
-    get() {
-      ${pkgs.systemd}/bin/busctl --user -- call xyz.iinuwa.credentialsd.Credentials /org/freedesktop/portal/desktop \
-        org.freedesktop.handler.portal.experimental.Credential GetCredential 'ssa{sv}s' "" "$1" 1 public_key s \
-        '{"challenge":"Y2hhbGxlbmdl","rpId":"fidotest.drv.dev","allowCredentials":[{"type":"public-key","id":"AQID"}],"userVerification":"discouraged"}' \
-        dev.drv.FidoTest 2>&1
+    PATH=${lib.makeBinPath [ pkgs.systemd pkgs.jq pkgs.coreutils ]}
+    call() {
+      busctl --user --json=short -- call xyz.iinuwa.credentialsd.Credentials /org/freedesktop/portal/desktop \
+        org.freedesktop.handler.portal.experimental.Credential "$@" 2>&1
+    }
+    # The one string in the reply's a{sv} under KEY, whatever busctl's JSON nesting.
+    field() { jq -r --arg k "$1" '[.. | objects | select(has($k)) | .[$k] | (.data // .)] | first // empty' 2>/dev/null; }
+    create() {
+      call CreateCredential 'sssa{sv}s' "" "$1" publicKey 1 public_key s \
+        '{"rp":{"id":"fidotest.drv.dev","name":"fido-test"},"user":{"id":"AQID","name":"probe","displayName":"probe"},"challenge":"Y2hhbGxlbmdl","pubKeyCredParams":[{"type":"public-key","alg":-7}],"authenticatorSelection":{"residentKey":"discouraged","userVerification":"discouraged"},"extensions":{"hmacCreateSecret":true}}' \
+        dev.drv.FidoTest
+    }
+    get() { # origin, credential id, salt
+      call GetCredential 'ssa{sv}s' "" "$1" 1 public_key s \
+        "{\"challenge\":\"Y2hhbGxlbmdl\",\"rpId\":\"fidotest.drv.dev\",\"allowCredentials\":[{\"type\":\"public-key\",\"id\":\"$2\"}],\"userVerification\":\"discouraged\",\"extensions\":{\"hmacGetSecret\":{\"salt1\":\"$3\"}}}" \
+        dev.drv.FidoTest
     }
     {
-      echo "own origin: $(get app:dev.drv.FidoTest)"
-      echo "other origin: $(get app:dev.rho.Gui)"
+      made=$(create app:dev.drv.FidoTest)
+      reg=$(field registration_response_json <<<"$made")
+      if [ -z "$reg" ]; then echo "created: $made"; else
+        id=$(jq -r .id <<<"$reg")
+        echo "created: hmac-secret $(jq -r .clientExtensionResults.hmacCreateSecret <<<"$reg"), credential id of ''${#id} chars"
+        hmac() { get app:dev.drv.FidoTest "$id" "$1" | field authentication_response_json | jq -r '.clientExtensionResults.hmacGetSecret.output1 // "none"'; }
+        salt=cmhvIGlyb2ggaWRlbnRpdHkgdjEgKDMyIGJ5dGVzKSE
+        a=$(hmac $salt); b=$(hmac $salt); c=$(hmac YW5vdGhlciBzYWx0IGZvciB0aGUgZmlkbyBwcm9iZSE)
+        if [ "$a" = "$b" ] && [ ''${#a} -eq 43 ] && [ "$c" != "$a" ] && [ ''${#c} -eq 43 ]; then
+          echo "hmac-secret: the same salt agrees, 32 bytes; another salt differs"
+        else
+          echo "hmac-secret: $a / $b / $c"
+        fi
+      fi
+      echo "other origin: $(get app:dev.rho.Gui AQID $salt)"
     } > "$HOME/out/fido.txt"
-    ${pkgs.coreutils}/bin/touch "$HOME/out/done"
+    touch "$HOME/out/done"
   '';
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"
@@ -141,6 +168,11 @@ in
   services.drv.package = niri;
 
   services.openssh.enable = true;
+  # The emulated CanoKey (nix/dev-vm.nix) is drv-agent's like a YubiKey (the module's rule
+  # names Yubico's vendor id only).
+  services.udev.extraRules = ''
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="20a0", ATTRS{idProduct}=="42d4", GROUP="drv-agent", MODE="0660"
+  '';
   # Something for the chooser to show.
   systemd.tmpfiles.rules = [
     "d /var/lib/drv-files/notes 0700 drv-files drv-files -"

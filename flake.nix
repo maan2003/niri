@@ -95,7 +95,7 @@
             outputHashes = {
               "smithay-0.7.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
               "smithay-drm-extras-0.1.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
-              "libwebauthn-0.10.0" = "sha256-ejwriclLirnad+x5wfJzvVVYtf1U5OQSHh9xHHURBZQ=";
+              "libwebauthn-0.10.0" = "sha256-u7BpzfW8CJshZZgjXssIy9eoWzmj2ZMYFgh8d9luEAc=";
             };
           };
 

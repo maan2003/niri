@@ -16,7 +16,8 @@ drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
 drv-shell = { version = "26.4.0", path = "../drv-shell", default-features = false, optional = true }
 # linux-credentials' WebAuthn client: CTAP2 over the hidraw nodes. No BLE, NFC or hybrid.
-libwebauthn = { git = "https://github.com/linux-credentials/libwebauthn", rev = "efa374d6303eb1ebeff373878fa76736f3d2c308", default-features = false, optional = true }
+# The fork carries hmacGetSecret through the JSON request path (rho/hmac-get-secret; upstream PR pending).
+libwebauthn = { git = "https://github.com/maan2003/libwebauthn", rev = "fb735a70ff3ab308675e5fc3527f800a698f80ae", default-features = false, optional = true }
 rustix = { version = "1.1.4", features = ["fs", "net", "std"], optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
