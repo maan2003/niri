@@ -101,6 +101,16 @@ let
       echo "other origin: $(get app:dev.rho.Gui AQID $salt)"
     } > "$HOME/out/fido.txt"
     touch "$HOME/out/done"
+    # The PIN dialog and its refusal (nix/smoke.sh sets a PIN on the key first, then drives
+    # the shell): an assertion with UV required, twice, each timed.
+    for n in 1 2; do
+      while [ ! -e "$HOME/out/go-pin$n" ]; do sleep 0.5; done
+      start=$(date +%s)
+      reply=$(call GetCredential 'ssa{sv}s' "" app:dev.drv.FidoTest 1 public_key s \
+        "{\"challenge\":\"Y2hhbGxlbmdl\",\"rpId\":\"fidotest.drv.dev\",\"allowCredentials\":[{\"type\":\"public-key\",\"id\":\"$id\"}],\"userVerification\":\"required\"}" \
+        dev.drv.FidoTest)
+      echo "uv required, answered after $(( $(date +%s) - start ))s: $reply" > "$HOME/out/pin$n.txt"
+    done
   '';
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"
@@ -305,6 +315,9 @@ in
     pkgs.wayland-utils
     pkgs.weston
     pkgs.foot
+    # nix/smoke.sh sets a PIN on the emulated key (fido2-token asks at a tty: expect).
+    pkgs.libfido2
+    pkgs.expect
   ];
 
   # A camera for drv-cast: a loopback device fed a test pattern, which WirePlumber

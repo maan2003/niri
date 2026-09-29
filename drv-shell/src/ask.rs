@@ -166,7 +166,7 @@ mod client {
             Ok(Touching {
                 shell: self.clone(),
                 id,
-                _rx: rx,
+                rx,
             })
         }
     }
@@ -174,7 +174,14 @@ mod client {
     pub struct Touching {
         shell: Arc<Client>,
         id: u64,
-        _rx: mpsc::Receiver<Response>,
+        rx: mpsc::Receiver<Response>,
+    }
+
+    impl Touching {
+        /// Whether the person has refused (Escape at the dialog) since the last look.
+        pub fn refused(&self) -> bool {
+            matches!(self.rx.try_recv(), Ok(Response::Cancelled { .. }))
+        }
     }
 
     impl Drop for Touching {

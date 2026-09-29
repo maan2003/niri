@@ -42,6 +42,21 @@ key esc; sleep 1
 expect "the ssh agent's PIN ask waited for the unlock and is refused" 'drv-shell: hello \(uid 100001\): refused to use your security key'
 expect "and the agent hears so" 'drv-agent: hello \(uid 100001\): the PIN was refused'
 
+echo "== the FIDO door's PIN dialog (a PIN set on the emulated key)"
+# fido2-token asks the new PIN twice at its tty; the key had none (a second run finds it set).
+$SSH "dev=\$(fido2-token -L | sed -n 's/^\(\/dev\/hidraw[0-9]*\):.*/\1/p' | head -1); expect -c 'spawn fido2-token -S '\$dev'; expect \"PIN:\"; send \"123456\r\"; expect \"PIN:\"; send \"123456\r\"; expect eof' >/dev/null 2>&1; fido2-token -I \$dev | grep -o 'pin retries: [0-9]*'" | grep -q 'pin retries: 8' && echo "PASS the key has a PIN with 8 tries" || fail "setting the key's PIN"
+mark; $SSH touch $F/go-pin1; sleep 4
+expect "the door asks the shell, saying how many tries are left" 'drv-fido: fido-test \(uid 100015\): asking the PIN \(8 attempts left\)'
+key esc; sleep 2
+expect "refused at the shell" 'drv-shell: fido-test \(uid 100015\): refused to use your security key'
+expect "and the door gives up at once" 'drv-fido: fido-test \(uid 100015\): the PIN was refused'
+file_has "the app is answered within seconds, not after the key's timeout" $F/pin1.txt '^uv required, answered after [0-5]s: .*"error"'
+mark; $SSH touch $F/go-pin2; sleep 4
+key 9 9 9 9 9 9 ret; sleep 3
+expect "a wrong PIN is asked again, one try fewer" 'drv-fido: fido-test \(uid 100015\): asking the PIN \(7 attempts left\)'
+key esc; sleep 2
+file_has "and refusing then answers the app" $F/pin2.txt '^uv required, answered after [0-9]s: .*"error"'
+
 # The boot-time probes: their lines are older than the unlock's mark.
 since="1970-01-01"
 echo "== an sshd of the app's own (the ssh-test probe)"
