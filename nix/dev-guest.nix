@@ -59,6 +59,22 @@ let
       echo "not a uri: $(open '-https://example.com')"
     } > "$HOME/out/open.txt"
   '';
+  # The FIDO door through the shim, as linux-credentials' portal API: a GetCredential for the
+  # app's own origin reaches drv-agent (no key in the VM: it says so), one for another origin
+  # is refused by the door.
+  fidoTest = pkgs.writeShellScript "fido-test" ''
+    get() {
+      ${pkgs.systemd}/bin/busctl --user -- call xyz.iinuwa.credentialsd.Credentials /org/freedesktop/portal/desktop \
+        org.freedesktop.handler.portal.experimental.Credential GetCredential 'ssa{sv}s' "" "$1" 1 public_key s \
+        '{"challenge":"Y2hhbGxlbmdl","rpId":"fidotest.drv.dev","allowCredentials":[{"type":"public-key","id":"AQID"}],"userVerification":"discouraged"}' \
+        dev.drv.FidoTest 2>&1
+    }
+    {
+      echo "own origin: $(get app:dev.drv.FidoTest)"
+      echo "other origin: $(get app:dev.rho.Gui)"
+    } > "$HOME/out/fido.txt"
+    ${pkgs.coreutils}/bin/touch "$HOME/out/done"
+  '';
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"
   '';
@@ -243,6 +259,7 @@ in
       # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
       open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
+      fido-test = { uid = 100015; bus = true; exec = [ "${fidoTest}" ]; autostart = true; menu = false; state = [ "out" ]; fido = [ "app:dev.drv.FidoTest" ]; };
       ssh-test = {
         uid = 100014; autostart = true; menu = false; network = true; nix = true; state = [ "out" ];
         shell = "${pkgs.bashInteractive}/bin/bash"; exec = [ "${sshTest}" ];

@@ -74,6 +74,9 @@ pub struct AppConfig {
     /// May use the ssh agent; drv-agent asks on every connection.
     #[serde(default)]
     pub agent: bool,
+    /// The origins it may claim at the FIDO door (`app:dev.rho.Gui`).
+    #[serde(default)]
+    pub fido: Vec<String>,
     /// Extra environment for this app only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -104,6 +107,7 @@ impl AppConfig {
             grants: self.grants.clone(),
             icon: self.icon.clone(),
             agent: self.agent,
+            fido: self.fido.clone(),
         }
     }
 }

@@ -130,6 +130,9 @@ struct Args {
     /// The agent's door, world-connectable: the agent asks drv-appd about every peer UID.
     #[arg(long, default_value = "/run/drv/agent")]
     agent_socket: PathBuf,
+    /// The agent's FIDO door (`SOCK_SEQPACKET`), the same way.
+    #[arg(long, default_value = "/run/drv/fido")]
+    fido_socket: PathBuf,
     /// An entry under `/run` the agent sees (udev's database, for the authenticators). Repeatable.
     #[arg(long = "agent-expose")]
     agent_expose: Vec<PathBuf>,
@@ -343,6 +346,7 @@ fn supervise(args: Args) -> Result<(), String> {
         cast: listen_seqpacket(&args.cast_socket)?,
         notify: listen_seqpacket(&args.notify_socket)?,
         agent: listen(&args.agent_socket)?,
+        fido: listen_seqpacket(&args.fido_socket)?,
         apps: listen(&args.apps_socket)?,
     };
 
@@ -394,6 +398,7 @@ struct Doors {
     cast: UnixListener,
     notify: UnixListener,
     agent: UnixListener,
+    fido: UnixListener,
     apps: UnixListener,
 }
 
@@ -617,6 +622,7 @@ fn start_set(
             vec![
                 ("shell", l.agent_shell.0.as_fd()),
                 ("listener", doors.agent.as_fd()),
+                ("fido", doors.fido.as_fd()),
             ],
         ),
         (

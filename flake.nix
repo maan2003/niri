@@ -95,6 +95,7 @@
             outputHashes = {
               "smithay-0.7.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
               "smithay-drm-extras-0.1.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
+              "libwebauthn-0.10.0" = "sha256-ejwriclLirnad+x5wfJzvVVYtf1U5OQSHh9xHHURBZQ=";
             };
           };
 
@@ -163,7 +164,7 @@
             # No default features below applies to every package: the services' binaries
             # are behind their `service` features (the compositor and the shim want only
             # their wires).
-            ++ [ "drv-shell/service" "drv-files/service" "drv-cast/service" ];
+            ++ [ "drv-shell/service" "drv-files/service" "drv-cast/service" "drv-agent/service" ];
           buildNoDefaultFeatures = true;
 
           # ever since this commit:

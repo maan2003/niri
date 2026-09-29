@@ -2,7 +2,8 @@
 //! the desktop names apps expect (`org.freedesktop.portal.Desktop`,
 //! `org.freedesktop.Notifications`), answers what it can itself (settings, versions) and
 //! turns the rest into the set's own wires: files to drv-files, screens and cameras to
-//! drv-cast, notifications to drv-shell, URIs to drv-appd. Each of those keys the
+//! drv-cast, notifications to drv-shell, URIs to drv-appd, WebAuthn (linux-credentials'
+//! portal API, `xyz.iinuwa.credentialsd.Credentials`) to drv-agent's FIDO door. Each of those keys the
 //! connection on this uid; the shim is compatibility, never a boundary. Whatever an app
 //! does to this process, it gains only the ability to speak those wires directly, which it
 //! could anyway. D-Bus ends here.
@@ -16,6 +17,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use anyhow::{Context as _, bail};
 use clap::Parser;
+use drv_agent::fido::{Reply as FidoReply, Request as FidoRequest};
 use drv_cast::wire::{Cursor, FromCast, Source, ToCast};
 use drv_dbus_shim::{sender_component, NOTIFICATIONS_NAME, NOTIFICATIONS_PATH, PORTAL_NAME, PORTAL_PATH};
 use drv_files::wire::{FromFiles, Kind as Chooser, ToFiles};
@@ -47,6 +49,11 @@ const SOURCE_TYPES: u32 = 1 | 2;
 /// `AvailableCursorModes`: hidden, embedded, metadata.
 const CURSOR_MODES: u32 = 1 | 2 | 4;
 
+/// linux-credentials' gateway: its name, and its interface on the portal path. The answer
+/// is the portal shape, `(response u, results a{sv})`: 0 and the credential, 2 and `error`.
+const CREDENTIALS_NAME: &str = "xyz.iinuwa.credentialsd.Credentials";
+const CREDENTIALS: &str = "org.freedesktop.handler.portal.experimental.Credential";
+
 const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 const FAILED: &str = "org.freedesktop.DBus.Error.Failed";
 
@@ -67,6 +74,9 @@ struct Args {
     /// drv-appd's public socket, for OpenURI.
     #[arg(long, env = "DRV_APPD_SOCKET", default_value = "/run/drv/appd.sock")]
     appd: PathBuf,
+    /// drv-agent's FIDO door.
+    #[arg(long, default_value = drv_agent::fido::SOCKET)]
+    fido: PathBuf,
     /// The app, run once the names are owned.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
@@ -87,10 +97,11 @@ fn run(args: Args) -> anyhow::Result<()> {
     let bus = Connection::from(zbus::Connection::from(bus_iter.inner()));
     bus.request_name(NOTIFICATIONS_NAME)?;
     bus.request_name(PORTAL_NAME)?;
+    bus.request_name(CREDENTIALS_NAME)?;
 
     let shim = Arc::new(Shim {
         bus,
-        paths: Paths { files: args.files, cast: args.cast, notify: args.notify, appd: args.appd },
+        paths: Paths { files: args.files, cast: args.cast, notify: args.notify, appd: args.appd, fido: args.fido },
         files: OnceLock::new(),
         cast: OnceLock::new(),
         notify: OnceLock::new(),
@@ -277,6 +288,7 @@ struct Paths {
     cast: PathBuf,
     notify: PathBuf,
     appd: PathBuf,
+    fido: PathBuf,
 }
 
 struct Shim {
@@ -446,6 +458,7 @@ impl Shim {
                 OPEN_URI => self.open_uri(msg, hdr, &member),
                 SETTINGS => self.settings(msg, hdr, &member).map(Ours::Reply),
                 PROPERTIES => self.properties(msg, hdr, &member),
+                CREDENTIALS => self.credentials(msg, hdr, &member),
                 _ => unknown(hdr, &interface, &member),
             };
         }
@@ -825,6 +838,67 @@ impl Shim {
         }
     }
 
+    /// linux-credentials' `CreateCredential` and `GetCredential`: the origin and the WebAuthn
+    /// JSON go to drv-agent's FIDO door as they are, one connection per ceremony, on a
+    /// thread: the answer waits on the person and the key. The door decides (the manifest's
+    /// origins, the relying party); `claimed_app_id`, the parent window and the activation
+    /// token mean nothing here, the door knows the uid.
+    fn credentials(self: &Arc<Self>, msg: &Message, _hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
+        let request = match member {
+            "CreateCredential" => {
+                let (_parent, origin, kind, options, _app_id): (String, String, String, HashMap<String, OwnedValue>, String) =
+                    msg.body().deserialize().context("CreateCredential arguments")?;
+                if kind != "publicKey" {
+                    bail!("no credentials of type {kind}");
+                }
+                FidoRequest::Create { origin, public_key: public_key_of(&options)? }
+            }
+            "GetCredential" => {
+                let (_parent, origin, options, _app_id): (String, String, HashMap<String, OwnedValue>, String) =
+                    msg.body().deserialize().context("GetCredential arguments")?;
+                FidoRequest::Get { origin, public_key: public_key_of(&options)? }
+            }
+            other => bail!("no {other} on {CREDENTIALS}"),
+        };
+        let json_key = match member {
+            "CreateCredential" => "registration_response_json",
+            _ => "authentication_response_json",
+        };
+        let shim = self.clone();
+        let msg = msg.clone();
+        let member = member.to_owned();
+        std::thread::spawn(move || {
+            let hdr = msg.header();
+            let answer = shim.fido(&request);
+            let reply = match answer {
+                Ok(FidoReply::Credential { json }) => {
+                    let credential: HashMap<&str, Value<'_>> = HashMap::from([(json_key, Value::from(json))]);
+                    let results: HashMap<&str, Value<'_>> =
+                        HashMap::from([("type", Value::from("public-key")), ("public_key", Value::from(credential))]);
+                    Message::method_return(&hdr).and_then(|b| b.build(&(0u32, results))).map_err(Into::into)
+                }
+                Ok(FidoReply::Failed { reason }) => {
+                    drv_os::say!("drv-dbus-shim: {member}: {reason}");
+                    let results: HashMap<&str, Value<'_>> = HashMap::from([("error", Value::from(reason))]);
+                    Message::method_return(&hdr).and_then(|b| b.build(&(2u32, results))).map_err(Into::into)
+                }
+                Err(err) => failed(&hdr, format!("{err:#}")),
+            };
+            if let Err(err) = reply.and_then(|r| shim.bus.send(&r).map_err(Into::into)) {
+                drv_os::say!("drv-dbus-shim: {member} reply: {err}");
+            }
+        });
+        Ok(Ours::Done)
+    }
+
+    /// One ceremony at the FIDO door: a fresh connection, the request, its answer.
+    fn fido(&self, request: &FidoRequest) -> anyhow::Result<FidoReply> {
+        let door = connect(&self.paths.fido)?;
+        seq::send(&door, request, &[]).context("the FIDO door")?;
+        let (reply, _) = seq::recv::<FidoReply>(&door).context("the FIDO door's answer")?;
+        Ok(reply)
+    }
+
     /// `OpenURI`: drv-appd starts the manifest handler; no prompt. `writable`, `ask` and
     /// the parent window are ignored. Its own connection, on its own thread: the answer
     /// waits on a launch.
@@ -906,6 +980,13 @@ impl Shim {
             other => error(hdr, UNKNOWN_METHOD, format!("no {other} on {NOTIFICATIONS_NAME}"))?,
         }))
     }
+}
+
+/// The WebAuthn JSON of a credentials request: `options["public_key"]`, a string.
+fn public_key_of(options: &HashMap<String, OwnedValue>) -> anyhow::Result<String> {
+    let value = options.get("public_key").context("no public_key in the options")?;
+    let json: &str = value.downcast_ref().context("public_key is not a string")?;
+    Ok(json.to_owned())
 }
 
 /// There is no other portal behind the shim.

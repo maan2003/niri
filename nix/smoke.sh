@@ -59,6 +59,13 @@ for _ in $(seq 1 30); do $SSH test -e $G/done && break; sleep 1; done
 $SSH grep -q 'no identities' $G/agent.txt && fail "the agent answered an app without the grant" || echo "PASS the agent's door is shut without the grant"
 expect "and says so" 'drv-agent: refused uid 100002'
 
+echo "== the FIDO door (the fido-test probe)"
+F=/var/lib/drv-apps/100015/out
+for _ in $(seq 1 30); do $SSH test -e $F/done && break; sleep 1; done
+file_has "the app's own origin reaches drv-agent" $F/fido.txt '^own origin: .*2 1 "error" s "no security key is plugged in"$'
+file_has "another origin is refused at the door" $F/fido.txt '^other origin: .*2 1 "error" s "app:dev.rho.Gui is not an origin of this app"$'
+expect "and logged there" 'drv-agent: fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
+
 echo "== unlock"
 mark; key 1 2 3 4 ret; sleep 2
 expect "PIN accepted" "PIN accepted; unlocking"

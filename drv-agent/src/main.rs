@@ -10,6 +10,11 @@
 //! person at the shell (fd `shell`) and loads the resident keys with `ssh-add -K` itself.
 //! ssh-agent's own prompts while signing (the PIN of a verify-required key, a touch) come
 //! the same way: we are its askpass, reaching the door over a socket in our `/tmp`.
+//!
+//! A second door, `/run/drv/fido`, is WebAuthn on the same authenticators for the apps
+//! whose manifest lists the origins they may claim (`ceremony`).
+
+mod ceremony;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead as _, Read as _, Write as _};
@@ -95,7 +100,10 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
     // set started: an app started meanwhile waits in the backlog instead of finding no
     // socket. The door is the uid check below, not a mode: apps of any uid may connect.
     let listener = fds.listener("listener").map_err(|e| e.to_string())?;
-    let appd = Appd::open().map_err(|e| format!("drv-appd: {e}"))?;
+    let fido = fds
+        .listener_of("fido", Kind::SeqPacket)
+        .map_err(|e| e.to_string())?;
+    let appd = Arc::new(Appd::open().map_err(|e| format!("drv-appd: {e}"))?);
     let _ = std::fs::remove_file(ASKPASS);
     let askpass = UnixListener::bind(ASKPASS).map_err(|e| format!("{ASKPASS}: {e}"))?;
     let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -121,7 +129,16 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
         std::thread::sleep(Duration::from_millis(20));
     }
     let shell = Shell::start(shell)?;
-    drv_os::say!("drv-agent: serving the door");
+    {
+        let (appd, shell) = (appd.clone(), shell.clone());
+        std::thread::spawn(move || {
+            if let Err(err) = ceremony::serve(fido, appd, shell) {
+                drv_os::say!("drv-agent: fido: {err}");
+                process::exit(1);
+            }
+        });
+    }
+    drv_os::say!("drv-agent: serving the doors");
     let door = Arc::new(Door {
         private: private.to_owned(),
         ssh_add: ssh_add.to_owned(),
@@ -171,7 +188,7 @@ fn serve(private: &Path, ssh_agent: &Path, ssh_add: &Path) -> Result<(), String>
 
 /// Our line to the shell: requests under ids of our own, answers back on a thread to
 /// whoever waits for that id.
-struct Shell {
+pub(crate) struct Shell {
     out: Mutex<OwnedFd>,
     waiting: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
     next: AtomicU64,
@@ -245,7 +262,7 @@ impl Shell {
     }
 
     /// The PIN the person typed, or None if they refused.
-    fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
+    pub(crate) fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
         let (app, prompt) = (app.to_owned(), prompt.to_owned());
         let (_, rx) = self.ask(|id| Request::Secret {
             id,
@@ -263,7 +280,12 @@ impl Shell {
     }
 
     /// A touch prompt, up until what this returns is dropped.
-    fn touch(self: &Arc<Self>, app: &str, uid: u32, prompt: &str) -> Result<Touching, String> {
+    pub(crate) fn touch(
+        self: &Arc<Self>,
+        app: &str,
+        uid: u32,
+        prompt: &str,
+    ) -> Result<Touching, String> {
         let (app, prompt) = (app.to_owned(), prompt.to_owned());
         let (id, rx) = self.ask(|id| Request::Touch {
             id,
@@ -280,7 +302,7 @@ impl Shell {
     }
 }
 
-struct Touching {
+pub(crate) struct Touching {
     shell: Arc<Shell>,
     id: u64,
     _rx: mpsc::Receiver<Response>,

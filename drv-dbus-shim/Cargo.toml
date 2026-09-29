@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap = { workspace = true, features = ["env"] }
+drv-agent = { version = "26.4.0", path = "../drv-agent", default-features = false }
 drv-cast = { version = "26.4.0", path = "../drv-cast", default-features = false }
 drv-files = { version = "26.4.0", path = "../drv-files", default-features = false }
 drv-os = { version = "26.4.0", path = "../drv-os" }

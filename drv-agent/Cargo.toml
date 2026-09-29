@@ -3,11 +3,26 @@ name = "drv-agent"
 version = "26.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "The ssh agent: OpenSSH's ssh-agent behind a door that knows which UIDs may knock."
+description = "The ssh agent: OpenSSH's ssh-agent behind a door that knows which UIDs may knock, and a FIDO door beside it."
+
+[features]
+default = ["service"]
+# The binary; off for crates that want only the FIDO door's wire (the shim).
+service = ["dep:clap", "dep:drv-os", "dep:drv-shell", "dep:libwebauthn", "dep:rustix", "dep:serde_json", "dep:tokio"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-drv-os = { version = "26.4.0", path = "../drv-os" }
+clap = { version = "4.5", features = ["derive"], optional = true }
+drv-os = { version = "26.4.0", path = "../drv-os", optional = true }
 drv-policy = { version = "26.4.0", path = "../drv-policy" }
-drv-shell = { version = "26.4.0", path = "../drv-shell", default-features = false }
-rustix = { version = "1.1.4", features = ["fs", "net", "std"] }
+drv-shell = { version = "26.4.0", path = "../drv-shell", default-features = false, optional = true }
+# linux-credentials' WebAuthn client: CTAP2 over the hidraw nodes. No BLE, NFC or hybrid.
+libwebauthn = { git = "https://github.com/linux-credentials/libwebauthn", rev = "efa374d6303eb1ebeff373878fa76736f3d2c308", default-features = false, optional = true }
+rustix = { version = "1.1.4", features = ["fs", "net", "std"], optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"], optional = true }
+
+[[bin]]
+name = "drv-agent"
+path = "src/main.rs"
+required-features = ["service"]

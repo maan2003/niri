@@ -117,6 +117,9 @@ pub struct AppPolicy {
     /// May use the ssh agent (drv-agent checks it on every connection).
     #[serde(default)]
     pub agent: bool,
+    /// The origins it may claim at the FIDO door (`app:dev.rho.Gui`), exactly as claimed.
+    #[serde(default)]
+    pub fido: Vec<String>,
 }
 
 impl AppPolicy {
@@ -129,6 +132,7 @@ impl AppPolicy {
             grants: Vec::new(),
             icon: None,
             agent: false,
+            fido: Vec::new(),
         }
     }
 
@@ -141,6 +145,7 @@ impl AppPolicy {
             grants: vec![Grant::Lookup],
             icon: None,
             agent: true,
+            fido: Vec::new(),
         }
     }
 
