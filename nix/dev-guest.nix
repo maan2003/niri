@@ -121,6 +121,22 @@ let
         dev.drv.FidoTest)
       echo "uv required, answered after $(( $(date +%s) - start ))s: $reply" > "$HOME/out/pin$n.txt"
     done
+    # Cancelling: the same ask, named by a handle_token, then `Request.Close` on the portal
+    # request handle (the sender's unique name is in its path: busctl's, by its pid) while
+    # the shell asks the PIN; the door sees the app hang up and the call is answered at once.
+    while [ ! -e "$HOME/out/go-cancel" ]; do sleep 0.5; done
+    start=$(date +%s)
+    busctl --user --json=short -- call xyz.iinuwa.credentialsd.Credentials /org/freedesktop/portal/desktop \
+      org.freedesktop.handler.portal.experimental.Credential GetCredential 'ssa{sv}s' "" app:dev.drv.FidoTest 2 public_key s \
+      "{\"challenge\":\"Y2hhbGxlbmdl\",\"rpId\":\"fidotest.drv.dev\",\"allowCredentials\":[{\"type\":\"public-key\",\"id\":\"$id\"}],\"userVerification\":\"required\"}" \
+      handle_token s cancelme dev.drv.FidoTest > "$HOME/out/cancel.reply" 2>&1 &
+    pid=$!
+    sleep 2
+    sender=$(busctl --user --json=short list --unique | jq -r --argjson pid $pid '[.[] | select(.pid == $pid) | .name | ltrimstr(":") | gsub("[.]"; "_")] | first')
+    busctl --user call xyz.iinuwa.credentialsd.Credentials "/org/freedesktop/portal/desktop/request/$sender/cancelme" \
+      org.freedesktop.portal.Request Close > "$HOME/out/cancel.close" 2>&1
+    wait $pid
+    echo "cancelled, answered after $(( $(date +%s) - start ))s: $(cat "$HOME/out/cancel.reply")" > "$HOME/out/cancel.txt"
   '';
   micTest = pkgs.writeShellScript "mic-test" ''
     exec ${pkgs.pipewire}/bin/pw-record "$HOME/out/rec.wav"

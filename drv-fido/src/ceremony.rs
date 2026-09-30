@@ -34,7 +34,7 @@ use libwebauthn::transport::{Channel as _, ChannelSettings, Device as _};
 use libwebauthn::webauthn::WebAuthn as _;
 use libwebauthn::webauthn::error::{PlatformError, WebAuthnError};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// Accepts forever on the door. Each connection is one request, answered when its ceremony
 /// ends; ceremonies queue on `one`.
@@ -269,6 +269,7 @@ async fn ceremony(
         .await
         .map_err(|e| format!("{name}: {e:?}"))?;
     let handle = channel.get_handle();
+    let gone = Arc::new(Notify::new());
     let prompts = tokio::spawn(prompt(
         channel.get_ux_update_receiver(),
         shell.clone(),
@@ -279,6 +280,7 @@ async fn ceremony(
             key,
         },
         handle.clone(),
+        gone.clone(),
     ));
     // The app gone: one blocking read on its socket ends when it closes (or when we answer
     // and close it ourselves, when the cancel goes nowhere).
@@ -292,6 +294,8 @@ async fn ceremony(
             })
             .await;
             drv_os::say!("drv-fido: {app} (uid {uid}): the app hung up");
+            // A PIN ask up at the shell goes down; a touch waited for on the key is cancelled.
+            gone.notify_one();
             handle.cancel_ongoing_operation().await;
         })
     };
@@ -397,11 +401,14 @@ struct Asking {
     key: String,
 }
 
+/// `gone` says the app hung up: a PIN being asked is cancelled instead (the key waits on
+/// nothing else then, so cancelling the operation does not reach it).
 async fn prompt(
     mut updates: broadcast::Receiver<UvUpdate>,
     shell: Arc<Shell>,
     asking: Asking,
     handle: HidChannelHandle,
+    gone: Arc<Notify>,
 ) {
     let Asking {
         app,
@@ -446,26 +453,53 @@ async fn prompt(
                     continue;
                 }
                 drv_os::say!("drv-fido: {app} (uid {uid}): asking the PIN ({tries})");
-                let (shell, of, what) = (shell.clone(), app.clone(), what.clone());
                 // The count only once it matters: the key blocks after eight misses.
                 let prompt = match pin.attempts_left {
                     Some(n) if n <= 3 => format!("PIN for your {key} ({n} tries left)"),
                     _ => format!("PIN for your {key}"),
                 };
-                let answer =
-                    tokio::task::spawn_blocking(move || shell.pin(&of, uid, &what, &prompt)).await;
+                // The ask goes down with `asked`: when answered, or when the ceremony ends
+                // first (the app hung up, the key was pulled) and this task is aborted.
+                let mut asked = match shell.secret(&app, uid, &what, &prompt) {
+                    Ok(asked) => asked,
+                    Err(err) => {
+                        drv_os::say!("drv-fido: {err}");
+                        pin.cancel();
+                        continue;
+                    }
+                };
+                let answer = loop {
+                    tokio::select! {
+                        update = updates.recv() => match update {
+                            Err(broadcast::error::RecvError::Closed) => break None,
+                            _ => {}
+                        },
+                        _ = gone.notified() => break Some(None),
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                            if let Some(answer) = asked.answer() {
+                                break Some(Some(answer));
+                            }
+                        }
+                    }
+                };
+                drop(asked);
+                let Some(answer) = answer else { break };
                 match answer {
-                    Ok(Ok(Some(typed))) => {
+                    Some(Ok(Some(typed))) => {
                         if let Err(err) = pin.send_pin(&typed) {
                             drv_os::say!("drv-fido: the PIN: {err}");
                         }
                     }
-                    Ok(Ok(None)) => {
+                    Some(Ok(None)) => {
                         drv_os::say!("drv-fido: {app} (uid {uid}): the PIN was refused");
                         pin.cancel();
                     }
-                    Ok(Err(err)) => drv_os::say!("drv-fido: {err}"),
-                    Err(err) => drv_os::say!("drv-fido: {err}"),
+                    Some(Err(err)) => {
+                        drv_os::say!("drv-fido: {err}");
+                        pin.cancel();
+                    }
+                    // The app hung up.
+                    None => pin.cancel(),
                 }
             }
             Ok(UvUpdate::PinNotSet(_)) => {

@@ -250,10 +250,11 @@ impl<From: Answer> Link<From> {
 // ---------------------------------------------------------------- state
 
 /// Which service a request handle went to.
-#[derive(Clone, Copy)]
 enum Where {
     Files,
     Cast,
+    /// A FIDO ceremony: the door's connection, to shut down so the door sees the app hang up.
+    Fido(OwnedFd),
 }
 
 /// A screencast session, from `CreateSession` to `Close` or the cast's end.
@@ -492,6 +493,9 @@ impl Shim {
                         let cast = self.cast()?;
                         cast.forget(req);
                         cast.tell(&ToCast::Cancel { req })?;
+                    }
+                    Where::Fido(door) => {
+                        let _ = rustix::net::shutdown(&door, rustix::net::Shutdown::Both);
                     }
                 }
             }
@@ -842,24 +846,30 @@ impl Shim {
     /// JSON go to drv-fido's door as they are, one connection per ceremony, on a
     /// thread: the answer waits on the person and the key. The door decides (the manifest's
     /// origins, the relying party); `claimed_app_id`, the parent window and the activation
-    /// token mean nothing here, the door knows the uid.
-    fn credentials(self: &Arc<Self>, msg: &Message, _hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
-        let request = match member {
+    /// token mean nothing here, the door knows the uid. A `handle_token` in the options
+    /// names a portal request handle: `Request.Close` on it shuts the connection, which the
+    /// door takes as the app hanging up (the ceremony ends, the key is cancelled).
+    fn credentials(self: &Arc<Self>, msg: &Message, hdr: &Header<'_>, member: &str) -> anyhow::Result<Ours> {
+        let caller = caller_of(hdr)?;
+        let (request, options) = match member {
             "CreateCredential" => {
                 let (_parent, origin, kind, options, _app_id): (String, String, String, HashMap<String, OwnedValue>, String) =
                     msg.body().deserialize().context("CreateCredential arguments")?;
                 if kind != "publicKey" {
                     bail!("no credentials of type {kind}");
                 }
-                FidoRequest::Create { origin, public_key: public_key_of(&options)? }
+                (FidoRequest::Create { origin, public_key: public_key_of(&options)? }, options)
             }
             "GetCredential" => {
                 let (_parent, origin, options, _app_id): (String, String, HashMap<String, OwnedValue>, String) =
                     msg.body().deserialize().context("GetCredential arguments")?;
-                FidoRequest::Get { origin, public_key: public_key_of(&options)? }
+                (FidoRequest::Get { origin, public_key: public_key_of(&options)? }, options)
             }
             other => bail!("no {other} on {CREDENTIALS}"),
         };
+        let door = connect(&self.paths.fido)?;
+        let handle = handle_for(msg, &caller, &options, "handle_token");
+        self.state.lock().unwrap().handles.insert(handle.clone(), (Where::Fido(door.try_clone()?), 0));
         let json_key = match member {
             "CreateCredential" => "registration_response_json",
             _ => "authentication_response_json",
@@ -869,7 +879,8 @@ impl Shim {
         let member = member.to_owned();
         std::thread::spawn(move || {
             let hdr = msg.header();
-            let answer = shim.fido(&request);
+            let answer = shim.fido(door, &request);
+            shim.state.lock().unwrap().handles.remove(&handle);
             let reply = match answer {
                 Ok(FidoReply::Credential { json }) => {
                     let credential: HashMap<&str, Value<'_>> = HashMap::from([(json_key, Value::from(json))]);
@@ -891,9 +902,8 @@ impl Shim {
         Ok(Ours::Done)
     }
 
-    /// One ceremony at the FIDO door: a fresh connection, the request, its answer.
-    fn fido(&self, request: &FidoRequest) -> anyhow::Result<FidoReply> {
-        let door = connect(&self.paths.fido)?;
+    /// One ceremony at the FIDO door: on its own connection, the request, its answer.
+    fn fido(&self, door: OwnedFd, request: &FidoRequest) -> anyhow::Result<FidoReply> {
         seq::send(&door, request, &[]).context("the FIDO door")?;
         let (reply, _) = seq::recv::<FidoReply>(&door).context("the FIDO door's answer")?;
         Ok(reply)

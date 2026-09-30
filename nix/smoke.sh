@@ -62,6 +62,10 @@ key 9 9 9 9 9 9 ret; sleep 3
 expect "a wrong PIN is asked again, one try fewer" 'drv-fido: fido-test \(uid 100015\): asking the PIN \(7 attempts left\)'
 key esc; sleep 2
 file_has "and refusing then answers the app" $F/pin2.txt '^uv required, answered after [0-9]s: .*"error"'
+mark; $SSH touch $F/go-cancel; sleep 5
+expect "a third ask waits at the shell" 'drv-fido: fido-test \(uid 100015\): asking the PIN \(7 attempts left\)'
+expect "closing the portal request handle hangs the door up" 'drv-fido: fido-test \(uid 100015\): the app hung up'
+file_has "and the app's call is answered at once" $F/cancel.txt '^cancelled, answered after [0-5]s: '
 
 # The boot-time probes: their lines are older than the unlock's mark.
 since="1970-01-01"

@@ -174,6 +174,31 @@ mod client {
             }
         }
 
+        /// A secret asked at the shell; the answer is looked for. Dropped unanswered, the ask
+        /// is withdrawn.
+        pub fn secret(
+            self: &Arc<Self>,
+            app: &str,
+            uid: u32,
+            what: &str,
+            prompt: &str,
+        ) -> Result<Asked, String> {
+            let (app, what, prompt) = (app.to_owned(), what.to_owned(), prompt.to_owned());
+            let (id, rx) = self.ask(|id| Request::Secret {
+                id,
+                app,
+                uid,
+                what,
+                prompt,
+            })?;
+            Ok(Asked {
+                shell: self.clone(),
+                id,
+                rx,
+                answered: false,
+            })
+        }
+
         /// A touch prompt, up until what this returns is dropped.
         pub fn touch(
             self: &Arc<Self>,
@@ -195,6 +220,40 @@ mod client {
                 id,
                 rx,
             })
+        }
+    }
+
+    pub struct Asked {
+        shell: Arc<Client>,
+        id: u64,
+        rx: mpsc::Receiver<Response>,
+        answered: bool,
+    }
+
+    impl Asked {
+        /// The secret typed, `Ok(None)` if the person refused, or nothing yet.
+        pub fn answer(&mut self) -> Option<Result<Option<String>, String>> {
+            let answer = match self.rx.try_recv() {
+                Ok(Response::Secret { secret, .. }) => Ok(Some(secret)),
+                Ok(Response::Cancelled { .. }) => Ok(None),
+                Ok(_) => Err("the shell answered something else".to_owned()),
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => Err("the shell is gone".to_owned()),
+            };
+            self.answered = true;
+            Some(answer)
+        }
+    }
+
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            if self.answered {
+                return;
+            }
+            self.shell.waiting.lock().unwrap().remove(&self.id);
+            if let Err(err) = self.shell.send(&Request::Cancel { id: self.id }) {
+                drv_os::say!("{}: {err}", self.shell.who);
+            }
         }
     }
 
@@ -221,4 +280,4 @@ mod client {
     }
 }
 #[cfg(feature = "client")]
-pub use client::{Client, Touching};
+pub use client::{Asked, Client, Touching};
