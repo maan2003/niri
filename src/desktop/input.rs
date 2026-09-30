@@ -19,7 +19,8 @@ pub struct Held {
 
 pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input) -> Result<()> {
     let time = crate::utils::get_monotonic_time().as_millis() as u32;
-    if !matches!(input, Input::Feedback(_)) {
+    if !matches!(input, Input::Feedback(_) | Input::Quality { .. }) {
+        quality.interaction.fetch_add(1, Ordering::AcqRel);
         state.niri.notify_activity();
     }
     match input {
@@ -116,15 +117,20 @@ pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input
             }
         }
         Input::Feedback(feedback) => {
-            quality.feedback(&mut held.feedback_id, feedback, std::time::Instant::now());
-            if feedback.recover {
+            if quality.feedback(&mut held.feedback_id, feedback, std::time::Instant::now()) {
                 super::video::request_recovery(state, quality)?;
+            } else if state
+                .backend
+                .headless()
+                .video
+                .as_ref()
+                .is_some_and(|video| video.capture_ready())
+            {
+                state.niri.queue_redraw_all();
             }
         }
         Input::Quality { bitrate, keyframe } => {
-            quality
-                .bitrate
-                .store(bitrate.clamp(128_000, 20_000_000), Ordering::Release);
+            quality.set_bitrate(bitrate);
             if keyframe {
                 super::video::request_recovery(state, quality)?;
             }

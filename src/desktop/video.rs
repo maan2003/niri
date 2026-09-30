@@ -1,15 +1,14 @@
 //! Composition runs on the compositor thread; VP9 runs on a subscription-owned
 //! thread in this same process. No screenshot client or external encoder exists.
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use calloop::channel;
 use calloop::timer::{TimeoutAction, Timer};
 use rho_desktop_media::codec::{Encoder, Image};
-use rho_desktop_media::media;
+use rho_desktop_media::{media, FrameKind};
 use rho_desktop_proto::Feedback;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
@@ -21,15 +20,18 @@ pub struct Frame {
     image: Image,
     settled: bool,
     timestamp_us: u64,
+    interaction: u64,
 }
 pub struct Video {
     frames: Arc<RawFrames>,
     next: Instant,
     scheduled: bool,
     recovery_scheduled: bool,
+    capture_pending: bool,
     refinement: bool,
     revision: u64,
     born: Instant,
+    interaction: u64,
     quality: Arc<Quality>,
 }
 pub enum Command {
@@ -37,17 +39,17 @@ pub enum Command {
     Stop,
 }
 pub struct Quality {
-    pub bitrate: AtomicU32,
     pub keyframe: AtomicBool,
     pub composed: AtomicU64,
     pub encoded: AtomicU64,
     pub origin: Instant,
+    pub interaction: AtomicU64,
     capture_us: AtomicU64,
     encode_us: AtomicU64,
-    latest_us: AtomicU64,
     last_key_us: AtomicU64,
-    viewers: Mutex<BTreeMap<u64, (Feedback, Instant)>>,
     next_viewer: AtomicU64,
+    sender: Mutex<rho_desktop_media::sender::Sender>,
+    wake: Mutex<Weak<RawFrames>>,
 }
 
 /// A single raw slot: replacing it is safe before the encoder has seen the image.
@@ -70,17 +72,34 @@ impl RawFrames {
             self.ready.notify_one();
         }
     }
-    fn take(&self) -> Option<Frame> {
+    fn take(&self, quality: Option<&Quality>) -> Option<Frame> {
         let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(frame) = state.0.take() {
-                return Some(frame);
-            }
             if state.1 {
                 return None;
             }
+            if state.0.as_ref().is_some_and(|frame| {
+                frame.settled
+                    && quality
+                        .is_some_and(|q| q.interaction.load(Ordering::Acquire) != frame.interaction)
+            }) {
+                state.0 = None;
+            }
+            if state
+                .0
+                .as_ref()
+                .is_some_and(|frame| quality.is_none_or(|q| q.admit(frame.settled)))
+            {
+                return state.0.take();
+            }
             state = self.ready.wait(state).unwrap();
         }
+    }
+    fn wake(&self) {
+        // Pair notification with the mailbox mutex so feedback cannot arrive
+        // between the admission check and entering the condition-variable wait.
+        let _state = self.state.lock().unwrap();
+        self.ready.notify_all();
     }
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
@@ -97,57 +116,67 @@ impl Drop for Video {
 impl Default for Quality {
     fn default() -> Self {
         Self {
-            bitrate: AtomicU32::new(2_000_000),
             keyframe: AtomicBool::new(true),
             composed: AtomicU64::new(0),
             encoded: AtomicU64::new(0),
             origin: Instant::now(),
+            interaction: AtomicU64::new(0),
             capture_us: AtomicU64::new(0),
             encode_us: AtomicU64::new(0),
-            latest_us: AtomicU64::new(0),
             last_key_us: AtomicU64::new(0),
-            viewers: Mutex::new(BTreeMap::new()),
             next_viewer: AtomicU64::new(1),
+            sender: Mutex::new(Default::default()),
+            wake: Mutex::new(Weak::new()),
         }
     }
 }
 impl Quality {
-    pub fn feedback(&self, id: &mut Option<u64>, feedback: Feedback, now: Instant) {
+    pub fn feedback(&self, id: &mut Option<u64>, feedback: Feedback, now: Instant) -> bool {
         let id = *id.get_or_insert_with(|| self.next_viewer.fetch_add(1, Ordering::Relaxed));
-        self.viewers.lock().unwrap().insert(id, (feedback, now));
-        if feedback.recover {
+        let recover = self.sender.lock().unwrap().feedback(id, feedback, now);
+        if recover {
             self.keyframe.store(true, Ordering::Release);
+        }
+        if let Some(frames) = self.wake.lock().unwrap().upgrade() {
+            frames.wake();
+        }
+        recover
+    }
+    pub fn set_bitrate(&self, bitrate: u32) {
+        self.sender.lock().unwrap().set_bitrate(bitrate);
+    }
+    pub(super) fn admit(&self, settled: bool) -> bool {
+        if self.keyframe.load(Ordering::Acquire) {
+            return true;
+        }
+        let budget = self.sender.lock().unwrap().budget(Instant::now());
+        if settled {
+            budget.refine
+        } else {
+            budget.ready
         }
     }
     pub fn remove_viewer(&self, id: Option<u64>) {
         if let Some(id) = id {
-            self.viewers.lock().unwrap().remove(&id);
+            self.sender.lock().unwrap().remove(id);
+            if let Some(frames) = self.wake.lock().unwrap().upgrade() {
+                frames.wake();
+            }
         }
     }
     fn interval(&self, now: Instant) -> Duration {
         let capture = self.capture_us.load(Ordering::Relaxed);
         let encode = self.encode_us.load(Ordering::Relaxed);
-        let latest = self.latest_us.load(Ordering::Relaxed);
-        // Target a 50% combined capture and encode duty budget.
+        // Network pressure gates admission. Only CPU cost controls this interval.
         let local = capture.saturating_add(encode).saturating_mul(2);
-        let mut receiver = 33_334_u64;
-        let mut viewers = self.viewers.lock().unwrap();
-        viewers.retain(|_, (_, seen)| {
-            now.saturating_duration_since(*seen) < Duration::from_millis(600)
-        });
-        for (feedback, _) in viewers.values() {
-            receiver = receiver.max(feedback.decode_us.saturating_mul(2));
-            receiver = receiver.max((feedback.lag_us / 3).min(150_000));
-            if latest
-                > feedback
-                    .presented
-                    .map_or(0, |id| id.timestamp_us)
-                    .saturating_add(500_000)
-            {
-                receiver = receiver.max(100_000);
-            }
-        }
-        Duration::from_micros(local.max(receiver))
+        let decode = self
+            .sender
+            .lock()
+            .unwrap()
+            .budget(now)
+            .decode_us
+            .saturating_mul(2);
+        Duration::from_micros(local.max(decode).max(33_334))
     }
 }
 /// Request a keyframe even if the output is idle, retrying when group spacing permits.
@@ -189,11 +218,19 @@ impl Video {
             next: Instant::now(),
             scheduled: false,
             recovery_scheduled: false,
+            capture_pending: false,
             refinement: false,
             revision: 0,
             born: Instant::now(),
+            interaction: 0,
             quality,
         }
+    }
+    pub(super) fn capture_ready(&self) -> bool {
+        self.capture_pending && self.admission_ready()
+    }
+    fn admission_ready(&self) -> bool {
+        self.quality.admit(self.refinement)
     }
     /// Called only for compositor damage, initial demand, or one refinement.
     pub fn render(
@@ -203,6 +240,18 @@ impl Video {
         output: &Output,
     ) -> Result<()> {
         let now = Instant::now();
+        let interaction = self.quality.interaction.load(Ordering::Acquire);
+        if interaction != self.interaction {
+            self.interaction = interaction;
+            self.refinement = false;
+            self.revision += 1;
+        }
+        if !self.admission_ready() {
+            // Remember the deferred capture: readiness can change on the encoder
+            // thread before feedback arrives, so testing only an edge loses wakes.
+            self.capture_pending = true;
+            return Ok(());
+        }
         if now < self.next {
             if !self.scheduled {
                 self.scheduled = true;
@@ -219,6 +268,7 @@ impl Video {
             }
             return Ok(());
         }
+        self.capture_pending = false;
         let captured = Instant::now();
         let timestamp_us = captured.duration_since(self.quality.origin).as_micros() as u64;
         self.quality.composed.fetch_add(1, Ordering::Relaxed);
@@ -231,6 +281,7 @@ impl Video {
             image,
             settled,
             timestamp_us,
+            interaction,
         });
         self.next = Instant::now() + self.quality.interval(Instant::now());
         if !settled {
@@ -296,25 +347,35 @@ pub async fn run(
             quality.keyframe.store(true, Ordering::Release);
             let frames = Arc::new(RawFrames::new());
             let raw = frames.clone();
+            quality.sender.lock().unwrap().reset();
+            *quality.wake.lock().unwrap() = Arc::downgrade(&frames);
             let (encoded, mut packets) = mpsc::channel(2);
             let q = quality.clone();
             let encoding = tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut encoder = None;
                 let mut previous: Option<Image> = None;
-                let mut last_key = Instant::now();
-                while let Some(frame) = raw.take() {
+                let mut checkpoint_us = 0;
+                let mut checkpoint_bytes = 0usize;
+                let mut checkpoints = 0usize;
+                while let Some(frame) = raw.take(Some(&q)) {
                     let started = Instant::now();
                     let image = frame.image;
                     let requested = q.keyframe.swap(false, Ordering::AcqRel);
                     let last_key_us = q.last_key_us.load(Ordering::Relaxed);
-                    let force = recovery_due(
-                        previous.is_none(),
-                        requested,
-                        frame.timestamp_us,
-                        last_key_us,
-                    );
+                    let force = checkpoint_bytes >= 8 * 1024 * 1024
+                        || checkpoints >= 4096
+                        || recovery_due(
+                            previous.is_none(),
+                            requested,
+                            frame.timestamp_us,
+                            last_key_us,
+                        );
                     if requested && !force {
                         q.keyframe.store(true, Ordering::Release);
+                        // The admission bypass is for one replacement keyframe,
+                        // not more dependencies on the failed group while waiting
+                        // for minimum group spacing.
+                        continue;
                     }
                     if !force
                         && !frame.settled
@@ -323,25 +384,52 @@ pub async fn run(
                         continue;
                     }
                     let size = (image.width, image.height);
-                    let rate = q.bitrate.load(Ordering::Acquire) as usize;
+                    let budget = q.sender.lock().unwrap().budget(Instant::now());
+                    let rate = budget.bitrate as usize;
                     if encoder.as_ref().is_none_or(|(old, _)| *old != size) {
                         encoder = Some((size, Encoder::new(size.0, size.1, rate)?));
                     }
                     let encoder = &mut encoder.as_mut().unwrap().1;
                     encoder.quality(rate, frame.settled)?;
-                    for packet in encoder.encode(
-                        &image.bgra,
-                        // Startup, late viewers, and recovery request their own keyframe.
-                        // Keep a periodic fallback without rebuilding the whole screen
-                        // every two seconds during sparse interaction.
-                        force || last_key.elapsed() >= Duration::from_secs(10),
-                    )? {
+                    let kind = if force {
+                        FrameKind::Key
+                    } else if frame.timestamp_us.saturating_sub(checkpoint_us) >= 2_000_000 {
+                        // Promote only real captures, never wake an idle desktop for a timer.
+                        FrameKind::Checkpoint
+                    } else {
+                        FrameKind::State
+                    };
+                    for packet in encoder.encode(&image.bgra, kind)? {
                         q.encoded.fetch_add(1, Ordering::Relaxed);
-                        if packet.keyframe {
-                            last_key = Instant::now();
+                        if packet.kind == FrameKind::Key {
+                            checkpoint_bytes = 0;
+                            checkpoints = 0;
                             q.last_key_us.store(frame.timestamp_us, Ordering::Relaxed);
                         }
-                        q.latest_us.store(frame.timestamp_us, Ordering::Relaxed);
+                        if packet.kind != FrameKind::State {
+                            checkpoint_us = frame.timestamp_us;
+                            checkpoint_bytes += packet.data.len();
+                            checkpoints += 1;
+                        }
+                        q.sender.lock().unwrap().encoded(
+                            frame.timestamp_us,
+                            packet.data.len(),
+                            packet.kind,
+                            frame.settled,
+                            Instant::now(),
+                        );
+                        tracing::debug!(
+                            timestamp_us = frame.timestamp_us,
+                            bytes = packet.data.len(),
+                            kind = ?packet.kind,
+                            settled = frame.settled,
+                            bitrate = rate,
+                            outstanding_bytes = budget.outstanding_bytes,
+                            window_bytes = budget.window_bytes,
+                            oldest_us = budget.oldest_us,
+                            encode_us = started.elapsed().as_micros() as u64,
+                            "desktop encoded"
+                        );
                         if encoded.blocking_send((frame.timestamp_us, packet)).is_err() {
                             return Ok(());
                         }
@@ -364,7 +452,7 @@ pub async fn run(
                 tokio::select! {
                     _=used.unused()=>break Ok(()),
                     packet=packets.recv()=>match packet {
-                        Some((time,packet))=>if let Err(error)=video.write(packet.keyframe,time,packet.data.into()) {break Err(error)},
+                        Some((time,packet))=>if let Err(error)=video.write(packet.kind,time,packet.data.into()) {break Err(error)},
                         None=>break Err(anyhow::anyhow!("VP9 encoder stopped")),
                     }
                 }
@@ -393,16 +481,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slow_viewer_controls_pacing_until_expired_or_disconnected() {
+    fn slow_decoder_controls_pacing_until_disconnected() {
         let quality = Quality::default();
         let now = Instant::now();
         let mut fast = None;
         let mut slow = None;
         let frame = FrameId {
-            group: 3,
+            epoch: 3,
             timestamp_us: 300_000,
         };
-        quality.latest_us.store(310_000, Ordering::Relaxed);
         quality.feedback(
             &mut fast,
             Feedback {
@@ -434,10 +521,15 @@ mod tests {
             },
             now,
         );
-        assert_eq!(quality.interval(now), Duration::from_micros(150_000));
-        assert_eq!(
-            quality.interval(now + Duration::from_millis(600)),
-            Duration::from_micros(33_334)
+        // Network lag no longer masquerades as capture/decoder CPU cost.
+        assert_eq!(quality.interval(now), Duration::from_micros(33_334));
+        assert!(
+            !quality
+                .sender
+                .lock()
+                .unwrap()
+                .budget(now + Duration::from_secs(2))
+                .ready
         );
     }
 
@@ -450,20 +542,19 @@ mod tests {
         assert_eq!(quality.interval(now), Duration::from_micros(108_000));
         quality.capture_us.store(0, Ordering::Relaxed);
         quality.encode_us.store(0, Ordering::Relaxed);
-        quality.latest_us.store(800_000, Ordering::Relaxed);
         let mut viewer = None;
         quality.feedback(
             &mut viewer,
             Feedback {
                 presented: Some(FrameId {
-                    group: 1,
+                    epoch: 1,
                     timestamp_us: 10_000,
                 }),
                 ..Default::default()
             },
             now,
         );
-        assert_eq!(quality.interval(now), Duration::from_micros(100_000));
+        assert_eq!(quality.interval(now), Duration::from_micros(33_334));
         quality.capture_us.store(61_000, Ordering::Relaxed);
         quality.encode_us.store(42_000, Ordering::Relaxed);
         quality.feedback(
@@ -474,7 +565,7 @@ mod tests {
             },
             now,
         );
-        // Lag pressure caps at 150ms; local work still needs 206ms.
+        // Network lag does not replace the local duty budget.
         assert_eq!(quality.interval(now), Duration::from_micros(206_000));
         quality.feedback(
             &mut viewer,
@@ -513,6 +604,104 @@ mod tests {
     }
 
     #[test]
+    fn refinement_waits_for_receipt_and_new_input_replaces_it_before_encoding() {
+        let quality = Quality::default();
+        quality.keyframe.store(false, Ordering::Release);
+        let now = Instant::now();
+        let mut viewer = None;
+        quality.feedback(
+            &mut viewer,
+            Feedback {
+                rtt_us: 200_000,
+                delivery_bps: 2_000_000,
+                ..Default::default()
+            },
+            now,
+        );
+        quality
+            .sender
+            .lock()
+            .unwrap()
+            .encoded(1, 30_000, FrameKind::State, false, now);
+        assert!(quality.admit(false));
+        assert!(!quality.admit(true));
+
+        let raw = RawFrames::new();
+        raw.put(Frame {
+            image: Image {
+                width: 1,
+                height: 1,
+                bgra: vec![0; 4],
+            },
+            settled: true,
+            timestamp_us: 2,
+            interaction: 0,
+        });
+        quality.interaction.fetch_add(1, Ordering::AcqRel);
+        raw.put(Frame {
+            image: Image {
+                width: 1,
+                height: 1,
+                bgra: vec![1; 4],
+            },
+            settled: false,
+            timestamp_us: 3,
+            interaction: 1,
+        });
+        let frame = raw.take(Some(&quality)).unwrap();
+        assert_eq!(frame.timestamp_us, 3);
+        assert!(!frame.settled);
+        quality.feedback(
+            &mut viewer,
+            Feedback {
+                received: Some(FrameId {
+                    epoch: 1,
+                    timestamp_us: 1,
+                }),
+                rtt_us: 200_000,
+                delivery_bps: 2_000_000,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(quality.admit(true));
+    }
+
+    #[test]
+    fn deferred_capture_retries_even_if_readiness_changed_before_feedback() {
+        let quality = Arc::new(Quality::default());
+        quality.keyframe.store(false, Ordering::Release);
+        let mut video = Video::new(Arc::new(RawFrames::new()), quality.clone());
+        assert!(!video.capture_ready(), "idle feedback must not capture");
+        video.capture_pending = true;
+        quality.sender.lock().unwrap().encoded(
+            10,
+            100_000,
+            FrameKind::State,
+            false,
+            Instant::now(),
+        );
+        assert!(!video.capture_ready());
+        let mut viewer = None;
+        quality.feedback(
+            &mut viewer,
+            Feedback {
+                received: Some(FrameId {
+                    epoch: 1,
+                    timestamp_us: 10,
+                }),
+                ..Default::default()
+            },
+            Instant::now(),
+        );
+        // Readiness is already true before the next control callback checks it.
+        assert!(quality.admit(false));
+        assert!(video.capture_ready());
+        video.capture_pending = false;
+        assert!(!video.capture_ready());
+    }
+
+    #[test]
     fn mailbox_replaces_only_unencoded_images() {
         let raw = RawFrames::new();
         let frame = |n| Frame {
@@ -523,12 +712,13 @@ mod tests {
             },
             settled: false,
             timestamp_us: n as u64,
+            interaction: 0,
         };
         raw.put(frame(1));
         raw.put(frame(2));
-        assert_eq!(raw.take().unwrap().timestamp_us, 2);
+        assert_eq!(raw.take(None).unwrap().timestamp_us, 2);
         raw.close();
         raw.put(frame(3));
-        assert!(raw.take().is_none());
+        assert!(raw.take(None).is_none());
     }
 }
