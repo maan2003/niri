@@ -130,14 +130,14 @@ mod client {
             Ok((id, rx))
         }
 
-        /// The PIN the person typed, or None if they refused.
-        pub fn pin(&self, app: &str, uid: u32, prompt: &str) -> Result<Option<String>, String> {
-            let (app, prompt) = (app.to_owned(), prompt.to_owned());
+        /// The PIN the person typed, or None if they refused. `what` follows "`app` wants to".
+        pub fn pin(&self, app: &str, uid: u32, what: &str, prompt: &str) -> Result<Option<String>, String> {
+            let (app, what, prompt) = (app.to_owned(), what.to_owned(), prompt.to_owned());
             let (_, rx) = self.ask(|id| Request::Secret {
                 id,
                 app,
                 uid,
-                what: "use your security key".to_owned(),
+                what,
                 prompt,
             })?;
             match rx.recv() {
@@ -153,14 +153,15 @@ mod client {
             self: &Arc<Self>,
             app: &str,
             uid: u32,
+            what: &str,
             prompt: &str,
         ) -> Result<Touching, String> {
-            let (app, prompt) = (app.to_owned(), prompt.to_owned());
+            let (app, what, prompt) = (app.to_owned(), what.to_owned(), prompt.to_owned());
             let (id, rx) = self.ask(|id| Request::Touch {
                 id,
                 app,
                 uid,
-                what: "use your security key".to_owned(),
+                what,
                 prompt,
             })?;
             Ok(Touching {

@@ -48,7 +48,7 @@ $SSH "dev=\$(fido2-token -L | sed -n 's/^\(\/dev\/hidraw[0-9]*\):.*/\1/p' | head
 mark; $SSH touch $F/go-pin1; sleep 4
 expect "the door asks the shell, saying how many tries are left" 'drv-fido: fido-test \(uid 100015\): asking the PIN \(8 attempts left\)'
 key esc; sleep 2
-expect "refused at the shell" 'drv-shell: fido-test \(uid 100015\): refused to use your security key'
+expect "refused at the shell, which said what for" 'drv-shell: fido-test \(uid 100015\): refused to sign in to fidotest.drv.dev'
 expect "and the door gives up at once" 'drv-fido: fido-test \(uid 100015\): the PIN was refused'
 file_has "the app is answered within seconds, not after the key's timeout" $F/pin1.txt '^uv required, answered after [0-5]s: .*"error"'
 mark; $SSH touch $F/go-pin2; sleep 4

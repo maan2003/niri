@@ -176,14 +176,52 @@ async fn ceremony(
             Op::Get(get)
         }
     };
-    let devices = list_devices()
-        .await
-        .map_err(|e| format!("listing security keys: {e:?}"))?;
-    let mut device = devices
-        .into_iter()
-        .next()
-        .ok_or("no security key is plugged in")?;
+    // What the dialog says after "<app> wants to": the operation and the relying party, which
+    // the manifest check above vouches for; the account only on registration, where the app
+    // chose it.
+    let what = match &op {
+        Op::Make(make) => match make
+            .user
+            .name
+            .as_deref()
+            .or(make.user.display_name.as_deref())
+        {
+            Some(user) => format!("register a security key with {host} as \"{user}\""),
+            None => format!("register a security key with {host}"),
+        },
+        Op::Get(_) => format!("sign in to {host}"),
+    };
+    // No key yet: ask for one and wait for it, until the person refuses or the app hangs up.
+    let mut inserting = None;
+    let mut device = loop {
+        let devices = list_devices()
+            .await
+            .map_err(|e| format!("listing security keys: {e:?}"))?;
+        if let Some(device) = devices.into_iter().next() {
+            break device;
+        }
+        match &inserting {
+            None => {
+                drv_os::say!("drv-fido: {app} (uid {uid}): no security key: waiting for one");
+                inserting = Some(shell.touch(app, uid, &what, "Insert your security key")?);
+            }
+            Some(touching) if touching.refused() => return Err("refused".to_owned()),
+            Some(_) if hung_up(sock) => return Err("the app hung up".to_owned()),
+            Some(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    };
+    drop(inserting);
     let name = device.to_string();
+    // The key by its product name, when it has one.
+    let key = match &device.backend {
+        libwebauthn::transport::hid::device::HidBackendDevice::HidApiDevice(info) => info
+            .product_string()
+            .map(str::trim)
+            .filter(|p| !p.is_empty()),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+    .map_or_else(|| "security key".to_owned(), str::to_owned);
     let mut channel = device
         .channel(ChannelSettings::default())
         .await
@@ -192,8 +230,12 @@ async fn ceremony(
     let prompts = tokio::spawn(prompt(
         channel.get_ux_update_receiver(),
         shell.clone(),
-        app.to_owned(),
-        uid,
+        Asking {
+            app: app.to_owned(),
+            uid,
+            what,
+            key,
+        },
         handle.clone(),
     ));
     // The app gone: one blocking read on its socket ends when it closes (or when we answer
@@ -270,13 +312,26 @@ const LAST_TRIES: u32 = 1;
 /// The authenticator's asks, at the shell: a touch is shown until the next word from it,
 /// the end, or the person's refusal, which cancels the operation on the key; a PIN is
 /// typed there and handed back, its refusal cancels the operation too.
+/// Who asks, for what, on which key: the dialogs' words.
+struct Asking {
+    app: String,
+    uid: u32,
+    what: String,
+    key: String,
+}
+
 async fn prompt(
     mut updates: broadcast::Receiver<UvUpdate>,
     shell: Arc<Shell>,
-    app: String,
-    uid: u32,
+    asking: Asking,
     handle: HidChannelHandle,
 ) {
+    let Asking {
+        app,
+        uid,
+        what,
+        key,
+    } = asking;
     let mut touching: Option<drv_shell::ask::Touching> = None;
     loop {
         let update = if touching.is_some() {
@@ -296,7 +351,9 @@ async fn prompt(
         };
         match update {
             Ok(UvUpdate::PresenceRequired) => {
-                touching = shell.touch(&app, uid, "Touch your security key").ok();
+                touching = shell
+                    .touch(&app, uid, &what, &format!("Touch your {key}"))
+                    .ok();
             }
             Ok(UvUpdate::PinRequired(pin)) => {
                 touching = None;
@@ -312,10 +369,14 @@ async fn prompt(
                     continue;
                 }
                 drv_os::say!("drv-fido: {app} (uid {uid}): asking the PIN ({tries})");
-                let (shell, of) = (shell.clone(), app.clone());
-                let prompt = format!("Enter your security key's PIN ({tries})");
+                let (shell, of, what) = (shell.clone(), app.clone(), what.clone());
+                // The count only once it matters: the key blocks after eight misses.
+                let prompt = match pin.attempts_left {
+                    Some(n) if n <= 3 => format!("PIN for your {key} ({n} tries left)"),
+                    _ => format!("PIN for your {key}"),
+                };
                 let answer =
-                    tokio::task::spawn_blocking(move || shell.pin(&of, uid, &prompt)).await;
+                    tokio::task::spawn_blocking(move || shell.pin(&of, uid, &what, &prompt)).await;
                 match answer {
                     Ok(Ok(Some(typed))) => {
                         if let Err(err) = pin.send_pin(&typed) {

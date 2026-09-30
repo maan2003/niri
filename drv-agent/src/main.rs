@@ -218,7 +218,7 @@ impl Door {
             return;
         }
         let prompt = "Enter its PIN to load its ssh keys";
-        match self.shell.pin(app, uid, prompt) {
+        match self.shell.pin(app, uid, "use your security key", prompt) {
             Ok(Some(pin)) => {
                 if let Err(err) = self.load_resident(&pin) {
                     drv_os::say!("drv-agent: {app} (uid {uid}): {err}");
@@ -300,7 +300,7 @@ impl Door {
             .cloned()
             .unwrap_or_else(|| ("an app".to_owned(), 0));
         if kind == "none" {
-            match self.shell.touch(&app, uid, prompt) {
+            match self.shell.touch(&app, uid, "use your security key", prompt) {
                 Ok(_up) => {
                     let _ = conn.get_mut().read(&mut [0u8; 1]);
                 }
@@ -308,7 +308,7 @@ impl Door {
             }
             return;
         }
-        match self.shell.pin(&app, uid, prompt) {
+        match self.shell.pin(&app, uid, "use your security key", prompt) {
             Ok(Some(pin)) => {
                 let _ = writeln!(conn.get_mut(), "{pin}");
             }
