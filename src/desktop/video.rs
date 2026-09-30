@@ -17,13 +17,14 @@ use tokio::sync::mpsc;
 use crate::niri::Niri;
 
 pub struct Frame {
-    image: Image,
+    image: Arc<Image>,
     settled: bool,
     timestamp_us: u64,
     interaction: u64,
 }
 pub struct Video {
     frames: Arc<RawFrames>,
+    previous: Option<Arc<Image>>,
     next: Instant,
     scheduled: bool,
     recovery_scheduled: bool,
@@ -215,6 +216,7 @@ impl Video {
     pub fn new(frames: Arc<RawFrames>, quality: Arc<Quality>) -> Self {
         Self {
             frames,
+            previous: None,
             next: Instant::now(),
             scheduled: false,
             recovery_scheduled: false,
@@ -230,7 +232,9 @@ impl Video {
         self.capture_pending && self.admission_ready()
     }
     fn admission_ready(&self) -> bool {
-        self.quality.admit(self.refinement)
+        self.quality.admit(
+            self.refinement && self.interaction == self.quality.interaction.load(Ordering::Acquire),
+        )
     }
     /// Called only for compositor damage, initial demand, or one refinement.
     pub fn render(
@@ -240,12 +244,6 @@ impl Video {
         output: &Output,
     ) -> Result<()> {
         let now = Instant::now();
-        let interaction = self.quality.interaction.load(Ordering::Acquire);
-        if interaction != self.interaction {
-            self.interaction = interaction;
-            self.refinement = false;
-            self.revision += 1;
-        }
         if !self.admission_ready() {
             // Remember the deferred capture: readiness can change on the encoder
             // thread before feedback arrives, so testing only an edge loses wakes.
@@ -273,19 +271,12 @@ impl Video {
         let timestamp_us = captured.duration_since(self.quality.origin).as_micros() as u64;
         self.quality.composed.fetch_add(1, Ordering::Relaxed);
         let image = super::capture_pixels(niri, renderer, output)?;
-        let settled = std::mem::take(&mut self.refinement);
         self.quality
             .capture_us
             .store(captured.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.frames.put(Frame {
-            image,
-            settled,
-            timestamp_us,
-            interaction,
-        });
         self.next = Instant::now() + self.quality.interval(Instant::now());
-        if !settled {
-            self.revision += 1;
+        let interaction = self.quality.interaction.load(Ordering::Acquire);
+        if self.submit(image, timestamp_us, interaction) {
             let revision = self.revision;
             let born = self.born;
             let output = output.clone();
@@ -305,6 +296,35 @@ impl Video {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(())
+    }
+
+    /// Callback-only redraws must not postpone the quiet deadline. Input still
+    /// replaces a queued refinement even when it did not change any pixels.
+    fn submit(&mut self, image: Image, timestamp_us: u64, interaction: u64) -> bool {
+        let changed = self.previous.as_ref().is_none_or(|previous| {
+            previous.width != image.width
+                || previous.height != image.height
+                || previous.bgra != image.bgra
+        });
+        let input_changed = interaction != self.interaction;
+        let settled = std::mem::take(&mut self.refinement) && !changed && !input_changed;
+        if !changed && !input_changed && !settled && !self.quality.keyframe.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.interaction = interaction;
+        let image = Arc::new(image);
+        self.previous = Some(image.clone());
+        self.frames.put(Frame {
+            image,
+            settled,
+            timestamp_us,
+            interaction,
+        });
+        if !settled {
+            self.revision += 1;
+        }
+        !settled
     }
 }
 
@@ -353,7 +373,7 @@ pub async fn run(
             let q = quality.clone();
             let encoding = tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut encoder = None;
-                let mut previous: Option<Image> = None;
+                let mut previous: Option<Arc<Image>> = None;
                 let mut checkpoint_us = 0;
                 let mut checkpoint_bytes = 0usize;
                 let mut checkpoints = 0usize;
@@ -628,22 +648,22 @@ mod tests {
 
         let raw = RawFrames::new();
         raw.put(Frame {
-            image: Image {
+            image: Arc::new(Image {
                 width: 1,
                 height: 1,
                 bgra: vec![0; 4],
-            },
+            }),
             settled: true,
             timestamp_us: 2,
             interaction: 0,
         });
         quality.interaction.fetch_add(1, Ordering::AcqRel);
         raw.put(Frame {
-            image: Image {
+            image: Arc::new(Image {
                 width: 1,
                 height: 1,
                 bgra: vec![1; 4],
-            },
+            }),
             settled: false,
             timestamp_us: 3,
             interaction: 1,
@@ -702,14 +722,86 @@ mod tests {
     }
 
     #[test]
+    fn identical_redraws_preserve_refinement_deadline_and_queued_refinement() {
+        let quality = Arc::new(Quality::default());
+        quality.keyframe.store(false, Ordering::Release);
+        let raw = Arc::new(RawFrames::new());
+        let mut video = Video::new(raw.clone(), quality);
+        let image = || Image {
+            width: 2,
+            height: 1,
+            bgra: vec![17, 83, 201, 255, 9, 41, 121, 255],
+        };
+        assert!(video.submit(image(), 1, 0));
+        let revision = video.revision;
+        for timestamp in 2..10 {
+            assert!(!video.submit(image(), timestamp, 0));
+            assert_eq!(video.revision, revision);
+        }
+        video.refinement = true; // The original 180ms timer fires.
+        assert!(!video.submit(image(), 10, 0));
+        assert!(!video.submit(image(), 11, 0)); // A callback-only redraw follows.
+        let frame = raw.take(None).unwrap();
+        assert!(frame.settled);
+        assert_eq!(
+            frame.timestamp_us, 10,
+            "duplicate must not replace refinement"
+        );
+        assert_eq!(video.revision, revision);
+    }
+
+    #[test]
+    fn changed_pixels_or_input_restart_refinement_instead_of_marking_motion_settled() {
+        let quality = Arc::new(Quality::default());
+        quality.keyframe.store(false, Ordering::Release);
+        let raw = Arc::new(RawFrames::new());
+        let mut video = Video::new(raw.clone(), quality.clone());
+        let image = |n| Image {
+            width: 1,
+            height: 1,
+            bgra: vec![n, 43, 117, 255],
+        };
+        assert!(video.submit(image(1), 1, 0));
+        video.refinement = true;
+        assert!(video.submit(image(2), 2, 0));
+        assert!(
+            !raw.take(None).unwrap().settled,
+            "damage at the deadline is motion"
+        );
+        video.refinement = true;
+        assert!(!video.submit(image(2), 3, 0));
+
+        // New input invalidates the queued refinement, even without new pixels.
+        quality.interaction.store(1, Ordering::Release);
+        video.refinement = true;
+        quality
+            .sender
+            .lock()
+            .unwrap()
+            .encoded(2, 30_000, FrameKind::State, false, Instant::now());
+        assert!(!quality.admit(true));
+        assert!(
+            video.admission_ready(),
+            "new input must bypass refinement-only admission"
+        );
+        assert!(video.submit(image(2), 4, 1));
+        let frame = raw.take(None).unwrap();
+        assert!(!frame.settled);
+        assert_eq!(frame.interaction, 1);
+        video.refinement = true; // The replacement quiet timer fires.
+        assert!(!video.submit(image(2), 5, 1));
+        assert!(raw.take(None).unwrap().settled);
+    }
+
+    #[test]
     fn mailbox_replaces_only_unencoded_images() {
         let raw = RawFrames::new();
         let frame = |n| Frame {
-            image: Image {
+            image: Arc::new(Image {
                 width: 1,
                 height: 1,
                 bgra: vec![n; 4],
-            },
+            }),
             settled: false,
             timestamp_us: n as u64,
             interaction: 0,

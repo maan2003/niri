@@ -22,6 +22,9 @@ pub fn apply(state: &mut State, held: &mut Held, quality: &Quality, input: Input
     if !matches!(input, Input::Feedback(_) | Input::Quality { .. }) {
         quality.interaction.fetch_add(1, Ordering::AcqRel);
         state.niri.notify_activity();
+        // Even a no-op input invalidates an unencoded refinement. Capture it
+        // again so it receives a new quiet deadline instead of being lost.
+        state.niri.queue_redraw_all();
     }
     match input {
         Input::Move { x, y } => {
