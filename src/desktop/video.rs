@@ -331,7 +331,10 @@ pub async fn run(
                     encoder.quality(rate, frame.settled)?;
                     for packet in encoder.encode(
                         &image.bgra,
-                        force || last_key.elapsed() >= Duration::from_secs(2),
+                        // Startup, late viewers, and recovery request their own keyframe.
+                        // Keep a periodic fallback without rebuilding the whole screen
+                        // every two seconds during sparse interaction.
+                        force || last_key.elapsed() >= Duration::from_secs(10),
                     )? {
                         q.encoded.fetch_add(1, Ordering::Relaxed);
                         if packet.keyframe {
