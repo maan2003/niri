@@ -13,7 +13,7 @@
 use std::io::Read as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Duration;
 
 use drv_fido::wire::{Reply, Request};
@@ -29,10 +29,10 @@ use libwebauthn::ops::webauthn::{
 use libwebauthn::proto::CtapError;
 use libwebauthn::transport::hid::channel::HidChannelHandle;
 use libwebauthn::transport::hid::list_devices;
-use libwebauthn::webauthn::error::PlatformError;
 use libwebauthn::transport::{Channel as _, ChannelSettings, Device as _};
 use libwebauthn::webauthn::WebAuthn as _;
-use libwebauthn::webauthn::error::WebAuthnError;
+use libwebauthn::webauthn::error::{PlatformError, WebAuthnError};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use tokio::sync::broadcast;
 
 /// Accepts forever on the door. Each connection is one request, answered when its ceremony
@@ -54,7 +54,20 @@ pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std:
             }
         };
         let outcome = allowed(&policy, request.origin()).and_then(|()| {
-            let _one = one.lock().unwrap_or_else(|p| p.into_inner());
+            let _one = match one.try_lock() {
+                Ok(one) => one,
+                Err(TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(TryLockError::WouldBlock) => {
+                    drv_os::say!(
+                        "drv-fido: {} (uid {uid}): waiting for the ceremony in progress",
+                        policy.name
+                    );
+                    one.lock().unwrap_or_else(|p| p.into_inner())
+                }
+            };
+            if hung_up(&sock) {
+                return Err("the app hung up while waiting".to_owned());
+            }
             runtime.block_on(ceremony(&request, &policy.name, uid, &shell, &sock))
         });
         let reply = match outcome {
@@ -68,6 +81,15 @@ pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std:
             drv_os::say!("drv-fido: {} (uid {uid}): answering: {err}", policy.name);
         }
     })
+}
+
+/// Whether the app closed its end while its request waited its turn.
+fn hung_up(sock: &OwnedFd) -> bool {
+    let mut fds = [PollFd::new(sock, PollFlags::RDHUP)];
+    matches!(poll(&mut fds, Some(&Timespec::default())), Ok(n) if n > 0)
+        && fds[0]
+            .revents()
+            .intersects(PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR)
 }
 
 /// The manifest lists the origins the app may claim, exactly as it claims them.
@@ -321,7 +343,7 @@ async fn prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::relying_party;
+    use super::{OwnedFd, UnixStream, hung_up, relying_party};
 
     #[test]
     fn app_ids_become_reversed_hosts() {
@@ -347,5 +369,17 @@ mod tests {
         assert!(relying_party("app:a..b").is_err());
         assert!(relying_party("app:a/b").is_err());
         assert!(relying_party("rho").is_err());
+    }
+
+    #[test]
+    fn hung_up_sees_the_peer_close_and_only_that() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let ours = OwnedFd::from(ours);
+        assert!(!hung_up(&ours));
+        // Data waiting is not a hangup.
+        std::io::Write::write_all(&mut &theirs, b"x").unwrap();
+        assert!(!hung_up(&ours));
+        drop(theirs);
+        assert!(hung_up(&ours));
     }
 }
