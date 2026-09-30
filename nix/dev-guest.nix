@@ -99,6 +99,16 @@ let
         fi
       fi
       echo "other origin: $(get app:dev.rho.Gui AQID $salt)"
+      # A web origin (the https://* grant): the relying party must be a registrable suffix of
+      # the host. A bogus credential id keeps the key from asking anything.
+      web() { # rp id
+        call GetCredential 'ssa{sv}s' "" https://login.example.com 1 public_key s \
+          "{\"challenge\":\"Y2hhbGxlbmdl\",\"rpId\":\"$1\",\"allowCredentials\":[{\"type\":\"public-key\",\"id\":\"AQID\"}],\"userVerification\":\"discouraged\"}" \
+          dev.drv.FidoTest
+      }
+      echo "web origin, rp a suffix: $(web example.com)"
+      echo "web origin, rp elsewhere: $(web evil.com)"
+      echo "web origin, rp a public suffix: $(web co.uk)"
     } > "$HOME/out/fido.txt"
     touch "$HOME/out/done"
     # The PIN dialog and its refusal (nix/smoke.sh sets a PIN on the key first, then drives
@@ -301,7 +311,7 @@ in
       # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
       open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
-      fido-test = { uid = 100015; bus = true; exec = [ "${fidoTest}" ]; autostart = true; menu = false; state = [ "out" ]; fido = [ "app:dev.drv.FidoTest" ]; };
+      fido-test = { uid = 100015; bus = true; exec = [ "${fidoTest}" ]; autostart = true; menu = false; state = [ "out" ]; fido = [ "app:dev.drv.FidoTest" "https://*" ]; };
       ssh-test = {
         uid = 100014; autostart = true; menu = false; network = true; nix = true; state = [ "out" ];
         shell = "${pkgs.bashInteractive}/bin/bash"; exec = [ "${sshTest}" ];

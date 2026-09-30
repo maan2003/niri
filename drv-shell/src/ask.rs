@@ -50,7 +50,7 @@ mod client {
 
     use drv_policy::seq;
 
-    use super::{Request, Response, VERSION};
+    use super::{Choice, Request, Response, VERSION};
 
     /// A service's line to the shell: requests under ids of our own, answers back on a thread
     /// to whoever waits for that id. The shell gone ends the process: nothing works without it.
@@ -142,6 +142,32 @@ mod client {
             })?;
             match rx.recv() {
                 Ok(Response::Secret { secret, .. }) => Ok(Some(secret)),
+                Ok(Response::Cancelled { .. }) => Ok(None),
+                Ok(_) => Err("the shell answered something else".to_owned()),
+                Err(_) => Err("the shell is gone".to_owned()),
+            }
+        }
+
+        /// One of `choices` by its key, or None if they refused.
+        pub fn pick(
+            &self,
+            app: &str,
+            uid: u32,
+            what: &str,
+            note: &str,
+            choices: Vec<Choice>,
+        ) -> Result<Option<String>, String> {
+            let (app, what, note) = (app.to_owned(), what.to_owned(), note.to_owned());
+            let (_, rx) = self.ask(|id| Request::Pick {
+                id,
+                app,
+                uid,
+                what,
+                note,
+                choices,
+            })?;
+            match rx.recv() {
+                Ok(Response::Picked { key, .. }) => Ok(Some(key)),
                 Ok(Response::Cancelled { .. }) => Ok(None),
                 Ok(_) => Err("the shell answered something else".to_owned()),
                 Err(_) => Err("the shell is gone".to_owned()),

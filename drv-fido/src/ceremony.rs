@@ -22,9 +22,10 @@ use drv_policy::{AppPolicy, seq};
 use drv_shell::ask::Client as Shell;
 use libwebauthn::UvUpdate;
 use libwebauthn::ops::webauthn::idl::origin::{Origin, RequestOrigin};
+use libwebauthn::ops::webauthn::psl::PublicSuffixList;
 use libwebauthn::ops::webauthn::{
     GetAssertionRequest, GetAssertionResponse, MakeCredentialRequest, MakeCredentialResponse,
-    OriginValidation, RequestSettings, WebAuthnIDLResponse as _,
+    OriginValidation, RelatedOrigins, RequestSettings, WebAuthnIDLResponse as _,
 };
 use libwebauthn::proto::CtapError;
 use libwebauthn::transport::hid::channel::HidChannelHandle;
@@ -37,7 +38,12 @@ use tokio::sync::broadcast;
 
 /// Accepts forever on the door. Each connection is one request, answered when its ceremony
 /// ends; ceremonies queue on `one`.
-pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std::io::Result<()> {
+pub fn serve(
+    listener: UnixListener,
+    appd: Arc<Appd>,
+    shell: Arc<Shell>,
+    psl: Option<Arc<dyn PublicSuffixList>>,
+) -> std::io::Result<()> {
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -68,7 +74,14 @@ pub fn serve(listener: UnixListener, appd: Arc<Appd>, shell: Arc<Shell>) -> std:
             if hung_up(&sock) {
                 return Err("the app hung up while waiting".to_owned());
             }
-            runtime.block_on(ceremony(&request, &policy.name, uid, &shell, &sock))
+            runtime.block_on(ceremony(
+                &request,
+                &policy.name,
+                uid,
+                &shell,
+                psl.as_deref(),
+                &sock,
+            ))
         });
         let reply = match outcome {
             Ok(json) => Reply::Credential { json },
@@ -92,18 +105,25 @@ fn hung_up(sock: &OwnedFd) -> bool {
             .intersects(PollFlags::RDHUP | PollFlags::HUP | PollFlags::ERR)
 }
 
-/// The manifest lists the origins the app may claim, exactly as it claims them.
+/// The manifest lists the origins the app may claim, exactly as it claims them; `https://*`
+/// is every web origin, for the one app that is a browser and vouches for what it claims.
 fn allowed(policy: &AppPolicy, origin: &str) -> Result<(), String> {
-    if policy.fido.iter().any(|o| o == origin) {
+    if policy
+        .fido
+        .iter()
+        .any(|o| o == origin || (o == "https://*" && origin.starts_with("https://")))
+    {
         Ok(())
     } else {
         Err(format!("{origin} is not an origin of this app"))
     }
 }
 
-/// The origin as WebAuthn sees it, and the host the relying party must be.
-fn relying_party(origin: &str) -> Result<(RequestOrigin, String), String> {
-    let host = if let Some(app_id) = origin.strip_prefix("app:") {
+/// The origin as WebAuthn sees it and, for an `app:` origin, the one host its relying party
+/// must be. A web origin's relying party is checked the web's way instead (a registrable
+/// suffix of the origin's host, by the public suffix list), as a browser would.
+fn relying_party(origin: &str) -> Result<(RequestOrigin, Option<String>), String> {
+    if let Some(app_id) = origin.strip_prefix("app:") {
         let labels: Vec<&str> = app_id.split('.').collect();
         if labels.iter().any(|l| {
             l.is_empty()
@@ -113,22 +133,23 @@ fn relying_party(origin: &str) -> Result<(RequestOrigin, String), String> {
         }) {
             return Err(format!("{origin}: not an app id"));
         }
-        labels
+        let host = labels
             .iter()
             .rev()
             .map(|l| l.to_ascii_lowercase())
             .collect::<Vec<_>>()
-            .join(".")
-    } else if let Some(rest) = origin.strip_prefix("https://") {
-        rest.to_owned()
+            .join(".");
+        let parsed: Origin = format!("https://{host}")
+            .parse()
+            .map_err(|e| format!("{origin}: {e}"))?;
+        let host = parsed.host.as_str().to_owned();
+        Ok((RequestOrigin::new(parsed), Some(host)))
+    } else if origin.starts_with("https://") {
+        let parsed: Origin = origin.parse().map_err(|e| format!("{origin}: {e}"))?;
+        Ok((RequestOrigin::new(parsed), None))
     } else {
-        return Err(format!("{origin}: neither app: nor https://"));
-    };
-    let parsed: Origin = format!("https://{host}")
-        .parse()
-        .map_err(|e| format!("{origin}: {e}"))?;
-    let host = parsed.host.as_str().to_owned();
-    Ok((RequestOrigin::new(parsed), host))
+        Err(format!("{origin}: neither app: nor https://"))
+    }
 }
 
 enum Op {
@@ -144,21 +165,35 @@ async fn ceremony(
     app: &str,
     uid: u32,
     shell: &Arc<Shell>,
+    psl: Option<&dyn PublicSuffixList>,
     sock: &OwnedFd,
 ) -> Result<String, String> {
-    let (request_origin, host) = relying_party(request.origin())?;
+    let (request_origin, app_host) = relying_party(request.origin())?;
     let settings = RequestSettings {
-        origin: OriginValidation::Trust,
+        origin: match (&app_host, psl) {
+            (Some(_), _) => OriginValidation::Trust,
+            (None, Some(public_suffix_list)) => OriginValidation::Validate {
+                public_suffix_list,
+                related_origins: RelatedOrigins::Disabled,
+            },
+            (None, None) => {
+                return Err("no public suffix list: web origins are refused".to_owned());
+            }
+        },
     };
     let op = match request {
         Request::Create { public_key, .. } => {
             let make = MakeCredentialRequest::prepare(&request_origin, public_key, &settings)
                 .await
                 .map_err(|e| format!("the request: {e}"))?;
-            if make.relying_party.id != host {
+            if app_host
+                .as_ref()
+                .is_some_and(|host| make.relying_party.id != *host)
+            {
                 return Err(format!(
-                    "relying party {} is not {host}",
-                    make.relying_party.id
+                    "relying party {} is not {}",
+                    make.relying_party.id,
+                    app_host.unwrap_or_default()
                 ));
             }
             Op::Make(make)
@@ -167,10 +202,14 @@ async fn ceremony(
             let get = GetAssertionRequest::prepare(&request_origin, public_key, &settings)
                 .await
                 .map_err(|e| format!("the request: {e}"))?;
-            if get.relying_party_id != host {
+            if app_host
+                .as_ref()
+                .is_some_and(|host| get.relying_party_id != *host)
+            {
                 return Err(format!(
-                    "relying party {} is not {host}",
-                    get.relying_party_id
+                    "relying party {} is not {}",
+                    get.relying_party_id,
+                    app_host.unwrap_or_default()
                 ));
             }
             Op::Get(get)
@@ -180,16 +219,19 @@ async fn ceremony(
     // the manifest check above vouches for; the account only on registration, where the app
     // chose it.
     let what = match &op {
-        Op::Make(make) => match make
-            .user
-            .name
-            .as_deref()
-            .or(make.user.display_name.as_deref())
-        {
-            Some(user) => format!("register a security key with {host} as \"{user}\""),
-            None => format!("register a security key with {host}"),
-        },
-        Op::Get(_) => format!("sign in to {host}"),
+        Op::Make(make) => {
+            let rp = &make.relying_party.id;
+            match make
+                .user
+                .name
+                .as_deref()
+                .or(make.user.display_name.as_deref())
+            {
+                Some(user) => format!("register a security key with {rp} as \"{user}\""),
+                None => format!("register a security key with {rp}"),
+            }
+        }
+        Op::Get(get) => format!("sign in to {}", get.relying_party_id),
     };
     // No key yet: ask for one and wait for it, until the person refuses or the app hangs up.
     let mut inserting = None;
@@ -233,7 +275,7 @@ async fn ceremony(
         Asking {
             app: app.to_owned(),
             uid,
-            what,
+            what: what.clone(),
             key,
         },
         handle.clone(),
@@ -284,10 +326,45 @@ async fn ceremony(
             serde_json::to_string(&json)
         }
         (Op::Get(get), Done::Get(response)) => {
-            let assertion = response
-                .assertions
-                .into_iter()
-                .next()
+            let mut assertions = response.assertions;
+            // Several accounts on the key for this relying party: the person picks one at
+            // the shell; the browser sees one credential, as WebAuthn wants.
+            let chosen = if assertions.len() > 1 {
+                let choices = assertions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let user = a.user.as_ref();
+                        let name = user.and_then(|u| u.display_name.clone().or(u.name.clone()));
+                        let detail = user
+                            .and_then(|u| u.name.clone())
+                            .filter(|n| Some(n) != name.as_ref());
+                        drv_shell::ask::Choice {
+                            key: i.to_string(),
+                            name: name.unwrap_or_else(|| format!("account {}", i + 1)),
+                            detail: detail.unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                let (shell, of, what) = (shell.clone(), app.to_owned(), what.clone());
+                let picked = tokio::task::spawn_blocking(move || {
+                    shell.pick(&of, uid, &what, "Which account?", choices)
+                })
+                .await
+                .map_err(|e| e.to_string())??;
+                match picked {
+                    Some(key) => key.parse::<usize>().ok().filter(|i| *i < assertions.len()),
+                    None => {
+                        drv_os::say!("drv-fido: {app} (uid {uid}): the account pick was refused");
+                        return Err("refused".to_owned());
+                    }
+                }
+            } else {
+                Some(0)
+            };
+            let assertion = chosen
+                .filter(|i| *i < assertions.len())
+                .map(|i| assertions.swap_remove(i))
                 .ok_or_else(|| format!("{name}: no assertion"))?;
             let mut json = assertion
                 .to_idl_model(get)
@@ -404,22 +481,23 @@ async fn prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::{OwnedFd, UnixStream, hung_up, relying_party};
+    use drv_policy::AppPolicy;
+
+    use super::{OwnedFd, UnixStream, allowed, hung_up, relying_party};
 
     #[test]
     fn app_ids_become_reversed_hosts() {
         let (origin, host) = relying_party("app:dev.rho.Gui").unwrap();
-        assert_eq!(host, "gui.rho.dev");
+        assert_eq!(host.as_deref(), Some("gui.rho.dev"));
         assert_eq!(origin.origin.to_string(), "https://gui.rho.dev");
-        assert_eq!(relying_party("app:Gui").unwrap().1, "gui");
+        assert_eq!(relying_party("app:Gui").unwrap().1.as_deref(), Some("gui"));
     }
 
     #[test]
     fn https_origins_are_their_host() {
-        assert_eq!(
-            relying_party("https://Example.com").unwrap().1,
-            "example.com"
-        );
+        let (origin, host) = relying_party("https://Example.com").unwrap();
+        assert_eq!(origin.origin.host.as_str(), "example.com");
+        assert_eq!(host, None);
         assert!(relying_party("https://example.com/path").is_err());
     }
 
@@ -442,5 +520,18 @@ mod tests {
         assert!(!hung_up(&ours));
         drop(theirs);
         assert!(hung_up(&ours));
+    }
+
+    #[test]
+    fn the_web_grant_is_https_only_and_exact_grants_stay_exact() {
+        let mut policy = AppPolicy::unknown();
+        policy.fido = vec!["https://*".to_owned(), "app:dev.rho.Gui".to_owned()];
+        assert!(allowed(&policy, "https://login.example.com").is_ok());
+        assert!(allowed(&policy, "https://*").is_ok());
+        assert!(allowed(&policy, "http://login.example.com").is_err());
+        assert!(allowed(&policy, "app:dev.rho.Gui").is_ok());
+        assert!(allowed(&policy, "app:dev.rho.Other").is_err());
+        policy.fido = vec!["app:dev.rho.Gui".to_owned()];
+        assert!(allowed(&policy, "https://login.example.com").is_err());
     }
 }

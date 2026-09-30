@@ -30,6 +30,12 @@ for _ in $(seq 1 30); do $SSH test -e $F/done && break; sleep 1; done
 file_has "the app's own origin makes a credential on the emulated key" $F/fido.txt '^created: hmac-secret true, credential id of [0-9]+ chars$'
 file_has "and its hmac-secret is the credential's" $F/fido.txt '^hmac-secret: the same salt agrees, 32 bytes; another salt differs$'
 file_has "another origin is refused at the door" $F/fido.txt '^other origin: .*"error".*"app:dev.rho.Gui is not an origin of this app"'
+# The https://* grant: the relying party must be a registrable suffix of the origin's host
+# (the public suffix list). A suffix reaches the key (which has no such credential); an
+# unrelated host and a bare public suffix are refused before the key hears anything.
+file_has "a web origin with the relying party its registrable suffix reaches the key" $F/fido.txt '^web origin, rp a suffix: .*"error".*Ctap\(NoCredentials\)'
+file_has "a relying party elsewhere is refused at the door" $F/fido.txt '^web origin, rp elsewhere: .*"error".*"the request: Mismatching relying party ID: evil.com != login.example.com"'
+file_has "and a public suffix is no relying party" $F/fido.txt '^web origin, rp a public suffix: .*"error".*"the request: Mismatching relying party ID: co.uk'
 expect "and logged there" 'drv-fido: fido-test \(uid 100015\): app:dev.rho.Gui is not an origin of this app'
 
 echo "== unlock"
