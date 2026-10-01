@@ -120,6 +120,10 @@ pub struct AppPolicy {
     /// The origins it may claim at the FIDO door (`app:dev.rho.Gui`), exactly as claimed.
     #[serde(default)]
     pub fido: Vec<String>,
+    /// Edits documents in place: a file it opens through the chooser is writable, not only
+    /// one it saves (drv-files).
+    #[serde(default)]
+    pub edits: bool,
 }
 
 impl AppPolicy {
@@ -133,6 +137,7 @@ impl AppPolicy {
             icon: None,
             agent: false,
             fido: Vec::new(),
+            edits: false,
         }
     }
 
@@ -146,6 +151,7 @@ impl AppPolicy {
             icon: None,
             agent: true,
             fido: Vec::new(),
+            edits: true,
         }
     }
 

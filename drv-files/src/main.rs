@@ -56,7 +56,7 @@ const MAX_TYPED: usize = 200;
 
 /// From the threads that read the apps' connections.
 enum Event {
-    New { conn: u64, out: OwnedFd, app: String, uid: u32 },
+    New { conn: u64, out: OwnedFd, app: String, uid: u32, edits: bool },
     Choose { conn: u64, req: u64, kind: Ask },
     Cancel { conn: u64, req: u64 },
     Gone { conn: u64 },
@@ -66,6 +66,8 @@ struct Conn {
     out: OwnedFd,
     app: String,
     uid: u32,
+    /// The manifest's `edits`: its Open grants are writable too.
+    edits: bool,
 }
 
 struct Pending {
@@ -73,6 +75,7 @@ struct Pending {
     req: u64,
     app: String,
     uid: u32,
+    edits: bool,
     kind: Ask,
 }
 
@@ -134,8 +137,8 @@ struct App {
 impl App {
     fn on_event(&mut self, qh: &QueueHandle<Self>, ev: Event) {
         match ev {
-            Event::New { conn, out, app, uid } => {
-                self.conns.insert(conn, Conn { out, app, uid });
+            Event::New { conn, out, app, uid, edits } => {
+                self.conns.insert(conn, Conn { out, app, uid, edits });
             }
             Event::Gone { conn } => {
                 // Its questions go with it; a dialog up for it comes down.
@@ -148,7 +151,7 @@ impl App {
             }
             Event::Choose { conn, req, kind } => {
                 let Some(c) = self.conns.get(&conn) else { return };
-                let pending = Pending { conn, req, app: c.app.clone(), uid: c.uid, kind };
+                let pending = Pending { conn, req, app: c.app.clone(), uid: c.uid, edits: c.edits, kind };
                 self.queue.push_back(pending);
                 self.next(qh);
             }
@@ -284,12 +287,16 @@ impl App {
             self.draw();
             return;
         }
-        let write = d.saving();
+        // Saving makes the file; an app that edits in place gets what it opens writable.
+        let write = d.saving() || d.req.edits;
         let path = self.files.join(&d.dir).join(&name);
         let mut options = OpenOptions::new();
         options.read(true).custom_flags(libc::O_NOFOLLOW);
         if write {
-            options.write(true).create(true).mode(0o600);
+            options.write(true);
+        }
+        if d.saving() {
+            options.create(true).mode(0o600);
         }
         let file = match options.open(&path).and_then(check_regular) {
             Ok(file) => file,
@@ -478,7 +485,7 @@ static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 /// One app's connection, on its own thread: the hello, then its requests to the event loop,
 /// which answers on a dup.
-fn conn(tx: Sender<Event>, sock: OwnedFd, uid: u32, app: String) {
+fn conn(tx: Sender<Event>, sock: OwnedFd, uid: u32, app: String, edits: bool) {
     match seq::recv::<ToFiles>(&sock) {
         Ok((ToFiles::Hello { version }, _)) if version == wire::VERSION => {}
         Ok((other, _)) => {
@@ -502,7 +509,7 @@ fn conn(tx: Sender<Event>, sock: OwnedFd, uid: u32, app: String) {
         }
     };
     let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-    if tx.send(Event::New { conn, out, app: app.clone(), uid }).is_err() {
+    if tx.send(Event::New { conn, out, app: app.clone(), uid, edits }).is_err() {
         return;
     }
     loop {
@@ -583,7 +590,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("event loop: {e}"))?;
     thread::spawn(move || {
         let err = door.serve(listener, "drv-files", move |sock, uid, policy| {
-            conn(tx.clone(), sock, uid, policy.name.clone())
+            conn(tx.clone(), sock, uid, policy.name.clone(), policy.edits)
         });
         drv_os::say!("drv-files: the socket: {err:?}");
         process::exit(1);

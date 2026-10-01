@@ -326,11 +326,11 @@ in
       # writes a scratch file next to the document and renames it onto it; the lock file
       # `.~lock.<name>#` is a scratch file too). It only takes the native (portal) dialog
       # when it believes it is on Plasma, hence OOO_FORCE_DESKTOP. jit: its UNO bridge
-      # writes vtable trampolines at runtime.
+      # writes vtable trampolines at runtime. edits: what it opens it may save in place.
       libreoffice = {
         uid = 100016;
         exec = [ "${libreoffice}/bin/libreoffice" ];
-        gpu = true; bus = true; jit = true;
+        gpu = true; bus = true; jit = true; edits = true;
         state = [ ".config/libreoffice" ];
         env.SAL_USE_VCLPLUGIN = "kf6";
         env.QT_QPA_PLATFORM = "wayland";

@@ -187,18 +187,22 @@ expect "mailto refused" 'no app opens mailto: URIs'
 expect "junk refused" 'drv-dbus-shim: OpenURI: "-https://example.com" is not a URI'
 
 echo "== LibreOffice"
-# Its pickers are Qt's portal dialogs: the chooser opens notes/todo.txt read-only, and after
-# an edit Save As gets a writable grant for a new /todo.txt (saved through a scratch file).
+# Its pickers are Qt's portal dialogs: the chooser opens notes/todo.txt writable (the manifest's
+# `edits`), Save writes it in place, and Save As gets a writable grant for a new /todo.txt (both
+# saved through a scratch file).
 $SSH rm -f /var/lib/drv-files/todo.txt
 mark; menu libre
 expect_soon "libreoffice launched" 'launched "libreoffice" as uid 100016'
 sleep 25                # its first start makes the profile and starts over; the Start Center takes a while
 for _ in $(seq 1 10); do key ctrl-o; sleep 5; journal | grep -q 'FileChooser.OpenFile' && break; done
 key ret; sleep 1.2      # into notes/
-key ret; sleep 10       # todo.txt; Writer shows it read-only
-expect "drv-files granted the pick" 'drv-files: libreoffice \(uid 100016\) gets /var/lib/drv-files/notes/todo.txt as /run/drv/doc/[0-9]+/todo.txt$'
+key ret; sleep 10       # todo.txt, for editing
+expect "drv-files granted the pick, writable" 'drv-files: libreoffice \(uid 100016\) gets /var/lib/drv-files/notes/todo.txt as /run/drv/doc/[0-9]+/todo.txt, writable'
 key esc; sleep 1        # the first-run welcome
-key ctrl-shift-m; sleep 2; key end; type_word shipit
+key end; type_word shipit
+key ctrl-s; sleep 4
+key alt-t; sleep 4      # keep the text format
+file_has "saved in place" /var/lib/drv-files/notes/todo.txt 'build the portalshipit'
 key ctrl-shift-s; sleep 5
 key ret; sleep 5        # save under the offered name, in /
 key alt-t; sleep 4      # keep the text format

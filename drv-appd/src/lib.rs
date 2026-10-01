@@ -77,6 +77,9 @@ pub struct AppConfig {
     /// The origins it may claim at the FIDO door (`app:dev.rho.Gui`).
     #[serde(default)]
     pub fido: Vec<String>,
+    /// Edits documents in place: its Open grants at drv-files are writable.
+    #[serde(default)]
+    pub edits: bool,
     /// Extra environment for this app only.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -108,6 +111,7 @@ impl AppConfig {
             icon: self.icon.clone(),
             agent: self.agent,
             fido: self.fido.clone(),
+            edits: self.edits,
         }
     }
 }
