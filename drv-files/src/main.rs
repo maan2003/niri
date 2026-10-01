@@ -362,8 +362,19 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     let dim = (0.6, 0.6, 0.65, 1.);
     let blue = (0.55, 0.75, 1., 1.);
     p.fill(0.08, 0.09, 0.12);
-    let verb = if d.saving() { "save" } else if d.editing() { "edit" } else { "open" };
-    p.text(PAD, PAD, 20., &format!("{} wants to {verb} a file", d.req.app), Align::Left, fg);
+    // An ask to change a file in place is told apart from a look at one by more than a word:
+    // an amber stripe, a pen, the title in amber.
+    let amber = (1., 0.75, 0.3, 1.);
+    let (verb, title) = if d.saving() {
+        ("save", fg)
+    } else if d.editing() {
+        p.rect(0., 0., p.width, 5., amber);
+        ("edit", amber)
+    } else {
+        ("open", fg)
+    };
+    let pen = if d.editing() { "\u{270E} " } else { "" };
+    p.text(PAD, PAD, 20., &format!("{pen}{} wants to {verb} a file", d.req.app), Align::Left, title);
     p.text(PAD, PAD + 40., 15., &format!("/{}", d.dir.display()), Align::Left, blue);
 
     let top = PAD + 72.;
@@ -392,6 +403,7 @@ fn paint(p: &Painter, d: &Dialog, shown: &[usize]) {
     p.text(PAD, bottom + 6., 16., &format!("{label}: {}{cursor}", d.typed), Align::Left, fg);
     let (hint, color) = match &d.note {
         Some(note) => (note.as_str(), (1., 0.6, 0.5, 1.)),
+        None if d.editing() => ("Enter let it edit   Backspace up   Esc cancel", dim),
         None => ("Enter choose   Backspace up   Esc cancel", dim),
     };
     p.text(PAD, p.height - PAD - ROW + 8., 13., hint, Align::Left, color);
