@@ -1,15 +1,20 @@
 //! The first thing that runs as an app, inside the root the forker built for it, with no
 //! privilege (DESIGN-app-namespace, "Who does what"). The forker left a root tmpfs the app
 //! owns, with the store, the device and sysfs views, proc, the doors and `/state` mounted in
-//! it; this makes the rest: `/tmp`, `/etc` linked from the store (plus the host's resolver),
-//! the runtime directory, HOME (of the run, with the declared state directories linked from
-//! `/state`, or `/state` itself), the HOME defaults from the store, the links at fixed places
-//! (`/bin/sh`). Then it puts itself under the app's Landlock rules, the syscall denylist and
-//! MDWE, forks the app and stays as PID 1 of its namespace: reaps, passes signals on, ends
-//! with the app's status. The system configuration puts it in front of every app's command,
-//! with everything it needs on the command line; the forker knows nothing of it. A bug here
-//! is worth exactly one app.
+//! it; this makes the rest: `/tmp`, `/etc` (its own account, the resolver the forker handed
+//! over, the rest linked from the store), the runtime directory, HOME (of the run, with the
+//! declared state directories linked from `/state`, or `/state` itself), the HOME defaults
+//! from the store, the links at fixed places (`/bin/sh`), the person's folders. Then it puts
+//! itself under the app's Landlock rules, the syscall denylist and MDWE, forks the app and
+//! stays as PID 1 of its namespace: reaps, passes signals on, ends with the app's status.
+//!
+//! Everything it does is said by the app's run file (`services.drv.mkApp` writes it): an
+//! executable in the store whose first line names this program as its interpreter and whose
+//! rest is JSON, `Run` below. The manifest launches that file and nothing else; drv-appd and
+//! the forker know neither this program nor what the file says. Arguments after the file (the
+//! OpenURI portal's URI) go to the app. A bug here is worth exactly one app.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -18,8 +23,8 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use clap::Parser;
 use drv_os::landlock::{self, Ruleset};
+use serde::Deserialize;
 
 /// HOME of the run: gone with the app.
 const HOME_RUN: &str = "/home/app";
@@ -34,62 +39,93 @@ const RUNTIME: &str = "/run/app";
 const DOCS: &str = "/run/drv/doc";
 const STORE: &str = "/nix/store";
 const DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket";
+/// The manifest's name for the app, in the environment drv-appd gives it: its account.
+const APP_ENV: &str = "DRV_APP";
 
-#[derive(Parser)]
-#[command(
-    name = "drv-init",
-    about = "Make an app's root its own, restrict, run it, be its init"
-)]
-struct Args {
-    /// A store path: the app's `/etc`, linked entry by entry.
-    #[arg(long)]
+/// The run file's JSON. Every path is in the store.
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct Run {
+    /// The app's `/etc`, linked entry by entry (the account, the resolver and the name
+    /// service switch are made here).
+    #[serde(default)]
     etc: Option<PathBuf>,
-    /// A path under HOME that persists: made under `/state`, linked from HOME. Repeatable;
-    /// nothing with `--home persist`, where HOME is `/state`.
-    #[arg(long = "state")]
+    /// The account's shell (`/etc/passwd`).
+    shell: String,
+    /// Paths under HOME that persist: made under `/state`, linked from HOME. Nothing with
+    /// `home = "persist"`, where HOME is `/state`.
+    #[serde(default)]
     state: Vec<PathBuf>,
-    /// A store path: HOME defaults, linked into HOME entry by entry.
-    #[arg(long)]
+    /// HOME defaults, linked into HOME entry by entry.
+    #[serde(default)]
     files: Option<PathBuf>,
-    /// A folder of the person's files the forker mounted at `/files/<name>`: linked from
-    /// `~/<name>`. Repeatable.
-    #[arg(long = "folder")]
-    folders: Vec<PathBuf>,
     /// A daemon: started again when it exits, until this init is told to stop.
-    #[arg(long)]
+    #[serde(default)]
     restart: bool,
     /// `run`: HOME is /home/app, of the run. `persist`: HOME is /state, the app's whole home
     /// persists.
-    #[arg(long, default_value = "run")]
-    home: String,
+    #[serde(default)]
+    home: Home,
     /// A file listing the store paths the app may open (closureInfo's store-paths).
-    #[arg(long)]
+    #[serde(default)]
     closure: Option<PathBuf>,
-    /// `AT=TARGET`: a link at AT (an absolute path in the root) to TARGET (in the store).
-    /// Repeatable.
-    #[arg(long = "link")]
-    links: Vec<String>,
+    /// Links at fixed places (absolute paths in the root) to targets in the store.
+    #[serde(default)]
+    links: BTreeMap<String, String>,
     /// The app makes code at runtime (a JIT): no MDWE for it.
-    #[arg(long)]
+    #[serde(default)]
     jit: bool,
     /// The app may make user namespaces (a browser's own sandbox).
-    #[arg(long)]
+    #[serde(default)]
     userns: bool,
     /// The app runs nix: the whole store readable, the daemon's socket where nix looks.
-    #[arg(long)]
+    #[serde(default)]
     nix: bool,
-    /// Copy fd `resolv` (the host's resolver, from the forker) to `/etc/resolv.conf`.
-    #[arg(long)]
-    resolv: bool,
+    /// The app's own environment, over what drv-appd gave.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
     /// The app.
-    #[arg(last = true, required = true)]
-    argv: Vec<String>,
+    command: Vec<String>,
+}
+
+#[derive(Deserialize, Default, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum Home {
+    #[default]
+    Run,
+    Persist,
+}
+
+/// The run file: its first line names us, the rest is `Run`.
+fn read_run(path: &Path) -> Result<Run, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let json = match text.strip_prefix("#!") {
+        Some(rest) => rest.split_once('\n').map_or("", |(_, json)| json),
+        None => &text,
+    };
+    serde_json::from_str(json).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    let name = args.argv[0].clone();
-    match run(args) {
+    // Run as the run file's interpreter, we are named after the file: name ourselves.
+    let _ = rustix::thread::set_name(c"drv-init");
+    let argv: Vec<String> = std::env::args().collect();
+    let name = std::env::var(APP_ENV).unwrap_or_else(|_| "app".to_owned());
+    let Some(file) = argv.get(1) else {
+        drv_os::say!("drv-init: {name}: no run file");
+        return ExitCode::from(125);
+    };
+    let run_ = match read_run(Path::new(file)) {
+        Ok(mut run_) => {
+            run_.command.extend(argv[2..].iter().cloned());
+            run_
+        }
+        Err(err) => {
+            drv_os::say!("drv-init: {name}: {err}");
+            return ExitCode::from(125);
+        }
+    };
+    match run(&name, run_) {
         Ok(never) => match never {},
         Err(err) => {
             drv_os::say!("drv-init: {name}: {err}");
@@ -100,18 +136,14 @@ fn main() -> ExitCode {
 
 /// The root, the rules, then the app in a child and this process as its init. Returns only
 /// on a failure before the fork.
-fn run(args: Args) -> Result<Infallible, String> {
-    let persist = match args.home.as_str() {
-        "run" => false,
-        "persist" => true,
-        other => return Err(format!("--home {other:?}: run or persist")),
-    };
+fn run(name: &str, args: Run) -> Result<Infallible, String> {
+    if args.command.is_empty() {
+        return Err("the run file names no command".to_owned());
+    }
+    let persist = args.home == Home::Persist;
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the forker: {e}"))?;
-    let resolv = if args.resolv {
-        Some(fds.file("resolv").map_err(|e| e.to_string())?)
-    } else {
-        None
-    };
+    // The forker hands the host's resolver to a networked app and to no other.
+    let resolv = fds.file("resolv").ok();
     // 1. The directories of the run, in the root tmpfs the forker left us.
     make_dir("/tmp", 0o1777)?;
     make_dir("/etc", 0o755)?;
@@ -122,7 +154,31 @@ fn run(args: Args) -> Result<Infallible, String> {
         make_dir(HOME_RUN, 0o700)?;
         PathBuf::from(HOME_RUN)
     };
-    // 2. /etc from the store, the resolver from the host.
+    // 2. /etc: the account (the manifest's name, this uid), the name service switch (DNS
+    // for a networked app), the rest from the store, the resolver from the host.
+    let (uid, gid) = (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    );
+    write_etc(
+        "passwd",
+        &format!(
+            "app-{name}:x:{uid}:{gid}:{name}:{}:{}\n",
+            home.display(),
+            args.shell
+        ),
+    )?;
+    write_etc("group", &format!("app-{name}:x:{gid}:\n"))?;
+    write_etc(
+        "nsswitch.conf",
+        &format!(
+            "passwd: files\ngroup: files\nhosts: files{}\n",
+            if resolv.is_some() { " dns" } else { "" }
+        ),
+    )?;
+    write_etc("hosts", "127.0.0.1 localhost\n::1 localhost\n")?;
+    // Of this app, not the host's: D-Bus and the toolkits want one.
+    write_etc("machine-id", &format!("{uid:032x}\n"))?;
     if let Some(etc) = &args.etc {
         for entry in std::fs::read_dir(etc).map_err(|e| format!("{}: {e}", etc.display()))? {
             let entry = entry.map_err(|e| format!("{}: {e}", etc.display()))?;
@@ -133,14 +189,12 @@ fn run(args: Args) -> Result<Infallible, String> {
         copy_to(fd, Path::new("/etc/resolv.conf"))?;
     }
     // 3. The links at fixed places: into the store only.
-    for spec in &args.links {
-        let (at, target) = spec
-            .split_once('=')
-            .ok_or_else(|| format!("--link {spec:?}: not AT=TARGET"))?;
+    for (at, target) in &args.links {
         let (at, target) = (Path::new(at), Path::new(target));
         if !at.is_absolute() || !target.starts_with(STORE) {
             return Err(format!(
-                "--link {spec:?}: not absolute or not into the store"
+                "link {}: not absolute or not into the store",
+                at.display()
             ));
         }
         link(target, at)?;
@@ -167,12 +221,20 @@ fn run(args: Args) -> Result<Infallible, String> {
     if let Some(files) = &args.files {
         link_tree(files, files, &home)?;
     }
-    for name in &args.folders {
-        link(&Path::new(FILES).join(name), &home.join(name))?;
+    // The person's folders the forker mounted: each linked from HOME.
+    let folders = match std::fs::read_dir(FILES) {
+        Ok(entries) => entries
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{FILES}: {e}"))?,
+        Err(_) => Vec::new(),
+    };
+    for folder in &folders {
+        link(&Path::new(FILES).join(folder), &home.join(folder))?;
     }
     // 5. The rules, on this process and so on the app: what it may open, which syscalls it
     // may not make, no writable and executable memory. no_new_privs is the forker's doing.
-    restrict(&args, persist)?;
+    restrict(&args, persist, !folders.is_empty())?;
     let spawn = move || -> Result<libc::pid_t, String> {
         // SAFETY: single-threaded; the child only execs or exits.
         let pid = unsafe { libc::fork() };
@@ -180,13 +242,14 @@ fn run(args: Args) -> Result<Infallible, String> {
             return Err(format!("fork: {}", io::Error::last_os_error()));
         }
         if pid == 0 {
-            let err = Command::new(&args.argv[0])
-                .args(&args.argv[1..])
+            let err = Command::new(&args.command[0])
+                .args(&args.command[1..])
+                .envs(&args.env)
                 .env("HOME", &home)
                 .env("XDG_RUNTIME_DIR", RUNTIME)
                 .current_dir(&home)
                 .exec();
-            drv_os::say!("drv-init: exec {}: {err}", args.argv[0]);
+            drv_os::say!("drv-init: exec {}: {err}", args.command[0]);
             std::process::exit(126);
         }
         Ok(pid)
@@ -198,7 +261,7 @@ fn run(args: Args) -> Result<Infallible, String> {
 /// The app's Landlock domain (read and execute on its closure, or on the whole store with
 /// `nix`; the views and the doors read-only, the documents and its own directories
 /// writable; nothing else exists), the syscall denylist, MDWE.
-fn restrict(args: &Args, persist: bool) -> Result<(), String> {
+fn restrict(args: &Run, persist: bool, folders: bool) -> Result<(), String> {
     let rules = Ruleset::new().map_err(|e| format!("landlock: {e}"))?;
     let all = rules.all();
     let allow = |path: &str, access: u64| {
@@ -235,7 +298,7 @@ fn restrict(args: &Args, persist: bool) -> Result<(), String> {
     for path in ["/tmp", "/etc", RUNTIME, STATE] {
         allow(path, all)?;
     }
-    if !args.folders.is_empty() {
+    if folders {
         allow(FILES, all)?;
     }
     if !persist {
@@ -334,6 +397,11 @@ fn make_dir(path: &str, mode: u32) -> Result<(), String> {
     std::fs::create_dir_all(path).map_err(|e| format!("mkdir {path}: {e}"))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|e| format!("chmod {path}: {e}"))
+}
+
+/// An entry of /etc written here, mode 0644.
+fn write_etc(name: &str, text: &str) -> Result<(), String> {
+    std::fs::write(Path::new("/etc").join(name), text).map_err(|e| format!("/etc/{name}: {e}"))
 }
 
 /// `fd`'s contents as the file at `to`, mode 0644.

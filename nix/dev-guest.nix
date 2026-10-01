@@ -5,6 +5,7 @@
 { niri, camera ? true, xkbOptions ? null }:
 { config, pkgs, lib, ... }:
 let
+  inherit (config.services.drv) mkApp;
   # A page that plays a sound forever, so a browser's audio path can be seen in PipeWire,
   # and shares the screen on a click.
   sharePage = pkgs.writeText "share.html" ''
@@ -274,52 +275,64 @@ in
       # launch it from the menu.
       notify-test = {
         uid = 100007;
-        bus = true;
-        exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the shim" ];
+        run = mkApp {
+          bus = true;
+          exec = [ "${pkgs.libnotify}/bin/notify-send" "-a" "Evil Corp" "<b>Hello</b>" "from uid 100007 via the shim" ];
+        };
       };
       hello = {
-        uid = 100001; exec = [ "${probe}" ]; autostart = true; menu = false;
-        state = [ "out" ];
+        uid = 100001; autostart = true; menu = false;
+        run = mkApp {
+          name = "hello";
+          exec = [ "${probe}" ];
+          state = [ "out" ];
+          packages = [ pkgs.openssh ];
+          files = { ".config/hello/greeting" = "hello from the store"; };
+        };
         agent = true;
-        packages = [ pkgs.openssh ];
-        files = { ".config/hello/greeting" = "hello from the store"; };
         # A folder of the person's files, its own inside (the probe writes into it).
         folders = [ "Shared" ];
       };
       # A daemon that dies once: drv-init starts it again, then it stays.
       restart-test = {
-        uid = 100013; autostart = true; menu = false; restart = true; state = [ "out" ]; folders = [ "Shared" ];
-        exec = [ "${pkgs.writeShellScript "restart-test" ''
-          if [ -e "$HOME/out/ran" ]; then exec ${pkgs.coreutils}/bin/sleep infinity; fi
-          ${pkgs.coreutils}/bin/touch "$HOME/out/ran"; exit 3
-        ''}" ];
+        uid = 100013; autostart = true; menu = false; folders = [ "Shared" ];
+        run = mkApp {
+          restart = true; state = [ "out" ];
+          exec = [ "${pkgs.writeShellScript "restart-test" ''
+            if [ -e "$HOME/out/ran" ]; then exec ${pkgs.coreutils}/bin/sleep infinity; fi
+            ${pkgs.coreutils}/bin/touch "$HOME/out/ran"; exit 3
+          ''}" ];
+        };
       };
-      gpu-probe = { uid = 100002; exec = [ "${probe}" ]; gpu = true; autostart = true; menu = false; state = [ "out" ]; packages = [ pkgs.openssh ]; };
-      flower = { uid = 100003; exec = [ "${pkgs.weston}/bin/weston-flower" ]; autostart = true; };
+      gpu-probe = { uid = 100002; run = mkApp { exec = [ "${probe}" ]; state = [ "out" ]; packages = [ pkgs.openssh ]; }; gpu = true; autostart = true; menu = false; };
+      flower = { uid = 100003; run = mkApp { exec = [ "${pkgs.weston}/bin/weston-flower" ]; }; autostart = true; };
       # A real browser: GPU, audio, its own home, a private session bus (compatibility, not
       # a boundary; the sandbox already hides the system bus). Flags come from here only.
       chromium = {
         uid = 100005;
-        bus = true;
-        exec = [
-          "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
-          "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRtcPipeWireCamera"
-          # Its log, for the camera: the portal dance happens in its video utility process.
-          "--enable-logging=stderr" "--v=0" "--vmodule=camera_portal=2,pipewire_session=2,video_capture_device_factory_webrtc=2"
-          "file:///share.html"
-        ];
-        # The page: a URL is not a store path the closure would list, a link is.
-        links."/share.html" = "${sharePage}";
+        run = mkApp {
+          name = "chromium";
+          bus = true;
+          exec = [
+            "${pkgs.chromium}/bin/chromium" "--ozone-platform=wayland"
+            "--autoplay-policy=no-user-gesture-required" "--enable-features=WebRtcPipeWireCamera"
+            # Its log, for the camera: the portal dance happens in its video utility process.
+            "--enable-logging=stderr" "--v=0" "--vmodule=camera_portal=2,pipewire_session=2,video_capture_device_factory_webrtc=2"
+            "file:///share.html"
+          ];
+          # The page: a URL is not a store path the closure would list, a link is.
+          links."/share.html" = "${sharePage}";
+          state = [ ".config/chromium" ".cache/chromium" ];
+          # Its single-instance socket lives under TMPDIR; /tmp is of the run, so a second
+          # launch (OpenURI while it runs) has to find the first one's socket in its state.
+          env.TMPDIR = "/home/app/.cache/chromium";
+          jit = true;
+          userns = true;
+        };
         gpu = true;
         network = true;
         audio = true;
         opens = [ "http" "https" ];
-        state = [ ".config/chromium" ".cache/chromium" ];
-        # Its single-instance socket lives under TMPDIR; /tmp is of the run, so a second
-        # launch (OpenURI while it runs) has to find the first one's socket in its state.
-        env.TMPDIR = "/home/app/.cache/chromium";
-        jit = true;
-        userns = true;
       };
       # LibreOffice as m2sh has it: the kf6 plugin under Qt's xdgdesktopportal theme, so
       # opening and saving go through the shell's chooser and the documents mount (a save
@@ -329,39 +342,43 @@ in
       # writes vtable trampolines at runtime. edits: what it opens it may save in place.
       libreoffice = {
         uid = 100016;
-        exec = [ "${libreoffice}/bin/libreoffice" ];
-        gpu = true; bus = true; jit = true; edits = true;
-        state = [ ".config/libreoffice" ];
-        env.SAL_USE_VCLPLUGIN = "kf6";
-        env.QT_QPA_PLATFORM = "wayland";
-        env.QT_QPA_PLATFORMTHEME = "xdgdesktopportal";
-        env.OOO_FORCE_DESKTOP = "plasma6";
-        env.SAL_ENABLE_FILE_LOCKING = "1";
+        run = mkApp {
+          name = "libreoffice";
+          exec = [ "${libreoffice}/bin/libreoffice" ];
+          bus = true; jit = true; edits = true;
+          state = [ ".config/libreoffice" ];
+          env.SAL_USE_VCLPLUGIN = "kf6";
+          env.QT_QPA_PLATFORM = "wayland";
+          env.QT_QPA_PLATFORMTHEME = "xdgdesktopportal";
+          env.OOO_FORCE_DESKTOP = "plasma6";
+          env.SAL_ENABLE_FILE_LOCKING = "1";
+        };
+        gpu = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # shim asks drv-files, the person picks, and the file arrives under /run/drv/doc.
       # Then it saves a copy the same way. Results in its home, result.txt.
-      chooser-test = { uid = 100008; bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; state = [ "out" ]; };
+      chooser-test = { uid = 100008; run = mkApp { bus = true; exec = [ "${config.services.drv.package}/bin/chooser-probe" ]; state = [ "out" ]; }; };
       # A client of screen sharing, as a browser would use it: session, Start (the person
       # picks a screen at the shell), the PipeWire remote, and what that remote can see.
       # Holds the cast 20 s, then closes. Results in its home, cast.txt.
-      cast-test = { uid = 100009; bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; audio = true; state = [ "out" ]; };
+      cast-test = { uid = 100009; run = mkApp { bus = true; exec = [ "${config.services.drv.package}/bin/cast-probe" ]; state = [ "out" ]; }; audio = true; };
       # Plays a sound: playback is free for an audio app.
       beep = {
         uid = 100006;
-        exec = [ "${pkgs.pipewire}/bin/pw-play" "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga" ];
+        run = mkApp { exec = [ "${pkgs.pipewire}/bin/pw-play" "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo/bell.oga" ]; };
         audio = true;
       };
       # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
-      mic-test = { uid = 100010; exec = [ "${micTest}" ]; audio = true; state = [ "out" ]; };
-      open-test = { uid = 100011; bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; };
-      fido-test = { uid = 100015; bus = true; exec = [ "${fidoTest}" ]; autostart = true; menu = false; state = [ "out" ]; fido = [ "app:dev.drv.FidoTest" "https://*" ]; };
+      mic-test = { uid = 100010; run = mkApp { exec = [ "${micTest}" ]; state = [ "out" ]; }; audio = true; };
+      open-test = { uid = 100011; run = mkApp { bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; }; };
+      fido-test = { uid = 100015; run = mkApp { bus = true; exec = [ "${fidoTest}" ]; state = [ "out" ]; }; autostart = true; menu = false; fido = [ "app:dev.drv.FidoTest" "https://*" ]; };
       ssh-test = {
-        uid = 100014; autostart = true; menu = false; network = true; nix = true; state = [ "out" ];
-        shell = "${pkgs.bashInteractive}/bin/bash"; exec = [ "${sshTest}" ];
+        uid = 100014; autostart = true; menu = false; network = true; nix = true;
+        run = mkApp { nix = true; state = [ "out" ]; shell = "${pkgs.bashInteractive}/bin/bash"; exec = [ "${sshTest}" ]; };
       };
       # A terminal: a pty of its own.
-      terminal = { uid = 100012; exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ]; gpu = true; packages = [ pkgs.fish pkgs.coreutils ]; };
+      terminal = { uid = 100012; run = mkApp { exec = [ "${pkgs.alacritty}/bin/alacritty" "-e" "${pkgs.fish}/bin/fish" ]; packages = [ pkgs.fish pkgs.coreutils ]; }; gpu = true; };
     };
   };
 

@@ -1596,10 +1596,11 @@ dependencies = [
 name = "drv-init"
 version = "26.4.0"
 dependencies = [
- "clap",
  "drv-os",
  "libc",
  "rustix 1.1.4",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
