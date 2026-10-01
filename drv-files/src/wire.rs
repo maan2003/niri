@@ -12,6 +12,8 @@ pub const SOCKET: &str = "/run/drv/files.sock";
 pub enum Kind {
     /// An existing file, read-only for the app.
     Open,
+    /// An existing file the app will change in place: writable. The person is told so.
+    Edit,
     /// A file to write, created if the person names a new one; `name` is offered.
     Save { name: String },
 }

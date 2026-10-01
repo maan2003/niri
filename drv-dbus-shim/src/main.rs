@@ -77,6 +77,10 @@ struct Args {
     /// drv-fido's door.
     #[arg(long, default_value = drv_fido::wire::SOCKET)]
     fido: PathBuf,
+    /// The app changes the files it opens in place (an office suite): `OpenFile` asks
+    /// drv-files for a file to edit, which the chooser says and which comes writable.
+    #[arg(long)]
+    edits: bool,
     /// The app, run once the names are owned.
     #[arg(trailing_var_arg = true, required = true)]
     command: Vec<String>,
@@ -102,6 +106,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     let shim = Arc::new(Shim {
         bus,
         paths: Paths { files: args.files, cast: args.cast, notify: args.notify, appd: args.appd, fido: args.fido },
+        edits: args.edits,
         files: OnceLock::new(),
         cast: OnceLock::new(),
         notify: OnceLock::new(),
@@ -295,6 +300,7 @@ struct Paths {
 struct Shim {
     bus: Connection,
     paths: Paths,
+    edits: bool,
     files: OnceLock<Arc<Link<FromFiles>>>,
     cast: OnceLock<Arc<Link<FromCast>>>,
     notify: OnceLock<Arc<Link<FromShell>>>,
@@ -610,6 +616,7 @@ impl Shim {
         let flag = |key: &str| options.get(key).cloned().and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
         let kind = match member {
             "OpenFile" if flag("directory") => bail!("directories are not handed out yet"),
+            "OpenFile" if self.edits => Chooser::Edit,
             "OpenFile" => Chooser::Open,
             "SaveFile" => Chooser::Save {
                 name: string("current_name").unwrap_or_default(),

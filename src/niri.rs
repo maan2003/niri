@@ -7080,7 +7080,6 @@ impl Niri {
                 icon: None,
                 agent: false,
                 fido: Vec::new(),
-                edits: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
@@ -7107,7 +7106,6 @@ impl Niri {
                 icon: None,
                 agent: false,
                 fido: Vec::new(),
-                edits: false,
             }),
         });
         match self.display_handle.insert_client(UnixStream::from(sock), data) {
