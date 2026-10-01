@@ -3,11 +3,11 @@
     "drv-nixos": {
       "flake": false,
       "locked": {
-        "lastModified": 1790879835,
-        "narHash": "sha256-SKdC5QS+kq6wWnByi5ErnYFrak9V7Q4tfGplPGq7n4k=",
+        "lastModified": 1790881689,
+        "narHash": "sha256-zdvZIVOjz4HKN9qtqYisZrAl17NDW1xCa5P0vJoFpLs=",
         "ref": "master",
-        "rev": "b14a4835c76f28e8b87dad1c68ef55a8e52d8a0f",
-        "revCount": 3344,
+        "rev": "41bdcd584f4530d1fa98bb1d31fbae7a7e12a0a0",
+        "revCount": 3346,
         "type": "git",
         "url": "https://git.sr.ht/~maan2003/nixos"
       },
