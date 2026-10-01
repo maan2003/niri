@@ -99,6 +99,14 @@ sd-notify = "0.4.5"
 serde.workspace = true
 serde_json.workspace = true
 smithay-drm-extras.workspace = true
+# unprefixed_malloc routes C-library allocations (Mesa, pango, cairo)
+# through jemalloc too; glibc keeps freed memory in per-thread arenas
+# instead of returning it. Profiling stays inert until MALLOC_CONF turns
+# it on.
+tikv-jemallocator = { version = "0.7", features = [
+  "profiling",
+  "unprefixed_malloc_on_supported_platforms",
+] }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 tracy-client.workspace = true
