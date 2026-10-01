@@ -449,8 +449,10 @@ fn listen_seqpacket(path: &Path) -> Result<UnixListener, String> {
 
 /// The documents mount, fresh for this set: a FUSE connection whose serving end goes to
 /// drv-files as fd `fuse`. `allow_other` because the apps are the readers; who may see what
-/// is drv-files' check, per request, by the caller's UID. What the last set served is gone
-/// with it, like the apps that held it.
+/// is drv-files' check, per request, by the caller's UID. `default_permissions` so the kernel
+/// holds them to the modes drv-files reports too: a read-only document fails access(2) for
+/// writing, which is how an app (LibreOffice) tells it must not try. What the last set
+/// served is gone with it, like the apps that held it.
 fn mount_docs(at: &Path, uid: u32, gid: u32) -> Result<OwnedFd, String> {
     let target = CString::new(at.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
     // SAFETY: a NUL-terminated path; a stale mount from the last set is the expected case.
@@ -462,7 +464,7 @@ fn mount_docs(at: &Path, uid: u32, gid: u32) -> Result<OwnedFd, String> {
         .open("/dev/fuse")
         .map_err(|e| format!("open /dev/fuse: {e}"))?;
     let data = CString::new(format!(
-        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other",
+        "fd={},rootmode=40000,user_id={uid},group_id={gid},allow_other,default_permissions",
         fuse.as_raw_fd()
     ))
     .map_err(|e| e.to_string())?;

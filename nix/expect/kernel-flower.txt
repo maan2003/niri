@@ -6,7 +6,7 @@ mount /dev/shm rw,nosuid,nodev,noexec tmpfs root=/ rw,uid=UID,gid=UID
 mount /nix/store ro,nosuid,nodev overlay root=/ host
 mount /proc rw,nosuid,nodev,noexec proc root=/ rw,hidepid=invisible,subset=pid
 mount /run/drv ro,nosuid,nodev,noexec tmpfs root=/drv rw,mode=755
-mount /run/drv/doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,allow_other
+mount /run/drv/doc rw,nosuid,nodev,noexec fuse root=/ rw,user_id=912,group_id=912,default_permissions,allow_other
 mount /state rw,nosuid,nodev,noexec ext4 root=/var/lib/drv-apps/UID rw
 mount /sys ro,nosuid,nodev,noexec tmpfs root=/drv-host/sys rw,mode=755
 Uid: UID UID UID UID

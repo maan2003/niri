@@ -186,6 +186,26 @@ expect "https went to chromium" '"chromium" \(uid 100005\) opens "https://exampl
 expect "mailto refused" 'no app opens mailto: URIs'
 expect "junk refused" 'drv-dbus-shim: OpenURI: "-https://example.com" is not a URI'
 
+echo "== LibreOffice"
+# Its pickers are Qt's portal dialogs: the chooser opens notes/todo.txt read-only, and after
+# an edit Save As gets a writable grant for a new /todo.txt (saved through a scratch file).
+$SSH rm -f /var/lib/drv-files/todo.txt
+mark; menu libre
+expect_soon "libreoffice launched" 'launched "libreoffice" as uid 100016'
+sleep 25                # its first start makes the profile and starts over; the Start Center takes a while
+for _ in $(seq 1 10); do key ctrl-o; sleep 5; journal | grep -q 'FileChooser.OpenFile' && break; done
+key ret; sleep 1.2      # into notes/
+key ret; sleep 10       # todo.txt; Writer shows it read-only
+expect "drv-files granted the pick" 'drv-files: libreoffice \(uid 100016\) gets /var/lib/drv-files/notes/todo.txt as /run/drv/doc/[0-9]+/todo.txt$'
+key esc; sleep 1        # the first-run welcome
+key ctrl-shift-m; sleep 2; key end; type_word shipit
+key ctrl-shift-s; sleep 5
+key ret; sleep 5        # save under the offered name, in /
+key alt-t; sleep 4      # keep the text format
+expect "a writable grant for the save" 'drv-files: libreoffice \(uid 100016\) gets /var/lib/drv-files/todo.txt as /run/drv/doc/[0-9]+/todo.txt, writable'
+file_has "saved through the portal" /var/lib/drv-files/todo.txt 'build the portalshipit'
+key ctrl-q; sleep 3
+
 echo "== health"
 absent "no panics" 'panicked at|RUST_BACKTRACE'
 absent "no members died" 'drv-supervisor: .* (exited|died|killed)|restarting the set'

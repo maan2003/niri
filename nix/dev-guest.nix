@@ -190,6 +190,17 @@ let
   '';
   # The kernel's account of a task, for nix/kernel-state.sh: an out-of-tree module built
   # against this VM's kernel. Dev only; a real install has no such thing.
+  # LibreOffice's launcher (oosplash) exits unless /proc/version exists, which the sandbox's
+  # subset=pid proc hides. All it does besides is run soffice.bin again when that asks for a
+  # restart (exit 79 or 81, e.g. after creating the profile), so keep the nixpkgs wrapper for
+  # its environment and replace its last line with that loop.
+  libreoffice = pkgs.runCommand "libreoffice-nosplash" { } ''
+    mkdir -p $out/bin
+    sed -E 's|^("/nix/store/[^"]*/lib/libreoffice/program/)soffice" +"\$@" *$|while \1soffice.bin" "$@"; code=$?; [ $code = 79 ] \|\| [ $code = 81 ]; do :; done; (exit $code)|' \
+      ${pkgs.libreoffice-qt6-fresh}/lib/libreoffice/program/soffice > $out/bin/libreoffice
+    test "$(grep -c '^while ' $out/bin/libreoffice)" = 1
+    chmod +x $out/bin/libreoffice
+  '';
   kernel = config.boot.kernelPackages.kernel;
   kdump = pkgs.stdenv.mkDerivation {
     name = "drv-kdump-${kernel.version}";
@@ -309,6 +320,23 @@ in
         env.TMPDIR = "/home/app/.cache/chromium";
         jit = true;
         userns = true;
+      };
+      # LibreOffice as m2sh has it: the kf6 plugin under Qt's xdgdesktopportal theme, so
+      # opening and saving go through the shell's chooser and the documents mount (a save
+      # writes a scratch file next to the document and renames it onto it; the lock file
+      # `.~lock.<name>#` is a scratch file too). It only takes the native (portal) dialog
+      # when it believes it is on Plasma, hence OOO_FORCE_DESKTOP. jit: its UNO bridge
+      # writes vtable trampolines at runtime.
+      libreoffice = {
+        uid = 100016;
+        exec = [ "${libreoffice}/bin/libreoffice" ];
+        gpu = true; bus = true; jit = true;
+        state = [ ".config/libreoffice" ];
+        env.SAL_USE_VCLPLUGIN = "kf6";
+        env.QT_QPA_PLATFORM = "wayland";
+        env.QT_QPA_PLATFORMTHEME = "xdgdesktopportal";
+        env.OOO_FORCE_DESKTOP = "plasma6";
+        env.SAL_ENABLE_FILE_LOCKING = "1";
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # shim asks drv-files, the person picks, and the file arrives under /run/drv/doc.
