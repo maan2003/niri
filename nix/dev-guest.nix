@@ -326,12 +326,12 @@ in
           # Its single-instance socket lives under TMPDIR; /tmp is of the run, so a second
           # launch (OpenURI while it runs) has to find the first one's socket in its state.
           env.TMPDIR = "/home/app/.cache/chromium";
-          jit = true;
-          userns = true;
         };
         gpu = true;
         network = true;
         audio = true;
+        jit = true;
+        userns = true;
         opens = [ "http" "https" ];
       };
       # LibreOffice as m2sh has it: the kf6 plugin under Qt's xdgdesktopportal theme, so
@@ -345,7 +345,7 @@ in
         run = mkApp {
           name = "libreoffice";
           exec = [ "${libreoffice}/bin/libreoffice" ];
-          bus = true; jit = true; edits = true;
+          bus = true; edits = true;
           state = [ ".config/libreoffice" ];
           env.SAL_USE_VCLPLUGIN = "kf6";
           env.QT_QPA_PLATFORM = "wayland";
@@ -353,7 +353,7 @@ in
           env.OOO_FORCE_DESKTOP = "plasma6";
           env.SAL_ENABLE_FILE_LOCKING = "1";
         };
-        gpu = true;
+        gpu = true; jit = true;
       };
       # A client of the file chooser, as a GTK app would use it: asks its private bus, the
       # shim asks drv-files, the person picks, and the file arrives under /run/drv/doc.

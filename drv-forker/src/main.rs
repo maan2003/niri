@@ -4,8 +4,9 @@
 //! takes privilege and nothing else (ARCH-app-policy, "Launching"; DESIGN-app-namespace): a
 //! mount namespace with a root tmpfs the app owns, the few mounts into it (the store, the
 //! device and sysfs views, proc, the doors, the app's state, the person's folders it is given),
-//! the cgroup, the UID switch, and
-//! the exec of drv-init, which as the app makes the rest of the root and restricts itself.
+//! the cgroup, the UID switch, the syscall denylist and MDWE, and
+//! the exec of the command (the app's run file, so drv-init), which as the app makes the
+//! rest of the root and takes its Landlock rules.
 //! No config files, no policy, no idea what an "app" is beyond the request type: drv-appd is
 //! the brain; a bug here is reachable only through it. Zygote on Android has the same shape.
 
@@ -373,9 +374,17 @@ impl Forker {
         // through hidepid), no capability of any kind.
         drv_os::creds::switch_to(u, g, &[g], CapabilitySet::empty())?;
 
-        // 5. As the app, with nothing: its command (drv-init, which the system configuration
-        // puts first: it makes the rest of the root, restricts itself, runs the app and stays
-        // as its init), with the resolver's fd for a networked app.
+        // 5. As the app, with nothing: the two doors nothing of the app's can reopen, then
+        // its command, with the resolver's fd for a networked app. The syscall denylist
+        // (no executable memfd, no io_uring, no user namespace unless the manifest says
+        // `userns`) and MDWE (unless `jit`) survive the exec and every fork; both are put on
+        // here, after the switch, so what the app does with its own root (drv-init, which
+        // the command is, making the rest of the root and taking the Landlock rules) is
+        // already under them.
+        drv_os::seccomp::refuse_app_doors(launch.userns).map_err(|e| e.to_string())?;
+        if !launch.jit {
+            drv_os::creds::refuse_exec_gain()?;
+        }
         let mut env: Vec<(String, String)> = launch.env.clone();
         let path = env
             .iter()

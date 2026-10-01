@@ -93,6 +93,12 @@ pub struct AppConfig {
     /// Runs nix: the daemon's socket in its root (and, from drv-init, the whole store).
     #[serde(default)]
     pub nix: bool,
+    /// Makes code at runtime (a JIT): the forker leaves W^X memory to it.
+    #[serde(default)]
+    pub jit: bool,
+    /// May make user namespaces (a browser's own sandbox).
+    #[serde(default)]
+    pub userns: bool,
     /// Folders of the person's files the app has as its own (`~/<name>`), drv-files' on disk.
     #[serde(default)]
     pub folders: Vec<String>,
@@ -282,6 +288,8 @@ impl Appd {
             gpu: app.gpu,
             nix: app.nix,
             folders: app.folders.clone(),
+            jit: app.jit,
+            userns: app.userns,
         };
         self.forker.launch(&launch)?;
         Ok(app.uid)

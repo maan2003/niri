@@ -607,8 +607,8 @@ fn log_denied(nr: c_int, args: [u64; 3]) {
 /// and `vm.memfd_noexec`, only the store runs code) and io_uring. Without `userns`, no user
 /// namespace either: `unshare`, `clone` and `setns` refuse CLONE_NEWUSER and `clone3`, whose
 /// flags are behind a pointer, is not there (ENOSYS, which libc falls back from). Everything
-/// else passes: this is a denylist for a few doors, not the sandbox. drv-init applies it, as
-/// the app, before the app runs. Needs no_new_privs.
+/// else passes: this is a denylist for a few doors, not the sandbox. The forker applies it
+/// once it is the app, before the exec. Needs no_new_privs.
 pub fn refuse_app_doors(userns: bool) -> io::Result<()> {
     const MFD_EXEC: u64 = 0x0010;
     let arch = std::env::consts::ARCH

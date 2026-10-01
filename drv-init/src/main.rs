@@ -5,7 +5,8 @@
 //! over, the rest linked from the store), the runtime directory, HOME (of the run, with the
 //! declared state directories linked from `/state`, or `/state` itself), the HOME defaults
 //! from the store, the links at fixed places (`/bin/sh`), the person's folders. Then it puts
-//! itself under the app's Landlock rules, the syscall denylist and MDWE, forks the app and
+//! itself under the app's Landlock rules (the forker already put on the syscall denylist and
+//! MDWE), forks the app and
 //! stays as PID 1 of its namespace: reaps, passes signals on, ends with the app's status.
 //!
 //! Everything it does is said by the app's run file (`services.drv.mkApp` writes it): an
@@ -72,12 +73,6 @@ struct Run {
     /// Links at fixed places (absolute paths in the root) to targets in the store.
     #[serde(default)]
     links: BTreeMap<String, String>,
-    /// The app makes code at runtime (a JIT): no MDWE for it.
-    #[serde(default)]
-    jit: bool,
-    /// The app may make user namespaces (a browser's own sandbox).
-    #[serde(default)]
-    userns: bool,
     /// The app runs nix: the whole store readable, the daemon's socket where nix looks.
     #[serde(default)]
     nix: bool,
@@ -232,8 +227,8 @@ fn run(name: &str, args: Run) -> Result<Infallible, String> {
     for folder in &folders {
         link(&Path::new(FILES).join(folder), &home.join(folder))?;
     }
-    // 5. The rules, on this process and so on the app: what it may open, which syscalls it
-    // may not make, no writable and executable memory. no_new_privs is the forker's doing.
+    // 5. The rules, on this process and so on the app: what it may open. The syscall
+    // denylist, MDWE and no_new_privs are already on, the forker's doing.
     restrict(&args, persist, !folders.is_empty())?;
     let spawn = move || -> Result<libc::pid_t, String> {
         // SAFETY: single-threaded; the child only execs or exits.
@@ -260,7 +255,7 @@ fn run(name: &str, args: Run) -> Result<Infallible, String> {
 
 /// The app's Landlock domain (read and execute on its closure, or on the whole store with
 /// `nix`; the views and the doors read-only, the documents and its own directories
-/// writable; nothing else exists), the syscall denylist, MDWE.
+/// writable; nothing else exists).
 fn restrict(args: &Run, persist: bool, folders: bool) -> Result<(), String> {
     let rules = Ruleset::new().map_err(|e| format!("landlock: {e}"))?;
     let all = rules.all();
@@ -307,10 +302,6 @@ fn restrict(args: &Run, persist: bool, folders: bool) -> Result<(), String> {
     rules
         .restrict_self()
         .map_err(|e| format!("landlock: {e}"))?;
-    drv_os::seccomp::refuse_app_doors(args.userns).map_err(|e| e.to_string())?;
-    if !args.jit {
-        drv_os::creds::refuse_exec_gain()?;
-    }
     Ok(())
 }
 

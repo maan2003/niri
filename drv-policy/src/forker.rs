@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::seq;
 
 /// An app, as far as the forker is concerned: the UID, the mounts that depend on the
-/// manifest (the render node, the nix daemon's socket, the host's network) and the command.
-/// Everything the app does to its own root once it is the app (its `/etc`, HOME, the links,
-/// the Landlock rules, the syscall filter) is drv-init's, from the command line the system
-/// configuration gave it. No paths here: the forker has its own.
+/// manifest (the render node, the nix daemon's socket, the host's network), the two doors
+/// the forker closes or not (user namespaces, writable-and-executable memory) and the
+/// command. Everything the app does to its own root once it is the app (its `/etc`, HOME,
+/// the links, the Landlock rules) is drv-init's, from the run file. No paths here: the
+/// forker has its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
     pub uid: u32,
@@ -36,6 +37,13 @@ pub struct Launch {
     /// idmapped bind at `/files/<name>` in the root: the app's own inside, drv-files' on disk.
     #[serde(default)]
     pub folders: Vec<String>,
+    /// The app makes code at runtime (a browser's JIT): no MDWE for it.
+    #[serde(default)]
+    pub jit: bool,
+    /// The app may make user namespaces (a browser's own sandbox); every other app is
+    /// refused them by the syscall filter.
+    #[serde(default)]
+    pub userns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
