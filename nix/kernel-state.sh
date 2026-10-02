@@ -42,6 +42,8 @@ awk -v uid="$uid" '
     printf "mount %s %s %s root=%s %s\n", mp, opts, fstype, root, sup }
 ' /proc/$p/mountinfo | sort -k2,2
 grep -E "^(Uid|Gid|Groups|Cap[A-Za-z]*|NoNewPrivs|Seccomp):" /proc/$p/status | sed "s/$uid/UID/g; s/[[:space:]]\+/ /g; s/ $//"
+# The SELinux context (nix/selinux.nix): the forker puts an app in drv_app_t.
+echo "label $(tr -d '\0' < /proc/$p/attr/current)"
 for n in mnt net pid user uts ipc cgroup time; do
   if [ "$(readlink /proc/$p/ns/$n)" = "$(readlink /proc/1/ns/$n)" ]; then echo "ns $n host"; else echo "ns $n own"; fi
 done

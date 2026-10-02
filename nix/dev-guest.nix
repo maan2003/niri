@@ -382,7 +382,16 @@ in
     };
   };
 
+  # SELinux, as a spike: the kernel built with it (every nixpkgs kernel is; `lsm=` picks it),
+  # systemd loading the policy of nix/selinux.nix at boot, enforcing, the tools to look.
+  security.lsm = [ "selinux" ];
+  systemd.package = pkgs.systemd.override { withSelinux = true; };
+  environment.etc."selinux/config".text = "SELINUX=enforcing\nSELINUXTYPE=drv\n";
+  environment.etc."selinux/drv".source = import ./selinux.nix { inherit pkgs kernel; };
+
   environment.systemPackages = [
+    pkgs.policycoreutils
+    (lib.getBin pkgs.libselinux)
     pkgs.wayland-utils
     pkgs.weston
     pkgs.foot
