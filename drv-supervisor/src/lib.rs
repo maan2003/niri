@@ -285,6 +285,13 @@ pub fn start_service(
                     &groups,
                     s.caps,
                 )?;
+                // Under SELinux (the module's selinux.nix), the exec lands in the member's
+                // own domain, named after it: drv-files is drv_files_t, compositor-gpu
+                // drv_compositor_gpu_t; the whole range, as the system's.
+                drv_os::creds::exec_in_domain(&format!(
+                    "u:r:drv_{}_t:s0-s0:c0.c1023",
+                    s.name.trim_start_matches("drv-").replace('-', "_")
+                ))?;
                 rustix::thread::set_no_new_privs(true).map_err(|e| format!("no_new_privs: {e}"))
             };
             child().map_err(|e| {

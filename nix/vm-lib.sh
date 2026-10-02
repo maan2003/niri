@@ -56,7 +56,9 @@ expect_soon() {
 file_has() {
   local name=$1 path=$2 pat=$3 out content
   for _ in $(seq 1 30); do
-    content=$($SSH "cat '$path' 2>/dev/null")
+    # Under SELinux root reads nothing of the person's tree: read as drv-files' domain
+    # (a no-op where there is no SELinux).
+    content=$($SSH "echo -n u:r:drv_files_t:s0-s0:c0.c1023 > /proc/thread-self/attr/exec 2>/dev/null; cat '$path' 2>/dev/null")
     out=$(grep -E -- "$pat" <<<"$content" | head -2)
     [ -n "$out" ] && break
     sleep 1

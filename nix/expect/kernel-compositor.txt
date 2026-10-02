@@ -36,7 +36,7 @@ CapBnd: 0000000000000000
 CapAmb: 0000000000000000
 NoNewPrivs: 1
 Seccomp: 2
-label u:r:base_t:s0-s0:c0.c1023
+label u:r:drv_compositor_t:s0-s0:c0.c1023
 ns mnt own
 ns net own
 ns pid host
