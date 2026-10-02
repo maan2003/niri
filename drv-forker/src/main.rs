@@ -382,8 +382,13 @@ impl Forker {
         // the command is, making the rest of the root and taking the Landlock rules) is
         // already under them.
         drv_os::seccomp::refuse_app_doors(launch.userns).map_err(|e| e.to_string())?;
-        // Under SELinux (the spike of nix/selinux.nix), the exec lands in the app domain.
-        drv_os::creds::exec_in_domain("user_u:base_r:drv_app_t")?;
+        // Under SELinux (the module's selinux.nix), the exec lands in the app domain with the
+        // app's two categories, from its uid as Android does it: no other app's dominate them.
+        drv_os::creds::exec_in_domain(&format!(
+            "u:r:drv_app_t:s0:c{},c{}",
+            uid % 256,
+            256 + (uid / 256) % 256
+        ))?;
         if !launch.jit {
             drv_os::creds::refuse_exec_gain()?;
         }

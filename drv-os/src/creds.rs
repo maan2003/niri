@@ -120,7 +120,7 @@ pub fn refuse_exec_gain() -> Result<(), String> {
 /// The SELinux domain the exec lands in, when the kernel runs SELinux: this thread's own
 /// label reads as a context then (`user:role:type`); under another LSM, or none, it does
 /// not, and nothing is asked. Written to this thread's `attr/exec`, as libselinux's
-/// setexeccon does. A spike: the context is the forker's constant for now.
+/// setexeccon does.
 pub fn exec_in_domain(context: &str) -> Result<bool, String> {
     let current = std::fs::read_to_string("/proc/thread-self/attr/current").unwrap_or_default();
     if current.trim_end_matches('\0').split(':').count() < 3 {

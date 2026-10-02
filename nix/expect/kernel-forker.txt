@@ -38,7 +38,7 @@ CapBnd: 00000000002001c4
 CapAmb: 00000000002001c4
 NoNewPrivs: 1
 Seccomp: 0
-label user_u:base_r:base_t
+label u:r:base_t:s0-s0:c0.c1023
 ns mnt own
 ns net host
 ns pid host

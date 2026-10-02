@@ -19,7 +19,7 @@ CapBnd: 0000000000000000
 CapAmb: 0000000000000000
 NoNewPrivs: 1
 Seccomp: 2
-label user_u:base_r:drv_app_t
+label u:r:drv_app_t:s0:cA,cB
 ns mnt own
 ns net own
 ns pid own
