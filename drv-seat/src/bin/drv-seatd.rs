@@ -8,7 +8,9 @@
 //! devices and drives the VT), so the seal goes on before that fork and the child inherits
 //! it. What stays: opening existing device nodes and ttys (never creating files), DRM, evdev
 //! and VT ioctls, reading udev's database. The parent loses fork and netlink again once the
-//! seat and udev are up.
+//! seat and udev are up. It also holds logind's sleep delay (the system bus is a socket it
+//! connects before the seal): the compositor hears of the sleep in time to lock, and of the
+//! wake in time to draw.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -18,6 +20,7 @@ use std::process::ExitCode;
 use std::rc::Rc;
 
 use clap::Parser;
+use drv_seat::login1::Login1;
 use drv_seat::{Device, DeviceKind, Event, Request, Response, VERSION};
 use libseat::{Seat, SeatEvent};
 use rustix::event::{PollFd, PollFlags};
@@ -171,6 +174,10 @@ struct Daemon {
     events: Rc<RefCell<VecDeque<SeatEvent>>>,
     active: bool,
     devices: Devices,
+    /// logind, when the system bus is in our `/run`.
+    login1: Option<Login1>,
+    /// The sleep delay we hold: dropped when the compositor is ready, taken again on wake.
+    inhibitor: Option<OwnedFd>,
 }
 
 impl Daemon {
@@ -183,14 +190,65 @@ impl Daemon {
             .map_err(|err| format!("dispatching the seat: {err:?}"))?;
         let devices = Devices::new(seat.name())
             .map_err(|err| format!("listing the seat's devices: {err}"))?;
+        let mut login1 = match Login1::connect() {
+            Ok(login1) => Some(login1),
+            Err(err) => {
+                drv_os::say!("drv-seatd: no logind ({err}); sleep goes unannounced");
+                None
+            }
+        };
+        let inhibitor = login1.as_mut().and_then(|l| match l.inhibit() {
+            Ok(fd) => Some(fd),
+            Err(err) => {
+                drv_os::say!("drv-seatd: logind's sleep delay: {err}");
+                None
+            }
+        });
         let mut daemon = Daemon {
             seat,
             events,
             active: false,
             devices,
+            login1,
+            inhibitor,
         };
         daemon.drain(None);
         Ok(daemon)
+    }
+
+    /// logind spoke: `PrepareForSleep(true)` goes to the client as `Sleep` (the delay we hold
+    /// keeps the system up until it answers `ReadyToSleep`; with no client, nothing to wait
+    /// for); `false` takes the next delay and tells the client `Wake`.
+    fn on_login1(&mut self, client: Option<&OwnedFd>) {
+        let Some(login1) = self.login1.as_mut() else {
+            return;
+        };
+        if let Err(err) = login1.pump() {
+            drv_os::say!("drv-seatd: logind: {err}; sleep goes unannounced from now");
+            self.login1 = None;
+            self.inhibitor = None;
+            return;
+        }
+        for start in login1.sleep_events() {
+            let msg = if start {
+                if client.is_none() {
+                    self.inhibitor = None;
+                }
+                Event::Sleep
+            } else {
+                match login1.inhibit() {
+                    Ok(fd) => self.inhibitor = Some(fd),
+                    Err(err) => drv_os::say!("drv-seatd: logind's sleep delay: {err}"),
+                }
+                Event::Wake
+            };
+            drv_os::say!("drv-seatd: {msg:?}");
+            if let Some(client) = client {
+                if let Err(err) = drv_seat::send(client, &msg, &[]) {
+                    drv_os::say!("drv-seatd: sending {msg:?}: {err}");
+                }
+            }
+        }
     }
 
     /// Applies queued seat events, telling the client if there is one.
@@ -254,23 +312,26 @@ impl Daemon {
                 Ok(fd) => fd.try_clone_to_owned()?,
                 Err(err) => break Err(io::Error::other(format!("seat fd: {err:?}"))),
             };
-            let mut fds = [
+            let mut fds = vec![
                 PollFd::new(&control, PollFlags::IN),
                 PollFd::new(&seat_fd, PollFlags::IN),
                 PollFd::new(&self.devices.monitor, PollFlags::IN),
             ];
+            if let Some(login1) = &self.login1 {
+                fds.push(PollFd::from_borrowed_fd(login1.fd(), PollFlags::IN));
+            }
             rustix::event::poll(&mut fds, None)?;
-            let (control_ready, seat_ready, udev_ready) = (
-                !fds[0].revents().is_empty(),
-                !fds[1].revents().is_empty(),
-                !fds[2].revents().is_empty(),
-            );
+            let ready: Vec<bool> = fds.iter().map(|fd| !fd.revents().is_empty()).collect();
             drop(fds);
+            let (control_ready, seat_ready, udev_ready) = (ready[0], ready[1], ready[2]);
             if seat_ready {
                 self.dispatch(Some(&events));
             }
             if udev_ready {
                 self.devices.dispatch(Some(&events));
+            }
+            if ready.get(3) == Some(&true) {
+                self.on_login1(Some(&events));
             }
             if !control_ready {
                 continue;
@@ -308,6 +369,10 @@ impl Daemon {
                     Ok(()) => (Response::Done, None),
                     Err(err) => (Response::Error(format!("switch to vt {vt}: {err:?}")), None),
                 },
+                Request::ReadyToSleep => {
+                    self.inhibitor = None;
+                    (Response::Done, None)
+                }
                 Request::Hello { .. } => (Response::Error("already said hello".into()), None),
             };
             let fds: Vec<_> = fd.iter().map(|fd| fd.as_fd()).collect();
@@ -368,8 +433,10 @@ fn lockdown(opening: bool) -> io::Result<()> {
         allow.ioctl_type(ty)?;
     }
     if opening {
-        // libseat forks its server with a socketpair to it; udev binds its netlink socket.
+        // libseat forks its server with a socketpair to it; udev binds its netlink socket; the
+        // system bus is connected (what follows on it is sendmsg and recvmsg, kept).
         allow.allow(&[libc::SYS_clone, libc::SYS_wait4, libc::SYS_socketpair, libc::SYS_bind]);
+        allow.connect_unix()?;
         #[cfg(target_arch = "x86_64")]
         allow.allow(&[libc::SYS_fork]);
         allow.socket(libc::AF_NETLINK)?;

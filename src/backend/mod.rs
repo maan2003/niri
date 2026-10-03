@@ -210,14 +210,6 @@ impl Backend {
         }
     }
 
-    /// Render and commit every output's next frame in full, damaged or not.
-    pub fn redraw_all(&mut self, niri: &mut Niri) {
-        match self {
-            Backend::Tty(tty) => tty.redraw_all(niri),
-            Backend::Headless(_) => (),
-        }
-    }
-
     pub fn tty_checked(&mut self) -> Option<&mut Tty> {
         if let Self::Tty(v) = self {
             Some(v)

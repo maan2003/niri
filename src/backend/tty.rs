@@ -463,6 +463,20 @@ impl Tty {
                 }
                 self.device_changed(dev as dev_t, niri, false)
             }
+            // Locked before the sleep rather than on the first check after it: the clock skew
+            // check_lease watches needs more than 2 s asleep, and the lease outlives a short
+            // sleep. The ack goes before the lock frame is on screen; the kernel's blank on
+            // resume (drm_kms_helper.blank_on_resume) is what keeps the old frame off the
+            // panel, this is what makes the first one the lock's.
+            SeatEvent::Sleep => {
+                debug!("going to sleep: locking");
+                niri.lock_now();
+                niri.queue_redraw_all();
+                if let Err(err) = self.session.ready_to_sleep() {
+                    warn!("error telling the seat daemon we are ready to sleep: {err}");
+                }
+            }
+            SeatEvent::Wake => self.redraw_all(niri),
             SeatEvent::Removed { dev } => {
                 let dev = dev as dev_t;
                 if let Some(device) = self.input_devices.remove(&dev) {
@@ -1960,8 +1974,9 @@ impl Tty {
         false
     }
 
-    /// Render and commit every output's next frame in full: what is on screen is not the scene
-    /// (black after the kernel's blank on resume), and an undamaged scene is never committed.
+    /// Back from sleep: the kernel resumed with every plane off (drm_kms_helper.blank_on_resume)
+    /// and nothing has damaged the scene since, so the first frame is forced rather than waited
+    /// for until the next input; every output's next frame is rendered and committed in full.
     pub fn redraw_all(&mut self, niri: &mut Niri) {
         if !self.session.is_active() {
             return;

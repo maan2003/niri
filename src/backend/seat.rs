@@ -98,6 +98,11 @@ impl DrvSeatSession {
         Ok(drv_seat::recv(&self.inner.control)?)
     }
 
+    /// The session is locked; the seat daemon lets the sleep go ahead.
+    pub fn ready_to_sleep(&self) -> Result<(), Error> {
+        self.expect_done(&Request::ReadyToSleep)
+    }
+
     fn expect_done(&self, request: &Request) -> Result<(), Error> {
         match self.call(request)? {
             (Response::Done, _) => Ok(()),

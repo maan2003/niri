@@ -3,12 +3,16 @@
 //! spawner, requests in lock step, a reply may carry one fd. The daemon also owns udev: `Hello`
 //! answers with the seat's current devices, and hotplug plus session enable/disable arrive on
 //! a second socket handed over with `Hello`, so they never interleave with replies. Only an
-//! announced device can be opened.
+//! announced device can be opened. The daemon also holds logind's sleep delay: `Event::Sleep`
+//! says the system is about to sleep and waits for `Request::ReadyToSleep` (the compositor
+//! has locked); `Event::Wake` follows the resume.
+
+pub mod login1;
 
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change; the daemon answers `Hello` with its own version.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
@@ -18,6 +22,8 @@ pub enum Request {
     /// Close a device opened here. The client drops its own fd itself.
     Close { id: u32 },
     SwitchVt { vt: i32 },
+    /// The session is locked: the daemon lets the sleep go ahead (answers `Done`).
+    ReadyToSleep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +53,12 @@ pub enum Event {
     /// A DRM device's connectors changed.
     Changed { dev: u64 },
     Removed { dev: u64 },
+    /// logind's `PrepareForSleep(true)`: the sleep waits (up to its delay limit) for
+    /// `Request::ReadyToSleep`.
+    Sleep,
+    /// logind's `PrepareForSleep(false)`: back from sleep; the outputs show whatever the kernel
+    /// left (black with blank-on-resume) until the next commit.
+    Wake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
