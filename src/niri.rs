@@ -891,6 +891,20 @@ impl State {
 
         debug!("laptop lid {}", if is_closed { "closed" } else { "opened" });
         self.niri.is_lid_closed = is_closed;
+        // The lid is the sleep switch of a laptop on its own (logind suspends on it), and the
+        // set has no logind to hear the sleep itself from. Closing it with the panel the only
+        // output locks before the sleep: a lease on CLOCK_BOOTTIME outlives a short one, and
+        // the clock skew check_lease watches does not show under s2idle (Apple silicon keeps
+        // CLOCK_MONOTONIC running). Opening it is the wake: the kernel resumed with every plane
+        // off (drm_kms_helper.blank_on_resume) and nothing has damaged the scene since, so the
+        // first frame is forced rather than waited for until the next input.
+        if is_closed {
+            if self.niri.global_space.outputs().count() <= 1 {
+                self.niri.lock_now();
+            }
+        } else {
+            self.backend.redraw_all(&mut self.niri);
+        }
         self.backend.on_output_config_changed(&mut self.niri);
     }
 

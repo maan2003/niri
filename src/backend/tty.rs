@@ -1960,6 +1960,19 @@ impl Tty {
         false
     }
 
+    /// Render and commit every output's next frame in full: what is on screen is not the scene
+    /// (black after the kernel's blank on resume), and an undamaged scene is never committed.
+    pub fn redraw_all(&mut self, niri: &mut Niri) {
+        if !self.session.is_active() {
+            return;
+        }
+        debug!("redrawing every output in full");
+        if let Err(err) = self.request_ack(Request::RedrawAll) {
+            warn!("error requesting a full redraw: {err:?}");
+        }
+        niri.queue_redraw_all();
+    }
+
     pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
         let _span = tracy_client::span!("Tty::on_output_config_changed");
 

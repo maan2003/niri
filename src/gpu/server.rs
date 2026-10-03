@@ -480,6 +480,10 @@ impl Server {
                 drm.cleanup(dev, &off)?;
                 Event::Ack
             }
+            Request::RedrawAll => {
+                drm.redraw_all();
+                Event::Ack
+            }
             Request::EnableOutput {
                 output,
                 connector,

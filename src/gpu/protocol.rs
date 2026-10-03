@@ -612,6 +612,9 @@ pub enum Request {
         dev: DevId,
         off: Vec<u32>,
     },
+    /// Draw and commit every output's next frame in full: the kernel put something else on
+    /// screen meanwhile (black after resume), and an undamaged scene would never be committed.
+    RedrawAll,
     /// Reply: `OutputState`.
     EnableOutput {
         output: OutputRef,

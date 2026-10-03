@@ -298,6 +298,15 @@ impl DrmState {
         }
     }
 
+    /// Every surface's next frame is rendered and committed in full.
+    pub fn redraw_all(&mut self) {
+        for device in self.devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                surface.compositor.reset_buffers();
+            }
+        }
+    }
+
     fn device(&mut self, dev: DevId) -> anyhow::Result<&mut Device> {
         self.devices.get_mut(&dev).context("unknown device")
     }
