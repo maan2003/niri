@@ -1,4 +1,4 @@
-//! Blur options; the blur itself runs in the GPU process (see `gpu::gl::blur`).
+//! Blur options; the blur itself runs in the GPU process (see `gpu::vello::effects`).
 
 use crate::gpu::protocol::BlurParams;
 

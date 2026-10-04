@@ -172,7 +172,7 @@ use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
-    render_to_texture, shaders, RenderCtx, RenderTarget,
+    render_to_texture, RenderCtx, RenderTarget,
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
@@ -605,11 +605,19 @@ pub struct PopupGrabState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyboardFocus {
     // Layout is focused by default if there's nothing else to focus.
-    Layout { surface: Option<WlSurface> },
-    LayerShell { surface: WlSurface },
-    LockScreen { surface: Option<WlSurface> },
+    Layout {
+        surface: Option<WlSurface>,
+    },
+    LayerShell {
+        surface: WlSurface,
+    },
+    LockScreen {
+        surface: Option<WlSurface>,
+    },
     /// The host workspace's terminal, shown over the layout.
-    Host { surface: WlSurface },
+    Host {
+        surface: WlSurface,
+    },
     ScreenshotUi,
     ExitConfirmDialog,
     Overview,
@@ -1680,7 +1688,6 @@ impl State {
         let mut preserved_output_config = None;
         let mut window_rules_changed = false;
         let mut layer_rules_changed = false;
-        let mut shaders_changed = false;
         let mut cursor_inactivity_timeout_changed = false;
         let mut recent_windows_changed = false;
         let mut old_config = self.niri.config.borrow_mut();
@@ -1755,36 +1762,6 @@ impl State {
 
         if config.layer_rules != old_config.layer_rules {
             layer_rules_changed = true;
-        }
-
-        if config.animations.window_resize.custom_shader
-            != old_config.animations.window_resize.custom_shader
-        {
-            let src = config.animations.window_resize.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_resize_program(renderer, src);
-            });
-            shaders_changed = true;
-        }
-
-        if config.animations.window_close.custom_shader
-            != old_config.animations.window_close.custom_shader
-        {
-            let src = config.animations.window_close.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_close_program(renderer, src);
-            });
-            shaders_changed = true;
-        }
-
-        if config.animations.window_open.custom_shader
-            != old_config.animations.window_open.custom_shader
-        {
-            let src = config.animations.window_open.custom_shader.as_deref();
-            self.backend.with_primary_renderer(|renderer| {
-                shaders::set_custom_open_program(renderer, src);
-            });
-            shaders_changed = true;
         }
 
         if config.cursor.hide_after_inactive_ms != old_config.cursor.hide_after_inactive_ms {
@@ -1871,10 +1848,6 @@ impl State {
 
         if layer_rules_changed {
             self.niri.recompute_layer_rules();
-        }
-
-        if shaders_changed {
-            self.niri.update_shaders();
         }
 
         if cursor_inactivity_timeout_changed {
@@ -2909,16 +2882,16 @@ impl Niri {
                     }),
             })
             .flatten()
-            .and_then(|(path, listener)| match listener
-                .and_then(|listener| serve_apps_listener(&event_loop, listener))
-            {
-                Ok(()) => {
-                    info!("listening on apps Wayland socket: {}", path.display());
-                    Some(path)
-                }
-                Err(err) => {
-                    warn!("error creating apps socket {}: {err:?}", path.display());
-                    None
+            .and_then(|(path, listener)| {
+                match listener.and_then(|listener| serve_apps_listener(&event_loop, listener)) {
+                    Ok(()) => {
+                        info!("listening on apps Wayland socket: {}", path.display());
+                        Some(path)
+                    }
+                    Err(err) => {
+                        warn!("error creating apps socket {}: {err:?}", path.display());
+                        None
+                    }
                 }
             });
 
@@ -4740,11 +4713,11 @@ impl Niri {
         }
     }
 
-    pub fn update_shaders(&mut self) {
-        self.layout.update_shaders();
+    pub fn update_paints(&mut self) {
+        self.layout.update_paints();
 
         for mapped in self.mapped_layer_surfaces.values_mut() {
-            mapped.update_shaders();
+            mapped.update_paints();
         }
     }
 
@@ -4992,7 +4965,7 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
             mon.render_workspaces(ctx.r(), focus_ring, &mut |elem| push(elem.into()));
 
@@ -5015,7 +4988,7 @@ impl Niri {
             self.layout
                 .render_interactive_move_for_output(ctx.r(), output, &mut |elem| push(elem.into()));
 
-            mon.render_insert_hint_between_workspaces(ctx.renderer, &mut |elem| push(elem.into()));
+            mon.render_insert_hint_between_workspaces(&mut |elem| push(elem.into()));
 
             // Macro instead of closure to avoid borrowing push().
             macro_rules! process {
@@ -5055,7 +5028,7 @@ impl Niri {
             }
         }
 
-        mon.render_workspace_shadows(ctx.renderer, &mut |elem| push(elem.into()));
+        mon.render_workspace_shadows(&mut |elem| push(elem.into()));
 
         // Then the backdrop.
         push_popups_from_layer!(Layer::Background, true);
@@ -7044,9 +7017,7 @@ impl Niri {
                         }
                         Ok(PostAction::Continue)
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        Ok(PostAction::Continue)
-                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(PostAction::Continue),
                     Err(err) => {
                         warn!("drv-cast connection lost: {err}");
                         state.niri.portal = None;

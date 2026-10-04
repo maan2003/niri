@@ -366,9 +366,9 @@ impl<W: LayoutElement> ScrollingSpace<W> {
         }
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         for col in &mut self.columns {
-            col.update_shaders();
+            col.update_paints();
         }
     }
 
@@ -2979,8 +2979,7 @@ impl<W: LayoutElement> ScrollingSpace<W> {
             // Draw the tab indicator on top.
             {
                 let pos = col_pos.to_physical_precise_round(scale).to_logical(scale);
-                col.tab_indicator
-                    .render(ctx.renderer, pos, &mut |elem| push(elem.into()));
+                col.tab_indicator.render(pos, &mut |elem| push(elem.into()));
             }
 
             for (tile, tile_off, visible) in col.tiles_in_render_order() {
@@ -4111,12 +4110,12 @@ impl<W: LayoutElement> Column<W> {
         }
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         for tile in &mut self.tiles {
-            tile.update_shaders();
+            tile.update_paints();
         }
 
-        self.tab_indicator.update_shaders();
+        self.tab_indicator.update_paints();
     }
 
     pub fn advance_animations(&mut self) {

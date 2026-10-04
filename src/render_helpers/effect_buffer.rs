@@ -1,7 +1,7 @@
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{bail, Context as _};
+use anyhow::Context as _;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::{Id, RenderElementStates};
@@ -14,7 +14,6 @@ use smithay::utils::{Buffer, Logical, Physical, Scale, Size, Transform};
 use crate::gpu::remote::{RemoteFrame, RemoteRenderer, RemoteTexture};
 use crate::niri::OutputRenderElements;
 use crate::render_helpers::blur::BlurOptions;
-use crate::render_helpers::shaders::Shaders;
 
 /// Keys for the GPU process's per-buffer blur pyramid cache.
 static NEXT_BLUR_KEY: AtomicU64 = AtomicU64::new(1);
@@ -144,16 +143,11 @@ impl EffectBuffer {
         elements
     }
 
-    pub fn prepare(&mut self, renderer: &mut RemoteRenderer, blur: bool) -> bool {
+    pub fn prepare(&mut self, renderer: &mut RemoteRenderer) -> bool {
         if let Err(err) = self.prepare_offscreen(renderer) {
             warn!("error preparing offscreen: {err:?}");
             return false;
         };
-
-        if blur && !Shaders::from_renderer(renderer).blur {
-            warn!("error preparing blur: blur shader unavailable");
-            return false;
-        }
 
         true
     }
@@ -280,9 +274,6 @@ impl EffectBuffer {
             texture.clone()
         } else {
             let renderer = frame.renderer();
-            if !Shaders::from_renderer(renderer).blur {
-                bail!("blur shader unavailable");
-            }
             let blurred =
                 renderer.blur_texture(self.blur_key, &offscreen.texture, self.blur_options.into());
             offscreen.blurred.insert(blurred).clone()

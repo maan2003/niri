@@ -7,6 +7,6 @@ fn smoke_in_separate_process() {
     // The process seals itself before answering, so everything below runs under the seccomp
     // allowlist, like the real compositor.
     let client = GpuClient::spawn_process(exe, Mode::Headless, &[], None)
-        .expect("spawning gpu process (needs EGL, e.g. llvmpipe)");
+        .expect("spawning gpu process (needs Vulkan, e.g. Lavapipe)");
     run_smoke(client).unwrap();
 }

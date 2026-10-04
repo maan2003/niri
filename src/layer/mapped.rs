@@ -103,8 +103,8 @@ impl MappedLayer {
         self.blur_config = config.blur;
     }
 
-    pub fn update_shaders(&mut self) {
-        self.shadow.update_shaders();
+    pub fn update_paints(&mut self) {
+        self.shadow.update_paints();
     }
 
     pub fn update_sizes(&mut self, view_size: Size<f64, Logical>, scale: f64) {
@@ -230,8 +230,7 @@ impl MappedLayer {
         }
 
         let location = location.to_physical_precise_round(scale).to_logical(scale);
-        self.shadow
-            .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+        self.shadow.render(location, &mut |elem| push(elem.into()));
 
         let geometry = Rectangle::new(location, self.block_out_buffer.size());
         let surface_off = Point::new(0., 0.); // No geometry on layer surfaces.

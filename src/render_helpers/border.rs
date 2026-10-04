@@ -1,20 +1,14 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use glam::{Mat3, Vec2};
 use niri_config::{
     Color, CornerRadius, GradientColorSpace, GradientInterpolation, HueInterpolation,
 };
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use super::renderer::NiriRenderer;
-use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::paint_element::PaintRenderElement;
+use crate::gpu::protocol::{BorderParams, GradientHue, GradientSpace, Paint, RoundedGeometry};
 use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 
 /// Renders a wide variety of borders and border parts.
@@ -25,7 +19,7 @@ use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 /// * as a background rectangle and as parts of a border line.
 #[derive(Debug, Clone)]
 pub struct BorderRenderElement {
-    inner: ShaderRenderElement,
+    inner: PaintRenderElement,
     params: Parameters,
 }
 
@@ -40,8 +34,6 @@ struct Parameters {
     geometry: Rectangle<f64, Logical>,
     border_width: f32,
     corner_radius: CornerRadius,
-    // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
-    scale: f32,
     alpha: f32,
 }
 
@@ -57,10 +49,9 @@ impl BorderRenderElement {
         geometry: Rectangle<f64, Logical>,
         border_width: f32,
         corner_radius: CornerRadius,
-        scale: f32,
         alpha: f32,
     ) -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
+        let inner = PaintRenderElement::empty(Kind::Unspecified);
         let mut rv = Self {
             inner,
             params: Parameters {
@@ -73,7 +64,6 @@ impl BorderRenderElement {
                 geometry,
                 border_width,
                 corner_radius,
-                scale,
                 alpha,
             },
         };
@@ -82,7 +72,7 @@ impl BorderRenderElement {
     }
 
     pub fn empty() -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
+        let inner = PaintRenderElement::empty(Kind::Unspecified);
         Self {
             inner,
             params: Parameters {
@@ -95,7 +85,6 @@ impl BorderRenderElement {
                 geometry: Default::default(),
                 border_width: 0.,
                 corner_radius: Default::default(),
-                scale: 1.,
                 alpha: 1.,
             },
         }
@@ -117,7 +106,6 @@ impl BorderRenderElement {
         geometry: Rectangle<f64, Logical>,
         border_width: f32,
         corner_radius: CornerRadius,
-        scale: f32,
         alpha: f32,
     ) {
         let params = Parameters {
@@ -130,7 +118,6 @@ impl BorderRenderElement {
             geometry,
             border_width,
             corner_radius,
-            scale,
             alpha,
         };
         if self.params == params {
@@ -152,7 +139,6 @@ impl BorderRenderElement {
             geometry,
             border_width,
             corner_radius,
-            scale,
             alpha,
         } = self.params;
 
@@ -182,50 +168,44 @@ impl BorderRenderElement {
             Mat3::from_scale(area_size) * Mat3::from_translation(-geo_loc / area_size);
 
         let colorspace = match gradient_format.color_space {
-            GradientColorSpace::Srgb => 0.,
-            GradientColorSpace::SrgbLinear => 1.,
-            GradientColorSpace::Oklab => 2.,
-            GradientColorSpace::Oklch => 3.,
+            GradientColorSpace::Srgb => GradientSpace::Srgb,
+            GradientColorSpace::SrgbLinear => GradientSpace::LinearSrgb,
+            GradientColorSpace::Oklab => GradientSpace::Oklab,
+            GradientColorSpace::Oklch => GradientSpace::Oklch,
         };
 
         let hue_interpolation = match gradient_format.hue_interpolation {
-            HueInterpolation::Shorter => 0.,
-            HueInterpolation::Longer => 1.,
-            HueInterpolation::Increasing => 2.,
-            HueInterpolation::Decreasing => 3.,
+            HueInterpolation::Shorter => GradientHue::Shorter,
+            HueInterpolation::Longer => GradientHue::Longer,
+            HueInterpolation::Increasing => GradientHue::Increasing,
+            HueInterpolation::Decreasing => GradientHue::Decreasing,
         };
 
         self.inner.update(
             size,
             None,
-            scale,
             alpha,
-            Rc::new([
-                Uniform::new("colorspace", colorspace),
-                Uniform::new("hue_interpolation", hue_interpolation),
-                Uniform::new("color_from", color_from.to_array_unpremul()),
-                Uniform::new("color_to", color_to.to_array_unpremul()),
-                Uniform::new("grad_offset", grad_offset.to_array()),
-                Uniform::new("grad_width", w),
-                Uniform::new("grad_vec", grad_vec.to_array()),
-                mat3_uniform("input_to_geo", input_to_geo),
-                Uniform::new("geo_size", geo_size.to_array()),
-                Uniform::new("outer_radius", <[f32; 4]>::from(corner_radius)),
-                Uniform::new("border_width", border_width),
-            ]),
-            HashMap::new(),
+            Paint::Border(BorderParams {
+                geometry: RoundedGeometry {
+                    size: geo_size.to_array(),
+                    radii: corner_radius.into(),
+                    input_to_geo: input_to_geo.to_cols_array(),
+                },
+                width: border_width,
+                color_from: color_from.to_array_unpremul(),
+                color_to: color_to.to_array_unpremul(),
+                gradient_offset: grad_offset.to_array(),
+                gradient_width: w,
+                gradient_vector: grad_vec.to_array(),
+                gradient_space: colorspace,
+                gradient_hue: hue_interpolation,
+            }),
         );
     }
 
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
         self.inner = self.inner.with_location(location);
         self
-    }
-
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer)
-            .program(ProgramType::Border)
-            .is_some()
     }
 }
 
@@ -288,17 +268,15 @@ impl RenderElement<RemoteRenderer> for BorderRenderElement {
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
         let _span = tracy_client::span!("BorderRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("BorderRenderElement::draw"), |frame| {
-            RenderElement::<RemoteRenderer>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
+        RenderElement::<RemoteRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
     }
 
     fn underlying_storage(&self, renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

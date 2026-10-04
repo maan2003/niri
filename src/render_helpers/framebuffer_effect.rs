@@ -1,17 +1,15 @@
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Frame as _;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Transform};
 
+use crate::gpu::protocol::{ClipParams, PostprocessParams};
 use crate::gpu::remote::{CaptureHandle, RemoteError, RemoteFrame, RemoteRenderer};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::blur::BlurOptions;
-use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::utils::region::TransformedRegion;
 
 #[derive(Debug)]
@@ -79,11 +77,11 @@ impl FramebufferEffect {
 }
 
 impl FramebufferEffectElement {
-    fn compute_uniforms(
+    fn postprocess_params(
         &self,
         crop: Rectangle<f64, Logical>,
         transform: Transform,
-    ) -> [Uniform<'static>; 7] {
+    ) -> PostprocessParams {
         let offset = crop.loc - (self.clip_geo.loc - self.geometry.loc);
         let offset = Vec2::new(offset.x as f32, offset.y as f32);
         let crop_size = Vec2::new(crop.size.w as f32, crop.size.h as f32);
@@ -93,23 +91,25 @@ impl FramebufferEffectElement {
         let input_to_clip_geo =
             Mat3::from_scale(crop_size / clip_size) * Mat3::from_translation(offset / crop_size);
 
-        // Revert the effect of the texture transform.
+        // Captures use the inverse output transform for sampling. Cancel that sampler's
+        // actual affine matrix, including its flipped rotations.
         let transform_mat = Mat3::from_translation(Vec2::new(0.5, 0.5))
-            * transform.matrix()
+            * transform.invert().matrix()
             * Mat3::from_translation(Vec2::new(-0.5, -0.5));
-        let input_to_clip_geo = input_to_clip_geo * transform_mat;
+        let input_to_clip_geo = input_to_clip_geo * transform_mat.inverse();
 
         let clip_geo_size = (self.clip_geo.size.w as f32, self.clip_geo.size.h as f32);
 
-        [
-            Uniform::new("niri_scale", self.scale),
-            Uniform::new("geo_size", clip_geo_size),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", input_to_clip_geo),
-            Uniform::new("noise", self.noise),
-            Uniform::new("saturation", self.saturation),
-            Uniform::new("bg_color", [0f32, 0., 0., 0.]),
-        ]
+        PostprocessParams {
+            clip: ClipParams {
+                size: [clip_geo_size.0, clip_geo_size.1],
+                radii: self.corner_radius.into(),
+                input_to_geo: input_to_clip_geo.to_cols_array(),
+            },
+            noise: self.noise,
+            saturation: self.saturation,
+            background: [0.; 4],
+        }
     }
 }
 
@@ -224,18 +224,49 @@ impl RenderElement<RemoteRenderer> for FramebufferEffectElement {
             clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
         );
 
-        let has_program = Shaders::from_renderer(frame.renderer())
-            .postprocess_and_clip
-            .is_some();
-        let uniforms = has_program.then(|| {
-            let mut uniforms = self.compute_uniforms(crop, frame.transformation()).to_vec();
-            // The sampled framebuffer content is already in the output blend space.
-            uniforms.extend(FrameBlendState::uniforms_for_content(frame, true));
-            uniforms
-        });
-        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
-
-        frame.draw_captured(handle, clamped_dst, &filtered, uniforms);
+        let params = self.postprocess_params(crop, frame.transformation());
+        frame.draw_captured(handle, clamped_dst, &filtered, params);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_clip_cancels_all_texture_transforms() {
+        let elem = FramebufferEffectElement {
+            id: Id::new(),
+            commit: CommitCounter::default(),
+            geometry: Rectangle::new((10., 20.).into(), (120., 80.).into()),
+            clip_geo: Rectangle::new((17., 31.).into(), (90., 60.).into()),
+            corner_radius: CornerRadius::default(),
+            subregion: None,
+            scale: 1.,
+            blur_options: None,
+            noise: 0.,
+            saturation: 1.,
+        };
+        let crop = Rectangle::new((13., 15.).into(), (48., 24.).into());
+        // The sampler's coordinates for logical (0.2, 0.7), derived independently for
+        // each transform. Non-square geometry and unequal offsets expose axis mistakes.
+        for (transform, sampled) in [
+            (Transform::Normal, [0.2, 0.7]),
+            (Transform::_90, [0.3, 0.2]),
+            (Transform::_180, [0.8, 0.3]),
+            (Transform::_270, [0.7, 0.8]),
+            (Transform::Flipped, [0.8, 0.7]),
+            (Transform::Flipped90, [0.3, 0.8]),
+            (Transform::Flipped180, [0.2, 0.3]),
+            (Transform::Flipped270, [0.7, 0.2]),
+        ] {
+            let params = elem.postprocess_params(crop, transform);
+            let geo = Mat3::from_cols_array(&params.clip.input_to_geo)
+                * glam::vec3(sampled[0], sampled[1], 1.);
+            // (6 + 48 * 0.2) / 90, (4 + 24 * 0.7) / 60.
+            assert!((geo.x - 0.17333333).abs() < 1e-6, "{transform:?}: {geo:?}");
+            assert!((geo.y - 0.34666666).abs() < 1e-6, "{transform:?}: {geo:?}");
+        }
     }
 }

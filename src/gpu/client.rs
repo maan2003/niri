@@ -12,13 +12,13 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use super::protocol::{
     self, Caps, CastCursorMode, CursorFrameDesc, DevId, DeviceResult, DmabufDesc, Event, GpuEvent,
-    Image, Rect, Request, ShaderKind, TexId, PROTOCOL_VERSION,
+    Image, Rect, Request, TexId, PROTOCOL_VERSION,
 };
 use super::transport::Channel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Surfaceless EGL, no outputs. Tests and the headless backend.
+    /// Headless Vulkan rendering, no outputs. Tests and the headless backend.
     Headless,
     /// Waits for DRM devices from the core and scans out on them.
     Drm,
@@ -155,7 +155,9 @@ impl GpuClient {
         let (ours, theirs) = Channel::pair()?;
         let thread = std::thread::Builder::new()
             .name("gpu-server".into())
-            .spawn(move || super::server::run(theirs.into_fd(), mode, false, Vec::new(), None, false))?;
+            .spawn(move || {
+                super::server::run(theirs.into_fd(), mode, false, Vec::new(), None, false)
+            })?;
         let mut client = Self {
             chan: ours,
             child: None,
@@ -411,19 +413,6 @@ impl GpuClient {
         match self.request(&Request::ReadTexture { id, region, format }, &[])? {
             Event::Image(image) => Ok(image),
             other => Err(anyhow!("expected Image, got {other:?}")),
-        }
-    }
-
-    /// Returns whether the shader is now available.
-    pub fn set_custom_shader(
-        &mut self,
-        kind: ShaderKind,
-        src: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        let src = src.map(str::to_owned);
-        match self.request(&Request::SetCustomShader { kind, src }, &[])? {
-            Event::ShaderSet { available } => Ok(available),
-            other => Err(anyhow!("expected ShaderSet, got {other:?}")),
         }
     }
 

@@ -1,7 +1,7 @@
 # The desktop's binaries cross-built on devbox (nix/cross-drv.sh) and dropped into
 # nix/m2-prebuilt/{bin,resources} (not in git), patched for the guest's libraries the way
 # the nixos repo's niri-bin does it. The guest then never compiles niri.
-{ lib, stdenv, autoPatchelfHook, dbus, libdisplay-info_0_3, libglvnd, libinput, libxkbcommon
+{ lib, stdenv, autoPatchelfHook, dbus, libdisplay-info_0_3, vulkan-loader, libinput, libxkbcommon
 , libgbm, cairo, glib, pango, pipewire, pixman, seatd, systemd, wayland, fuse3 }:
 stdenv.mkDerivation {
   pname = "drv-prebuilt";
@@ -9,7 +9,7 @@ stdenv.mkDerivation {
   src = ./m2-prebuilt;
   dontStrip = true;
   nativeBuildInputs = [ autoPatchelfHook ];
-  buildInputs = [ (lib.getLib stdenv.cc.cc) dbus libdisplay-info_0_3 libglvnd libinput libxkbcommon
+  buildInputs = [ (lib.getLib stdenv.cc.cc) dbus libdisplay-info_0_3 vulkan-loader libinput libxkbcommon
     libgbm cairo glib pango pipewire pixman seatd systemd wayland fuse3 ];
   installPhase = ''
     runHook preInstall

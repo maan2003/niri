@@ -442,10 +442,10 @@ impl<W: LayoutElement> Workspace<W> {
         self.update_config(self.base_options.clone());
     }
 
-    pub fn update_shaders(&mut self) {
-        self.scrolling.update_shaders();
-        self.floating.update_shaders();
-        self.shadow.update_shaders();
+    pub fn update_paints(&mut self) {
+        self.scrolling.update_paints();
+        self.floating.update_paints();
+        self.shadow.update_paints();
     }
 
     pub fn windows(&self) -> impl Iterator<Item = &W> + '_ {
@@ -1694,12 +1694,8 @@ impl<W: LayoutElement> Workspace<W> {
         );
     }
 
-    pub fn render_shadow<R: NiriRenderer>(
-        &self,
-        renderer: &mut R,
-        push: &mut dyn FnMut(ShadowRenderElement),
-    ) {
-        self.shadow.render(renderer, Point::from((0., 0.)), push);
+    pub fn render_shadow(&self, push: &mut dyn FnMut(ShadowRenderElement)) {
+        self.shadow.render(Point::from((0., 0.)), push);
     }
 
     pub fn render_background(&self) -> SolidColorRenderElement {

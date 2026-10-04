@@ -3,6 +3,10 @@
 Niri has several animations which you can configure in the same way.
 Additionally, you can disable or slow down all animations at once.
 
+Animations use built-in rendering. The former `custom-shader` option (inline GLSL or a path)
+has been removed; remove it from existing configurations. Duration, easing curves, springs,
+and per-animation `off` settings are unchanged.
+
 Here's a quick glance at the available animations with their default values.
 
 ```kdl
@@ -179,49 +183,6 @@ animations {
 }
 ```
 
-##### `custom-shader`
-
-<sup>Since: 0.1.6</sup>
-
-You can write a custom shader for drawing the window during an open animation.
-
-See [this example shader](./examples/open_custom_shader.frag) for a full documentation with several animations to experiment with.
-
-If a custom shader fails to compile, niri will print a warning and fall back to the default, or previous successfully compiled shader.
-When running niri as a systemd service, you can see the warnings in the journal: `journalctl -ef /usr/bin/niri`
-
-> [!WARNING]
->
-> Custom shaders do not have a backwards compatibility guarantee.
-> I may need to change their interface as I'm developing new features.
-
-Example: open will fill the current geometry with a solid gradient that gradually fades in.
-
-```kdl
-animations {
-    window-open {
-        duration-ms 250
-        curve "linear"
-
-        custom-shader r"
-            vec4 open_color(vec3 coords_geo, vec3 size_geo) {
-                vec4 color = vec4(0.0);
-
-                if (0.0 <= coords_geo.x && coords_geo.x <= 1.0
-                        && 0.0 <= coords_geo.y && coords_geo.y <= 1.0)
-                {
-                    vec4 from = vec4(1.0, 0.0, 0.0, 1.0);
-                    vec4 to = vec4(0.0, 1.0, 0.0, 1.0);
-                    color = mix(from, to, coords_geo.y);
-                }
-
-                return color * niri_clamped_progress;
-            }
-        "
-    }
-}
-```
-
 #### `window-close`
 
 <sup>Since: 0.1.5</sup>
@@ -235,46 +196,6 @@ animations {
     window-close {
         duration-ms 150
         curve "ease-out-quad"
-    }
-}
-```
-
-##### `custom-shader`
-
-<sup>Since: 0.1.6</sup>
-
-You can write a custom shader for drawing the window during a close animation.
-
-See [this example shader](./examples/close_custom_shader.frag) for a full documentation with several animations to experiment with.
-
-If a custom shader fails to compile, niri will print a warning and fall back to the default, or previous successfully compiled shader.
-When running niri as a systemd service, you can see the warnings in the journal: `journalctl -ef /usr/bin/niri`
-
-> [!WARNING]
->
-> Custom shaders do not have a backwards compatibility guarantee.
-> I may need to change their interface as I'm developing new features.
-
-Example: close will fill the current geometry with a solid gradient that gradually fades away.
-
-```kdl
-animations {
-    window-close {
-        custom-shader r"
-            vec4 close_color(vec3 coords_geo, vec3 size_geo) {
-                vec4 color = vec4(0.0);
-
-                if (0.0 <= coords_geo.x && coords_geo.x <= 1.0
-                        && 0.0 <= coords_geo.y && coords_geo.y <= 1.0)
-                {
-                    vec4 from = vec4(1.0, 0.0, 0.0, 1.0);
-                    vec4 to = vec4(0.0, 1.0, 0.0, 1.0);
-                    color = mix(from, to, coords_geo.y);
-                }
-
-                return color * (1.0 - niri_clamped_progress);
-            }
-        "
     }
 }
 ```
@@ -331,38 +252,6 @@ Also, very small resizes (up to 10 pixels) are not animated.
 animations {
     window-resize {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.0001
-    }
-}
-```
-
-##### `custom-shader`
-
-<sup>Since: 0.1.6</sup>
-
-You can write a custom shader for drawing the window during a resize animation.
-
-See [this example shader](./examples/resize_custom_shader.frag) for a full documentation with several animations to experiment with.
-
-If a custom shader fails to compile, niri will print a warning and fall back to the default, or previous successfully compiled shader.
-When running niri as a systemd service, you can see the warnings in the journal: `journalctl -ef /usr/bin/niri`
-
-> [!WARNING]
->
-> Custom shaders do not have a backwards compatibility guarantee.
-> I may need to change their interface as I'm developing new features.
-
-Example: resize will show the next (after resize) window texture right away, stretched to the current geometry.
-
-```kdl
-animations {
-    window-resize {
-        custom-shader r"
-            vec4 resize_color(vec3 coords_curr_geo, vec3 size_curr_geo) {
-                vec3 coords_tex_next = niri_geo_to_tex_next * coords_curr_geo;
-                vec4 color = texture2D(niri_tex_next, coords_tex_next.st);
-                return color;
-            }
-        "
     }
 }
 ```
@@ -436,20 +325,6 @@ The close fade-out animation of the recent windows switcher.
 animations {
     recent-windows-close {
         spring damping-ratio=1.0 stiffness=800 epsilon=0.001
-    }
-}
-```
-
-### Specifying `custom-shader` by Path
-
-<sup>Since: next release</sup>
-
-For animations that accept a `custom-shader`, you can also attach the shader by path, rather than writing it out inline.
-
-```kdl,must-fail
-animations {
-    window-open {
-        custom-shader path="./my-shader.glsl"
     }
 }
 ```

@@ -3,21 +3,20 @@ use std::iter::zip;
 use niri_config::CornerRadius;
 use smithay::utils::{Logical, Point, Rectangle, Size};
 
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::shadow::ShadowRenderElement;
 
 #[derive(Debug)]
 pub struct Shadow {
-    shader_rects: Vec<Rectangle<f64, Logical>>,
-    shaders: Vec<ShadowRenderElement>,
+    paint_rects: Vec<Rectangle<f64, Logical>>,
+    paints: Vec<ShadowRenderElement>,
     config: niri_config::Shadow,
 }
 
 impl Shadow {
     pub fn new(config: niri_config::Shadow) -> Self {
         Self {
-            shader_rects: Vec::new(),
-            shaders: Vec::new(),
+            paint_rects: Vec::new(),
+            paints: Vec::new(),
             config,
         }
     }
@@ -26,8 +25,8 @@ impl Shadow {
         self.config = config;
     }
 
-    pub fn update_shaders(&mut self) {
-        for elem in &mut self.shaders {
+    pub fn update_paints(&mut self) {
+        for elem in &mut self.paints {
             elem.damage_all();
         }
     }
@@ -71,7 +70,7 @@ impl Shadow {
         };
         let radius = win_radius.expanded_by(spread as f32);
 
-        let shader_size = box_size + Size::from((width, width)).upscale(2.);
+        let paint_size = box_size + Size::from((width, width)).upscale(2.);
 
         let color = if is_active {
             self.config.color
@@ -82,9 +81,9 @@ impl Shadow {
                 .unwrap_or(self.config.color * 0.75)
         };
 
-        let shader_geo = Rectangle::new(Point::from((-width, -width)), shader_size);
+        let paint_geo = Rectangle::new(Point::from((-width, -width)), paint_size);
 
-        // This is actually offset relative to shader_geo, this is handled below.
+        // This is actually offset relative to paint_geo, this is handled below.
         let window_geo = Rectangle::new(Point::from((0., 0.)), win_size);
 
         if !self.config.draw_behind_window {
@@ -122,18 +121,17 @@ impl Shadow {
                 rect.loc -= offset;
             }
 
-            self.shader_rects = shader_geo.subtract_rects(background);
-            self.shaders
-                .resize_with(self.shader_rects.len(), Default::default);
+            self.paint_rects = paint_geo.subtract_rects(background);
+            self.paints
+                .resize_with(self.paint_rects.len(), Default::default);
 
-            for (shader, rect) in zip(&mut self.shaders, &mut self.shader_rects) {
-                shader.update(
+            for (paint, rect) in zip(&mut self.paints, &mut self.paint_rects) {
+                paint.update(
                     rect.size,
                     Rectangle::new(rect.loc.upscale(-1.), box_size),
                     color,
                     sigma as f32,
                     radius,
-                    scale as f32,
                     Rectangle::new(window_geo.loc - offset - rect.loc, window_geo.size),
                     win_radius,
                     alpha,
@@ -142,43 +140,32 @@ impl Shadow {
                 rect.loc += offset;
             }
         } else {
-            self.shader_rects.resize_with(1, Default::default);
-            self.shader_rects[0] = shader_geo;
+            self.paint_rects.resize_with(1, Default::default);
+            self.paint_rects[0] = paint_geo;
 
-            self.shaders.resize_with(1, Default::default);
-            self.shaders[0].update(
-                shader_geo.size,
-                Rectangle::new(shader_geo.loc.upscale(-1.), box_size),
+            self.paints.resize_with(1, Default::default);
+            self.paints[0].update(
+                paint_geo.size,
+                Rectangle::new(paint_geo.loc.upscale(-1.), box_size),
                 color,
                 sigma as f32,
                 radius,
-                scale as f32,
                 Rectangle::zero(),
                 Default::default(),
                 alpha,
             );
 
-            self.shader_rects[0].loc += offset;
+            self.paint_rects[0].loc += offset;
         }
     }
 
-    pub fn render(
-        &self,
-        renderer: &mut impl NiriRenderer,
-        location: Point<f64, Logical>,
-        push: &mut dyn FnMut(ShadowRenderElement),
-    ) {
+    pub fn render(&self, location: Point<f64, Logical>, push: &mut dyn FnMut(ShadowRenderElement)) {
         if !self.config.on {
             return;
         }
 
-        let has_shadow_shader = ShadowRenderElement::has_shader(renderer);
-        if !has_shadow_shader {
-            return;
-        }
-
-        for (shader, rect) in zip(&self.shaders, &self.shader_rects) {
-            push(shader.clone().with_location(location + rect.loc));
+        for (paint, rect) in zip(&self.paints, &self.paint_rects) {
+            push(paint.clone().with_location(location + rect.loc));
         }
     }
 }

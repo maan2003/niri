@@ -320,8 +320,7 @@ impl RenderElement<RemoteRenderer> for OffscreenRenderElement {
             opaque_regions,
             Transform::Normal,
             self.alpha,
-            None,
-            &[],
+            frame.texture_options(),
         )
     }
 

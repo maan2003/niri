@@ -672,6 +672,24 @@ mod tests {
     }
 
     #[test]
+    fn custom_animation_shaders_are_removed() {
+        for animation in ["window-open", "window-close", "window-resize"] {
+            for option in [
+                r#"custom-shader "void main() {}""#,
+                r#"custom-shader path="/missing/shader.glsl""#,
+            ] {
+                let text = format!("animations {{\n{animation} {{\n{option}\n}}\n}}\n");
+                let error = Config::parse_mem(&text).unwrap_err();
+                let error = format!("{:?}", miette::Report::new(error));
+                assert!(
+                    error.contains("`custom-shader` has been removed"),
+                    "{animation}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parse() {
         let parsed = do_parse(
             r##"
@@ -1578,7 +1596,6 @@ mod tests {
                             },
                         ),
                     },
-                    custom_shader: None,
                 },
                 window_close: WindowCloseAnim {
                     anim: Animation {
@@ -1595,7 +1612,6 @@ mod tests {
                             },
                         ),
                     },
-                    custom_shader: None,
                 },
                 horizontal_view_movement: HorizontalViewMovementAnim(
                     Animation {
@@ -1631,7 +1647,6 @@ mod tests {
                             },
                         ),
                     },
-                    custom_shader: None,
                 },
                 config_notification_open_close: ConfigNotificationOpenCloseAnim(
                     Animation {

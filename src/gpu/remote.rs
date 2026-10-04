@@ -1,4 +1,4 @@
-//! A smithay renderer that describes frames for the GPU process instead of touching GL.
+//! A smithay renderer that describes frames for the GPU process instead of rendering locally.
 //!
 //! Resource calls become [`Command`]s right away. Draw calls are collected into a
 //! [`SceneFrame`] (nodes of ops) that is sent as one command when the frame finishes. Commands
@@ -16,17 +16,13 @@ use std::{fmt, mem};
 use smithay::backend::allocator::dmabuf::{Dmabuf, WeakDmabuf};
 use smithay::backend::allocator::format::{get_bpp, FormatSet};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
-use smithay::backend::egl::display::EGLBufferReader;
-use smithay::backend::egl::Error as EglError;
-use smithay::backend::renderer::gles::Uniform as GlesUniform;
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{
     Bind, Color32F, ContextId, DebugFlags, ErasedContextId, ExportMem, Frame, ImportDma,
-    ImportDmaWl, ImportEgl, ImportMem, ImportMemWl, Offscreen, Renderer, RendererSuper, Texture,
+    ImportDmaWl, ImportMem, ImportMemWl, Offscreen, Renderer, RendererSuper, Texture,
     TextureFilter, TextureMapping,
 };
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::shm::{self, shm_format_to_fourcc};
@@ -34,9 +30,9 @@ use smithay::wayland::shm::{self, shm_format_to_fourcc};
 use super::client::GpuClient;
 use super::convert;
 use super::protocol::{
-    BlendParams, BlurParams, Caps, CastInfo, Command, CursorFrameDesc, Node, Op, OutputRef, Rect,
-    Request, SceneFrame, ShaderKind, ShaderSupport, Target, TexId, TexProgram, ANONYMOUS_NODE,
-    MAX_CURSOR_FRAMES,
+    BlendParams, BlurParams, Caps, CastInfo, Command, CursorFrameDesc, Node, Op, OutputRef, Paint,
+    PostprocessParams, Rect, Request, SceneFrame, Target, TexId, TextureOptions, UiScene,
+    ANONYMOUS_NODE, MAX_CURSOR_FRAMES,
 };
 
 const MAX_PENDING_FDS: usize = 32;
@@ -85,7 +81,6 @@ struct Shared {
     next_id: AtomicU64,
     context_id: ContextId<RemoteTexture>,
     caps: RwLock<Caps>,
-    shaders: Mutex<ShaderSupport>,
     dmabuf_cache: Mutex<HashMap<WeakDmabuf, RemoteTexture>>,
 }
 
@@ -287,10 +282,6 @@ impl Texture for RemoteTexture {
     }
 }
 
-/// Handle to a texture shader program in the GPU process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RemoteTexProgram(pub TexProgram);
-
 /// A bound render target.
 #[derive(Debug)]
 pub struct RemoteTarget<'a> {
@@ -364,7 +355,6 @@ pub struct RemoteRenderer {
 impl RemoteRenderer {
     pub fn new(client: GpuClient) -> Self {
         let caps = client.caps().cloned().unwrap_or_default();
-        let shaders = caps.shaders;
         Self {
             shared: Arc::new(Shared {
                 client: Mutex::new(client),
@@ -372,7 +362,6 @@ impl RemoteRenderer {
                 next_id: AtomicU64::new(1),
                 context_id: ContextId::new(),
                 caps: RwLock::new(caps),
-                shaders: Mutex::new(shaders),
                 dmabuf_cache: Mutex::new(HashMap::new()),
             }),
             debug_flags: DebugFlags::empty(),
@@ -414,7 +403,6 @@ impl RemoteRenderer {
     /// Called once the GPU process has brought up its renderer (after the primary DRM device
     /// was added).
     pub fn set_caps(&self, caps: Caps) {
-        *self.shared.shaders.lock().unwrap() = caps.shaders;
         *self.shared.caps.write().unwrap() = caps;
     }
 
@@ -543,46 +531,8 @@ impl RemoteRenderer {
         self.texture(id, src.size(), Some(Fourcc::Abgr8888))
     }
 
-    /// Which shader programs the GPU process managed to compile.
-    pub fn shaders(&self) -> ShaderSupport {
-        *self.shared.shaders.lock().unwrap()
-    }
-
-    pub fn tex_program(&self, program: TexProgram) -> Option<RemoteTexProgram> {
-        let shaders = self.shaders();
-        let available = match program {
-            TexProgram::ClippedSurface => shaders.clipped_surface,
-            TexProgram::PostprocessAndClip => shaders.postprocess_and_clip,
-            TexProgram::GradientFade => shaders.gradient_fade,
-            TexProgram::TextureHdr => shaders.texture_hdr,
-        };
-        available.then_some(RemoteTexProgram(program))
-    }
-
-    /// Sends all recorded commands to the GPU process and waits for them to be accepted.
     pub fn flush(&self) -> Result<(), RemoteError> {
         self.shared.flush()
-    }
-
-    /// Replaces a customizable shader (resize/close/open) with `src`, or restores the default.
-    pub fn set_custom_shader(
-        &self,
-        kind: ShaderKind,
-        src: Option<&str>,
-    ) -> Result<(), RemoteError> {
-        self.flush()?;
-        let ok = self
-            .client()
-            .set_custom_shader(kind, src)
-            .map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
-        let mut shaders = self.shared.shaders.lock().unwrap();
-        match kind {
-            ShaderKind::Resize => shaders.resize = ok,
-            ShaderKind::Close => shaders.close = ok,
-            ShaderKind::Open => shaders.open = ok,
-            _ => (),
-        }
-        Ok(())
     }
 
     fn texture(&self, id: TexId, size: Size<i32, Buffer>, format: Option<Fourcc>) -> RemoteTexture {
@@ -592,6 +542,20 @@ impl RemoteRenderer {
             format,
             shared: Arc::downgrade(&self.shared),
         }))
+    }
+
+    /// Paints a cached UI surface entirely in the GPU process, acknowledging completion
+    /// before returning its remote texture handle. No UI pixels enter the core.
+    pub fn render_ui(&mut self, scene: UiScene) -> Result<RemoteTexture, RemoteError> {
+        let size = Size::from((scene.width as i32, scene.height as i32));
+        let id = self.shared.alloc_id();
+        self.flush()?;
+        let event = self
+            .client()
+            .request(&Request::RenderUi { id, scene }, &[])
+            .map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
+        GpuClient::expect_ack(event).map_err(|err| RemoteError::Gpu(format!("{err:#}")))?;
+        Ok(self.texture(id, size, Some(Fourcc::Abgr8888)))
     }
 
     fn read(
@@ -615,15 +579,15 @@ impl RemoteRenderer {
 
 pub struct RemoteFrame<'frame, 'buffer> {
     renderer: &'frame mut RemoteRenderer,
-    // Keeping the target borrowed ties 'buffer to 'frame like GlesFrame does.
+    // Keeping the target borrowed ties its lifetime to the frame.
     target: &'frame mut RemoteTarget<'buffer>,
     size: Size<i32, Physical>,
     transform: Transform,
     scene: Option<SceneFrame>,
     /// The node being described, if any.
     node: Option<OpenNode>,
-    /// Open tex-program scopes, innermost last; ops go to the innermost one.
-    scopes: Vec<Scope>,
+    /// Core-only draw context; every recorded texture carries its resolved intent.
+    texture_options: TextureOptions,
     /// Ops outside any node; become an anonymous node.
     loose: Vec<Op>,
     anonymous: u64,
@@ -633,11 +597,6 @@ struct OpenNode {
     node: Node,
     /// Whether ops go to `draw` (after `begin_node_draw`) or `capture`.
     in_draw: bool,
-}
-
-struct Scope {
-    program: Option<(TexProgram, Vec<GlesUniform<'static>>)>,
-    ops: Vec<Op>,
 }
 
 impl fmt::Debug for RemoteFrame<'_, '_> {
@@ -650,15 +609,6 @@ impl fmt::Debug for RemoteFrame<'_, '_> {
 }
 
 impl RemoteFrame<'_, '_> {
-    /// GPU spans are recorded in the GPU process; here this is a plain passthrough so render
-    /// elements can keep their `with_gpu_span` calls.
-    pub fn with_gpu_span<L, F, R>(&mut self, _location: L, func: F) -> R
-    where
-        F: FnOnce(&mut Self) -> R,
-    {
-        func(self)
-    }
-
     pub fn renderer(&mut self) -> &mut RemoteRenderer {
         self.renderer
     }
@@ -668,9 +618,7 @@ impl RemoteFrame<'_, '_> {
     }
 
     fn push_op(&mut self, op: Op) {
-        if let Some(scope) = self.scopes.last_mut() {
-            scope.ops.push(op);
-        } else if let Some(open) = &mut self.node {
+        if let Some(open) = &mut self.node {
             if open.in_draw {
                 open.node.draw.push(op);
             } else {
@@ -731,30 +679,10 @@ impl RemoteFrame<'_, '_> {
     }
 
     pub fn end_node(&mut self) {
-        while !self.scopes.is_empty() {
-            warn!("tex program scope left open by an element");
-            self.close_scope();
-        }
         match self.node.take() {
             Some(open) => self.scene.as_mut().unwrap().nodes.push(open.node),
             None => warn!("end_node outside a node"),
         }
-    }
-
-    fn close_scope(&mut self) {
-        let Some(scope) = self.scopes.pop() else {
-            warn!("closing a tex program scope that was never opened");
-            return;
-        };
-        let op = match scope.program {
-            Some((program, uniforms)) => Op::WithTexProgram {
-                program,
-                uniforms: convert::uniforms(&uniforms),
-                ops: scope.ops,
-            },
-            None => Op::Raw { ops: scope.ops },
-        };
-        self.push_op(op);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -767,8 +695,7 @@ impl RemoteFrame<'_, '_> {
         opaque_regions: &[Rectangle<i32, Physical>],
         transform: Transform,
         alpha: f32,
-        program: Option<&RemoteTexProgram>,
-        uniforms: &[GlesUniform<'_>],
+        options: TextureOptions,
     ) -> Result<(), RemoteError> {
         // Opaque regions arrive dst-relative; the scene is in frame coordinates.
         let opaque: Vec<_> = opaque_regions
@@ -786,65 +713,46 @@ impl RemoteFrame<'_, '_> {
             opaque: convert::rects(&opaque),
             transform: convert::transform(transform),
             alpha,
-            program: program.map(|p| p.0),
-            uniforms: convert::uniforms(uniforms),
+            options,
         });
         Ok(())
     }
 
-    pub fn override_default_tex_program(
+    /// Supply explicit texture intent while a Smithay element records its draws.
+    /// No stateful scope crosses the wire. Restoration also happens on a returned error.
+    pub fn with_texture_options<T>(
         &mut self,
-        program: RemoteTexProgram,
-        uniforms: Vec<GlesUniform<'static>>,
-    ) {
-        self.scopes.push(Scope {
-            program: Some((program.0, uniforms)),
-            ops: Vec::new(),
-        });
+        options: TextureOptions,
+        draw: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = mem::replace(&mut self.texture_options, options);
+        let result = draw(self);
+        self.texture_options = previous;
+        result
     }
 
-    pub fn clear_tex_program_override(&mut self) {
-        self.close_scope();
+    pub fn texture_options(&self) -> TextureOptions {
+        self.texture_options
     }
 
-    /// The blend space this frame is composited in (`None` = SDR).
+    /// Target encoded blend space (`None` = SDR).
     pub fn blend(&self) -> Option<BlendParams> {
         self.renderer.frame_blend
     }
 
-    /// Drops the current tex program override (including the frame-wide blend one) until
-    /// `restore_tex_program_override`, so content already in the blend space passes through.
-    pub fn suspend_tex_program_override(&mut self) {
-        self.scopes.push(Scope {
-            program: None,
-            ops: Vec::new(),
-        });
-    }
-
-    pub fn restore_tex_program_override(&mut self) {
-        self.close_scope();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_shader(
+    pub fn draw_paint(
         &mut self,
-        program: ShaderKind,
+        paint: Paint<RemoteTexture>,
         src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
-        scale: f32,
         alpha: f32,
-        uniforms: &[GlesUniform<'_>],
-        textures: &[(String, RemoteTexture)],
     ) {
-        self.push_op(Op::Shader {
-            program,
+        self.push_op(Op::Paint {
+            paint: paint.map_textures(|texture| texture.id()),
             src: convert::rect_f64(src),
             dst: convert::rect(dst),
-            scale,
             alpha,
-            uniforms: convert::uniforms(uniforms),
-            textures: textures.iter().map(|(n, t)| (n.clone(), t.id())).collect(),
         });
     }
 
@@ -870,12 +778,12 @@ impl RemoteFrame<'_, '_> {
         capture: &CaptureHandle,
         dst: Rectangle<i32, Physical>,
         _damage: &[Rectangle<i32, Physical>],
-        uniforms: &[GlesUniform<'_>],
+        postprocess: PostprocessParams,
     ) {
         self.push_op(Op::Captured {
             key: capture.key(),
             dst: convert::rect(dst),
-            uniforms: convert::uniforms(uniforms),
+            postprocess,
         });
     }
 
@@ -889,10 +797,6 @@ impl RemoteFrame<'_, '_> {
         if self.node.is_some() {
             warn!("frame finished inside a node");
             self.end_node();
-        }
-        while !self.scopes.is_empty() {
-            warn!("tex program scope left open at the end of a frame");
-            self.close_scope();
         }
         self.flush_loose();
         let mut scene = self.scene.take().unwrap();
@@ -915,12 +819,9 @@ fn op_bounds(op: &Op) -> Option<Rectangle<i32, Physical>> {
     match op {
         Op::Solid { dst, .. }
         | Op::Texture { dst, .. }
-        | Op::Shader { dst, .. }
+        | Op::Paint { dst, .. }
         | Op::Captured { dst, .. } => Some(convert::to_rect(*dst)),
         Op::Capture { .. } => None,
-        Op::WithTexProgram { ops, .. } | Op::Raw { ops } => {
-            ops.iter().filter_map(op_bounds).reduce(|a, b| a.merge(b))
-        }
     }
 }
 
@@ -999,8 +900,7 @@ impl Frame for RemoteFrame<'_, '_> {
             opaque_regions,
             src_transform,
             alpha,
-            None,
-            &[],
+            self.texture_options,
         )
     }
 
@@ -1095,7 +995,7 @@ impl Renderer for RemoteRenderer {
             transform: dst_transform,
             scene: Some(scene),
             node: None,
-            scopes: Vec::new(),
+            texture_options: TextureOptions::default(),
             loose: Vec::new(),
             anonymous: 0,
         })
@@ -1394,28 +1294,6 @@ impl ImportDma for RemoteRenderer {
 }
 
 impl ImportDmaWl for RemoteRenderer {}
-
-impl ImportEgl for RemoteRenderer {
-    fn bind_wl_display(&mut self, _display: &DisplayHandle) -> Result<(), EglError> {
-        // Legacy wl_drm buffers aren't supported; clients use linux-dmabuf.
-        Err(EglError::NoEGLDisplayBound)
-    }
-
-    fn unbind_wl_display(&mut self) {}
-
-    fn egl_reader(&self) -> Option<&EGLBufferReader> {
-        None
-    }
-
-    fn import_egl_buffer(
-        &mut self,
-        _buffer: &WlBuffer,
-        _surface: Option<&SurfaceData>,
-        _damage: &[Rectangle<i32, Buffer>],
-    ) -> Result<RemoteTexture, RemoteError> {
-        Err(RemoteError::Unsupported("EGL buffers"))
-    }
-}
 
 impl ExportMem for RemoteRenderer {
     type TextureMapping = RemoteMapping;

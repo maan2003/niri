@@ -3,21 +3,19 @@ use niri_config::CornerRadius;
 use smithay::backend::renderer::buffer_y_inverted;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use super::blend::{BlendContent, FrameBlendState};
+use super::blend::BlendContent;
 use super::damage::ExtraDamage;
 use super::renderer::NiriRenderer;
-use super::shaders::{mat3_uniform, Shaders};
-use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram};
+use crate::gpu::protocol::{ClipParams, TextureEffect, TextureOptions};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 
 #[derive(Debug)]
 pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
-    program: RemoteTexProgram,
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
@@ -36,13 +34,11 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         elem: WaylandSurfaceRenderElement<R>,
         scale: Scale<f64>,
         geometry: Rectangle<f64, Logical>,
-        program: RemoteTexProgram,
         corner_radius: CornerRadius,
         content: BlendContent,
     ) -> Self {
         Self {
             inner: elem,
-            program,
             corner_radius,
             geometry,
             scale: scale.x as f32,
@@ -50,7 +46,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         }
     }
 
-    fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
+    fn clip_params(&self) -> ClipParams {
         let scale = Scale::from(f64::from(self.scale));
         let elem_geo = self.inner.geometry(scale);
 
@@ -94,16 +90,11 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
 
         let geo_size = (self.geometry.size.w as f32, self.geometry.size.h as f32);
 
-        vec![
-            Uniform::new("niri_scale", self.scale),
-            Uniform::new("geo_size", geo_size),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", input_to_geo),
-        ]
-    }
-
-    pub fn shader(renderer: &mut R) -> Option<RemoteTexProgram> {
-        Shaders::get(renderer).clipped_surface.clone()
+        ClipParams {
+            size: [geo_size.0, geo_size.1],
+            radii: self.corner_radius.into(),
+            input_to_geo: input_to_geo.to_cols_array(),
+        }
     }
 
     pub fn will_clip(
@@ -241,23 +232,21 @@ impl RenderElement<RemoteRenderer> for ClippedSurfaceRenderElement<RemoteRendere
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
-        let mut uniforms = self.compute_uniforms();
-        uniforms.extend(FrameBlendState::uniforms_for_content(
-            frame,
-            FrameBlendState::content_in_blend_space(frame, self.content),
-        ));
-        frame.override_default_tex_program(self.program.clone(), uniforms);
-        let res = RenderElement::<RemoteRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
-        frame.clear_tex_program_override();
-        res
+        let options = TextureOptions {
+            color: self.content,
+            effect: Some(TextureEffect::Clip(self.clip_params())),
+        };
+        frame.with_texture_options(options, |frame| {
+            RenderElement::<RemoteRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            )
+        })
     }
 
     fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

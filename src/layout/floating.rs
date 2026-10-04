@@ -241,9 +241,9 @@ impl<W: LayoutElement> FloatingSpace<W> {
         self.options = options;
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         for tile in &mut self.tiles {
-            tile.update_shaders();
+            tile.update_paints();
         }
     }
 

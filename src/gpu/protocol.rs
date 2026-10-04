@@ -7,7 +7,55 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 19;
+
+/// A cached compositor UI surface. Text is shaped in the core; only paint and positioned
+/// glyphs cross the wire. Colors are straight sRGB RGBA; the result is premultiplied RGBA8.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiScene {
+    pub width: u32,
+    pub height: u32,
+    pub fonts: Vec<UiFont>,
+    pub ops: Vec<UiOp>,
+}
+
+/// Scene-local font data. `index` selects a face in a font collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiFont {
+    pub index: u32,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UiGlyph {
+    pub id: u32,
+    /// Absolute pixel position, with y at the glyph baseline.
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UiOp {
+    Rect {
+        rect: [f32; 4],
+        color: [f32; 4],
+    },
+    Circle {
+        center: [f32; 2],
+        radius: f32,
+        color: [f32; 4],
+    },
+    GlyphRun {
+        /// Index into `UiScene::fonts`.
+        font: u32,
+        font_size: f32,
+        /// Normalized F2Dot14 variation coordinates, in font axis order.
+        coords: Vec<i16>,
+        glyphs: Vec<UiGlyph>,
+        color: [f32; 4],
+    },
+}
 
 /// Texture ids a `LoadCursor` request reserves for its frames (`first_id..first_id + N`).
 pub const MAX_CURSOR_FRAMES: u64 = 256;
@@ -40,73 +88,146 @@ pub enum Transform {
     Flipped270,
 }
 
+/// Source encoding, independent of any rendering effect. `Target` denotes pixels
+/// already composited in the current target's encoded blend space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceColor {
+    #[default]
+    Srgb,
+    DisplayP3,
+    Hdr,
+    Target,
+}
+
+impl SourceColor {
+    /// Preserve the compositor's encoded-space policy: matching content passes through;
+    /// other content follows the existing SDR-to-target conversion (no new tone mapping).
+    pub fn conversion_to(self, target: Option<BlendParams>) -> Option<BlendParams> {
+        match (self, target) {
+            (Self::Target, _)
+            | (Self::DisplayP3, Some(BlendParams::DisplayP3))
+            | (Self::Hdr, Some(BlendParams::HdrPq { .. })) => None,
+            (_, target) => target,
+        }
+    }
+}
+
+/// A rounded shape in geometry units; the column-major matrix maps normalized
+/// effect input coordinates into those units.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RoundedGeometry {
+    pub size: [f32; 2],
+    pub radii: [f32; 4],
+    pub input_to_geo: [f32; 9],
+}
+
+/// Texture clipping uses normalized geometry coordinates, unlike decoration geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ClipParams {
+    pub size: [f32; 2],
+    pub radii: [f32; 4],
+    pub input_to_geo: [f32; 9],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GradientSpace {
+    Srgb,
+    LinearSrgb,
+    Oklab,
+    Oklch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GradientHue {
+    Shorter,
+    Longer,
+    Increasing,
+    Decreasing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BorderParams {
+    pub geometry: RoundedGeometry,
+    pub width: f32,
+    /// Straight sRGB endpoint colors.
+    pub color_from: [f32; 4],
+    pub color_to: [f32; 4],
+    pub gradient_offset: [f32; 2],
+    pub gradient_width: f32,
+    pub gradient_vector: [f32; 2],
+    pub gradient_space: GradientSpace,
+    pub gradient_hue: GradientHue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShadowParams {
+    pub geometry: RoundedGeometry,
+    pub window: Option<RoundedGeometry>,
+    /// Premultiplied sRGB.
+    pub color: [f32; 4],
+    pub sigma: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResizeParams {
+    pub input_to_geometry: [f32; 9],
+    pub geometry_size: [f32; 2],
+    pub previous_from_geometry: [f32; 9],
+    pub next_from_geometry: [f32; 9],
+    pub progress: f32,
+    pub radii: [f32; 4],
+    pub clip_to_geometry: bool,
+}
+
+/// Typed built-in paints. Core elements hold texture handles; the wire holds IDs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UniformVal {
-    F1(f32),
-    F2(f32, f32),
-    F3(f32, f32, f32),
-    F4(f32, f32, f32, f32),
-    I1(i32),
-    I2(i32, i32),
-    I3(i32, i32, i32),
-    I4(i32, i32, i32, i32),
-    U1(u32),
-    U2(u32, u32),
-    U3(u32, u32, u32),
-    U4(u32, u32, u32, u32),
-    Mat2x2 {
-        matrices: Vec<[f32; 4]>,
-        transpose: bool,
-    },
-    Mat2x3 {
-        matrices: Vec<[f32; 6]>,
-        transpose: bool,
-    },
-    Mat2x4 {
-        matrices: Vec<[f32; 8]>,
-        transpose: bool,
-    },
-    Mat3x2 {
-        matrices: Vec<[f32; 6]>,
-        transpose: bool,
-    },
-    Mat3x3 {
-        matrices: Vec<[f32; 9]>,
-        transpose: bool,
-    },
-    Mat3x4 {
-        matrices: Vec<[f32; 12]>,
-        transpose: bool,
-    },
-    Mat4x2 {
-        matrices: Vec<[f32; 8]>,
-        transpose: bool,
-    },
-    Mat4x3 {
-        matrices: Vec<[f32; 12]>,
-        transpose: bool,
-    },
-    Mat4x4 {
-        matrices: Vec<[f32; 16]>,
-        transpose: bool,
+pub enum Paint<T = TexId> {
+    Border(BorderParams),
+    Shadow(ShadowParams),
+    Resize {
+        params: ResizeParams,
+        previous: T,
+        next: T,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Uniform {
-    pub name: String,
-    pub value: UniformVal,
+impl<T> Paint<T> {
+    pub fn map_textures<U>(self, mut map: impl FnMut(T) -> U) -> Paint<U> {
+        match self {
+            Self::Border(params) => Paint::Border(params),
+            Self::Shadow(params) => Paint::Shadow(params),
+            Self::Resize {
+                params,
+                previous,
+                next,
+            } => Paint::Resize {
+                params,
+                previous: map(previous),
+                next: map(next),
+            },
+        }
+    }
 }
 
-/// Texture shader programs built into the GPU process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TexProgram {
-    ClippedSurface,
-    PostprocessAndClip,
-    GradientFade,
-    /// The default texture shader plus the blend-space encode; installed frame-wide on HDR /
-    /// wide-gamut outputs.
-    TextureHdr,
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PostprocessParams {
+    pub clip: ClipParams,
+    pub saturation: f32,
+    pub noise: f32,
+    pub background: [f32; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum TextureEffect {
+    Clip(ClipParams),
+    Postprocess(PostprocessParams),
+    Fade { cutoff: [f32; 2] },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct TextureOptions {
+    pub color: SourceColor,
+    pub effect: Option<TextureEffect>,
 }
 
 /// The blend space a frame is composited in; `None` in `Begin` means SDR (electrical sRGB).
@@ -116,23 +237,6 @@ pub enum BlendParams {
     HdrPq { ref_lum_scale: f32 },
     /// Display P3 with a 2.2 transfer.
     DisplayP3,
-}
-
-impl BlendParams {
-    /// The `niri_blend_mode` uniform value.
-    pub fn mode(self) -> f32 {
-        match self {
-            BlendParams::HdrPq { .. } => 1.,
-            BlendParams::DisplayP3 => 2.,
-        }
-    }
-
-    pub fn ref_lum_scale(self) -> f32 {
-        match self {
-            BlendParams::HdrPq { ref_lum_scale } => ref_lum_scale,
-            BlendParams::DisplayP3 => 0.,
-        }
-    }
 }
 
 /// HDR static metadata to signal on a connector (PQ, BT.2020 mastering primaries). Luminances
@@ -167,17 +271,6 @@ pub struct HdrCaps {
     pub min_luminance: u16,
     /// EDID desired content max frame-average luminance, cd/m² (0 = not provided).
     pub max_frame_avg_luminance: u16,
-}
-
-/// Pixel shader programs in the GPU process. Resize/Close/Open can be replaced by custom
-/// sources from the config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ShaderKind {
-    Border,
-    Shadow,
-    Resize,
-    Close,
-    Open,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,7 +394,7 @@ pub struct SceneFrame {
     pub height: i32,
     pub transform: Transform,
     /// Blend space of this frame. When set, default-program texture draws go through
-    /// `TexProgram::TextureHdr` and solid colors are encoded on the CPU.
+    /// Texture source encodings determine conversion; solids and built-in paints are SDR.
     pub blend: Option<BlendParams>,
     /// Offscreen targets are cleared to this before drawing; outputs and casts clear
     /// themselves to transparent.
@@ -380,18 +473,14 @@ pub enum Op {
         opaque: Vec<Rect<i32>>,
         transform: Transform,
         alpha: f32,
-        program: Option<TexProgram>,
-        uniforms: Vec<Uniform>,
+        options: TextureOptions,
     },
-    /// niri's custom pixel shaders (borders, shadows, resize/open/close animations).
-    Shader {
-        program: ShaderKind,
+    /// Built-in paint, evaluated as SDR content in the target's blend space.
+    Paint {
+        paint: Paint,
         src: Rect<f64>,
         dst: Rect<i32>,
-        scale: f32,
         alpha: f32,
-        uniforms: Vec<Uniform>,
-        textures: Vec<(String, TexId)>,
     },
     /// Snapshot the framebuffer under `dst` (blurred if requested) for a later `Captured`.
     Capture {
@@ -401,21 +490,11 @@ pub enum Op {
         scale: f32,
         blur: Option<BlurParams>,
     },
+    /// A backdrop is already encoded in the target space; never encode it again.
     Captured {
         key: u64,
         dst: Rect<i32>,
-        uniforms: Vec<Uniform>,
-    },
-    /// `ops` drawn with `program` as the default texture program.
-    WithTexProgram {
-        program: TexProgram,
-        uniforms: Vec<Uniform>,
-        ops: Vec<Op>,
-    },
-    /// `ops` drawn with no default-program override at all (not even the frame's blend
-    /// program): content already encoded in the blend space passes through numerically.
-    Raw {
-        ops: Vec<Op>,
+        postprocess: PostprocessParams,
     },
 }
 
@@ -505,20 +584,6 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShaderSupport {
-    pub border: bool,
-    pub shadow: bool,
-    pub resize: bool,
-    pub clipped_surface: bool,
-    pub postprocess_and_clip: bool,
-    pub gradient_fade: bool,
-    pub blur: bool,
-    pub close: bool,
-    pub open: bool,
-    pub texture_hdr: bool,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Caps {
     pub renderer: String,
@@ -526,7 +591,6 @@ pub struct Caps {
     pub dmabuf_formats: Vec<(u32, u64)>,
     /// Formats the GPU can render into (for screencast / image-copy dmabuf buffers).
     pub dmabuf_render_formats: Vec<(u32, u64)>,
-    pub shaders: ShaderSupport,
 }
 
 impl Request {
@@ -562,6 +626,11 @@ pub enum Request {
         id: TexId,
         desc: DmabufDesc,
     },
+    /// Paints a UI scene into a Vulkan texture. Reply: Ack.
+    RenderUi {
+        id: TexId,
+        scene: UiScene,
+    },
     ReadTexture {
         id: TexId,
         region: Rect<i32>,
@@ -569,20 +638,13 @@ pub enum Request {
     },
     /// Replied to (Ack) once everything sent before it has executed and finished on the GPU.
     Sync,
-    /// Reply: `ShaderSet`.
-    SetCustomShader {
-        kind: ShaderKind,
-        src: Option<String>,
-    },
 
     // DRM/KMS. The core opens the device through libseat and hands over the fd.
     /// Fd attached. Reply: `DeviceAdded`. Devices may be added in any order.
     ///
-    /// The GPU process owns the device model: the renderer is created on the first device
-    /// whose EGL display works and, when `render_node_hint` is set, resolves to that render
-    /// node. That's not always the render node's own card: on Asahi the GPU's card node has no
-    /// KMS and Mesa renders through the display controller's node instead. Every other device
-    /// is display-only and scans out buffers allocated on the rendering device.
+    /// The GPU process owns the device model: the renderer is created on the first
+    /// Vulkan-capable card matching `render_node_hint`, when set. Every other device is
+    /// display-only and scans out buffers allocated on the rendering device.
     ///
     /// Hot-plug only: the initial devices come with the process's command line or in
     /// `Start`, so Mesa can initialize before the sandbox seals. A sealed process cannot bring
@@ -853,9 +915,6 @@ pub enum Event {
     Cursor {
         frames: Vec<CursorFrameDesc>,
     },
-    ShaderSet {
-        available: bool,
-    },
     /// `render_node` and `caps` are set when this device brought up the renderer.
     DeviceAdded {
         render_node: Option<DevId>,
@@ -943,5 +1002,42 @@ impl From<&ModeDesc> for DrmMode {
             name,
         };
         DrmMode::from(raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_encoding_selects_only_existing_target_conversion() {
+        let pq = Some(BlendParams::HdrPq {
+            ref_lum_scale: 0.0203,
+        });
+        let p3 = Some(BlendParams::DisplayP3);
+        for target in [None, pq, p3] {
+            assert_eq!(SourceColor::Srgb.conversion_to(target), target);
+            assert_eq!(SourceColor::Target.conversion_to(target), None);
+        }
+        assert_eq!(SourceColor::Hdr.conversion_to(pq), None);
+        assert_eq!(SourceColor::DisplayP3.conversion_to(p3), None);
+        // Nonmatching descriptions retain the existing SDR-conversion fallback.
+        assert_eq!(SourceColor::Hdr.conversion_to(p3), p3);
+        assert_eq!(SourceColor::DisplayP3.conversion_to(pq), pq);
+        assert_eq!(SourceColor::Hdr.conversion_to(None), None);
+        assert_eq!(SourceColor::DisplayP3.conversion_to(None), None);
+    }
+
+    #[test]
+    fn typed_texture_intent_round_trips_without_effect_color_coupling() {
+        let options = TextureOptions {
+            color: SourceColor::DisplayP3,
+            effect: Some(TextureEffect::Fade {
+                cutoff: [0.17, 0.81],
+            }),
+        };
+        let bytes = postcard::to_stdvec(&options).unwrap();
+        let decoded: TextureOptions = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, options);
     }
 }

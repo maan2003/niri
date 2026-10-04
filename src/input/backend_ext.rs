@@ -1,6 +1,5 @@
 use ::input as libinput;
 use smithay::backend::input;
-use smithay::backend::winit::WinitVirtualDevice;
 use smithay::output::Output;
 
 use crate::niri::State;
@@ -26,20 +25,6 @@ pub trait NiriInputDevice: input::Device {
 impl NiriInputDevice for libinput::Device {
     fn output(&self, _state: &State) -> Option<Output> {
         // FIXME: Allow specifying the output per-device?
-        None
-    }
-}
-
-impl NiriInputDevice for WinitVirtualDevice {
-    fn output(&self, _state: &State) -> Option<Output> {
-        // FIXME: we should be returning the single output that the winit backend creates,
-        // but for now, that will cause issues because the output is normally upside down,
-        // so we apply Transform::Flipped180 to it and that would also cause
-        // the cursor position to be flipped, which is not what we want.
-        //
-        // instead, we just return None and rely on the fact that it has only one output.
-        // doing so causes the cursor to be placed in *global* output coordinates,
-        // which are not flipped, and happen to be what we want.
         None
     }
 }

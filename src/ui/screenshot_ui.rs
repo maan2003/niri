@@ -1,15 +1,12 @@
 use std::cell::RefCell;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::f64::consts::TAU;
 use std::iter::zip;
 use std::rc::Rc;
 
 use arrayvec::ArrayVec;
 use niri_config::{Action, Config};
 use niri_ipc::SizeChange;
-use pango::{Alignment, FontDescription};
-use pangocairo::cairo::{self, ImageSurface};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::TouchSlot;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement};
@@ -19,6 +16,7 @@ use smithay::input::keyboard::{Keysym, ModifiersState};
 use smithay::output::{Output, WeakOutput};
 use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
+use super::paint::{Paint, Text, TextOptions};
 use crate::animation::{Animation, Clock};
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::layout::floating::DIRECTIONAL_MOVE_PX;
@@ -33,7 +31,7 @@ const SELECTION_BORDER: i32 = 2;
 
 const PADDING: i32 = 8;
 const RADIUS: i32 = 16;
-const FONT: &str = "sans 14px";
+const FONT: f32 = 14.;
 const BORDER: i32 = 4;
 const TEXT_HIDE_P: &str =
     "Press <span face='mono' bgcolor='#2C2C2C'> Space </span> to save the screenshot.\n\
@@ -1129,95 +1127,49 @@ fn render_panel(
     scale: f64,
     text: &str,
 ) -> anyhow::Result<TextureBuffer<RemoteTexture>> {
+    paint(scale, text)?.render(renderer, scale)
+}
+
+fn paint(scale: f64, text: &str) -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("screenshot_ui::render_panel");
-
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    // Keep the border width even to avoid blurry edges.
-    let border_width = (f64::from(BORDER) / 2. * scale).round() * 2.;
-    let half_border_width = (border_width / 2.) as i32;
-    let radius: i32 = to_physical_precise_round(scale, RADIUS);
-    let circle_stroke: f64 = to_physical_precise_round(scale, 2.);
-
-    // Add 2 px of spacing to separate the backgrounds of the "Space" and "P" keys.
-    let spacing = to_physical_precise_round::<i32>(scale, 2) * 1024;
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
-
-    let (mut width, mut height) = layout.pixel_size();
-
-    width += padding + radius * 2 + padding - half_border_width + padding;
-    height = max(height, radius * 2);
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    let padding = f64::from(padding);
-    let half_border_width = f64::from(half_border_width);
-    let r = f64::from(radius);
-
-    let yc = f64::from(height / 2);
-
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r, 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
-
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke, 0., TAU);
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.fill()?;
-
-    cr.new_sub_path();
-    cr.arc(padding + r, yc, r - circle_stroke * 2., 0., TAU);
-    cr.set_source_rgb(1., 1., 1.);
-    cr.fill()?;
-
-    cr.move_to(padding + r * 2. + padding - half_border_width, padding);
-
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Left);
-    layout.set_markup(text);
-    layout.set_spacing(spacing);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.3, 0.3, 0.3);
-    cr.set_line_width(border_width);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
+    let border = ((BORDER as f64 / 2. * scale).round() * 2. / scale) as f32;
+    let half_border = border / 2.;
+    let text = Text::with_options(
+        text,
+        TextOptions {
+            font_size: FONT,
+            line_spacing: 2.,
+            ..Default::default()
+        },
+        true,
     )?;
+    let (text_width, text_height) = text.size();
+    let width = (text_width as f32 + (PADDING * 3 + RADIUS * 2) as f32 - half_border).ceil() as i32;
+    let height = max(text_height, RADIUS * 2) + PADDING * 2;
+    let mut paint = Paint::new(width, height);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    let x = (PADDING + RADIUS) as f32;
+    let y = (height / 2) as f32;
+    paint.circle(x, y, RADIUS as f32, [1.; 4]);
+    paint.circle(x, y, (RADIUS - 2) as f32, [0.1, 0.1, 0.1, 1.]);
+    paint.circle(x, y, (RADIUS - 4) as f32, [1.; 4]);
+    paint.text(
+        &text,
+        (PADDING * 2 + RADIUS * 2) as f32 - half_border,
+        PADDING as f32,
+    );
+    paint.border(border, [0.3, 0.3, 0.3, 1.]);
+    Ok(paint)
+}
 
-    Ok(buffer)
+#[cfg(test)]
+pub(super) fn test_paint(scale: f64, show_pointer: bool) -> anyhow::Result<Paint> {
+    paint(
+        scale,
+        if show_pointer {
+            TEXT_HIDE_P
+        } else {
+            TEXT_SHOW_P
+        },
+    )
 }

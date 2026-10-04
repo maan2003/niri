@@ -259,10 +259,10 @@ impl<W: LayoutElement> Tile<W> {
         self.window.update_config(self.options.blur);
     }
 
-    pub fn update_shaders(&mut self) {
-        self.border.update_shaders();
-        self.focus_ring.update_shaders();
-        self.shadow.update_shaders();
+    pub fn update_paints(&mut self) {
+        self.border.update_paints();
+        self.focus_ring.update_paints();
+        self.shadow.update_paints();
     }
 
     pub fn update_window(&mut self) {
@@ -1122,69 +1122,63 @@ impl<W: LayoutElement> Tile<W> {
             &mut |elem| push(elem.into()),
         );
 
-        // If we're resizing, try to render a shader, or a fallback.
+        // If we're resizing, render the crossfade, or a fallback on texture failure.
         let mut pushed_resize = false;
         if let Some(resize) = &self.resize_animation {
-            if ResizeRenderElement::has_shader(ctx.renderer) {
-                let mut ctx = ctx.as_remote();
+            let mut ctx = ctx.as_remote();
 
-                if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
-                    let mut window_elements = Vec::new();
-                    self.window.render_normal(
-                        ctx.r(),
-                        Point::from((0., 0.)),
+            if let Some(texture_from) = resize.snapshot.texture(ctx.r(), scale) {
+                let mut window_elements = Vec::new();
+                self.window
+                    .render_normal(ctx.r(), Point::from((0., 0.)), scale, 1., &mut |elem| {
+                        window_elements.push(elem)
+                    });
+
+                let current = resize
+                    .offscreen
+                    .render(ctx.renderer, scale, &window_elements)
+                    .map_err(|err| warn!("error rendering window to texture: {err:?}"))
+                    .ok();
+
+                // Clip blocked-out resizes unconditionally because they use solid color render
+                // elements.
+                let clip_to_geometry =
+                    if ctx.target.should_block_out(resize.snapshot.block_out_from)
+                        && ctx.target.should_block_out(rules.block_out_from)
+                    {
+                        true
+                    } else {
+                        clip_to_geometry
+                    };
+
+                if let Some((elem_current, _sync_point, mut data)) = current {
+                    let texture_current = elem_current.texture().clone();
+                    // The offset and size are computed in physical pixels and converted to
+                    // logical with the same `scale`, so converting them back with rounding
+                    // inside the geometry() call gives us the same physical result back.
+                    let texture_current_geo = elem_current.geometry(scale);
+
+                    let elem = ResizeRenderElement::new(
+                        area,
                         scale,
-                        1.,
-                        &mut |elem| window_elements.push(elem),
+                        texture_from.clone(),
+                        resize.snapshot.size,
+                        (texture_current, texture_current_geo),
+                        window_size,
+                        resize.anim.clamped_value().clamp(0., 1.) as f32,
+                        radius,
+                        clip_to_geometry,
+                        win_alpha,
                     );
 
-                    let current = resize
-                        .offscreen
-                        .render(ctx.renderer, scale, &window_elements)
-                        .map_err(|err| warn!("error rendering window to texture: {err:?}"))
-                        .ok();
+                    // We're drawing the resize paint, not the offscreen directly.
+                    data.id = elem.id().clone();
 
-                    // Clip blocked-out resizes unconditionally because they use solid color render
-                    // elements.
-                    let clip_to_geometry =
-                        if ctx.target.should_block_out(resize.snapshot.block_out_from)
-                            && ctx.target.should_block_out(rules.block_out_from)
-                        {
-                            true
-                        } else {
-                            clip_to_geometry
-                        };
-
-                    if let Some((elem_current, _sync_point, mut data)) = current {
-                        let texture_current = elem_current.texture().clone();
-                        // The offset and size are computed in physical pixels and converted to
-                        // logical with the same `scale`, so converting them back with rounding
-                        // inside the geometry() call gives us the same physical result back.
-                        let texture_current_geo = elem_current.geometry(scale);
-
-                        let elem = ResizeRenderElement::new(
-                            area,
-                            scale,
-                            texture_from.clone(),
-                            resize.snapshot.size,
-                            (texture_current, texture_current_geo),
-                            window_size,
-                            resize.anim.value() as f32,
-                            resize.anim.clamped_value().clamp(0., 1.) as f32,
-                            radius,
-                            clip_to_geometry,
-                            win_alpha,
-                        );
-
-                        // We're drawing the resize shader, not the offscreen directly.
-                        data.id = elem.id().clone();
-
-                        // This is not a problem for split popups as the code will look for them by
-                        // original id when it doesn't find them on the offscreen.
-                        self.window.set_offscreen_data(Some(data));
-                        push(elem.into());
-                        pushed_resize = true;
-                    }
+                    // This is not a problem for split popups as the code will look for them by
+                    // original id when it doesn't find them on the offscreen.
+                    self.window.set_offscreen_data(Some(data));
+                    push(elem.into());
+                    pushed_resize = true;
                 }
             }
 
@@ -1202,34 +1196,25 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         // If we're not resizing, render the window itself.
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
         if !pushed_resize {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
-            let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer);
             let clip = |elem| match elem {
                 LayoutElementRenderElement::Wayland(elem) => {
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry {
-                        if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(
-                                elem.inner(),
+                        if ClippedSurfaceRenderElement::will_clip(elem.inner(), scale, geo, radius)
+                        {
+                            let content = elem.content();
+                            return ClippedSurfaceRenderElement::new(
+                                elem.into_inner(),
                                 scale,
                                 geo,
                                 radius,
-                            ) {
-                                let content = elem.content();
-                                return ClippedSurfaceRenderElement::new(
-                                    elem.into_inner(),
-                                    scale,
-                                    geo,
-                                    shader.clone(),
-                                    radius,
-                                    content,
-                                )
-                                .into();
-                            }
+                                content,
+                            )
+                            .into();
                         }
                     }
 
@@ -1238,12 +1223,12 @@ impl<W: LayoutElement> Tile<W> {
                 }
                 LayoutElementRenderElement::SolidColor(elem) => {
                     // In this branch we're rendering a blocked-out window with a solid
-                    // color. We need to render it with a rounded corner shader even if
+                    // color. We need to render it with a rounded corner paint even if
                     // clip_to_geometry is false, because in this case we're assuming that
                     // the unclipped window CSD already has corners rounded to the
                     // user-provided radius, so our blocked-out rendering should match that
                     // radius.
-                    if radius != CornerRadius::default() && has_border_shader {
+                    if radius != CornerRadius::default() {
                         return BorderRenderElement::new(
                             geo.size,
                             Rectangle::from_size(geo.size),
@@ -1254,7 +1239,6 @@ impl<W: LayoutElement> Tile<W> {
                             Rectangle::from_size(geo.size),
                             0.,
                             radius,
-                            scale.x as f32,
                             1.,
                         )
                         .with_location(geo.loc)
@@ -1272,7 +1256,7 @@ impl<W: LayoutElement> Tile<W> {
                 }
             };
 
-            if clip_to_geometry && clip_shader.is_some() {
+            if clip_to_geometry {
                 let damage = self.rounded_corner_damage.render(geo);
                 push(damage.into());
             }
@@ -1288,7 +1272,7 @@ impl<W: LayoutElement> Tile<W> {
 
             // During the un/fullscreen animation, render a border element in order to use the
             // animated corner radius.
-            if fullscreen_progress < 1. && has_border_shader {
+            if fullscreen_progress < 1. {
                 let border_width = self.visual_border_width().unwrap_or(0.);
                 let radius = self
                     .window
@@ -1308,7 +1292,6 @@ impl<W: LayoutElement> Tile<W> {
                     Rectangle::from_size(size),
                     0.,
                     radius,
-                    scale.x as f32,
                     alpha,
                 )
                 .with_location(location);
@@ -1325,11 +1308,10 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if let Some(width) = self.visual_border_width() {
-            self.border.render(
-                ctx.renderer,
-                location + Point::from((width, width)),
-                &mut |elem| push(elem.into()),
-            );
+            self.border
+                .render(location + Point::from((width, width)), &mut |elem| {
+                    push(elem.into())
+                });
         }
 
         // Hide the focus ring when maximized/fullscreened. It's not normally visible anyway due to
@@ -1338,12 +1320,11 @@ impl<W: LayoutElement> Tile<W> {
         // a bit weird).
         if focus_ring && expanded_progress < 1. {
             self.focus_ring
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+                .render(location, &mut |elem| push(elem.into()));
         }
 
         if expanded_progress < 1. {
-            self.shadow
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            self.shadow.render(location, &mut |elem| push(elem.into()));
         }
 
         let surface_anim_scale = animated_window_size / window_size;

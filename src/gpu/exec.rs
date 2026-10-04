@@ -1,4 +1,4 @@
-//! GPU-process side: owns textures and runs core commands on a real `GlesRenderer`.
+//! GPU-process side: owns resident Vulkan textures and executes Vello paint.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -12,7 +12,6 @@ use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufFlags};
 use smithay::backend::allocator::format::get_bpp;
 use smithay::backend::allocator::{Buffer as _, Fourcc, Modifier};
 use smithay::backend::renderer::element::memory::MemoryBuffer;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTarget, GlesTexture};
 use smithay::backend::renderer::{
     Bind as _, Color32F, DebugFlags, ExportMem as _, Frame as _, ImportDma as _, ImportMem as _,
     Offscreen as _, Renderer as _, Texture as _,
@@ -22,27 +21,23 @@ use tracing::warn;
 
 use super::convert;
 use super::draw::draw_ops;
-use super::gl::blend;
-use super::gl::blur::Blur;
-use super::gl::capture::Capture;
-use super::gl::shaders::Shaders;
 use super::protocol::{
     Caps, Command, CursorFrameDesc, DmabufDesc, Image, OutputRef, PlaneDesc, Rect, SceneFrame,
-    ShaderKind, ShaderSupport, Target, TexId,
+    Target, TexId, UiScene,
 };
+use super::vello::{effects, VelloRenderer, VelloTarget, VelloTexture};
 
 /// Objects the core refers to by id.
 #[derive(Default)]
-pub struct Tables {
-    pub textures: HashMap<TexId, GlesTexture>,
+pub(crate) struct Tables {
+    pub textures: HashMap<TexId, VelloTexture>,
     /// Dmabufs behind imported textures, for direct scanout and for binding as render targets.
     pub dmabufs: HashMap<TexId, Dmabuf>,
     /// CPU copies of small memory/shm textures (cursor images), so the DRM compositor can put
-    /// them on the cursor plane without going through GL.
+    /// them on the cursor plane without compositing.
     pub memory: HashMap<TexId, MemoryBuffer>,
     pools: ShmPools,
-    pub(super) captures: HashMap<u64, Capture>,
-    blurs: HashMap<u64, Blur>,
+    pub(super) captures: HashMap<u64, VelloTexture>,
 }
 
 /// Textures up to this many pixels keep a CPU copy in `Tables::memory`.
@@ -145,12 +140,9 @@ impl ShmPools {
     }
 }
 
-/// Blur pyramids are cheap to recreate; cap how many we keep for closed windows.
-const MAX_BLUR_CACHE: usize = 64;
-
 pub struct Executor {
-    pub(super) renderer: Option<GlesRenderer>,
-    pub tables: RefCell<Tables>,
+    pub(super) renderer: Option<VelloRenderer>,
+    pub(crate) tables: RefCell<Tables>,
     /// Frames sent for outputs, waiting for `Present`.
     pub output_frames: HashMap<OutputRef, SceneFrame>,
     /// Screencast frames found in the last `execute`, in order; the server hands them to the
@@ -211,7 +203,7 @@ pub fn build_dmabuf(desc: &DmabufDesc, fds: &mut VecDeque<OwnedFd>) -> anyhow::R
 }
 
 impl Executor {
-    pub fn new(renderer: Option<GlesRenderer>) -> Self {
+    pub(crate) fn new(renderer: Option<VelloRenderer>) -> Self {
         Self {
             renderer,
             tables: RefCell::new(Tables::default()),
@@ -220,42 +212,35 @@ impl Executor {
         }
     }
 
+    pub fn render_ui(&mut self, id: TexId, scene: UiScene) -> anyhow::Result<()> {
+        let texture = self.renderer()?.render_ui(scene)?;
+        self.tables.borrow_mut().textures.insert(id, texture);
+        Ok(())
+    }
+
     pub fn has_renderer(&self) -> bool {
         self.renderer.is_some()
     }
 
-    pub fn set_renderer(&mut self, renderer: GlesRenderer) {
+    pub(crate) fn set_renderer(&mut self, renderer: VelloRenderer) {
         self.renderer = Some(renderer);
     }
 
-    /// Drops all GL state. Textures go first: they belong to the renderer's context.
+    /// Drops texture handles before the Vulkan renderer.
     pub fn clear_renderer(&mut self) {
         *self.tables.borrow_mut() = Tables::default();
         self.output_frames.clear();
         self.renderer = None;
     }
 
-    pub fn renderer(&mut self) -> anyhow::Result<&mut GlesRenderer> {
+    pub(crate) fn renderer(&mut self) -> anyhow::Result<&mut VelloRenderer> {
         self.renderer.as_mut().context("no renderer yet")
     }
 
     pub fn caps(&mut self) -> anyhow::Result<Caps> {
         let renderer = self.renderer()?;
-        let s = Shaders::get(renderer);
-        let shaders = ShaderSupport {
-            border: s.border.is_some(),
-            shadow: s.shadow.is_some(),
-            resize: s.program(ShaderKind::Resize).is_some(),
-            clipped_surface: s.clipped_surface.is_some(),
-            postprocess_and_clip: s.postprocess_and_clip.is_some(),
-            gradient_fade: s.gradient_fade.is_some(),
-            blur: s.blur.is_some(),
-            close: s.program(ShaderKind::Close).is_some(),
-            open: s.program(ShaderKind::Open).is_some(),
-            texture_hdr: s.texture_hdr.is_some(),
-        };
         Ok(Caps {
-            renderer: "gles".to_owned(),
+            renderer: "vello-vulkan".to_owned(),
             mem_formats: renderer.mem_formats().map(|f| f as u32).collect(),
             dmabuf_formats: renderer
                 .dmabuf_formats()
@@ -263,27 +248,10 @@ impl Executor {
                 .map(|f| (f.code as u32, u64::from(f.modifier)))
                 .collect(),
             dmabuf_render_formats: renderer
-                .egl_context()
                 .dmabuf_render_formats()
                 .iter()
                 .map(|f| (f.code as u32, u64::from(f.modifier)))
                 .collect(),
-            shaders,
-        })
-    }
-
-    pub fn set_custom_shader(
-        &mut self,
-        kind: ShaderKind,
-        src: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        use super::gl::shaders as gl;
-        let renderer = self.renderer()?;
-        Ok(match kind {
-            ShaderKind::Resize => gl::set_custom_resize_program(renderer, src),
-            ShaderKind::Close => gl::set_custom_close_program(renderer, src),
-            ShaderKind::Open => gl::set_custom_open_program(renderer, src),
-            ShaderKind::Border | ShaderKind::Shadow => bail!("{kind:?} shader is not customizable"),
         })
     }
 
@@ -399,28 +367,28 @@ impl Executor {
 /// Renders a texture/dmabuf frame right away: full clear and unclipped draws, in order.
 /// One-shot targets (screenshots, screencopy, effect buffers) have no damage history.
 fn render_offscreen(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     tables: &RefCell<Tables>,
     frame: &SceneFrame,
 ) -> anyhow::Result<()> {
     let size = Size::<i32, Physical>::from((frame.width, frame.height));
     let transform = convert::to_transform(frame.transform);
-    let draw = |renderer: &mut GlesRenderer, fb: &mut GlesTarget<'_>| -> anyhow::Result<_> {
-        let mut gl_frame = renderer.render(fb, size, transform).context("render")?;
+    let draw = |renderer: &mut VelloRenderer, fb: &mut VelloTarget<'_>| -> anyhow::Result<_> {
+        let mut paint_frame = renderer.render(fb, size, transform).context("render")?;
         if let Some([r, g, b, a]) = frame.clear {
             let all = Rectangle::from_size(transform.transform_size(size));
-            gl_frame
+            paint_frame
                 .clear(Color32F::new(r, g, b, a), &[all])
                 .context("clear")?;
         }
         for node in &frame.nodes {
-            draw_ops(&mut gl_frame, tables, &node.capture, None)?;
-            draw_ops(&mut gl_frame, tables, &node.draw, None)?;
+            draw_ops(&mut paint_frame, tables, &node.capture, None)?;
+            draw_ops(&mut paint_frame, tables, &node.draw, None)?;
         }
-        gl_frame.finish().context("finish")
+        paint_frame.finish().context("finish")
     };
 
-    blend::apply(renderer, frame.blend);
+    renderer.set_blend(frame.blend);
     let res = match frame.target {
         Target::Texture(id) => {
             let mut texture = tables
@@ -436,8 +404,7 @@ fn render_offscreen(
                 .map(|_sync| None)
         }
         Target::Dmabuf(id) => {
-            // Bind the dmabuf itself rather than its imported texture: external (EGLImage)
-            // textures can't be framebuffer attachments.
+            // Bind with render-target usage and the external ownership/sync contract.
             let mut dmabuf = tables
                 .borrow()
                 .dmabufs
@@ -453,7 +420,7 @@ fn render_offscreen(
         _ => unreachable!(),
     };
     if frame.blend.is_some() {
-        blend::apply(renderer, None);
+        renderer.set_blend(None);
     }
     if let Some(sync) = res? {
         // The buffer leaves for another process (PipeWire consumer, image-copy client) as
@@ -468,7 +435,7 @@ fn render_offscreen(
 /// Commands other than frames.
 /// Commands valid outside a frame (and, via the frame's renderer guard, inside one).
 fn execute_one(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     tables: &mut Tables,
     cmd: Command,
     fds: &mut VecDeque<OwnedFd>,
@@ -674,7 +641,7 @@ fn execute_one(
             tables.captures.remove(&key);
         }
         Command::Blur {
-            key,
+            key: _,
             src,
             dst,
             params,
@@ -684,19 +651,7 @@ fn execute_one(
                 .get(&src)
                 .context("unknown texture")?
                 .clone();
-            if tables.blurs.len() > MAX_BLUR_CACHE && !tables.blurs.contains_key(&key) {
-                tables.blurs.clear();
-            }
-            let blur = match tables.blurs.entry(key) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(Blur::new(renderer).context("blur shader unavailable")?)
-                }
-            };
-            let options = params.into();
-            blur.prepare_textures(|f, s| renderer.create_buffer(f, s), &src, options)
-                .context("prepare blur textures")?;
-            let out = blur.render(renderer, &src, options).context("blur")?;
+            let out = effects::blur(renderer, &src, params).context("blur")?;
             tables.textures.insert(dst, out);
         }
         Command::SetDebugFlags { flags } => {

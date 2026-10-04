@@ -9,15 +9,14 @@ use super::LayoutElement;
 use crate::animation::{Animation, Clock};
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::utils::{
     floor_logical_in_physical_max1, round_logical_in_physical, round_logical_in_physical_max1,
 };
 
 #[derive(Debug)]
 pub struct TabIndicator {
-    shader_locs: Vec<Point<f64, Logical>>,
-    shaders: Vec<BorderRenderElement>,
+    paint_locs: Vec<Point<f64, Logical>>,
+    paints: Vec<BorderRenderElement>,
     open_anim: Option<Animation>,
     config: niri_config::TabIndicator,
 }
@@ -39,8 +38,8 @@ niri_render_elements! {
 impl TabIndicator {
     pub fn new(config: niri_config::TabIndicator) -> Self {
         Self {
-            shader_locs: Vec::new(),
-            shaders: Vec::new(),
+            paint_locs: Vec::new(),
+            paints: Vec::new(),
             open_anim: None,
             config,
         }
@@ -50,8 +49,8 @@ impl TabIndicator {
         self.config = config;
     }
 
-    pub fn update_shaders(&mut self) {
-        for elem in &mut self.shaders {
+    pub fn update_paints(&mut self) {
+        for elem in &mut self.paints {
             elem.damage_all();
         }
     }
@@ -111,17 +110,17 @@ impl TabIndicator {
         let floored_length = count as f64 * (px_per_tab + gaps_between) - gaps_between;
         let mut ones_left = ((length - floored_length) / pixel).round() as usize;
 
-        let mut shader_loc = Point::from((-gap - width, round((side - length) / 2.)));
+        let mut paint_loc = Point::from((-gap - width, round((side - length) / 2.)));
         match position {
             TabIndicatorPosition::Left => (),
-            TabIndicatorPosition::Right => shader_loc.x = area.size.w + gap,
-            TabIndicatorPosition::Top => mem::swap(&mut shader_loc.x, &mut shader_loc.y),
+            TabIndicatorPosition::Right => paint_loc.x = area.size.w + gap,
+            TabIndicatorPosition::Top => mem::swap(&mut paint_loc.x, &mut paint_loc.y),
             TabIndicatorPosition::Bottom => {
-                shader_loc.x = shader_loc.y;
-                shader_loc.y = area.size.h + gap;
+                paint_loc.x = paint_loc.y;
+                paint_loc.y = area.size.h + gap;
             }
         }
-        shader_loc += area.loc;
+        paint_loc += area.loc;
 
         (0..count).map(move |_| {
             let mut px_per_tab = px_per_tab;
@@ -130,14 +129,14 @@ impl TabIndicator {
                 px_per_tab += pixel;
             }
 
-            let loc = shader_loc;
+            let loc = paint_loc;
 
             match position {
                 TabIndicatorPosition::Left | TabIndicatorPosition::Right => {
-                    shader_loc.y += px_per_tab + gaps_between
+                    paint_loc.y += px_per_tab + gaps_between
                 }
                 TabIndicatorPosition::Top | TabIndicatorPosition::Bottom => {
-                    shader_loc.x += px_per_tab + gaps_between
+                    paint_loc.x += px_per_tab + gaps_between
                 }
             }
 
@@ -169,20 +168,20 @@ impl TabIndicator {
         scale: f64,
     ) {
         if !enabled || self.config.off {
-            self.shader_locs.clear();
-            self.shaders.clear();
+            self.paint_locs.clear();
+            self.paints.clear();
             return;
         }
 
         let count = tab_count;
         if self.config.hide_when_single_tab && count == 1 {
-            self.shader_locs.clear();
-            self.shaders.clear();
+            self.paint_locs.clear();
+            self.paints.clear();
             return;
         }
 
-        self.shaders.resize_with(count, Default::default);
-        self.shader_locs.resize_with(count, Default::default);
+        self.paints.resize_with(count, Default::default);
+        self.paint_locs.resize_with(count, Default::default);
 
         let position = self.config.position;
         let radius = self.config.corner_radius as f32;
@@ -190,8 +189,8 @@ impl TabIndicator {
         let mut tabs_left = tab_count;
 
         let rects = self.tab_rects(area, count, scale);
-        for ((shader, loc), (tab, rect)) in zip(
-            zip(&mut self.shaders, &mut self.shader_locs),
+        for ((paint, loc), (tab, rect)) in zip(
+            zip(&mut self.paints, &mut self.paint_locs),
             zip(tabs, rects),
         ) {
             *loc = rect.loc;
@@ -253,7 +252,7 @@ impl TabIndicator {
             let radius = radius.fit_to(rect.size.w as f32, rect.size.h as f32);
             tabs_left -= 1;
 
-            shader.update(
+            paint.update(
                 rect.size,
                 gradient_area,
                 tab.gradient.in_,
@@ -263,7 +262,6 @@ impl TabIndicator {
                 Rectangle::from_size(rect.size),
                 0.,
                 radius,
-                scale as f32,
                 1.,
             );
         }
@@ -292,17 +290,11 @@ impl TabIndicator {
 
     pub fn render(
         &self,
-        renderer: &mut impl NiriRenderer,
         pos: Point<f64, Logical>,
         push: &mut dyn FnMut(TabIndicatorRenderElement),
     ) {
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
-        if !has_border_shader {
-            return;
-        }
-
-        for (shader, loc) in zip(&self.shaders, &self.shader_locs) {
-            let elem = shader.clone().with_location(pos + *loc);
+        for (paint, loc) in zip(&self.paints, &self.paint_locs) {
+            let elem = paint.clone().with_location(pos + *loc);
             push(TabIndicatorRenderElement::from(elem));
         }
     }

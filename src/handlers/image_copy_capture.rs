@@ -89,11 +89,8 @@ pub fn source_output(source: &ImageCaptureSource) -> Option<Output> {
 ///
 /// `render_node` is the primary renderer's DRM render node (see
 /// `Backend::primary_render_node()`), and only shm will be supported without
-/// one. It is required since querying it from the EGL context fails for the TTY
-/// backend: since Mesa 23.3 and until at least 26.1.8, `_eglGetGbmDisplay()`
-/// clears the display's EGLDevice once a second EGLDisplay is created for the
-/// same GBM device, which the TTY backend does during initialization. See
-/// https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44351.
+/// one. The GPU worker reports the Vulkan adapter's render node explicitly; the
+/// core does not query renderer-native handles.
 pub fn output_capture_constraints(
     renderer: &RemoteRenderer,
     render_node: Option<DrmNode>,

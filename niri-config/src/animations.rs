@@ -1,13 +1,8 @@
-use std::cell::RefCell;
-use std::fs;
-use std::rc::Rc;
-
-use knuffel::ast::SpannedNode;
 use knuffel::errors::DecodeError;
 use knuffel::Decode as _;
 
-use crate::utils::{expand_home_path, expect_only_children, parse_arg_node, MergeWith};
-use crate::{FloatOrInt, Includes};
+use crate::utils::{expect_only_children, parse_arg_node, MergeWith};
+use crate::FloatOrInt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Animations {
@@ -156,61 +151,9 @@ impl Default for WorkspaceSwitchAnim {
     }
 }
 
-fn parse_custom_shader_path<S: knuffel::traits::ErrorSpan>(
-    spanned: &SpannedNode<S>,
-    ctx: &mut knuffel::decode::Context<S>,
-) -> Result<String, DecodeError<S>> {
-    let mut shader_text = None;
-
-    for (name, val) in &spanned.properties {
-        if &***name == "path" {
-            let path_val = knuffel::traits::DecodeScalar::decode(val, ctx)?;
-            let Some(path) = expand_home_path(path_val, spanned, ctx) else {
-                continue;
-            };
-
-            let includes = ctx.get::<Rc<RefCell<Includes>>>().unwrap();
-            includes.borrow_mut().0.push(path.to_path_buf());
-
-            match fs::read_to_string(&path) {
-                Ok(text) => shader_text = Some(text),
-                Err(e) => ctx.emit_error(DecodeError::missing(
-                    spanned,
-                    format!("failed to read custom shader from {path:?}: {e}"),
-                )),
-            }
-        } else {
-            ctx.emit_error(DecodeError::unexpected(
-                &val.literal,
-                "property",
-                format!("unexpected property `{}`", name.escape_default()),
-            ));
-        }
-    }
-
-    for arg in &spanned.arguments {
-        ctx.emit_error(DecodeError::unexpected(
-            &arg.literal,
-            "argument",
-            "unexpected argument",
-        ));
-    }
-
-    for child in spanned.children() {
-        ctx.emit_error(DecodeError::unexpected(
-            child,
-            "child",
-            "unexpected children",
-        ));
-    }
-
-    shader_text.ok_or_else(|| DecodeError::missing(spanned, "custom shader path missing"))
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowOpenAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
 }
 
 impl Default for WindowOpenAnim {
@@ -223,7 +166,6 @@ impl Default for WindowOpenAnim {
                     curve: Curve::EaseOutExpo,
                 }),
             },
-            custom_shader: None,
         }
     }
 }
@@ -231,7 +173,6 @@ impl Default for WindowOpenAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowCloseAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
 }
 
 impl Default for WindowCloseAnim {
@@ -244,7 +185,6 @@ impl Default for WindowCloseAnim {
                     curve: Curve::EaseOutQuad,
                 }),
             },
-            custom_shader: None,
         }
     }
 }
@@ -284,7 +224,6 @@ impl Default for WindowMovementAnim {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowResizeAnim {
     pub anim: Animation,
-    pub custom_shader: Option<String>,
 }
 
 impl Default for WindowResizeAnim {
@@ -298,7 +237,6 @@ impl Default for WindowResizeAnim {
                     epsilon: 0.0001,
                 }),
             },
-            custom_shader: None,
         }
     }
 }
@@ -391,9 +329,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -406,9 +342,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -421,9 +355,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -436,24 +368,8 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = if child.properties.contains_key("path") {
-                    Some(parse_custom_shader_path(child, ctx)?)
-                } else {
-                    Some(parse_arg_node("custom-shader", child, ctx)?)
-                };
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
+        let anim = Animation::decode_node(node, ctx, default)?;
+        Ok(Self { anim })
     }
 }
 
@@ -466,24 +382,8 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = if child.properties.contains_key("path") {
-                    Some(parse_custom_shader_path(child, ctx)?)
-                } else {
-                    Some(parse_arg_node("custom-shader", child, ctx)?)
-                };
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
+        let anim = Animation::decode_node(node, ctx, default)?;
+        Ok(Self { anim })
     }
 }
 
@@ -496,24 +396,8 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().anim;
-        let mut custom_shader = None;
-        let anim = Animation::decode_node(node, ctx, default, |child, ctx| {
-            if &**child.node_name == "custom-shader" {
-                custom_shader = if child.properties.contains_key("path") {
-                    Some(parse_custom_shader_path(child, ctx)?)
-                } else {
-                    Some(parse_arg_node("custom-shader", child, ctx)?)
-                };
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-
-        Ok(Self {
-            anim,
-            custom_shader,
-        })
+        let anim = Animation::decode_node(node, ctx, default)?;
+        Ok(Self { anim })
     }
 }
 
@@ -526,9 +410,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -541,9 +423,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -556,9 +436,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -571,9 +449,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -586,9 +462,7 @@ where
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
         let default = Self::default().0;
-        Ok(Self(Animation::decode_node(node, ctx, default, |_, _| {
-            Ok(false)
-        })?))
+        Ok(Self(Animation::decode_node(node, ctx, default)?))
     }
 }
 
@@ -607,10 +481,6 @@ impl Animation {
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
         default: Self,
-        mut process_children: impl FnMut(
-            &knuffel::ast::SpannedNode<S>,
-            &mut knuffel::decode::Context<S>,
-        ) -> Result<bool, DecodeError<S>>,
     ) -> Result<Self, DecodeError<S>> {
         #[derive(Default, PartialEq)]
         struct OptionalEasingParams {
@@ -779,14 +649,19 @@ impl Animation {
 
                     easing_params.curve = animation_curve;
                 }
+                "custom-shader" => {
+                    ctx.emit_error(DecodeError::unexpected(
+                        child,
+                        "node",
+                        "`custom-shader` has been removed; animations use built-in rendering",
+                    ));
+                }
                 name_str => {
-                    if !process_children(child, ctx)? {
-                        ctx.emit_error(DecodeError::unexpected(
-                            child,
-                            "node",
-                            format!("unexpected node `{}`", name_str.escape_default()),
-                        ));
-                    }
+                    ctx.emit_error(DecodeError::unexpected(
+                        child,
+                        "node",
+                        format!("unexpected node `{}`", name_str.escape_default()),
+                    ));
                 }
             }
         }

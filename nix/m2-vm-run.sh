@@ -20,9 +20,10 @@ stop() {
   pkill -f 'sway -c' 2>/dev/null || true
 }
 if [ "${1:-}" = stop ]; then stop; exit 0; fi
-# The guest reuses the host's kernel (nix/m2-vm.nix); nothing heavy may be compiled here.
+# The guest reuses the host's kernel and crosvm. Mesa may rebuild for the
+# guest-only Honeykrisp native-context fix in nix/m2-vm.nix.
 plan=$(nix build --impure --dry-run "path:$SRC#packages.aarch64-linux.m2-vm" 2>&1 >/dev/null || true)
-if echo "$plan" | grep -qE -- '-linux-[0-9]|-linux-asahi-[0-9.]+\.drv|-linux-config-|-virglrenderer-|-crosvm-[0-9]|-mesa-[0-9]|-llvm-'; then
+if echo "$plan" | grep -qE -- '-linux-[0-9]|-linux-asahi-[0-9.]+\.drv|-linux-config-|-virglrenderer-|-crosvm-[0-9]|-llvm-'; then
   echo "refusing to build: the plan compiles heavy things:"; echo "$plan"; exit 1
 fi
 nix build --impure -o "$M2VM/result" "path:$SRC#packages.aarch64-linux.m2-vm"

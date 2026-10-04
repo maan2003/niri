@@ -5,32 +5,31 @@ use std::sync::Mutex;
 
 use niri_config::Config;
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{Alignment, FontDescription};
 use smithay::backend::renderer::element::utils::RescaleRenderElement;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Point, Transform};
+use smithay::utils::Point;
 
+use super::paint::{Paint, Text, TextAlign, TextOptions};
 use crate::animation::{Animation, Clock};
+use crate::gpu::remote::RemoteTexture;
 use crate::niri_render_elements;
-use crate::render_helpers::memory::MemoryBuffer;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::utils::{output_size, to_physical_precise_round};
+use crate::utils::output_size;
 
 const KEY_NAME: &str = "Enter";
 const PADDING: i32 = 16;
-const FONT: &str = "sans 14px";
+const FONT: f32 = 14.;
 const BORDER: i32 = 8;
 const BACKDROP_COLOR: [f32; 4] = [0., 0., 0., 0.4];
 
 pub struct ExitConfirmDialog {
     state: State,
-    buffers: RefCell<HashMap<NotNan<f64>, Option<MemoryBuffer>>>,
+    scene: Option<Paint>,
+    buffers: RefCell<HashMap<NotNan<f64>, Option<TextureBuffer<RemoteTexture>>>>,
 
     clock: Clock,
     config: Rc<RefCell<Config>>,
@@ -56,7 +55,7 @@ enum State {
 
 impl ExitConfirmDialog {
     pub fn new(clock: Clock, config: Rc<RefCell<Config>>) -> Self {
-        let buffer = match render(1.) {
+        let scene = match render() {
             Ok(x) => Some(x),
             Err(err) => {
                 warn!("error creating the exit confirm dialog: {err:?}");
@@ -66,16 +65,15 @@ impl ExitConfirmDialog {
 
         Self {
             state: State::Hidden,
-            buffers: RefCell::new(HashMap::from([(NotNan::new(1.).unwrap(), buffer)])),
+            scene,
+            buffers: RefCell::new(HashMap::new()),
             clock,
             config,
         }
     }
 
     pub fn can_show(&self) -> bool {
-        let buffers = self.buffers.borrow();
-        let fallback = &buffers[&NotNan::new(1.).unwrap()];
-        fallback.is_some()
+        self.scene.is_some()
     }
 
     fn animation(&self, from: f64, to: f64) -> Animation {
@@ -165,22 +163,35 @@ impl ExitConfirmDialog {
         let scale = output.current_scale().fractional_scale();
         let output_size = output_size(output);
 
+        let Some(scene) = &self.scene else { return };
         let mut buffers = self.buffers.borrow_mut();
-        let Some(fallback) = buffers[&NotNan::new(1.).unwrap()].clone() else {
-            error!("exit confirm dialog opened without fallback buffer");
+        let remote = renderer.as_remote_renderer();
+        let fallback = buffers
+            .entry(NotNan::new(1.).unwrap())
+            .or_insert_with(|| {
+                let mut scene = scene.clone();
+                scene.border(BORDER as f32, [1., 0.3, 0.3, 1.]);
+                scene.render(remote, 1.).ok()
+            })
+            .clone();
+        let Some(fallback) = fallback else {
             return;
         };
-
         let buffer = buffers
             .entry(NotNan::new(scale).unwrap())
-            .or_insert_with(|| render(scale).ok());
-        let buffer = buffer.as_ref().unwrap_or(&fallback);
-
+            .or_insert_with(|| {
+                // Keep the border an even number of physical pixels at each scale.
+                let mut scene = scene.clone();
+                scene.border(
+                    ((BORDER as f64 / 2. * scale).round() * 2. / scale) as f32,
+                    [1., 0.3, 0.3, 1.],
+                );
+                scene.render(remote, scale).ok()
+            })
+            .as_ref()
+            .unwrap_or(&fallback)
+            .clone();
         let size = buffer.logical_size();
-        let Ok(buffer) = TextureBuffer::from_memory_buffer(renderer.as_remote_renderer(), buffer)
-        else {
-            return;
-        };
 
         let location = (output_size.to_point() - size.to_point()).downscale(2.);
         let mut location = location.to_physical_precise_round(scale).to_logical(scale);
@@ -222,64 +233,22 @@ impl ExitConfirmDialog {
     }
 }
 
-fn render(scale: f64) -> anyhow::Result<MemoryBuffer> {
+fn render() -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("exit_confirm_dialog::render");
-
-    let markup = text(true);
-
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_markup(&markup);
-
-    let (mut width, mut height) = layout.pixel_size();
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_alignment(Alignment::Center);
-    layout.set_markup(&markup);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(1., 0.3, 0.3);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = MemoryBuffer::new(
-        data.to_vec(),
-        Fourcc::Argb8888,
-        (width, height),
-        scale,
-        Transform::Normal,
-    );
-
-    Ok(buffer)
+    let text = Text::with_options(
+        &text(true),
+        TextOptions {
+            font_size: FONT,
+            align: TextAlign::Center,
+            ..Default::default()
+        },
+        true,
+    )?;
+    let (width, height) = text.size();
+    let mut paint = Paint::new(width + PADDING * 2, height + PADDING * 2);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    paint.text(&text, PADDING as f32, PADDING as f32);
+    Ok(paint)
 }
 
 fn text(markup: bool) -> String {
@@ -302,4 +271,11 @@ pub fn a11y_node() -> accesskit::Node {
     node.set_description(text(false));
     node.set_modal();
     node
+}
+
+#[cfg(test)]
+pub(super) fn test_paint() -> anyhow::Result<Paint> {
+    let mut paint = render()?;
+    paint.border(BORDER as f32, [1., 0.3, 0.3, 1.]);
+    Ok(paint)
 }

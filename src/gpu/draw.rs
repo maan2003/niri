@@ -1,42 +1,19 @@
-//! Runs scene ops on a `GlesFrame`.
+//! Runs scene ops on a Vello frame.
 //!
 //! The one place that turns frame-space ops into smithay draw calls. Every op is clipped by
 //! the same rule: the node's damage (frame coordinates) intersected with the op's `dst`, then
 //! made `dst`-relative because that is what smithay's draw calls want.
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use anyhow::Context as _;
-use smithay::backend::renderer::gles::{GlesFrame, GlesTexProgram};
-use smithay::backend::renderer::{Color32F, FrameContext as _};
+use smithay::backend::renderer::{Color32F, Frame as _, Texture as _};
 use smithay::utils::{Physical, Rectangle};
 
 use super::convert;
 use super::exec::Tables;
-use super::gl::capture::Capture;
-use super::gl::resources::Resources;
-use super::gl::shader::{self, DrawParams};
-use super::gl::shaders::Shaders;
-use super::protocol::{Op, Rect, TexProgram};
-
-struct TexPrograms {
-    clipped_surface: Option<GlesTexProgram>,
-    postprocess_and_clip: Option<GlesTexProgram>,
-    gradient_fade: Option<GlesTexProgram>,
-    texture_hdr: Option<GlesTexProgram>,
-}
-
-impl TexPrograms {
-    fn get(&self, program: TexProgram) -> Option<&GlesTexProgram> {
-        match program {
-            TexProgram::ClippedSurface => self.clipped_surface.as_ref(),
-            TexProgram::PostprocessAndClip => self.postprocess_and_clip.as_ref(),
-            TexProgram::GradientFade => self.gradient_fade.as_ref(),
-            TexProgram::TextureHdr => self.texture_hdr.as_ref(),
-        }
-    }
-}
+use super::protocol::{Op, Paint, Rect, SourceColor, TextureEffect, TextureOptions};
+use super::vello::{effects, VelloFrame};
 
 /// Damage for an op drawn at `dst`, relative to `dst`: the frame-space `clip` (or all of
 /// `dst` when there is none) intersected with `dst`. Empty means the op can be skipped.
@@ -71,31 +48,10 @@ fn relative_to(
         .collect()
 }
 
-/// Draws `ops` in order, clipped to `clip` (frame coordinates; `None` = unclipped).
-pub fn draw_ops(
-    frame: &mut GlesFrame<'_, '_>,
+/// Draws flat, explicitly encoded scene ops in painter order.
+pub(crate) fn draw_ops(
+    frame: &mut VelloFrame<'_, '_>,
     tables: &RefCell<Tables>,
-    ops: &[Op],
-    clip: Option<&[Rectangle<i32, Physical>]>,
-) -> anyhow::Result<()> {
-    let programs = {
-        let shaders = Shaders::get_from_frame(frame);
-        TexPrograms {
-            clipped_surface: shaders.clipped_surface.clone(),
-            postprocess_and_clip: shaders.postprocess_and_clip.clone(),
-            gradient_fade: shaders.gradient_fade.clone(),
-            texture_hdr: shaders.texture_hdr.clone(),
-        }
-    };
-    let resources = Resources::get(frame);
-    draw_ops_inner(frame, tables, &programs, resources.as_ref(), ops, clip)
-}
-
-fn draw_ops_inner(
-    frame: &mut GlesFrame<'_, '_>,
-    tables: &RefCell<Tables>,
-    programs: &TexPrograms,
-    resources: Option<&Rc<RefCell<Resources>>>,
     ops: &[Op],
     clip: Option<&[Rectangle<i32, Physical>]>,
 ) -> anyhow::Result<()> {
@@ -104,13 +60,10 @@ fn draw_ops_inner(
             Op::Solid { dst, color } => {
                 let dst = convert::to_rect(*dst);
                 let damage = op_damage(dst, clip);
-                if damage.is_empty() {
-                    continue;
+                if !damage.is_empty() {
+                    let [r, g, b, a] = *color;
+                    frame.draw_solid(dst, &damage, Color32F::new(r, g, b, a))?;
                 }
-                let [r, g, b, a] = *color;
-                frame
-                    .draw_solid(dst, &damage, Color32F::new(r, g, b, a))
-                    .context("draw_solid")?;
             }
             Op::Texture {
                 texture,
@@ -119,76 +72,71 @@ fn draw_ops_inner(
                 opaque,
                 transform,
                 alpha,
-                program,
-                uniforms,
+                options,
             } => {
                 let dst = convert::to_rect(*dst);
                 let damage = op_damage(dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
-                let tables = tables.borrow();
-                let texture = tables.textures.get(texture).context("unknown texture")?;
-                let uniforms = convert::to_uniforms(uniforms.clone());
-                frame
-                    .render_texture_from_to(
-                        texture,
-                        convert::to_rect_f64(*src),
-                        dst,
-                        &damage,
-                        &relative_to(opaque, dst),
-                        convert::to_transform(*transform),
-                        *alpha,
-                        program.and_then(|p| programs.get(p)),
-                        &uniforms,
-                    )
-                    .context("render_texture_from_to")?;
+                let texture = tables
+                    .borrow()
+                    .textures
+                    .get(texture)
+                    .cloned()
+                    .context("unknown texture")?;
+                effects::draw_texture(
+                    frame,
+                    &texture,
+                    convert::to_rect_f64(*src),
+                    dst,
+                    &damage,
+                    &relative_to(opaque, dst),
+                    convert::to_transform(*transform),
+                    *alpha,
+                    *options,
+                )?;
             }
-            Op::Shader {
-                program,
+            Op::Paint {
+                paint,
                 src,
                 dst,
-                scale,
                 alpha,
-                uniforms,
-                textures,
             } => {
                 let dst = convert::to_rect(*dst);
                 let damage = op_damage(dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
-                let Some(shader) = Shaders::get_from_frame(frame).program(*program) else {
-                    continue;
+                let lookup = |id| {
+                    tables
+                        .borrow()
+                        .textures
+                        .get(&id)
+                        .cloned()
+                        .context("unknown texture")
                 };
-                let tables = tables.borrow();
-                let textures = textures
-                    .iter()
-                    .map(|(name, id)| {
-                        tables
-                            .textures
-                            .get(id)
-                            .cloned()
-                            .map(|t| (name.clone(), t))
-                            .context("unknown texture")
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let uniforms = convert::to_uniforms(uniforms.clone());
-                shader::draw(
-                    frame,
-                    &shader,
-                    resources.context("GL resources missing")?,
-                    &DrawParams {
-                        src: convert::to_rect_f64(*src),
-                        dest: dst,
-                        damage: &damage,
-                        scale: *scale,
-                        alpha: *alpha,
-                        uniforms: &uniforms,
-                        textures: &textures,
+                let paint = match paint {
+                    Paint::Border(params) => Paint::Border(*params),
+                    Paint::Shadow(params) => Paint::Shadow(*params),
+                    Paint::Resize {
+                        params,
+                        previous,
+                        next,
+                    } => Paint::Resize {
+                        params: *params,
+                        previous: lookup(*previous)?,
+                        next: lookup(*next)?,
                     },
-                )
-                .context("draw shader")?;
+                };
+                effects::draw_paint(
+                    frame,
+                    &paint,
+                    convert::to_rect_f64(*src),
+                    dst,
+                    &damage,
+                    *alpha,
+                )?;
             }
             Op::Capture {
                 key,
@@ -197,67 +145,48 @@ fn draw_ops_inner(
                 scale,
                 blur,
             } => {
+                let texture = effects::capture(
+                    frame,
+                    convert::to_rect_f64(*src),
+                    convert::to_rect(*dst),
+                    *scale,
+                    *blur,
+                )?;
                 let mut tables = tables.borrow_mut();
-                let capture = match tables.captures.entry(*key) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let mut guard = frame.renderer();
-                        e.insert(Capture::new(guard.as_mut()))
-                    }
-                };
-                capture
-                    .capture(
-                        frame,
-                        convert::to_rect_f64(*src),
-                        convert::to_rect(*dst),
-                        *scale,
-                        blur.map(Into::into),
-                    )
-                    .context("capture framebuffer")?;
+                if let Some(texture) = texture {
+                    tables.captures.insert(*key, texture);
+                } else {
+                    tables.captures.remove(key);
+                }
             }
-            Op::Captured { key, dst, uniforms } => {
+            Op::Captured {
+                key,
+                dst,
+                postprocess,
+            } => {
                 let dst = convert::to_rect(*dst);
                 let damage = op_damage(dst, clip);
                 if damage.is_empty() {
                     continue;
                 }
-                let tables = tables.borrow();
-                let Some(capture) = tables.captures.get(key) else {
+                let Some(texture) = tables.borrow().captures.get(key).cloned() else {
                     continue;
                 };
-                let uniforms = convert::to_uniforms(uniforms.clone());
-                capture
-                    .draw(
-                        frame,
-                        dst,
-                        &damage,
-                        programs.postprocess_and_clip.as_ref(),
-                        &uniforms,
-                    )
-                    .context("draw captured")?;
-            }
-            Op::WithTexProgram {
-                program,
-                uniforms,
-                ops,
-            } => {
-                // Replaces the frame-wide blend override for the scope; restored after.
-                let saved = frame.take_tex_program_override();
-                if let Some(program) = programs.get(*program) {
-                    frame.override_default_tex_program(
-                        program.clone(),
-                        convert::to_uniforms(uniforms.clone()),
-                    );
-                }
-                let res = draw_ops_inner(frame, tables, programs, resources, ops, clip);
-                frame.set_tex_program_override(saved);
-                res?;
-            }
-            Op::Raw { ops } => {
-                let saved = frame.take_tex_program_override();
-                let res = draw_ops_inner(frame, tables, programs, resources, ops, clip);
-                frame.set_tex_program_override(saved);
-                res?;
+                let transform = frame.transformation().invert();
+                effects::draw_texture(
+                    frame,
+                    &texture,
+                    Rectangle::from_size(texture.size().to_f64()),
+                    dst,
+                    &damage,
+                    &[],
+                    transform,
+                    1.,
+                    TextureOptions {
+                        color: SourceColor::Target,
+                        effect: Some(TextureEffect::Postprocess(*postprocess)),
+                    },
+                )?;
             }
         }
     }
@@ -282,5 +211,421 @@ mod tests {
         assert_eq!(op_damage(dst, None), vec![rect(0, 0, 100, 100)]);
         // A clip that misses the op yields nothing.
         assert!(op_damage(dst, Some(&[rect(0, 0, 100, 100)])).is_empty());
+    }
+    use crate::gpu::protocol::{BlendParams, ClipParams, PostprocessParams};
+    fn postprocess(size: [f32; 2]) -> PostprocessParams {
+        PostprocessParams {
+            clip: ClipParams {
+                size,
+                radii: [0.; 4],
+                input_to_geo: glam::Mat3::IDENTITY.to_cols_array(),
+            },
+            saturation: 1.,
+            noise: 0.,
+            background: [0.; 4],
+        }
+    }
+
+    #[test]
+    fn ordered_capture_and_explicit_source_colors_render() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{
+            Bind as _, ExportMem as _, ImportMem as _, Offscreen as _, Renderer as _,
+        };
+        use smithay::utils::{Buffer, Transform};
+
+        use crate::gpu::server::new_headless_renderer;
+        let Ok(mut renderer) = new_headless_renderer() else {
+            eprintln!("no Vulkan renderer available, skipping");
+            return;
+        };
+        let texture = renderer
+            .import_memory(&[80, 120, 200, 255], Fourcc::Abgr8888, (1, 1).into(), false)
+            .unwrap();
+        let tables = RefCell::new(Tables::default());
+        tables.borrow_mut().textures.insert(1, texture);
+        let mut target = renderer
+            .create_buffer(Fourcc::Abgr8888, (10, 2).into())
+            .unwrap();
+        // Golden channels independently apply the specified BT.709->target matrices and
+        // 2.2 transfer; PQ additionally applies ST2084 at reference white 203 cd/m².
+        for (blend, converted, matching) in [
+            (
+                Some(BlendParams::HdrPq {
+                    ref_lum_scale: 0.0203,
+                }),
+                [98u8, 106, 132, 255],
+                SourceColor::Hdr,
+            ),
+            (
+                Some(BlendParams::DisplayP3),
+                [89, 119, 194, 255],
+                SourceColor::DisplayP3,
+            ),
+            (None, [80, 120, 200, 255], SourceColor::Srgb),
+        ] {
+            renderer.set_blend(blend);
+            {
+                let mut fb = renderer.bind(&mut target).unwrap();
+                let mut frame = renderer
+                    .render(&mut fb, (10, 2).into(), Transform::Normal)
+                    .unwrap();
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect(0, 0, 10, 2)])
+                    .unwrap();
+                let mut ops = Vec::new();
+                for (i, color) in [
+                    SourceColor::Target,
+                    SourceColor::Srgb,
+                    SourceColor::Hdr,
+                    SourceColor::DisplayP3,
+                    SourceColor::Srgb,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    ops.push(Op::Texture {
+                        texture: 1,
+                        src: Rect {
+                            x: 0.,
+                            y: 0.,
+                            w: 1.,
+                            h: 1.,
+                        },
+                        dst: Rect {
+                            x: i as i32 * 2,
+                            y: 0,
+                            w: 2,
+                            h: 1,
+                        },
+                        opaque: vec![],
+                        transform: super::super::protocol::Transform::Normal,
+                        alpha: 1.,
+                        options: TextureOptions {
+                            color,
+                            effect: None,
+                        },
+                    });
+                }
+                ops.extend([
+                    Op::Solid {
+                        dst: Rect {
+                            x: 0,
+                            y: 1,
+                            w: 2,
+                            h: 1,
+                        },
+                        color: [1., 0., 0., 1.],
+                    },
+                    Op::Capture {
+                        key: 7,
+                        src: Rect {
+                            x: 0.,
+                            y: 0.,
+                            w: 2.,
+                            h: 1.,
+                        },
+                        dst: Rect {
+                            x: 0,
+                            y: 1,
+                            w: 2,
+                            h: 1,
+                        },
+                        scale: 1.,
+                        blur: None,
+                    },
+                    // The snapshot must exclude this later overwrite.
+                    Op::Solid {
+                        dst: Rect {
+                            x: 0,
+                            y: 1,
+                            w: 2,
+                            h: 1,
+                        },
+                        color: [0., 0., 1., 1.],
+                    },
+                    Op::Captured {
+                        key: 7,
+                        dst: Rect {
+                            x: 2,
+                            y: 1,
+                            w: 2,
+                            h: 1,
+                        },
+                        postprocess: postprocess([2., 1.]),
+                    },
+                ]);
+                draw_ops(&mut frame, &tables, &ops, None).unwrap();
+                frame.finish().unwrap().wait().unwrap();
+            }
+            let mapping = renderer
+                .copy_texture(
+                    &target,
+                    Rectangle::<i32, Buffer>::from_size((10, 2).into()),
+                    Fourcc::Abgr8888,
+                )
+                .unwrap();
+            let pixels = renderer.map_texture(&mapping).unwrap();
+            for (i, color) in [
+                SourceColor::Target,
+                SourceColor::Srgb,
+                SourceColor::Hdr,
+                SourceColor::DisplayP3,
+                SourceColor::Srgb,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let expected = if color == SourceColor::Target || color == matching {
+                    [80, 120, 200, 255]
+                } else {
+                    converted
+                };
+                for (got, expected) in pixels[i * 8..i * 8 + 4].iter().zip(expected) {
+                    assert!(
+                        got.abs_diff(expected) <= 1,
+                        "source {color:?} target {blend:?}: {:?}",
+                        &pixels[i * 8..i * 8 + 4]
+                    );
+                }
+            }
+            if matches!(blend, Some(BlendParams::HdrPq { .. })) {
+                // sRGB red becomes PQ(0.627404,0.069097,0.016391)*203 nits; nonzero G/B
+                // also catches omitted gamut conversion and a second capture re-encode.
+                let captured = &pixels[(10 + 2) * 4..(10 + 3) * 4];
+                for (got, expected) in captured.iter().zip([136u8, 83, 56, 255]) {
+                    assert!(
+                        got.abs_diff(expected) <= 1,
+                        "snapshot before overwrite {captured:?}"
+                    );
+                }
+                let later = &pixels[10 * 4..11 * 4];
+                assert!(later[2] > later[0], "later blue overwrite {later:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rotated_backdrop_capture_retains_logical_orientation() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{
+            Bind as _, ExportMem as _, Offscreen as _, Renderer as _,
+        };
+        use smithay::utils::{Buffer, Transform};
+
+        use crate::gpu::server::new_headless_renderer;
+        let Ok(mut renderer) = new_headless_renderer() else {
+            eprintln!("no Vulkan renderer available, skipping");
+            return;
+        };
+        for transform in [
+            Transform::_90,
+            Transform::_270,
+            Transform::Flipped90,
+            Transform::Flipped270,
+        ] {
+            let tables = RefCell::new(Tables::default());
+            let mut target = renderer
+                .create_buffer(Fourcc::Abgr8888, (4, 6).into())
+                .unwrap();
+            {
+                let mut fb = renderer.bind(&mut target).unwrap();
+                let mut frame = renderer.render(&mut fb, (4, 6).into(), transform).unwrap();
+                frame
+                    .clear(Color32F::TRANSPARENT, &[rect(0, 0, 6, 4)])
+                    .unwrap();
+                let ops = vec![
+                    Op::Solid {
+                        dst: Rect {
+                            x: 0,
+                            y: 0,
+                            w: 1,
+                            h: 1,
+                        },
+                        color: [1., 0., 0., 1.],
+                    },
+                    Op::Solid {
+                        dst: Rect {
+                            x: 1,
+                            y: 0,
+                            w: 1,
+                            h: 1,
+                        },
+                        color: [0., 1., 0., 1.],
+                    },
+                    Op::Solid {
+                        dst: Rect {
+                            x: 0,
+                            y: 1,
+                            w: 1,
+                            h: 1,
+                        },
+                        color: [0., 0., 1., 1.],
+                    },
+                    Op::Solid {
+                        dst: Rect {
+                            x: 1,
+                            y: 1,
+                            w: 1,
+                            h: 1,
+                        },
+                        color: [1., 1., 0., 1.],
+                    },
+                    Op::Capture {
+                        key: 1,
+                        src: Rect {
+                            x: 0.,
+                            y: 0.,
+                            w: 2.,
+                            h: 2.,
+                        },
+                        dst: Rect {
+                            x: 0,
+                            y: 0,
+                            w: 2,
+                            h: 2,
+                        },
+                        scale: 1.,
+                        blur: None,
+                    },
+                    Op::Captured {
+                        key: 1,
+                        dst: Rect {
+                            x: 2,
+                            y: 0,
+                            w: 2,
+                            h: 2,
+                        },
+                        postprocess: postprocess([2., 2.]),
+                    },
+                ];
+                draw_ops(&mut frame, &tables, &ops, None).unwrap();
+                frame.finish().unwrap().wait().unwrap();
+            }
+            let expected = [
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+                [255, 255, 0, 255],
+            ];
+            for (index, (x, y)) in [(2, 0), (3, 0), (2, 1), (3, 1)].into_iter().enumerate() {
+                let physical = match transform {
+                    Transform::_90 => (3 - y, x),
+                    Transform::_270 => (y, 5 - x),
+                    Transform::Flipped90 => (3 - y, 5 - x),
+                    Transform::Flipped270 => (y, x),
+                    _ => unreachable!(),
+                };
+                let mapping = renderer
+                    .copy_texture(
+                        &target,
+                        Rectangle::<i32, Buffer>::new(physical.into(), (1, 1).into()),
+                        Fourcc::Abgr8888,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &renderer.map_texture(&mapping).unwrap()[..4],
+                    &expected[index],
+                    "capture {transform:?} logicalpixel {x},{y}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn partially_offscreen_capture_keeps_unclipped_coordinate_alignment() {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{
+            Bind as _, ExportMem as _, Offscreen as _, Renderer as _,
+        };
+        use smithay::utils::{Buffer, Transform};
+
+        use crate::gpu::server::new_headless_renderer;
+        let Ok(mut renderer) = new_headless_renderer() else {
+            eprintln!("no Vulkan renderer available, skipping");
+            return;
+        };
+        let tables = RefCell::new(Tables::default());
+        let mut target = renderer
+            .create_buffer(Fourcc::Abgr8888, (6, 2).into())
+            .unwrap();
+        {
+            let mut fb = renderer.bind(&mut target).unwrap();
+            let mut frame = renderer
+                .render(&mut fb, (6, 2).into(), Transform::Normal)
+                .unwrap();
+            frame
+                .clear(Color32F::TRANSPARENT, &[rect(0, 0, 6, 2)])
+                .unwrap();
+            let ops = vec![
+                Op::Solid {
+                    dst: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                    },
+                    color: [1., 0., 0., 1.],
+                },
+                Op::Solid {
+                    dst: Rect {
+                        x: 1,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                    },
+                    color: [0., 1., 0., 1.],
+                },
+                Op::Solid {
+                    dst: Rect {
+                        x: 2,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                    },
+                    color: [0., 0., 1., 1.],
+                },
+                Op::Capture {
+                    key: 1,
+                    src: Rect {
+                        x: 0.,
+                        y: 0.,
+                        w: 4.,
+                        h: 1.,
+                    },
+                    dst: Rect {
+                        x: -1,
+                        y: 0,
+                        w: 4,
+                        h: 1,
+                    },
+                    scale: 1.,
+                    blur: None,
+                },
+                Op::Captured {
+                    key: 1,
+                    dst: Rect {
+                        x: 2,
+                        y: 1,
+                        w: 4,
+                        h: 1,
+                    },
+                    postprocess: postprocess([4., 1.]),
+                },
+            ];
+            draw_ops(&mut frame, &tables, &ops, None).unwrap();
+            frame.finish().unwrap().wait().unwrap();
+        }
+        let mapping = renderer
+            .copy_texture(
+                &target,
+                Rectangle::<i32, Buffer>::new((2, 1).into(), (4, 1).into()),
+                Fourcc::Abgr8888,
+            )
+            .unwrap();
+        assert_eq!(
+            renderer.map_texture(&mapping).unwrap(),
+            &[0, 0, 0, 0, 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255,],
+            "clipped source must leave its missing pixel transparent, not stretch visible pixels"
+        );
     }
 }

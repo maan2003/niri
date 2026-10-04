@@ -10,9 +10,6 @@ use niri_config::{
     Action, Bind, Color, Config, CornerRadius, GradientInterpolation, Key, Modifiers, MruDirection,
     MruFilter, MruScope, Trigger,
 };
-use pango::FontDescription;
-use pangocairo::cairo::{self, ImageSurface};
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::utils::{
     Relocate, RelocateRenderElement, RescaleRenderElement,
 };
@@ -20,8 +17,9 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::Color32F;
 use smithay::input::keyboard::Keysym;
 use smithay::output::Output;
-use smithay::utils::{Logical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
+use super::paint::{Paint, Text, TextOptions};
 use crate::animation::{Animation, Clock};
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::layout::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -38,8 +36,7 @@ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderEleme
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::RenderCtx;
 use crate::utils::{
-    baba_is_float_offset, output_size, round_logical_in_physical, to_physical_precise_round,
-    with_toplevel_role,
+    baba_is_float_offset, output_size, round_logical_in_physical, with_toplevel_role,
 };
 use crate::window::mapped::MappedId;
 use crate::window::Mapped;
@@ -72,7 +69,7 @@ const PANEL_BORDER: i32 = 4;
 const BACKDROP_COLOR: Color32F = Color32F::new(0., 0., 0., 0.8);
 
 /// Font used to render the window titles.
-const FONT: &str = "sans 14px";
+const FONT: f32 = 14.;
 
 /// Scopes in the order they are cycled through.
 ///
@@ -374,40 +371,34 @@ impl Thumbnail {
         } else {
             CornerRadius::default()
         };
-
-        let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
-        let clip_shader = ClippedSurfaceRenderElement::shader(ctx.renderer);
         let geo = Rectangle::from_size(self.size.to_f64());
         // FIXME: deduplicate code with Tile::render_inner()
         let clip = move |elem| match elem {
             LayoutElementRenderElement::Wayland(elem) => {
-                if let Some(shader) = clip_shader.clone() {
-                    if ClippedSurfaceRenderElement::will_clip(elem.inner(), s, geo, radius) {
-                        let content = elem.content();
-                        let elem = ClippedSurfaceRenderElement::new(
-                            elem.into_inner(),
-                            s,
-                            geo,
-                            shader.clone(),
-                            radius,
-                            content,
-                        );
-                        return ThumbnailRenderElement::ClippedSurface(elem);
-                    }
+                if ClippedSurfaceRenderElement::will_clip(elem.inner(), s, geo, radius) {
+                    let content = elem.content();
+                    let elem = ClippedSurfaceRenderElement::new(
+                        elem.into_inner(),
+                        s,
+                        geo,
+                        radius,
+                        content,
+                    );
+                    return ThumbnailRenderElement::ClippedSurface(elem);
                 }
 
-                // If we don't have the shader, render it normally.
+                // Otherwise, render it normally.
                 let elem = LayoutElementRenderElement::Wayland(elem);
                 ThumbnailRenderElement::LayoutElement(elem)
             }
             LayoutElementRenderElement::SolidColor(elem) => {
                 // In this branch we're rendering a blocked-out window with a solid
-                // color. We need to render it with a rounded corner shader even if
+                // color. We need to render it with a rounded corner paint even if
                 // clip_to_geometry is false, because in this case we're assuming that
                 // the unclipped window CSD already has corners rounded to the
                 // user-provided radius, so our blocked-out rendering should match that
                 // radius.
-                if radius != CornerRadius::default() && has_border_shader {
+                if radius != CornerRadius::default() {
                     return BorderRenderElement::new(
                         geo.size,
                         Rectangle::from_size(geo.size),
@@ -418,7 +409,6 @@ impl Thumbnail {
                         Rectangle::from_size(geo.size),
                         0.,
                         radius,
-                        scale as f32,
                         1.,
                     )
                     .into();
@@ -495,14 +485,8 @@ impl Thumbnail {
                 Kind::Unspecified,
             );
 
-            let ctx = ctx.as_remote();
-            if let Some(program) = GradientFadeTextureRenderElement::shader(ctx.renderer) {
-                let elem = GradientFadeTextureRenderElement::new(texture, program);
-                push(WindowMruUiRenderElement::GradientFadeElem(elem));
-            } else {
-                let elem = PrimaryGpuTextureRenderElement(texture);
-                push(WindowMruUiRenderElement::TextureElement(elem));
-            }
+            let elem = GradientFadeTextureRenderElement::new(texture);
+            push(WindowMruUiRenderElement::GradientFadeElem(elem));
         }
 
         let is_urgent = mapped.is_urgent();
@@ -546,7 +530,7 @@ impl Thumbnail {
                 scale,
                 0.5,
             );
-            background.render(ctx.renderer, loc, &mut |elem| {
+            background.render(loc, &mut |elem| {
                 push(WindowMruUiRenderElement::FocusRing(elem))
             });
 
@@ -568,7 +552,7 @@ impl Thumbnail {
                 1.,
             );
 
-            border.render(ctx.renderer, loc, &mut |elem| {
+            border.render(loc, &mut |elem| {
                 push(WindowMruUiRenderElement::FocusRing(elem))
             });
         }
@@ -1671,46 +1655,23 @@ fn generate_title_texture(
     scale: f64,
 ) -> anyhow::Result<MruTexture> {
     let _span = tracy_client::span!("mru::generate_title_texture");
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    // On Window CSD, line breaks are either stripped or replaced with the linebreak symbol anyway.
-    // No use rendering it as multiple lines.
-    layout.set_single_paragraph_mode(true);
-    layout.set_font_description(Some(&font));
-    layout.set_text(title);
-
-    let (width, height) = layout.pixel_size();
-    ensure!(width > 0 && height > 0);
-
-    // Guard against overly long window titles.
-    let width = min(width, 16383);
-    let height = min(height, 16383);
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
+    // Window titles are a single line, including titles that contain line breaks.
+    let text = Text::with_options(
+        title,
+        TextOptions {
+            font_size: FONT,
+            single_line: true,
+            ..Default::default()
+        },
         false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
     )?;
-
-    Ok(buffer)
+    let (width, height) = text.size();
+    ensure!(width > 0 && height > 0);
+    // Bound the rendered texture, not only its logical size, on HiDPI outputs too.
+    let max_size = (16383. / scale).floor() as i32;
+    let mut paint = Paint::new(min(width, max_size), min(height, max_size));
+    paint.text(&text, 0., 0.);
+    paint.render(renderer, scale)
 }
 
 impl ScopePanel {
@@ -1732,39 +1693,39 @@ impl ScopePanel {
     }
 }
 
+fn make_panel_text(idx: usize) -> String {
+    let span_unselected = "<span fgcolor='#999999'>";
+    let span_end = "</span>";
+    let span_shortcut = "<span face='mono' bgcolor='#2C2C2C' letter_spacing='5000'><b>";
+    let span_shortcut_end = "</b></span>";
+
+    // Starts with a zero-width space to make letter_spacing work on the left.
+    let mut buf =
+        format!("\u{200B}{span_unselected}{span_shortcut}S{span_shortcut_end}cope:{span_end}");
+
+    for scope in SCOPE_CYCLE {
+        buf.push_str("  ");
+        if scope as usize != idx {
+            buf.push_str(span_unselected);
+        }
+        let text = match scope {
+            MruScope::All => format!("{span_shortcut}A{span_shortcut_end}ll"),
+            MruScope::Output => format!("{span_shortcut}O{span_shortcut_end}utput"),
+            MruScope::Workspace => format!("{span_shortcut}W{span_shortcut_end}orkspace"),
+        };
+        buf.push_str(&text);
+        if scope as usize != idx {
+            buf.push_str(span_end);
+        }
+    }
+
+    buf
+}
+
 fn generate_scope_panels(
     renderer: &mut RemoteRenderer,
     scale: f64,
 ) -> anyhow::Result<[MruTexture; 3]> {
-    fn make_panel_text(idx: usize) -> String {
-        let span_unselected = "<span fgcolor='#999999'>";
-        let span_end = "</span>";
-        let span_shortcut = "<span face='mono' bgcolor='#2C2C2C' letter_spacing='5000'><b>";
-        let span_shortcut_end = "</b></span>";
-
-        // Starts with a zero-width space to make letter_spacing work on the left.
-        let mut buf =
-            format!("\u{200B}{span_unselected}{span_shortcut}S{span_shortcut_end}cope:{span_end}");
-
-        for scope in SCOPE_CYCLE {
-            buf.push_str("  ");
-            if scope as usize != idx {
-                buf.push_str(span_unselected);
-            }
-            let text = match scope {
-                MruScope::All => format!("{span_shortcut}A{span_shortcut_end}ll"),
-                MruScope::Output => format!("{span_shortcut}O{span_shortcut_end}utput"),
-                MruScope::Workspace => format!("{span_shortcut}W{span_shortcut_end}orkspace"),
-            };
-            buf.push_str(&text);
-            if scope as usize != idx {
-                buf.push_str(span_end);
-            }
-        }
-
-        buf
-    }
-
     // Can't wait for array::try_map()
     Ok([
         render_panel(renderer, scale, &make_panel_text(0))?,
@@ -1778,65 +1739,21 @@ fn render_panel(
     scale: f64,
     text: &str,
 ) -> anyhow::Result<MruTexture> {
+    paint_panel(scale, text)?.render(renderer, scale)
+}
+
+fn paint_panel(scale: f64, text: &str) -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("mru::render_panel");
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let padding: i32 = to_physical_precise_round(scale, PANEL_PADDING);
-    // Keep the border width even to avoid blurry edges.
-    // Render to a dummy surface to determine the size.
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
-    let (mut width, mut height) = layout.pixel_size();
-
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    let padding = f64::from(padding);
-
-    cr.move_to(padding, padding);
-
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(text);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.5, 0.5);
-    cr.set_line_width((f64::from(PANEL_BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-
-    drop(cr);
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
+    let text = Text::markup(text, FONT)?;
+    let (width, height) = text.size();
+    let mut paint = Paint::new(width + PANEL_PADDING * 2, height + PANEL_PADDING * 2);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    paint.text(&text, PANEL_PADDING as f32, PANEL_PADDING as f32);
+    paint.border(
+        ((PANEL_BORDER as f64 / 2. * scale).round() * 2. / scale) as f32,
+        [0.5, 0.5, 0.5, 1.],
+    );
+    Ok(paint)
 }
 
 /// Returns key bindings available when the MRU UI is open.
@@ -1948,4 +1865,9 @@ fn make_dynamic_opened_binds(config: &Config) -> Vec<Bind> {
     }
 
     rv
+}
+
+#[cfg(test)]
+pub(super) fn test_paint(scale: f64) -> anyhow::Result<Paint> {
+    paint_panel(scale, &make_panel_text(1))
 }

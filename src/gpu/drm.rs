@@ -15,7 +15,7 @@ use bytemuck::cast_slice_mut;
 use smithay::backend::allocator::dmabuf::{AsDmabuf as _, Dmabuf};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::{Allocator, Buffer as _, Fourcc};
 use smithay::backend::drm::compositor::{
     DrmCompositor, FrameError, FrameFlags, PrimaryPlaneElement,
 };
@@ -24,10 +24,7 @@ use smithay::backend::drm::{
     Colorspace, ConnectorColorState, DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmError,
     DrmEventMetadata, DrmEventTime, DrmNode, DrmSurface, HdrOutputMetadata, VrrSupport,
 };
-use smithay::backend::egl::context::ContextPriority;
-use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::element::RenderElementPresentationState;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Bind as _, Color32F, DebugFlags, Frame as _, Renderer as _};
 use smithay::output::OutputModeSource;
 use smithay::reexports::calloop::RegistrationToken;
@@ -43,29 +40,71 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use super::convert;
 use super::exec::Executor;
-use super::gl::{blend, resources, shaders};
 use super::protocol::{
     BlendParams, ColorState, ConnectorInfo, DevId, ElementState, Event, HdrCaps, ModeDesc,
     OutputGeometry, OutputRef, PresentFlags, Presentation,
 };
 use super::scene::{self, NodeTracks};
+use super::vello::VelloRenderer;
 
 /// Scanout formats for SDR outputs: 8-bit only, like upstream niri. Asking for a 10-bit
 /// framebuffer isn't free (some drivers, notably nvidia, hang the initial modeset on 2101010),
 /// so outputs that did not opt into HDR / wide gamut stay 8-bit.
-const SDR_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Argb8888, Fourcc::Abgr8888];
+/// Include opaque formats themselves: legacy framebuffer creation may not retain
+/// an exporter's requested alpha-to-opaque reinterpretation.
+const SDR_COLOR_FORMATS: [Fourcc; 4] = [
+    Fourcc::Argb8888,
+    Fourcc::Xrgb8888,
+    Fourcc::Abgr8888,
+    Fourcc::Xbgr8888,
+];
 /// 10-bit formats tried (each probed for renderability) on HDR / wide-gamut outputs, ahead of
 /// the 8-bit ones.
 const TEN_BIT_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
 
 type GbmDrmCompositor =
-    DrmCompositor<GbmAllocator<DeviceFd>, GbmFramebufferExporter<DeviceFd>, u64, DeviceFd>;
+    DrmCompositor<ExplicitGbmAllocator, GbmFramebufferExporter<DeviceFd>, u64, DeviceFd>;
+
+/// Vulkan imports require a known layout, even when KMS only advertises implicit
+/// modifiers. Request an explicitly linear allocation in that case; never label
+/// an implicit allocation as linear after the fact.
+#[derive(Clone)]
+struct ExplicitGbmAllocator(GbmAllocator<DeviceFd>);
+
+impl Allocator for ExplicitGbmAllocator {
+    type Buffer = GbmBuffer;
+    type Error = std::io::Error;
+
+    fn create_buffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        fourcc: Fourcc,
+        modifiers: &[Modifier],
+    ) -> Result<GbmBuffer, Self::Error> {
+        let modifiers = if modifiers == [Modifier::Invalid] {
+            &[Modifier::Linear]
+        } else {
+            modifiers
+        };
+        let buffer = self.0.create_buffer(width, height, fourcc, modifiers)?;
+        if buffer.format().modifier == Modifier::Invalid {
+            return Err(std::io::Error::other(
+                "GBM did not provide an explicit modifier",
+            ));
+        }
+        Ok(buffer)
+    }
+}
 
 #[derive(Default)]
 pub struct DrmState {
     devices: HashMap<DevId, Device>,
-    /// The device whose EGL display hosts the renderer, once there is one.
+    /// Rendering is independent of KMS: a render-only GPU can feed a display-only card.
     renderer_dev: Option<DevId>,
+    renderer_node: Option<DrmNode>,
+    renderer_gbm: Option<GbmDevice<DeviceFd>>,
+    render_only: HashSet<DevId>,
     debug_tint: bool,
 }
 
@@ -74,9 +113,8 @@ struct Device {
     node: DrmNode,
     drm: DrmDevice,
     gbm: GbmDevice<DeviceFd>,
-    /// The render node Mesa uses for this device's EGL display; `None` when EGL doesn't work
-    /// here (display-only hardware, software renderers).
-    egl_node: Option<DrmNode>,
+    /// Render node associated with this DRM card; absent on display-only hardware.
+    render_node: Option<DrmNode>,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, Surface>,
     token: RegistrationToken,
@@ -164,11 +202,15 @@ fn mode_source(mode: &DrmMode, geometry: OutputGeometry) -> OutputModeSource {
 
 impl DrmState {
     pub fn device_ids(&self) -> Vec<DevId> {
-        self.devices.keys().copied().collect()
+        self.devices
+            .keys()
+            .chain(self.render_only.iter())
+            .copied()
+            .collect()
     }
 
     /// Takes over a DRM device the core opened. Devices come in any order: the renderer is
-    /// created on the first device whose EGL display works and matches `render_node_hint` (if
+    /// created on the first Vulkan-capable card matching `render_node_hint` (if
     /// the core has one); which device a display-only output allocates from is decided when
     /// the output is enabled.
     pub fn add_device(
@@ -179,57 +221,53 @@ impl DrmState {
         render_node_hint: Option<DevId>,
         register: impl FnOnce(DrmDeviceNotifier, DevId) -> anyhow::Result<RegistrationToken>,
     ) -> anyhow::Result<AddedDevice> {
-        ensure!(!self.devices.contains_key(&dev), "device already added");
+        ensure!(
+            !self.devices.contains_key(&dev) && !self.render_only.contains(&dev),
+            "device already added"
+        );
         let node = DrmNode::from_dev_id(dev).context("error creating DrmNode")?;
         let device_fd = DrmDeviceFd::new(DeviceFd::from(fd));
-        // Render-only cards (no KMS) fail here. On Asahi that's the GPU's own card node; Mesa
-        // renders through the display controller's node instead.
-        let (drm, notifier) = DrmDevice::new(device_fd.clone(), false).context("DrmDevice::new")?;
         let gbm = GbmDevice::new(device_fd.device_fd()).context("GbmDevice::new")?;
-
-        let try_initialize_gpu = || -> anyhow::Result<(EGLDisplay, DrmNode)> {
-            let display = unsafe { EGLDisplay::new(gbm.clone()).context("EGLDisplay::new")? };
-            let egl_device = EGLDevice::device_for_display(&display).context("EGLDevice")?;
-            ensure!(
-                !egl_device.is_software(),
-                "software EGL renderers are skipped"
-            );
-            let render_node = egl_device
-                .try_get_render_node()
-                .ok()
-                .flatten()
-                .unwrap_or(node);
-            Ok((display, render_node))
-        };
-
-        let mut egl_node = None;
+        let card_render_node = node
+            .node_with_type(smithay::backend::drm::NodeType::Render)
+            .and_then(Result::ok);
+        let wanted = render_node_hint.is_none_or(|hint| {
+            hint == node.dev_id() || card_render_node.is_some_and(|n| n.dev_id() == hint)
+        });
         let mut render_node = None;
-        match try_initialize_gpu() {
-            Ok((display, node_for_egl)) => {
-                debug!("device {node} renders on {node_for_egl}");
-                egl_node = Some(node_for_egl);
-                let wanted = render_node_hint.is_none_or(|hint| hint == node_for_egl.dev_id());
-                if exec.has_renderer() {
-                    debug!("renderer already exists; using {node} as a secondary device");
-                } else if !wanted {
-                    debug!("{node_for_egl} is not the requested render node; not rendering here");
-                } else {
-                    let context = EGLContext::new_with_priority(&display, ContextPriority::High)
-                        .context("EGLContext::new")?;
-                    let mut renderer =
-                        unsafe { GlesRenderer::new(context).context("GlesRenderer::new")? };
-                    resources::init(&mut renderer);
-                    shaders::init(&mut renderer);
-                    exec.set_renderer(renderer);
+        if !exec.has_renderer() && wanted {
+            // Render-only Vulkan drivers (including Honeykrisp) need not report a
+            // primary node in VK_EXT_physical_device_drm. Match the card's render
+            // node when available rather than requiring that optional alias.
+            match VelloRenderer::new_for_node(card_render_node.unwrap_or(node)) {
+                Ok(renderer) => {
+                    let actual = renderer
+                        .render_node()
+                        .context("Vulkan adapter has no DRM node")?;
                     self.renderer_dev = Some(dev);
-                    render_node = Some(node_for_egl.dev_id());
-                    info!("renderer created on {node} (render node {node_for_egl})");
+                    self.renderer_node = Some(actual);
+                    self.renderer_gbm = Some(gbm.clone());
+                    exec.set_renderer(renderer);
+                    render_node = Some(actual.dev_id());
+                    info!("Vello renderer created on {node} (render node {actual})");
+                }
+                Err(err) => {
+                    debug!("no Vulkan renderer for {node}, using it as display-only: {err:?}")
                 }
             }
-            Err(err) => {
-                debug!("failed to initialize EGL on {node}, using it as display-only: {err:?}");
-            }
         }
+
+        // A render-only GPU need not expose KMS. Keep its allocator/renderer even when
+        // DrmDevice cannot be constructed (for example Asahi's separate GPU/DCP devices).
+        let (drm, notifier) = match DrmDevice::new(device_fd.clone(), false) {
+            Ok(pair) => pair,
+            Err(err) if self.renderer_dev == Some(dev) => {
+                debug!("{node} is render-only: {err:?}");
+                self.render_only.insert(dev);
+                return Ok(AddedDevice { render_node });
+            }
+            Err(err) => return Err(err).context("DrmDevice::new"),
+        };
 
         let token = register(notifier, dev)?;
 
@@ -239,7 +277,7 @@ impl DrmState {
                 node,
                 drm,
                 gbm,
-                egl_node,
+                render_node: card_render_node,
                 drm_scanner: DrmScanner::new(),
                 surfaces: HashMap::new(),
                 token,
@@ -251,19 +289,27 @@ impl DrmState {
 
     /// Returns the device's event source token and whether it hosted the renderer, in which
     /// case the caller must drop the renderer too.
-    pub fn remove_device(&mut self, dev: DevId) -> Option<(RegistrationToken, bool)> {
-        let device = self.devices.remove(&dev)?;
+    pub fn remove_device(&mut self, dev: DevId) -> Option<(Option<RegistrationToken>, bool)> {
+        let device = self.devices.remove(&dev);
+        let render_only = self.render_only.remove(&dev);
+        if device.is_none() && !render_only {
+            return None;
+        }
         let was_renderer = self.renderer_dev == Some(dev);
         if was_renderer {
             self.renderer_dev = None;
+            self.renderer_node = None;
+            self.renderer_gbm = None;
         }
-        // The device may still be there (ignored by config); leave its CRTCs off.
-        for surface in device.surfaces.values() {
-            if let Err(err) = surface.compositor.surface().disable() {
-                debug!("error disabling output of removed device: {err:?}");
+        if let Some(device) = &device {
+            // The card may still be present but disabled by configuration.
+            for surface in device.surfaces.values() {
+                if let Err(err) = surface.compositor.surface().disable() {
+                    debug!("error disabling output of removed device: {err:?}");
+                }
             }
         }
-        Some((device.token, was_renderer))
+        Some((device.map(|d| d.token), was_renderer))
     }
 
     pub fn pause(&mut self) {
@@ -321,6 +367,13 @@ impl DrmState {
     /// Re-reads connectors. Disconnected outputs are torn down here; the core learns about
     /// them from the reply.
     pub fn rescan(&mut self, dev: DevId) -> anyhow::Result<Event> {
+        if self.render_only.contains(&dev) {
+            return Ok(Event::Scan {
+                connected: Vec::new(),
+                changed: Vec::new(),
+                disconnected: Vec::new(),
+            });
+        }
         let device = self.device(dev)?;
         let scan = device
             .drm_scanner
@@ -357,6 +410,9 @@ impl DrmState {
     }
 
     pub fn cleanup(&mut self, dev: DevId, off: &[u32]) -> anyhow::Result<()> {
+        if self.render_only.contains(&dev) {
+            return Ok(());
+        }
         let device = self.device(dev)?;
         let off: HashSet<u32> = off.iter().copied().collect();
         device.cleanup_mismatching_resources(&|crtc, _| off.contains(&u32::from(crtc)))?;
@@ -446,18 +502,21 @@ impl DrmState {
 
         // A device that renders on the renderer's GPU allocates its own scanout buffers; any
         // other device is display-only and scans out buffers allocated on the rendering device.
-        let display_only = device.egl_node.is_none() || device.egl_node != renderer_node;
-        let allocator = GbmAllocator::new(
+        let display_only = device.render_node.is_none() || device.render_node != renderer_node;
+        let allocator = ExplicitGbmAllocator(GbmAllocator::new(
             if display_only {
                 renderer_gbm
             } else {
                 device.gbm.clone()
             },
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
-        let exporter_node = if display_only { None } else { device.egl_node };
+        ));
+        let exporter_node = if display_only {
+            None
+        } else {
+            device.render_node
+        };
         let render_formats = renderer
-            .egl_context()
             .dmabuf_render_formats()
             .iter()
             .copied()
@@ -729,15 +788,12 @@ impl DrmState {
 
     /// GBM handle of the rendering device, for allocating outside `DrmState`.
     pub fn renderer_gbm(&self) -> Option<GbmDevice<DeviceFd>> {
-        let device = self.renderer_dev.and_then(|p| self.devices.get(&p))?;
-        Some(device.gbm.clone())
+        self.renderer_gbm.clone()
     }
 
     /// The render node the renderer is on.
     fn renderer_node(&self) -> Option<DrmNode> {
-        self.renderer_dev
-            .and_then(|p| self.devices.get(&p))
-            .and_then(|d| d.egl_node)
+        self.renderer_node
     }
 
     pub fn present(
@@ -766,7 +822,7 @@ impl DrmState {
             .elements
             .update(frame_rec.generation, &frame_rec.nodes);
         let id_map = surface.elements.id_map();
-        let storages = scene::node_storages(&exec.tables.borrow(), &frame_rec.nodes);
+        let storages = scene::node_storages(&exec.tables.borrow(), &frame_rec.nodes, blend);
         // smithay wants elements top to bottom; the core sends bottom to top.
         let elements =
             scene::scene_elements(&surface.elements, &frame_rec.nodes, &storages, &exec.tables);
@@ -790,12 +846,12 @@ impl DrmState {
         }
 
         let renderer = exec.renderer.as_mut().context("no renderer yet")?;
-        blend::apply(renderer, blend);
+        renderer.set_blend(blend);
         let res = surface
             .compositor
             .render_frame(renderer, &elements, [0.; 4], frame_flags);
         if blend.is_some() {
-            blend::apply(renderer, None);
+            renderer.set_blend(None);
         }
         let res = res.map_err(|err| anyhow!("error rendering frame: {err}"))?;
 
@@ -1057,7 +1113,7 @@ impl Device {
 /// Binds a candidate scanout buffer and clears it, so a format the renderer can't use is
 /// rejected before an output is built on it.
 fn test_render(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     buffer: &GbmBuffer,
     size: Size<i32, Physical>,
 ) -> Result<(), String> {

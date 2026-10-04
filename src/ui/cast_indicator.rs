@@ -11,24 +11,22 @@ use std::rc::Rc;
 
 use niri_config::{Action, Config, ModKey};
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::FontDescription;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Point, Transform};
+use smithay::utils::Point;
 
 use super::hotkey_overlay::key_name;
+use super::paint::{Paint, Text};
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::utils::{output_size, to_physical_precise_round};
+use crate::utils::output_size;
 
 const PADDING: i32 = 8;
 const MARGIN: i32 = 12;
 const DOT: i32 = 10;
-const FONT: &str = "sans 13px";
+const FONT: f32 = 13.;
 const BORDER: i32 = 3;
 
 pub struct CastIndicator {
@@ -160,68 +158,33 @@ fn render(
     scale: f64,
     text: &str,
 ) -> anyhow::Result<TextureBuffer<RemoteTexture>> {
+    paint(scale, text)?.render(renderer, scale)
+}
+
+fn paint(scale: f64, text: &str) -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("cast_indicator::render");
-
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let dot: i32 = to_physical_precise_round(scale, DOT);
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_text(text);
-
-    let (text_width, text_height) = layout.pixel_size();
-    let width = text_width + padding * 3 + dot;
-    let height = text_height + padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    // The red "recording" dot.
-    cr.set_source_rgb(1., 0.25, 0.25);
-    let r = f64::from(dot) / 2.;
-    cr.arc(
-        f64::from(padding) + r,
-        f64::from(height) / 2.,
+    let text = Text::new(text, FONT)?;
+    let (text_width, text_height) = text.size();
+    let width = text_width + PADDING * 3 + DOT;
+    let height = text_height + PADDING * 2;
+    let mut paint = Paint::new(width, height);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    let r = DOT as f32 / 2.;
+    paint.circle(
+        PADDING as f32 + r,
+        height as f32 / 2.,
         r,
-        0.,
-        std::f64::consts::TAU,
+        [1., 0.25, 0.25, 1.],
     );
-    cr.fill()?;
+    paint.text(&text, (PADDING * 2 + DOT) as f32, PADDING as f32);
+    paint.border(
+        ((BORDER as f64 / 2. * scale).round() * 2. / scale) as f32,
+        [1., 0.25, 0.25, 1.],
+    );
+    Ok(paint)
+}
 
-    cr.move_to((padding * 2 + dot).into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_text(text);
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.rectangle(0., 0., width.into(), height.into());
-    cr.set_source_rgb(1., 0.25, 0.25);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
+#[cfg(test)]
+pub(super) fn test_paint(scale: f64, text: &str) -> anyhow::Result<Paint> {
+    paint(scale, text)
 }

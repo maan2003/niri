@@ -31,7 +31,7 @@ use sd_notify::NotifyState;
 use smithay::reexports::wayland_server::Display;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str = "niri=debug,smithay::backend::renderer::gles=error";
+const DEFAULT_LOG_FILTER: &str = "niri=debug,wgpu_core=warn,wgpu_hal=warn";
 
 #[cfg(feature = "profile-with-tracy-allocations")]
 #[global_allocator]

@@ -1222,12 +1222,12 @@ impl<W: LayoutElement> Monitor<W> {
         true
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         for ws in &mut self.workspaces {
-            ws.update_shaders();
+            ws.update_paints();
         }
 
-        self.insert_hint_element.update_shaders();
+        self.insert_hint_element.update_paints();
     }
 
     pub fn update_output_size(&mut self) {
@@ -1653,7 +1653,6 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_insert_hint_between_workspaces<R: NiriRenderer>(
         &self,
-        renderer: &mut R,
         push: &mut dyn FnMut(MonitorRenderElement<R>),
     ) {
         if self.options.layout.insert_hint.off {
@@ -1667,7 +1666,7 @@ impl<W: LayoutElement> Monitor<W> {
         };
 
         self.insert_hint_element
-            .render(renderer, render_loc.location, &mut |elem| {
+            .render(render_loc.location, &mut |elem| {
                 let elem = MonitorInnerRenderElement::UncroppedInsertHint(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::default(), 1.);
                 let elem =
@@ -1782,11 +1781,7 @@ impl<W: LayoutElement> Monitor<W> {
 
                         if let Some(loc) = insert_hint_render_loc {
                             if loc.workspace == InsertWorkspace::Existing(ws.id()) {
-                                self.insert_hint_element.render(
-                                    ctx.renderer,
-                                    loc.location,
-                                    push!(),
-                                );
+                                self.insert_hint_element.render(loc.location, push!());
                             }
                         }
                     }
@@ -1815,7 +1810,6 @@ impl<W: LayoutElement> Monitor<W> {
 
     pub fn render_workspace_shadows<R: NiriRenderer>(
         &self,
-        renderer: &mut R,
         push: &mut dyn FnMut(MonitorRenderElement<R>),
     ) {
         let Some(progress) = self.overview_progress.as_ref().map(|p| p.clamped_value()) else {
@@ -1829,7 +1823,7 @@ impl<W: LayoutElement> Monitor<W> {
         let zoom = self.overview_zoom();
 
         for (ws, geo) in self.workspaces_with_render_geo() {
-            ws.render_shadow(renderer, &mut |elem| {
+            ws.render_shadow(&mut |elem| {
                 let elem = elem.with_alpha(alpha);
                 let elem = MonitorInnerRenderElement::Shadow(elem);
                 let elem = RescaleRenderElement::from_element(elem, Point::from((0, 0)), zoom);

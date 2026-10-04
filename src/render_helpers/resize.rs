@@ -1,23 +1,17 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::backend::renderer::Texture as _;
-use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 
-use super::renderer::NiriRenderer;
-use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::paint_element::PaintRenderElement;
+use crate::gpu::protocol::{Paint, ResizeParams};
 use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
 #[derive(Debug)]
-pub struct ResizeRenderElement(ShaderRenderElement);
+pub struct ResizeRenderElement(PaintRenderElement);
 
 impl ResizeRenderElement {
     #[allow(clippy::too_many_arguments)]
@@ -28,7 +22,6 @@ impl ResizeRenderElement {
         size_prev: Size<f64, Logical>,
         texture_next: (RemoteTexture, Rectangle<i32, Physical>),
         size_next: Size<f64, Logical>,
-        progress: f32,
         clamped_progress: f32,
         corner_radius: CornerRadius,
         clip_to_geometry: bool,
@@ -74,51 +67,35 @@ impl ResizeRenderElement {
         let input_to_curr_geo = Mat3::from_scale(area_size / curr_geo_size)
             * Mat3::from_translation((area_loc - curr_geo_loc) / area_size);
 
-        let curr_geo_to_prev_geo = Mat3::from_scale(curr_geo_size / size_prev);
-        let curr_geo_to_next_geo = Mat3::from_scale(curr_geo_size / size_next);
-
         let geo_to_tex_prev = Mat3::from_translation(-tex_prev_geo_loc / tex_prev_size)
             * Mat3::from_scale(size_prev / tex_prev_size * scale);
         let geo_to_tex_next = Mat3::from_translation(-tex_next_geo_loc / tex_next_size)
             * Mat3::from_scale(size_next / tex_next_size * scale);
 
         let corner_radius = corner_radius.fit_to(curr_geo_size.x, curr_geo_size.y);
-        let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
 
-        // Create the shader.
         Self(
-            ShaderRenderElement::new(
-                ProgramType::Resize,
+            PaintRenderElement::new(
+                Paint::Resize {
+                    params: ResizeParams {
+                        input_to_geometry: input_to_curr_geo.to_cols_array(),
+                        geometry_size: curr_geo_size.to_array(),
+                        previous_from_geometry: geo_to_tex_prev.to_cols_array(),
+                        next_from_geometry: geo_to_tex_next.to_cols_array(),
+                        progress: clamped_progress,
+                        radii: corner_radius.into(),
+                        clip_to_geometry,
+                    },
+                    previous: texture_prev,
+                    next: texture_next,
+                },
                 area.size,
                 None,
-                scale.x,
                 result_alpha,
-                Rc::new([
-                    mat3_uniform("niri_input_to_curr_geo", input_to_curr_geo),
-                    mat3_uniform("niri_curr_geo_to_prev_geo", curr_geo_to_prev_geo),
-                    mat3_uniform("niri_curr_geo_to_next_geo", curr_geo_to_next_geo),
-                    Uniform::new("niri_curr_geo_size", curr_geo_size.to_array()),
-                    mat3_uniform("niri_geo_to_tex_prev", geo_to_tex_prev),
-                    mat3_uniform("niri_geo_to_tex_next", geo_to_tex_next),
-                    Uniform::new("niri_progress", progress),
-                    Uniform::new("niri_clamped_progress", clamped_progress),
-                    Uniform::new("niri_corner_radius", <[f32; 4]>::from(corner_radius)),
-                    Uniform::new("niri_clip_to_geometry", clip_to_geometry),
-                ]),
-                HashMap::from([
-                    (String::from("niri_tex_prev"), texture_prev),
-                    (String::from("niri_tex_next"), texture_next),
-                ]),
                 Kind::Unspecified,
             )
             .with_location(area.loc),
         )
-    }
-
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer)
-            .program(ProgramType::Resize)
-            .is_some()
     }
 }
 
@@ -175,17 +152,15 @@ impl RenderElement<RemoteRenderer> for ResizeRenderElement {
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
         let _span = tracy_client::span!("ResizeRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("ResizeRenderElement::draw"), |frame| {
-            RenderElement::<RemoteRenderer>::draw(
-                &self.0,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
+        RenderElement::<RemoteRenderer>::draw(
+            &self.0,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
     }
 
     fn underlying_storage(&self, renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

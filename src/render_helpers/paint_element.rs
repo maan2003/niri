@@ -1,74 +1,47 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size};
 
-use super::blend::FrameBlendState;
-use super::shaders::{ProgramType, Shaders};
+use crate::gpu::protocol::Paint;
 use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
-/// Renders a shader with optional texture input, on the primary GPU.
+/// Renders a typed procedural paint on the primary GPU.
 #[derive(Debug, Clone)]
-pub struct ShaderRenderElement {
-    program: ProgramType,
+pub struct PaintRenderElement {
+    paint: Option<Paint<RemoteTexture>>,
     id: Id,
     commit_counter: CommitCounter,
     area: Rectangle<f64, Logical>,
     opaque_regions: Vec<Rectangle<f64, Logical>>,
-    // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
-    scale: f32,
     alpha: f32,
-    additional_uniforms: Rc<[Uniform<'static>]>,
-    textures: HashMap<String, RemoteTexture>,
     kind: Kind,
 }
 
-/// Marker for a compiled program in the GPU process; see [`Shaders::program`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShaderProgram(pub ProgramType);
-
-impl ShaderRenderElement {
-    #[allow(clippy::too_many_arguments)]
+impl PaintRenderElement {
     pub fn new(
-        program: ProgramType,
+        paint: Paint<RemoteTexture>,
         size: Size<f64, Logical>,
         opaque_regions: Option<Vec<Rectangle<f64, Logical>>>,
-        // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
-        scale: f32,
         alpha: f32,
-        additional_uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, RemoteTexture>,
         kind: Kind,
     ) -> Self {
-        Self {
-            program,
-            id: Id::new(),
-            commit_counter: CommitCounter::default(),
-            area: Rectangle::from_size(size),
-            opaque_regions: opaque_regions.unwrap_or_default(),
-            scale,
-            alpha,
-            additional_uniforms,
-            textures,
-            kind,
-        }
+        let mut element = Self::empty(kind);
+        element.paint = Some(paint);
+        element.area.size = size;
+        element.opaque_regions = opaque_regions.unwrap_or_default();
+        element.alpha = alpha;
+        element
     }
 
-    pub fn empty(program: ProgramType, kind: Kind) -> Self {
+    pub fn empty(kind: Kind) -> Self {
         Self {
-            program,
+            paint: None,
             id: Id::new(),
             commit_counter: CommitCounter::default(),
             area: Rectangle::default(),
             opaque_regions: vec![],
-            scale: 1.,
             alpha: 1.,
-            additional_uniforms: Rc::new([]),
-            textures: HashMap::new(),
             kind,
         }
     }
@@ -81,18 +54,13 @@ impl ShaderRenderElement {
         &mut self,
         size: Size<f64, Logical>,
         opaque_regions: Option<Vec<Rectangle<f64, Logical>>>,
-        scale: f32,
         alpha: f32,
-        uniforms: Rc<[Uniform<'static>]>,
-        textures: HashMap<String, RemoteTexture>,
+        paint: Paint<RemoteTexture>,
     ) {
         self.area.size = size;
         self.opaque_regions = opaque_regions.unwrap_or_default();
-        self.scale = scale;
         self.alpha = alpha;
-        self.additional_uniforms = uniforms;
-        self.textures = textures;
-
+        self.paint = Some(paint);
         self.commit_counter.increment();
     }
 
@@ -107,7 +75,7 @@ impl ShaderRenderElement {
     }
 }
 
-impl Element for ShaderRenderElement {
+impl Element for PaintRenderElement {
     fn id(&self) -> &Id {
         &self.id
     }
@@ -140,7 +108,7 @@ impl Element for ShaderRenderElement {
     }
 }
 
-impl RenderElement<RemoteRenderer> for ShaderRenderElement {
+impl RenderElement<RemoteRenderer> for PaintRenderElement {
     fn draw(
         &self,
         frame: &mut RemoteFrame<'_, '_>,
@@ -153,32 +121,9 @@ impl RenderElement<RemoteRenderer> for ShaderRenderElement {
         if damage.is_empty() {
             return Ok(());
         }
-        // The GPU process may have failed to compile this program; skip silently like before.
-        if Shaders::from_renderer(frame.renderer())
-            .program(self.program)
-            .is_none()
-        {
-            return Ok(());
+        if let Some(paint) = &self.paint {
+            frame.draw_paint(paint.clone(), src, dst, damage, self.alpha);
         }
-        let textures: Vec<(String, RemoteTexture)> = self
-            .textures
-            .iter()
-            .map(|(name, tex)| (name.clone(), tex.clone()))
-            .collect();
-        // Uniform values persist in the GPU-side program object, so the blend uniforms go
-        // with every draw.
-        let mut uniforms = self.additional_uniforms.to_vec();
-        uniforms.extend(FrameBlendState::uniforms(frame));
-        frame.draw_shader(
-            self.program.into(),
-            src,
-            dst,
-            damage,
-            self.scale,
-            self.alpha,
-            &uniforms,
-            &textures,
-        );
         Ok(())
     }
 

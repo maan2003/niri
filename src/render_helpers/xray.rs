@@ -5,17 +5,15 @@ use std::rc::Rc;
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
 use smithay::backend::renderer::element::{Element, Id, RenderElement};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, OpaqueRegions};
 use smithay::backend::renderer::Color32F;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram};
+use crate::gpu::protocol::{ClipParams, PostprocessParams, TextureEffect, TextureOptions};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 use crate::render_helpers::background_effect::RenderParams;
-use crate::render_helpers::blend::FrameBlendState;
 use crate::render_helpers::effect_buffer::EffectBuffer;
-use crate::render_helpers::shaders::{mat3_uniform, Shaders};
 use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::region::TransformedRegion;
 
@@ -73,12 +71,10 @@ pub struct XrayElement {
     input_to_clip_geo: Mat3,
     clip_geo_size: Vec2,
     corner_radius: CornerRadius,
-    scale: f32,
     blur: bool,
     noise: f32,
     saturation: f32,
     bg_color: Color32F,
-    program: Option<RemoteTexProgram>,
 }
 
 impl Xray {
@@ -102,8 +98,6 @@ impl Xray {
         saturation: f32,
         push: &mut dyn FnMut(XrayElement),
     ) {
-        let program = Shaders::get(ctx.renderer).postprocess_and_clip.clone();
-
         let zoom = xray_pos.zoom;
         let pos_in_backdrop = xray_pos.pos_in_backdrop.upscale(zoom);
 
@@ -124,7 +118,7 @@ impl Xray {
 
         let mut background = self.background[ctx.target as usize].borrow_mut();
         let prev = background.commit();
-        if background.prepare(ctx.renderer, blur) {
+        if background.prepare(ctx.renderer) {
             if background.commit() != prev {
                 trace!("background damaged");
             }
@@ -194,12 +188,10 @@ impl Xray {
                     input_to_clip_geo,
                     clip_geo_size,
                     corner_radius,
-                    scale: params.scale as f32,
                     blur,
                     noise,
                     saturation,
                     bg_color: *bg_color,
-                    program: program.clone(),
                 };
                 push(elem);
             }
@@ -211,7 +203,7 @@ impl Xray {
         }
 
         let prev = backdrop.commit();
-        if backdrop.prepare(ctx.renderer, blur) {
+        if backdrop.prepare(ctx.renderer) {
             if backdrop.commit() != prev {
                 trace!("backdrop damaged");
             }
@@ -244,12 +236,10 @@ impl Xray {
                 input_to_clip_geo,
                 clip_geo_size,
                 corner_radius: corner_radius.scaled_by(zoom as f32),
-                scale: params.scale as f32,
                 blur,
                 noise,
                 saturation,
                 bg_color: self.backdrop_color,
-                program: program.clone(),
             };
             push(elem);
         }
@@ -257,16 +247,17 @@ impl Xray {
 }
 
 impl XrayElement {
-    fn compute_uniforms(&self) -> [Uniform<'static>; 7] {
-        [
-            Uniform::new("niri_scale", self.scale),
-            Uniform::new("geo_size", <[f32; 2]>::from(self.clip_geo_size)),
-            Uniform::new("corner_radius", <[f32; 4]>::from(self.corner_radius)),
-            mat3_uniform("input_to_geo", self.input_to_clip_geo),
-            Uniform::new("noise", self.noise),
-            Uniform::new("saturation", self.saturation),
-            Uniform::new("bg_color", self.bg_color.components()),
-        ]
+    fn postprocess_params(&self) -> PostprocessParams {
+        PostprocessParams {
+            clip: ClipParams {
+                size: self.clip_geo_size.to_array(),
+                radii: self.corner_radius.into(),
+                input_to_geo: self.input_to_clip_geo.to_cols_array(),
+            },
+            noise: self.noise,
+            saturation: self.saturation,
+            background: self.bg_color.components(),
+        }
     }
 }
 
@@ -337,13 +328,6 @@ impl RenderElement<RemoteRenderer> for XrayElement {
             damage
         };
 
-        let uniforms = self.program.is_some().then(|| {
-            let mut uniforms = self.compute_uniforms().to_vec();
-            uniforms.extend(FrameBlendState::uniforms(frame));
-            uniforms
-        });
-        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
-
         frame.render_texture_from_to(
             &texture,
             src,
@@ -353,8 +337,10 @@ impl RenderElement<RemoteRenderer> for XrayElement {
             &[],
             Transform::Normal,
             1.,
-            self.program.as_ref(),
-            uniforms,
+            TextureOptions {
+                effect: Some(TextureEffect::Postprocess(self.postprocess_params())),
+                ..TextureOptions::default()
+            },
         )
     }
 }

@@ -30,7 +30,7 @@
           lib,
           cairo,
           dbus,
-          libGL,
+          mesa,
           libdisplay-info_0_3,
           libinput,
           seatd,
@@ -42,6 +42,7 @@
           rustPlatform,
           systemd,
           wayland,
+          vulkan-loader,
           installShellFiles,
           withDbus ? true,
           withSystemd ? true,
@@ -94,6 +95,7 @@
             # The smithay fork pin lives on a branch, not master, so builtins.fetchGit cannot
             # find it by rev; fetch it by hash instead.
             outputHashes = {
+              "vello_gpu-0.3.0" = "sha256-cuyniT7bLB/lyI9AIg+WQ6iQo0UDIZ/QIyz0yu+j6vk=";
               "smithay-0.7.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
               "smithay-drm-extras-0.1.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
               "libwebauthn-0.10.0" = "sha256-u7BpzfW8CJshZZgjXssIy9eoWzmj2ZMYFgh8d9luEAc=";
@@ -145,7 +147,6 @@
             [
               cairo
               dbus
-              libGL
               libdisplay-info_0_3
               libinput
               seatd
@@ -153,6 +154,7 @@
               libgbm
               pango
               wayland
+              vulkan-loader
             ]
             ++ lib.optional (withDbus || withScreencastSupport || withSystemd) dbus
             ++ lib.optional withScreencastSupport pipewire
@@ -177,13 +179,8 @@
           # this is fine for our build, we just need to make sure it has a directory to write to.
           preCheck = ''
             export XDG_RUNTIME_DIR="$(mktemp -d)"
+            export VK_DRIVER_FILES="$(echo ${mesa}/share/vulkan/icd.d/lvp_icd.*.json)"
           '';
-
-          checkFlags = [
-            # These tests require the ability to access a "valid EGL Display", but that won't work
-            # inside the Nix sandbox
-            "--skip=::egl"
-          ];
 
           postInstall =
             ''
@@ -201,12 +198,12 @@
             '';
 
           env = {
-            # Force linking with libEGL and libwayland-client so they end up in RPATH and
+            # Force linking with Vulkan and Wayland so they end up in RPATH and
             # can be discovered by `dlopen()`
             RUSTFLAGS = toString (
               map (arg: "-C link-arg=" + arg) [
                 "-Wl,--push-state,--no-as-needed"
-                "-lEGL"
+                "-lvulkan"
                 "-lwayland-client"
                 "-Wl,--pop-state"
               ]
@@ -320,7 +317,7 @@
                 drv-module
                 (import ./nix/dev-vm.nix {
                   niri = self.packages.${system}.niri-debug.overrideAttrs (_: {
-                    # Tests need an EGL display; the VM only needs the binaries.
+                    # The VM only needs the binaries; rendering tests run separately.
                     doCheck = false;
                   });
                 })

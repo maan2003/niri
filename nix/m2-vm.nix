@@ -63,6 +63,12 @@ in
 
   boot.kernelPackages = pkgs.linuxPackagesFor kernel;
 
+  # Honeykrisp supports native contexts, but Mesa 26.1.5 rejects PCI devices
+  # before checking for virtio_gpu. Keep this fix guest-only.
+  hardware.graphics.package = pkgs.mesa.overrideAttrs (old: {
+    patches = (old.patches or []) ++ [ ./mesa-asahi-virtio-pci.patch ];
+  });
+
   # Mesa's loader has no native-context probe for asahi: under virtio-gpu it would pick virgl,
   # which the host does not offer. Told to use asahi, agx notices the virtio device itself.
   services.drv.gpuEnv.MESA_LOADER_DRIVER_OVERRIDE = "asahi";

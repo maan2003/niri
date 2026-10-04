@@ -33,9 +33,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::make_ping;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{
-    Interest, LoopHandle, Mode as CalloopMode, PostAction,
-};
+use smithay::reexports::calloop::{Interest, LoopHandle, Mode as CalloopMode, PostAction};
 use smithay::reexports::drm::control::{Mode as DrmMode, ModeFlags, ModeTypeFlags};
 use smithay::reexports::input::{Device as InputDevice, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
@@ -64,7 +62,7 @@ use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
 use crate::niri::{client_allows, Niri, RedrawState, State};
 use crate::render_helpers::blend::{BlendSpace, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
-use crate::render_helpers::{shaders, RenderCtx, RenderTarget};
+use crate::render_helpers::{RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, is_laptop_panel, logical_output, PanelOrientation};
 
 pub struct Tty {
@@ -442,7 +440,12 @@ impl Tty {
                     DeviceKind::Input => {
                         self.input_paths.insert(dev, path.clone());
                         if self.session.is_active() {
-                            add_input_device(&mut self.libinput, &mut self.input_devices, dev, &path);
+                            add_input_device(
+                                &mut self.libinput,
+                                &mut self.input_devices,
+                                dev,
+                                &path,
+                            );
                         }
                     }
                     DeviceKind::Drm => {
@@ -688,19 +691,7 @@ impl Tty {
             self.renderer_ready = true;
             self.render_node = Some(render_node);
 
-            {
-                let config = self.config.borrow();
-                if let Some(src) = config.animations.window_resize.custom_shader.as_deref() {
-                    shaders::set_custom_resize_program(&mut self.renderer, Some(src));
-                }
-                if let Some(src) = config.animations.window_close.custom_shader.as_deref() {
-                    shaders::set_custom_close_program(&mut self.renderer, Some(src));
-                }
-                if let Some(src) = config.animations.window_open.custom_shader.as_deref() {
-                    shaders::set_custom_open_program(&mut self.renderer, Some(src));
-                }
-            }
-            niri.update_shaders();
+            niri.update_paints();
 
             if self.dmabuf_global.is_none() {
                 let formats = self.renderer.dmabuf_formats();
@@ -1470,7 +1461,7 @@ impl Tty {
                 skip_cursor_only_updates: debug.skip_cursor_only_updates_during_vrr && vrr,
             };
             if blend.is_some() {
-                // The cursor and overlay planes are filled without going through GLES, so
+                // The cursor and overlay planes are filled without compositor rendering, so
                 // their content would bypass the blend transform; composite them instead.
                 flags.cursor_plane = false;
                 flags.overlay_planes = false;
@@ -2387,10 +2378,7 @@ fn spawn_gpu(
 
 /// Watches the GPU socket: events are dispatched from here (or from the ping, when a
 /// synchronous request already drained the socket).
-fn register_gpu_source(
-    event_loop: &LoopHandle<'static, State>,
-    poll_fd: OwnedFd,
-) {
+fn register_gpu_source(event_loop: &LoopHandle<'static, State>, poll_fd: OwnedFd) {
     event_loop
         .insert_source(
             Generic::new(poll_fd, Interest::READ, CalloopMode::Level),

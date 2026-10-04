@@ -1,0 +1,15 @@
+diff --git a/src/asahi/vulkan/hk_physical_device.c b/src/asahi/vulkan/hk_physical_device.c
+--- a/src/asahi/vulkan/hk_physical_device.c
++++ b/src/asahi/vulkan/hk_physical_device.c
+@@ -1204,8 +1204,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
+    struct hk_instance *instance = (struct hk_instance *)_instance;
+    VkResult result;
+ 
++   /* Native Asahi devices use the platform bus; virtio-gpu may use PCI.
++    * Validate the kernel driver below rather than rejecting by bus type. */
+-   if (!(drm_device->available_nodes & (1 << DRM_NODE_RENDER)) ||
+-       drm_device->bustype != DRM_BUS_PLATFORM)
++   if (!(drm_device->available_nodes & (1 << DRM_NODE_RENDER)))
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
+ 
+    const char *path = drm_device->nodes[DRM_NODE_RENDER];

@@ -6,7 +6,6 @@ use smithay::utils::{Logical, Point, Rectangle, Size};
 
 use crate::niri_render_elements;
 use crate::render_helpers::border::BorderRenderElement;
-use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 
 #[derive(Debug)]
@@ -17,7 +16,7 @@ pub struct FocusRing {
     borders: [BorderRenderElement; 8],
     full_size: Size<f64, Logical>,
     is_border: bool,
-    use_border_shader: bool,
+    use_border_paint: bool,
     config: niri_config::FocusRing,
     thicken_corners: bool,
 }
@@ -38,7 +37,7 @@ impl FocusRing {
             borders: Default::default(),
             full_size: Default::default(),
             is_border: false,
-            use_border_shader: false,
+            use_border_paint: false,
             config,
             thicken_corners: true,
         }
@@ -48,7 +47,7 @@ impl FocusRing {
         self.config = config;
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         for elem in &mut self.borders {
             elem.damage_all();
         }
@@ -92,7 +91,7 @@ impl FocusRing {
             self.config.inactive_gradient
         };
 
-        self.use_border_shader = radius != CornerRadius::default() || gradient.is_some();
+        self.use_border_paint = radius != CornerRadius::default() || gradient.is_some();
 
         // Set the defaults for solid color + rounded corners.
         let gradient = gradient.unwrap_or_else(|| Gradient::from(color));
@@ -190,7 +189,6 @@ impl FocusRing {
                     Rectangle::new(full_rect.loc - loc, full_rect.size),
                     rounded_corner_border_width,
                     radius,
-                    scale as f32,
                     alpha,
                 );
             }
@@ -209,7 +207,6 @@ impl FocusRing {
                 Rectangle::new(full_rect.loc - self.locations[0], full_rect.size),
                 rounded_corner_border_width,
                 radius,
-                scale as f32,
                 alpha,
             );
         }
@@ -217,7 +214,6 @@ impl FocusRing {
 
     pub fn render(
         &self,
-        renderer: &mut impl NiriRenderer,
         location: Point<f64, Logical>,
         push: &mut dyn FnMut(FocusRingRenderElement),
     ) {
@@ -232,10 +228,8 @@ impl FocusRing {
             return;
         }
 
-        let has_border_shader = BorderRenderElement::has_shader(renderer);
-
         let mut push = |buffer, border: &BorderRenderElement, location: Point<f64, Logical>| {
-            let elem = if self.use_border_shader && has_border_shader {
+            let elem = if self.use_border_paint {
                 border.clone().with_location(location).into()
             } else {
                 let alpha = border.alpha();

@@ -9,7 +9,6 @@ pub mod cursor;
 pub mod draw;
 pub mod drm;
 pub mod exec;
-pub mod gl;
 pub mod protocol;
 pub mod record;
 pub mod remote;
@@ -18,6 +17,7 @@ pub mod scene;
 pub mod server;
 pub mod testing;
 pub mod transport;
+mod vello;
 
 #[cfg(test)]
 mod tests;

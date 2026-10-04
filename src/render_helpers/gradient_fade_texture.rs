@@ -1,28 +1,20 @@
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 
-use super::blend::FrameBlendState;
 use super::texture::TextureRenderElement;
-use crate::gpu::remote::{
-    RemoteError, RemoteFrame, RemoteRenderer, RemoteTexProgram, RemoteTexture,
-};
-use crate::render_helpers::shaders::Shaders;
+use crate::gpu::protocol::{TextureEffect, TextureOptions};
+use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer, RemoteTexture};
 
 #[derive(Debug, Clone)]
 pub struct GradientFadeTextureRenderElement {
     inner: TextureRenderElement<RemoteTexture>,
-    program: GradientFadeShader,
     cutoff: (f32, f32),
 }
 
-#[derive(Debug, Clone)]
-pub struct GradientFadeShader(RemoteTexProgram);
-
 impl GradientFadeTextureRenderElement {
-    pub fn new(texture: TextureRenderElement<RemoteTexture>, program: GradientFadeShader) -> Self {
+    pub fn new(texture: TextureRenderElement<RemoteTexture>) -> Self {
         let logical_w = texture.buffer().logical_size().w;
         let logical_src_w = texture.logical_src().size.w;
         let cutoff = if logical_src_w < logical_w {
@@ -36,14 +28,8 @@ impl GradientFadeTextureRenderElement {
         };
         Self {
             inner: texture,
-            program,
             cutoff,
         }
-    }
-
-    pub fn shader(renderer: &mut RemoteRenderer) -> Option<GradientFadeShader> {
-        let program = Shaders::get(renderer).gradient_fade.clone();
-        program.map(GradientFadeShader)
     }
 }
 
@@ -99,20 +85,23 @@ impl RenderElement<RemoteRenderer> for GradientFadeTextureRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
-        let mut uniforms = vec![Uniform::new("cutoff", self.cutoff)];
-        uniforms.extend(FrameBlendState::uniforms(frame));
-        frame.override_default_tex_program(self.program.0.clone(), uniforms);
-        let res = RenderElement::<RemoteRenderer>::draw(
-            &self.inner,
-            frame,
-            src,
-            dst,
-            damage,
-            opaque_regions,
-            cache,
-        );
-        frame.clear_tex_program_override();
-        res
+        let options = TextureOptions {
+            effect: Some(TextureEffect::Fade {
+                cutoff: [self.cutoff.0, self.cutoff.1],
+            }),
+            ..TextureOptions::default()
+        };
+        frame.with_texture_options(options, |frame| {
+            RenderElement::<RemoteRenderer>::draw(
+                &self.inner,
+                frame,
+                src,
+                dst,
+                damage,
+                opaque_regions,
+                cache,
+            )
+        })
     }
 
     fn underlying_storage(&self, _renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

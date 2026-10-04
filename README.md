@@ -40,7 +40,7 @@ When a monitor disconnects, its workspaces will move to another monitor, but upo
 - Configurable layout: gaps, borders, struts, window sizes
 - [Gradient borders](https://niri-wm.github.io/niri/Configuration%3A-Layout.html#gradients) with Oklab and Oklch support
 - [Background blur](https://niri-wm.github.io/niri/Window-Effects.html) for windows and layer-shell surfaces
-- [Animations](https://github.com/niri-wm/niri/assets/1794388/ce178da2-af9e-4c51-876f-8709c241d95e) with support for [custom shaders](https://github.com/niri-wm/niri/assets/1794388/27a238d6-0a22-4692-b794-30dc7a626fad)
+- [Animations](https://github.com/niri-wm/niri/assets/1794388/ce178da2-af9e-4c51-876f-8709c241d95e).
 - Live-reloading config
 - Works with [screen readers](https://niri-wm.github.io/niri/Accessibility.html)
 

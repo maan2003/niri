@@ -43,7 +43,6 @@ use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame as _, Offscreen, Renderer};
 use smithay::output::OutputModeSource;
@@ -62,6 +61,7 @@ use super::exec::{Deferred, Executor, Tables};
 use super::protocol::{CastCursorMode, CastEvent, CastInfo, CursorMeta, SceneFrame, Target};
 use super::scene::{self, NodeTracks, SceneElement};
 use super::server::Server;
+use super::vello::{VelloRenderer, VelloTexture};
 
 const SHM_BLOCKS: usize = 1;
 const SHM_BYTES_PER_PIXEL: usize = 4;
@@ -1178,7 +1178,7 @@ impl Cast {
     /// Returns whether a buffer was submitted.
     fn render_frame(
         &mut self,
-        renderer: &mut GlesRenderer,
+        renderer: &mut VelloRenderer,
         tables: &RefCell<Tables>,
         frame: SceneFrame,
     ) -> anyhow::Result<bool> {
@@ -1208,8 +1208,12 @@ impl Cast {
         let (storages, cursor_storages) = {
             let tables = tables.borrow();
             (
-                scene::node_storages(&tables, &frame.nodes),
-                scene::node_storages(&tables, cursor_nodes),
+                scene::node_storages(&tables, &frame.nodes, frame.blend),
+                scene::node_storages(
+                    &tables,
+                    cursor_nodes,
+                    cursor_frame.as_ref().and_then(|frame| frame.blend),
+                ),
             )
         };
         let elements = scene::scene_elements(&self.tracks, &frame.nodes, &storages, tables);
@@ -1361,7 +1365,7 @@ impl Cast {
         }
     }
 
-    fn dequeue_buffer_and_clear(&mut self, renderer: &mut GlesRenderer) -> bool {
+    fn dequeue_buffer_and_clear(&mut self, renderer: &mut VelloRenderer) -> bool {
         let mut inner = self.inner.borrow_mut();
 
         // Clear out the damage tracker if we're in Ready state.
@@ -1866,7 +1870,7 @@ unsafe fn add_invisible_cursor(spa_buffer: *mut spa_buffer) {
 /// Writes the cursor position and, if `redraw`, a freshly rendered bitmap of the (already
 /// relocated to 0,0) cursor elements into the buffer's cursor metadata.
 unsafe fn add_cursor_metadata(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     spa_buffer: *mut spa_buffer,
     meta: CursorMeta,
     cursor_size: Size<i32, Physical>,
@@ -1955,13 +1959,13 @@ fn buffer_size(size: Size<i32, Physical>) -> Size<i32, Buffer> {
 
 /// Renders `elements` (top to bottom) into a fresh texture and reads it back.
 fn render_and_download(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     size: Size<i32, Physical>,
     scale: Scale<f64>,
     fourcc: Fourcc,
     elements: &[SceneElement<'_>],
 ) -> anyhow::Result<Vec<u8>> {
-    let mut texture: GlesTexture = renderer
+    let mut texture: VelloTexture = renderer
         .create_buffer(fourcc, buffer_size(size))
         .context("error creating texture")?;
     let mut fb = renderer
@@ -1986,7 +1990,7 @@ fn render_and_download(
 }
 
 fn render_to_dmabuf(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     damage_tracker: &mut OutputDamageTracker,
     mut dmabuf: Dmabuf,
     elements: &[SceneElement<'_>],
@@ -2008,7 +2012,7 @@ fn render_to_dmabuf(
 }
 
 fn render_to_shmbuf(
-    renderer: &mut GlesRenderer,
+    renderer: &mut VelloRenderer,
     damage_tracker: &mut OutputDamageTracker,
     buffer: &Shmbuf,
     fourcc: Fourcc,
@@ -2024,7 +2028,7 @@ fn render_to_shmbuf(
         "invalid buffer size"
     );
 
-    let mut texture: GlesTexture = renderer
+    let mut texture: VelloTexture = renderer
         .create_buffer(fourcc, buffer_size(size))
         .context("error creating texture")?;
     let mut fb = renderer
@@ -2074,7 +2078,7 @@ fn render_to_shmbuf(
     Ok(())
 }
 
-fn clear_dmabuf(renderer: &mut GlesRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
+fn clear_dmabuf(renderer: &mut VelloRenderer, mut dmabuf: Dmabuf) -> anyhow::Result<SyncPoint> {
     let size = dmabuf.size();
     let size: Size<i32, Physical> = Size::from((size.w, size.h));
     let mut fb = renderer.bind(&mut dmabuf).context("error binding dmabuf")?;

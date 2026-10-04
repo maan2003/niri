@@ -30,7 +30,7 @@ This is important both for compositor responsiveness and predictability, and for
 
 ### When disabled, eye-candy features should not affect the performance.
 
-Things like animations and custom shaders do not run and are not present in the render tree when disabled.
+Animations do not run and are not present in the render tree when disabled.
 Extra offscreen rendering is avoided.
 
 Animations specifically are still "started" even when disabled, but with a duration of 0 (this way, they end as soon as the time is advanced).

@@ -2,27 +2,24 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::iter::zip;
 use std::rc::Rc;
 
 use niri_config::{Action, Bind, Config, Key, ModKey, Modifiers, Trigger};
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::{AttrColor, AttrInt, AttrList, AttrString, FontDescription, Weight};
 use smithay::backend::renderer::element::Kind;
 use smithay::input::keyboard::xkb::keysym_get_name;
 use smithay::output::{Output, WeakOutput};
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Scale, Transform};
+use smithay::utils::Scale;
 
+use super::paint::{Paint, Text, TextOptions};
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::utils::{output_size, to_physical_precise_round};
+use crate::utils::output_size;
 
 const PADDING: i32 = 8;
 // const MARGIN: i32 = PADDING * 2;
-const FONT: &str = "sans 14px";
+const FONT: f32 = 14.;
 const BORDER: i32 = 4;
 const LINE_INTERVAL: i32 = 2;
 const TITLE: &str = "Important Hotkeys";
@@ -140,10 +137,7 @@ impl HotkeyOverlay {
             let key = key.map(|key| key_name(true, self.mod_key, &key));
             let key = key.as_deref().unwrap_or("not bound");
 
-            let action = match pango::parse_markup(&action, '\0') {
-                Ok((_attrs, text, _accel)) => text,
-                Err(_) => action.into(),
-            };
+            let action = super::paint::plain_text(&action);
 
             writeln!(&mut buf, "{key} {action}").unwrap();
         }
@@ -309,150 +303,77 @@ fn render(
     mod_key: ModKey,
     scale: f64,
 ) -> anyhow::Result<RenderedOverlay> {
+    Ok(RenderedOverlay {
+        buffer: Some(paint(config, mod_key, scale)?.render(renderer, scale)?),
+    })
+}
+
+fn paint(config: &Config, mod_key: ModKey, scale: f64) -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("hotkey_overlay::render");
-
-    // let margin = MARGIN * scale;
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-    let line_interval: i32 = to_physical_precise_round(scale, LINE_INTERVAL);
-
-    // FIXME: if it doesn't fit, try splitting in two columns or something.
-    // let mut target_size = output_size;
-    // target_size.w -= margin * 2;
-    // target_size.h -= margin * 2;
-    // anyhow::ensure!(target_size.w > 0 && target_size.h > 0);
-
-    let strings = collect_actions(config)
+    let title = Text::with_options(
+        TITLE,
+        TextOptions {
+            font_size: FONT,
+            bold: true,
+            ..Default::default()
+        },
+        false,
+    )?;
+    let rows = collect_actions(config)
         .into_iter()
         .filter_map(|action| format_bind(&config.binds.0, action))
         .map(|(key, action)| {
             let key = key.map(|key| key_name(false, mod_key, &key));
-            let key = key.as_deref().unwrap_or("(not bound)");
-            let key = format!(" {key} ");
-            (key, action)
-        })
-        .collect::<Vec<_>>();
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-
-    let bold = AttrList::new();
-    bold.insert(AttrInt::new_weight(Weight::Bold));
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    let title_size = layout.pixel_size();
-
-    let attrs = AttrList::new();
-    attrs.insert(AttrString::new_family("Monospace"));
-    attrs.insert(AttrColor::new_background(12000, 12000, 12000));
-
-    layout.set_attributes(Some(&attrs));
-    let key_sizes = strings
-        .iter()
-        .map(|(key, _)| {
-            layout.set_text(key);
-            layout.pixel_size()
-        })
-        .collect::<Vec<_>>();
-
-    layout.set_attributes(None);
-    let action_sizes = strings
-        .iter()
-        .map(|(_, action)| {
-            layout.set_markup(action);
-            layout.pixel_size()
-        })
-        .collect::<Vec<_>>();
-
-    let key_width = key_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let action_width = action_sizes.iter().map(|(w, _)| w).max().unwrap();
-    let mut width = key_width + padding + action_width;
-
-    let mut height = zip(&key_sizes, &action_sizes)
-        .map(|((_, key_h), (_, act_h))| max(key_h, act_h))
-        .sum::<i32>()
-        + (key_sizes.len() - 1) as i32 * line_interval
-        + title_size.1
-        + padding;
-
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-
-    cr.set_source_rgb(1., 1., 1.);
-
-    cr.move_to(((width - title_size.0) / 2).into(), padding.into());
-    layout.set_attributes(Some(&bold));
-    layout.set_text(TITLE);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(padding.into(), (padding + title_size.1 + padding).into());
-
-    for ((key, action), ((_, key_h), (_, act_h))) in zip(&strings, zip(&key_sizes, &action_sizes)) {
-        layout.set_attributes(Some(&attrs));
-        layout.set_text(key);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to((key_width + padding).into(), 0.);
-
-        let (attrs, text) = match pango::parse_markup(action, '\0') {
-            Ok((attrs, text, _accel)) => (Some(attrs), text),
-            Err(err) => {
+            let key = format!(" {} ", key.as_deref().unwrap_or("(not bound)"));
+            let escaped = key
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;");
+            let key_text = Text::markup(
+                &format!("<span face='monospace' bgcolor='#2EE02EE02EE0'>{escaped}</span>"),
+                FONT,
+            )?;
+            let action_text = Text::markup(&action, FONT).or_else(|err| {
                 warn!("error parsing markup for key {key}: {err}");
-                (None, action.into())
-            }
-        };
-
-        layout.set_attributes(attrs.as_ref());
-        layout.set_text(&text);
-        pangocairo::functions::show_layout(&cr, &layout);
-
-        cr.rel_move_to(
-            (-(key_width + padding)).into(),
-            (max(key_h, act_h) + line_interval).into(),
-        );
+                Text::new(&action, FONT)
+            })?;
+            Ok((key_text, action_text))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let key_width = rows.iter().map(|(key, _)| key.size().0).max().unwrap();
+    let action_width = rows
+        .iter()
+        .map(|(_, action)| action.size().0)
+        .max()
+        .unwrap();
+    let width = key_width + PADDING + action_width + PADDING * 2;
+    let height = rows
+        .iter()
+        .map(|(key, action)| max(key.size().1, action.size().1))
+        .sum::<i32>()
+        + (rows.len() - 1) as i32 * LINE_INTERVAL
+        + title.size().1
+        + PADDING * 3;
+    let mut paint = Paint::new(width, height);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    paint.text(
+        &title,
+        ((width - title.size().0) / 2) as f32,
+        PADDING as f32,
+    );
+    let mut y = PADDING + title.size().1 + PADDING;
+    for (key, action) in rows {
+        let (_, key_h) = key.size();
+        let action_h = action.size().1;
+        paint.text(&key, PADDING as f32, y as f32);
+        paint.text(&action, (PADDING * 2 + key_width) as f32, y as f32);
+        y += max(key_h, action_h) + LINE_INTERVAL;
     }
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(0.5, 0.8, 1.0);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(RenderedOverlay {
-        buffer: Some(buffer),
-    })
+    paint.border(
+        ((BORDER as f64 / 2. * scale).round() * 2. / scale) as f32,
+        [0.5, 0.8, 1., 1.],
+    );
+    Ok(paint)
 }
 
 fn action_name(action: &Action) -> String {
@@ -714,4 +635,9 @@ mod tests {
             @" Super + P : Hello"
         );
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_paint(config: &Config, mod_key: ModKey, scale: f64) -> anyhow::Result<Paint> {
+    paint(config, mod_key, scale)
 }

@@ -2847,20 +2847,20 @@ impl<W: LayoutElement> Layout<W> {
         }
     }
 
-    pub fn update_shaders(&mut self) {
+    pub fn update_paints(&mut self) {
         if let Some(InteractiveMoveState::Moving(move_)) = &mut self.interactive_move {
-            move_.tile.update_shaders();
+            move_.tile.update_paints();
         }
 
         match &mut self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
-                    mon.update_shaders();
+                    mon.update_paints();
                 }
             }
             MonitorSet::NoOutputs { workspaces, .. } => {
                 for ws in workspaces {
-                    ws.update_shaders();
+                    ws.update_paints();
                 }
             }
         }

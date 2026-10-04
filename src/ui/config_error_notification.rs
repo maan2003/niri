@@ -6,22 +6,20 @@ use std::time::Duration;
 
 use niri_config::Config;
 use ordered_float::NotNan;
-use pangocairo::cairo::{self, ImageSurface};
-use pangocairo::pango::FontDescription;
 use smithay::backend::renderer::element::Kind;
 use smithay::output::Output;
-use smithay::reexports::gbm::Format as Fourcc;
-use smithay::utils::{Point, Transform};
+use smithay::utils::Point;
 
+use super::paint::{Paint, Text};
 use crate::animation::{Animation, Clock};
 use crate::gpu::remote::{RemoteRenderer, RemoteTexture};
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
-use crate::utils::{output_size, to_physical_precise_round};
+use crate::utils::output_size;
 
 const PADDING: i32 = 8;
-const FONT: &str = "sans 14px";
+const FONT: f32 = 14.;
 const BORDER: i32 = 4;
 
 pub struct ConfigErrorNotification {
@@ -179,72 +177,30 @@ fn render(
     scale: f64,
     created_path: Option<&Path>,
 ) -> anyhow::Result<TextureBuffer<RemoteTexture>> {
+    paint(scale, created_path)?.render(renderer, scale)
+}
+
+fn paint(scale: f64, created_path: Option<&Path>) -> anyhow::Result<Paint> {
     let _span = tracy_client::span!("config_error_notification::render");
-
-    let padding: i32 = to_physical_precise_round(scale, PADDING);
-
     let mut text = error_text(true);
-    let mut border_color = (1., 0.3, 0.3);
+    let mut border_color = [1., 0.3, 0.3, 1.];
     if let Some(path) = created_path {
         text = format!(
             "Created a default config file at \
              <span face='monospace' bgcolor='#000000'>{path:?}</span>",
         );
-        border_color = (0.5, 1., 0.5);
-    };
-
-    let mut font = FontDescription::from_string(FONT);
-    font.set_absolute_size(to_physical_precise_round(scale, font.size()));
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, 0, 0)?;
-    let cr = cairo::Context::new(&surface)?;
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
-
-    let (mut width, mut height) = layout.pixel_size();
-    width += padding * 2;
-    height += padding * 2;
-
-    let surface = ImageSurface::create(cairo::Format::ARgb32, width, height)?;
-    let cr = cairo::Context::new(&surface)?;
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.paint()?;
-
-    cr.move_to(padding.into(), padding.into());
-    let layout = pangocairo::functions::create_layout(&cr);
-    layout.context().set_round_glyph_positions(false);
-    layout.set_font_description(Some(&font));
-    layout.set_markup(&text);
-
-    cr.set_source_rgb(1., 1., 1.);
-    pangocairo::functions::show_layout(&cr, &layout);
-
-    cr.move_to(0., 0.);
-    cr.line_to(width.into(), 0.);
-    cr.line_to(width.into(), height.into());
-    cr.line_to(0., height.into());
-    cr.line_to(0., 0.);
-    cr.set_source_rgb(border_color.0, border_color.1, border_color.2);
-    // Keep the border width even to avoid blurry edges.
-    cr.set_line_width((f64::from(BORDER) / 2. * scale).round() * 2.);
-    cr.stroke()?;
-    drop(cr);
-
-    let data = surface.take_data().unwrap();
-    let buffer = TextureBuffer::from_memory(
-        renderer,
-        &data,
-        Fourcc::Argb8888,
-        (width, height),
-        false,
-        scale,
-        Transform::Normal,
-        Vec::new(),
-    )?;
-
-    Ok(buffer)
+        border_color = [0.5, 1., 0.5, 1.];
+    }
+    let text = Text::markup(&text, FONT)?;
+    let (width, height) = text.size();
+    let mut paint = Paint::new(width + PADDING * 2, height + PADDING * 2);
+    paint.fill([0.1, 0.1, 0.1, 1.]);
+    paint.text(&text, PADDING as f32, PADDING as f32);
+    paint.border(
+        ((BORDER as f64 / 2. * scale).round() * 2. / scale) as f32,
+        border_color,
+    );
+    Ok(paint)
 }
 
 pub fn error_text(markup: bool) -> String {
@@ -255,4 +211,9 @@ pub fn error_text(markup: bool) -> String {
     };
 
     format!("Failed to parse the config file. Please run {command} to see the errors.")
+}
+
+#[cfg(test)]
+pub(super) fn test_paint(scale: f64, created_path: Option<&Path>) -> anyhow::Result<Paint> {
+    paint(scale, created_path)
 }

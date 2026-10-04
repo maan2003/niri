@@ -5,3 +5,5 @@ pub mod hotkey_overlay;
 pub mod mru;
 pub mod screen_transition;
 pub mod screenshot_ui;
+
+pub mod paint;

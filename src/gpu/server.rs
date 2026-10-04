@@ -9,9 +9,6 @@ use calloop::channel::Sender;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::DrmEvent;
-use smithay::backend::egl::native::EGLSurfacelessDisplay;
-use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopHandle, LoopSignal, Mode as CalloopMode, PostAction,
@@ -26,23 +23,15 @@ use super::cast::{Casting, StartParams};
 use super::client::Mode;
 use super::drm::DrmState;
 use super::exec::Executor;
-use super::gl::{resources, shaders};
 #[cfg(feature = "xdp-gnome-screencast")]
 use super::protocol::CastEvent;
 use super::protocol::{DevId, DeviceResult, Event, GpuEvent, Request, PROTOCOL_VERSION};
 use super::transport::Channel;
+use super::vello::VelloRenderer;
 use super::{cursor, sandbox};
 
-pub fn new_surfaceless_renderer() -> anyhow::Result<GlesRenderer> {
-    let mut renderer = unsafe {
-        let display =
-            EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
-        let context = EGLContext::new(&display).context("error creating EGL context")?;
-        GlesRenderer::new(context).context("error creating renderer")?
-    };
-    resources::init(&mut renderer);
-    shaders::init(&mut renderer);
-    Ok(renderer)
+pub(crate) fn new_headless_renderer() -> anyhow::Result<VelloRenderer> {
+    VelloRenderer::new_headless().context("creating Vello Vulkan renderer")
 }
 
 pub(super) struct Server {
@@ -80,7 +69,7 @@ pub fn run(
         EventLoop::try_new().context("error creating event loop")?;
 
     let renderer = match mode {
-        Mode::Headless => Some(new_surfaceless_renderer()?),
+        Mode::Headless => Some(new_headless_renderer()?),
         Mode::Drm => None,
     };
     let exec = Executor::new(renderer);
@@ -110,10 +99,8 @@ pub fn run(
     };
 
     let (devices, render_node_hint) = if await_start {
-        let (request, fds): (Request, Vec<OwnedFd>) = server
-            .chan
-            .recv()
-            .context("waiting for the core's Start")?;
+        let (request, fds): (Request, Vec<OwnedFd>) =
+            server.chan.recv().context("waiting for the core's Start")?;
         match request {
             Request::Start {
                 devices,
@@ -313,6 +300,10 @@ impl Server {
                 exec.import_dmabuf(id, &desc, fds)?;
                 Event::Ack
             }
+            Request::RenderUi { id, scene } => {
+                exec.render_ui(id, scene)?;
+                Event::Ack
+            }
             Request::ReadTexture { id, region, format } => {
                 Event::Image(exec.read_texture(id, region, format)?)
             }
@@ -380,11 +371,7 @@ impl Server {
                 };
                 let mut formats = FormatSet::default();
                 if gbm.is_some() {
-                    formats = exec
-                        .renderer()?
-                        .egl_context()
-                        .dmabuf_render_formats()
-                        .clone();
+                    formats = exec.renderer()?.dmabuf_render_formats().clone();
                     if force_invalid_modifier {
                         formats = formats
                             .into_iter()
@@ -434,10 +421,6 @@ impl Server {
             | Request::CastStop { .. } => {
                 anyhow::bail!("built without screencast support")
             }
-            Request::SetCustomShader { kind, src } => Event::ShaderSet {
-                available: exec.set_custom_shader(kind, src.as_deref())?,
-            },
-
             Request::Start { .. } => anyhow::bail!("Start after startup"),
             Request::AddDevice {
                 dev,
@@ -457,10 +440,12 @@ impl Server {
             Request::RemoveDevice { dev } => {
                 let mut renderer_dropped = false;
                 if let Some((token, was_renderer)) = drm.remove_device(dev) {
-                    self.loop_handle.remove(token);
+                    if let Some(token) = token {
+                        self.loop_handle.remove(token);
+                    }
                     if was_renderer {
-                        // The renderer's EGL display belongs to this device; the next device
-                        // that qualifies creates a fresh one and reports caps again.
+                        // The Vulkan renderer belongs to this card. A replacement needs
+                        // initialization before the sandbox seals.
                         exec.clear_renderer();
                         renderer_dropped = true;
                     }

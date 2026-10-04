@@ -1,24 +1,18 @@
-use std::collections::HashMap;
-use std::rc::Rc;
-
 use glam::{Mat3, Vec2};
 use niri_config::{Color, CornerRadius};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::gpu_span_location;
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use super::renderer::NiriRenderer;
-use super::shader_element::ShaderRenderElement;
-use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::paint_element::PaintRenderElement;
+use crate::gpu::protocol::{Paint, RoundedGeometry, ShadowParams};
 use crate::gpu::remote::{RemoteError, RemoteFrame, RemoteRenderer};
 
 /// Renders a rounded rectangle shadow.
 #[derive(Debug, Clone)]
 pub struct ShadowRenderElement {
-    inner: ShaderRenderElement,
+    inner: PaintRenderElement,
     params: Parameters,
 }
 
@@ -29,8 +23,6 @@ struct Parameters {
     color: Color,
     sigma: f32,
     corner_radius: CornerRadius,
-    // Should only be used for visual improvements, i.e. corner radius anti-aliasing.
-    scale: f32,
     alpha: f32,
 
     window_geometry: Rectangle<f64, Logical>,
@@ -45,12 +37,11 @@ impl ShadowRenderElement {
         color: Color,
         sigma: f32,
         corner_radius: CornerRadius,
-        scale: f32,
         window_geometry: Rectangle<f64, Logical>,
         window_corner_radius: CornerRadius,
         alpha: f32,
     ) -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Shadow, Kind::Unspecified);
+        let inner = PaintRenderElement::empty(Kind::Unspecified);
         let mut rv = Self {
             inner,
             params: Parameters {
@@ -59,7 +50,6 @@ impl ShadowRenderElement {
                 color,
                 sigma,
                 corner_radius,
-                scale,
                 alpha,
                 window_geometry,
                 window_corner_radius,
@@ -70,7 +60,7 @@ impl ShadowRenderElement {
     }
 
     pub fn empty() -> Self {
-        let inner = ShaderRenderElement::empty(ProgramType::Shadow, Kind::Unspecified);
+        let inner = PaintRenderElement::empty(Kind::Unspecified);
         Self {
             inner,
             params: Parameters {
@@ -79,7 +69,6 @@ impl ShadowRenderElement {
                 color: Default::default(),
                 sigma: 0.,
                 corner_radius: Default::default(),
-                scale: 1.,
                 alpha: 1.,
                 window_geometry: Default::default(),
                 window_corner_radius: Default::default(),
@@ -99,7 +88,6 @@ impl ShadowRenderElement {
         color: Color,
         sigma: f32,
         corner_radius: CornerRadius,
-        scale: f32,
         window_geometry: Rectangle<f64, Logical>,
         window_corner_radius: CornerRadius,
         alpha: f32,
@@ -111,7 +99,6 @@ impl ShadowRenderElement {
             sigma,
             alpha,
             corner_radius,
-            scale,
             window_geometry,
             window_corner_radius,
         };
@@ -131,7 +118,6 @@ impl ShadowRenderElement {
             sigma,
             alpha,
             corner_radius,
-            scale,
             window_geometry,
             window_corner_radius,
         } = self.params;
@@ -154,22 +140,23 @@ impl ShadowRenderElement {
         self.inner.update(
             size,
             None,
-            scale,
             alpha,
-            Rc::new([
-                Uniform::new("shadow_color", color.to_array_premul()),
-                Uniform::new("sigma", sigma),
-                mat3_uniform("input_to_geo", input_to_geo),
-                Uniform::new("geo_size", geo_size.to_array()),
-                Uniform::new("corner_radius", <[f32; 4]>::from(corner_radius)),
-                mat3_uniform("window_input_to_geo", window_input_to_geo),
-                Uniform::new("window_geo_size", window_geo_size.to_array()),
-                Uniform::new(
-                    "window_corner_radius",
-                    <[f32; 4]>::from(window_corner_radius),
+            Paint::Shadow(ShadowParams {
+                geometry: RoundedGeometry {
+                    size: geo_size.to_array(),
+                    radii: corner_radius.into(),
+                    input_to_geo: input_to_geo.to_cols_array(),
+                },
+                window: (window_geo_size.x > 0. && window_geo_size.y > 0.).then_some(
+                    RoundedGeometry {
+                        size: window_geo_size.to_array(),
+                        radii: window_corner_radius.into(),
+                        input_to_geo: window_input_to_geo.to_cols_array(),
+                    },
                 ),
-            ]),
-            HashMap::new(),
+                color: color.to_array_premul(),
+                sigma,
+            }),
         );
     }
 
@@ -181,12 +168,6 @@ impl ShadowRenderElement {
     pub fn with_alpha(mut self, alpha: f32) -> Self {
         self.inner = self.inner.with_alpha(alpha);
         self
-    }
-
-    pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
-        Shaders::get(renderer)
-            .program(ProgramType::Shadow)
-            .is_some()
     }
 }
 
@@ -249,17 +230,15 @@ impl RenderElement<RemoteRenderer> for ShadowRenderElement {
         cache: Option<&UserDataMap>,
     ) -> Result<(), RemoteError> {
         let _span = tracy_client::span!("ShadowRenderElement::draw");
-        frame.with_gpu_span(gpu_span_location!("ShadowRenderElement::draw"), |frame| {
-            RenderElement::<RemoteRenderer>::draw(
-                &self.inner,
-                frame,
-                src,
-                dst,
-                damage,
-                opaque_regions,
-                cache,
-            )
-        })
+        RenderElement::<RemoteRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
     }
 
     fn underlying_storage(&self, renderer: &mut RemoteRenderer) -> Option<UnderlyingStorage<'_>> {

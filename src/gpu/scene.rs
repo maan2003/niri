@@ -13,7 +13,6 @@ use std::mem;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::element::memory::MemoryBuffer;
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
@@ -21,7 +20,8 @@ use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 use super::convert;
 use super::draw::draw_ops;
 use super::exec::Tables;
-use super::protocol::{ElementKind, Node, Op};
+use super::protocol::{BlendParams, ElementKind, Node, Op, SourceColor};
+use super::vello::{VelloError, VelloFrame, VelloRenderer};
 
 /// How many past frames of damage we remember for buffer ages.
 pub const DAMAGE_HISTORY: usize = 8;
@@ -97,7 +97,7 @@ impl NodeTracks {
 
 /// Builds smithay elements for `nodes`, top to bottom (the core sends bottom to top).
 /// `tracks` must have been updated with these nodes.
-pub fn scene_elements<'a>(
+pub(crate) fn scene_elements<'a>(
     tracks: &'a NodeTracks,
     nodes: &'a [Node],
     storages: &'a [Option<Storage>],
@@ -117,10 +117,14 @@ pub fn scene_elements<'a>(
     elements
 }
 
-pub fn node_storages(tables: &Tables, nodes: &[Node]) -> Vec<Option<Storage>> {
+pub(crate) fn node_storages(
+    tables: &Tables,
+    nodes: &[Node],
+    target: Option<BlendParams>,
+) -> Vec<Option<Storage>> {
     nodes
         .iter()
-        .map(|node| node_storage(tables, node))
+        .map(|node| node_storage(tables, node, target))
         .collect()
 }
 
@@ -131,25 +135,29 @@ pub enum Storage {
     Memory(MemoryBuffer),
 }
 
-fn node_storage(tables: &Tables, node: &Node) -> Option<Storage> {
+fn node_storage(tables: &Tables, node: &Node, target: Option<BlendParams>) -> Option<Storage> {
     let [Op::Texture {
         texture,
         src,
         dst,
         transform,
         alpha,
-        program,
-        uniforms,
+        options,
         ..
     }] = node.draw.as_slice()
     else {
         return None;
     };
-    // Anything but an untinted 1:1 copy of the whole element must be rendered.
+    // Matching described content and already-composited target content used to be
+    // scoped passthrough draws, which were not eligible for underlying storage.
+    // Nonmatching described content used the same plain-copy path as untagged SDR.
     if !node.capture.is_empty()
         || *alpha != 1.0
-        || program.is_some()
-        || !uniforms.is_empty()
+        || options.effect.is_some()
+        || options.color == SourceColor::Target
+        || (options.color != SourceColor::Srgb
+            && target.is_some()
+            && options.color.conversion_to(target).is_none())
         || *src != node.src
         || *dst != node.geometry
         || *transform != node.transform
@@ -167,7 +175,7 @@ fn node_storage(tables: &Tables, node: &Node) -> Option<Storage> {
 
 /// One core node as a smithay element. Damage and opaque regions come from the core, so the
 /// DRM compositor tracks and culls exactly like in-process smithay would.
-pub struct SceneElement<'a> {
+pub(crate) struct SceneElement<'a> {
     track: &'a NodeTrack,
     node: &'a Node,
     storage: Option<&'a Storage>,
@@ -250,16 +258,16 @@ impl Element for SceneElement<'_> {
     }
 }
 
-impl RenderElement<GlesRenderer> for SceneElement<'_> {
+impl RenderElement<VelloRenderer> for SceneElement<'_> {
     fn draw(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut VelloFrame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         dst: Rectangle<i32, Physical>,
         damage: &[Rectangle<i32, Physical>],
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
-    ) -> Result<(), GlesError> {
+    ) -> Result<(), VelloError> {
         // Ops are in frame coordinates; damage arrives element-relative.
         let clip: Vec<_> = damage
             .iter()
@@ -269,26 +277,20 @@ impl RenderElement<GlesRenderer> for SceneElement<'_> {
                 d
             })
             .collect();
-        if let Err(err) = draw_ops(frame, self.tables, &self.node.draw, Some(&clip)) {
-            warn!("error drawing node: {err:#}");
-        }
-        Ok(())
+        draw_ops(frame, self.tables, &self.node.draw, Some(&clip)).map_err(VelloError::from)
     }
 
     fn capture_framebuffer(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut VelloFrame<'_, '_>,
         _src: Rectangle<f64, Buffer>,
         _dst: Rectangle<i32, Physical>,
         _cache: &UserDataMap,
-    ) -> Result<(), GlesError> {
-        if let Err(err) = draw_ops(frame, self.tables, &self.node.capture, None) {
-            warn!("error capturing for node: {err:#}");
-        }
-        Ok(())
+    ) -> Result<(), VelloError> {
+        draw_ops(frame, self.tables, &self.node.capture, None).map_err(VelloError::from)
     }
 
-    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+    fn underlying_storage(&self, _renderer: &mut VelloRenderer) -> Option<UnderlyingStorage<'_>> {
         match self.storage? {
             Storage::Dmabuf(dmabuf) => Some(UnderlyingStorage::Dmabuf(dmabuf)),
             Storage::Memory(mem) => Some(UnderlyingStorage::Memory(mem)),
@@ -305,7 +307,8 @@ mod tests {
 
     use super::*;
     use crate::gpu::protocol::{Rect, Transform as PTransform};
-    use crate::gpu::server::new_surfaceless_renderer;
+    use crate::gpu::server::new_headless_renderer;
+    use crate::gpu::vello::VelloTexture;
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rect<i32> {
         convert::rect(Rectangle::<i32, Physical>::new(
@@ -339,12 +342,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn storage_color_eligibility_preserves_matching_passthrough_policy() {
+        use crate::gpu::protocol::{ClipParams, TextureEffect, TextureOptions};
+        let geometry = rect(11, 17, 2, 3);
+        let mut node = solid_node(1, geometry, None, [0.; 4]);
+        node.draw = vec![Op::Texture {
+            texture: 1,
+            src: node.src,
+            dst: geometry,
+            opaque: vec![geometry],
+            transform: node.transform,
+            alpha: 1.,
+            options: TextureOptions::default(),
+        }];
+        let mut tables = Tables::default();
+        tables.memory.insert(
+            1,
+            MemoryBuffer::from_slice(&[255; 24], Fourcc::Abgr8888, (2, 3)),
+        );
+        for (target, eligible) in [
+            (None, [true, true, true, false]),
+            (
+                Some(BlendParams::HdrPq {
+                    ref_lum_scale: 0.0203,
+                }),
+                [true, false, true, false],
+            ),
+            (Some(BlendParams::DisplayP3), [true, true, false, false]),
+        ] {
+            for (color, eligible) in [
+                SourceColor::Srgb,
+                SourceColor::Hdr,
+                SourceColor::DisplayP3,
+                SourceColor::Target,
+            ]
+            .into_iter()
+            .zip(eligible)
+            {
+                let Op::Texture { options, .. } = &mut node.draw[0] else {
+                    unreachable!()
+                };
+                options.color = color;
+                assert_eq!(
+                    node_storage(&tables, &node, target).is_some(),
+                    eligible,
+                    "source {color:?}, target {target:?}"
+                );
+            }
+            let Op::Texture { options, .. } = &mut node.draw[0] else {
+                unreachable!()
+            };
+            *options = TextureOptions {
+                color: SourceColor::Srgb,
+                effect: Some(TextureEffect::Clip(ClipParams {
+                    size: [2., 3.],
+                    radii: [0.; 4],
+                    input_to_geo: glam::Mat3::IDENTITY.to_cols_array(),
+                })),
+            };
+            assert!(
+                node_storage(&tables, &node, target).is_none(),
+                "effects must render"
+            );
+            let Op::Texture { options, .. } = &mut node.draw[0] else {
+                unreachable!()
+            };
+            *options = TextureOptions::default();
+        }
+    }
+
     /// Frame-space node damage must reach the op clipped and dst-relative: a node that
     /// changes color with partial damage repaints only the damaged part.
     #[test]
     fn node_damage_clips_ops_in_frame_space() {
-        let Ok(mut renderer) = new_surfaceless_renderer() else {
-            eprintln!("no EGL (llvmpipe) available, skipping");
+        let Ok(mut renderer) = new_headless_renderer() else {
+            eprintln!("no Vulkan renderer available, skipping");
             return;
         };
         let tables = RefCell::new(Tables::default());
@@ -359,21 +432,21 @@ mod tests {
         let blue = [0., 0., 1., 1.];
         let geometry = rect(10, 10, 40, 40);
 
-        let mut render = |renderer: &mut GlesRenderer,
-                          texture: &mut smithay::backend::renderer::gles::GlesTexture,
+        let mut render = |renderer: &mut VelloRenderer,
+                          texture: &mut VelloTexture,
                           tracks: &mut NodeTracks,
                           generation: u64,
                           nodes: Vec<Node>,
                           age: usize| {
             tracks.update(generation, &nodes);
-            let storages = node_storages(&tables.borrow(), &nodes);
+            let storages = node_storages(&tables.borrow(), &nodes, None);
             let elements = scene_elements(tracks, &nodes, &storages, &tables);
             let mut fb = renderer.bind(texture).unwrap();
             tracker
                 .render_output(renderer, &mut fb, age, &elements, Color32F::TRANSPARENT)
                 .unwrap();
         };
-        let pixel = |renderer: &mut GlesRenderer, texture: &_, x: i32, y: i32| -> [u8; 4] {
+        let pixel = |renderer: &mut VelloRenderer, texture: &_, x: i32, y: i32| -> [u8; 4] {
             let mapping = renderer
                 .copy_texture(
                     texture,
