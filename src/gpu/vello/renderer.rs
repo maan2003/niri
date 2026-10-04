@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 macro_rules! ensure { ($condition:expr, $($args:tt)*) => { if !$condition { return Err(anyhow::anyhow!($($args)*).into()); } }; }
@@ -128,6 +128,38 @@ impl TextureMapping for VelloMapping {
     }
 }
 
+/// Wall-clock submission latency includes DMA-buf waits, encoding and fence waits,
+/// not just GPU execution. Reset each reporting interval; never call this FPS.
+#[derive(Default)]
+struct SubmissionMetrics {
+    count: u64,
+    errors: u64,
+    total: Duration,
+    max: Duration,
+    acquire: PhaseMetrics,
+    encode: PhaseMetrics,
+    fence: PhaseMetrics,
+}
+#[derive(Default)]
+struct PhaseMetrics {
+    total: Duration,
+    max: Duration,
+}
+impl PhaseMetrics {
+    fn record(&mut self, elapsed: Duration) {
+        self.total += elapsed;
+        self.max = self.max.max(elapsed);
+    }
+}
+impl SubmissionMetrics {
+    fn record(&mut self, elapsed: Duration, failed: bool) {
+        self.count += 1;
+        self.errors += u64::from(failed);
+        self.total += elapsed;
+        self.max = self.max.max(elapsed);
+    }
+}
+
 struct Rasterizer {
     renderer: vello_gpu::Renderer,
     resources: Resources,
@@ -142,6 +174,8 @@ pub(crate) struct VelloRenderer {
     imports: HashMap<(WeakDmabuf, bool), Weak<TextureInner>>,
     rasterizers: HashMap<wgpu::TextureFormat, Rasterizer>,
     next_texture: u64,
+    metrics: SubmissionMetrics,
+    last_metrics: Instant,
     downscale: TextureFilter,
     upscale: TextureFilter,
     debug: DebugFlags,
@@ -270,6 +304,8 @@ impl VelloRenderer {
             imports: HashMap::new(),
             rasterizers: HashMap::new(),
             next_texture: 1,
+            metrics: SubmissionMetrics::default(),
+            last_metrics: Instant::now(),
             downscale: TextureFilter::Linear,
             upscale: TextureFilter::Linear,
             debug: DebugFlags::empty(),
@@ -312,6 +348,9 @@ impl VelloRenderer {
             &normalized,
             TargetInit::Clear(Default::default()),
         )?;
+        // Startup pipeline warm-up is not steady-state compositor latency.
+        renderer.metrics = SubmissionMetrics::default();
+        renderer.last_metrics = Instant::now();
         Ok(renderer)
     }
     pub fn device(&self) -> &wgpu::Device {
@@ -483,6 +522,57 @@ impl VelloRenderer {
         textures: &[VelloTexture],
         encode: impl FnOnce(&mut Self, &mut wgpu::CommandEncoder) -> Result<(), VelloError>,
     ) -> Result<(), VelloError> {
+        let start = Instant::now();
+        let result = self.submit_inner(textures, encode);
+        self.metrics.record(start.elapsed(), result.is_err());
+        if let Err(error) = &result {
+            tracing::warn!(%error, "Vello submission failed");
+        }
+        // At most one allocator walk per ten seconds, only while rendering.
+        // This needs no /proc access or new permissions in the sealed worker.
+        if self.last_metrics.elapsed() >= Duration::from_secs(10) {
+            self.log_metrics();
+        }
+        result
+    }
+
+    fn log_metrics(&mut self) {
+        let metrics = std::mem::take(&mut self.metrics);
+        let interval = self.last_metrics.elapsed();
+        self.last_metrics = Instant::now();
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        // External DMA-buf imports bypass wgpu's allocator. Do not describe these
+        // totals as total GPU/process memory, or count imported bytes twice.
+        let report = self.device.generate_allocator_report();
+        let live_imports = self.imports.values().filter(|t| t.strong_count() > 0).count();
+        tracing::debug!(
+            interval_ms = interval.as_millis() as u64,
+            submissions = metrics.count,
+            submission_errors = metrics.errors,
+            submission_wall_ms = metrics.total.as_secs_f64() * 1000.,
+            max_submission_wall_ms = metrics.max.as_secs_f64() * 1000.,
+            acquire_ms = metrics.acquire.total.as_secs_f64() * 1000.,
+            max_acquire_ms = metrics.acquire.max.as_secs_f64() * 1000.,
+            encode_submit_ms = metrics.encode.total.as_secs_f64() * 1000.,
+            max_encode_submit_ms = metrics.encode.max.as_secs_f64() * 1000.,
+            fence_wait_ms = metrics.fence.total.as_secs_f64() * 1000.,
+            max_fence_wait_ms = metrics.fence.max.as_secs_f64() * 1000.,
+            allocated_bytes = report.as_ref().map(|r| r.total_allocated_bytes),
+            reserved_bytes = report.as_ref().map(|r| r.total_reserved_bytes),
+            allocations = report.as_ref().map(|r| r.allocations.len()),
+            live_imports,
+            rasterizers = self.rasterizers.len(),
+            "Vello metrics (allocator excludes external DMA-bufs)"
+        );
+    }
+
+    fn submit_inner(
+        &mut self,
+        textures: &[VelloTexture],
+        encode: impl FnOnce(&mut Self, &mut wgpu::CommandEncoder) -> Result<(), VelloError>,
+    ) -> Result<(), VelloError> {
         let mut textures = textures.to_vec();
         textures.sort_by_key(|t| t.0.id.0);
         textures.dedup_by_key(|t| t.0.id.0);
@@ -499,15 +589,23 @@ impl VelloRenderer {
                 );
             }
         }
-        let bracket = dmabuf::bracket(&self.device, &textures)?;
+        let start = Instant::now();
+        let bracket = dmabuf::bracket(&self.device, &textures);
+        self.metrics.acquire.record(start.elapsed());
+        let bracket = bracket?;
         let errors = scopes(&self.device);
         let result = (|| {
+            let encode_start = Instant::now();
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("niri Vello frame"),
                 });
-            encode(self, &mut encoder)?;
+            let encoded = encode(self, &mut encoder);
+            if let Err(error) = encoded {
+                self.metrics.encode.record(encode_start.elapsed());
+                return Err(error);
+            }
             dmabuf::restore(&mut encoder, &textures);
             let main = encoder.finish();
             let submission = if let Some((acquire, release)) = bracket {
@@ -515,12 +613,14 @@ impl VelloRenderer {
             } else {
                 self.queue.submit([main])
             };
-            self.device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(submission),
-                    timeout: Some(Duration::from_secs(30)),
-                })
-                .context("waiting for Vello submission")?;
+            self.metrics.encode.record(encode_start.elapsed());
+            let wait_start = Instant::now();
+            let waited = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(Duration::from_secs(30)),
+            });
+            self.metrics.fence.record(wait_start.elapsed());
+            waited.context("waiting for Vello submission")?;
             Ok(())
         })();
         check_scopes(errors)?;
@@ -1545,6 +1645,67 @@ pub(crate) fn texture_matrix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_metrics_count_failures_and_reset() {
+        let mut metrics = SubmissionMetrics::default();
+        metrics.record(Duration::from_millis(3), false);
+        metrics.record(Duration::from_millis(19), true);
+        metrics.record(Duration::from_millis(5), false);
+        metrics.acquire.record(Duration::from_millis(2));
+        metrics.acquire.record(Duration::from_millis(7));
+        metrics.encode.record(Duration::from_millis(11));
+        metrics.fence.record(Duration::from_millis(4));
+        let interval = std::mem::take(&mut metrics);
+        assert_eq!(interval.acquire.total, Duration::from_millis(9));
+        assert_eq!(interval.acquire.max, Duration::from_millis(7));
+        assert_eq!(interval.encode.total, Duration::from_millis(11));
+        assert_eq!(interval.fence.total, Duration::from_millis(4));
+        assert_eq!(metrics.acquire.total, Duration::ZERO);
+        assert_eq!(metrics.encode.max, Duration::ZERO);
+        assert_eq!(metrics.fence.total, Duration::ZERO);
+        assert_eq!(interval.count, 3);
+        assert_eq!(interval.errors, 1);
+        assert_eq!(interval.total, Duration::from_millis(27));
+        assert_eq!(interval.max, Duration::from_millis(19));
+        metrics.record(Duration::from_millis(2), false);
+        assert_eq!(metrics.count, 1);
+        assert_eq!(metrics.errors, 0);
+        assert_eq!(metrics.total, Duration::from_millis(2));
+        assert_eq!(metrics.max, Duration::from_millis(2));
+    }
+
+    #[test]
+    fn submission_reporting_preserves_errors_and_resets_interval() {
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_test_writer()
+                .finish(),
+        );
+        let mut renderer = VelloRenderer::new_headless().unwrap();
+        renderer.metrics = SubmissionMetrics::default();
+        let error = renderer
+            .submit(&[], |_, _| Err(anyhow::anyhow!("diagnostic test error").into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("diagnostic test error"));
+        assert_eq!(renderer.metrics.count, 1);
+        assert_eq!(renderer.metrics.errors, 1);
+
+        // Exercise the real backend report rather than substitute CPU RSS.
+        let report = renderer.device.generate_allocator_report().unwrap();
+        assert!(report.total_allocated_bytes > 0);
+        assert!(report.total_reserved_bytes >= report.total_allocated_bytes);
+        renderer.log_metrics();
+        assert_eq!(renderer.metrics.count, 0);
+        assert_eq!(renderer.metrics.errors, 0);
+
+        // The periodic path also reports and resets after a successful submission.
+        renderer.last_metrics = Instant::now() - Duration::from_secs(10);
+        renderer.submit(&[], |_, _| Ok(())).unwrap();
+        assert_eq!(renderer.metrics.count, 0);
+        assert!(renderer.last_metrics.elapsed() < Duration::from_secs(10));
+    }
 
     fn pixels(renderer: &mut VelloRenderer, texture: &VelloTexture) -> Vec<[u8; 4]> {
         let mapping = renderer

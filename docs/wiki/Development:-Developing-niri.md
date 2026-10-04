@@ -16,6 +16,28 @@ Niri uses [`tracing`](https://lib.rs/crates/tracing) for logging. This is how lo
 - `debug!`: less important messages related to normal operation. Running niri with `debug!` messages hidden should not negatively impact the UX.
 - `trace!`: everything that can be useful for debugging but is otherwise too spammy or performance intensive. `trace!` messages are *compiled out* of release builds.
 
+## GPU diagnostics
+
+With `RUST_LOG=niri::gpu::vello=debug`, the GPU worker logs `Vello metrics`
+at most every ten seconds while submitting work. `allocated_bytes` counts live
+wgpu allocator allocations; `reserved_bytes` includes unused allocator capacity.
+Neither includes imported DMA-bufs, browser allocations, or all driver memory.
+`live_imports` counts live cached image imports, not unique physical buffers.
+
+`submission_wall_ms` is the interval's cumulative submission time;
+`max_submission_wall_ms` is its worst submission. Both include DMA-buf waits,
+CPU encoding and GPU fence waits: these are **not** GPU timestamps or FPS.
+`acquire_ms`, `encode_submit_ms`, and `fence_wait_ms` break out the cumulative
+DMA-buf acquire, CPU encode/queue-submit and fence-wait phases, with corresponding
+`max_*` fields. Fence waits may be short when work completed during CPU encoding;
+they do not measure total GPU busy time. Phase totals exclude validation/bookkeeping.
+`submission_errors` counts failed submissions; failures also log their error.
+An idle compositor produces no periodic samples.
+
+On the drv desktop, correlate these with `journalctl -u drv-supervisor -o short-monotonic`
+and `journalctl -k -o short-monotonic`. Memory pressure, GPU resets and image
+corruption are different symptoms; low RSS alone cannot rule out GPU memory use.
+
 ## Tests
 
 We have some unit tests, most prominently for the layout code and for config parsing.
