@@ -427,7 +427,7 @@ impl App {
         let Some(name) = name else {
             return;
         };
-        match self.menu.appd.launch(name.clone()) {
+        match self.menu.appd.launch(name.clone(), None) {
             Ok(uid) => drv_os::say!("drv-shell: launched {name:?} as uid {uid}"),
             Err(err) => drv_os::say!("drv-shell: launching {name:?}: {err}"),
         }

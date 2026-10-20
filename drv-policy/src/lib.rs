@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(client.lookup(7).unwrap().name, "seven");
         assert!(client.lookup(7).unwrap().allows(Global::Dmabuf));
         assert_eq!(client.lookup(8).unwrap().name, "unknown");
-        assert!(client.launch("seven".to_owned()).is_err());
+        assert!(client.launch("seven".to_owned(), None).is_err());
         drop(client);
         server.join().unwrap().unwrap();
     }

@@ -16,13 +16,21 @@ pub trait Handler: Send + Sync {
     /// UIDs need the peer to hold [`Grant::Lookup`].
     fn lookup(&self, peer: u32, uid: u32) -> Result<AppPolicy, String>;
     /// Start the named app (see [`Request::Launch`]); returns the UID it runs as.
-    fn launch(&self, peer: u32, app: &str) -> Result<u32, String>;
+    fn launch(&self, peer: u32, app: &str, token: Option<&str>) -> Result<u32, String>;
     /// The names `launch` accepts (see [`Request::Apps`]).
     fn apps(&self, peer: u32) -> Result<Vec<String>, String>;
     /// Open a URI with its manifest handler (see [`Request::Open`]); returns the handler's UID.
-    fn open(&self, peer: u32, uri: &str) -> Result<u32, String>;
+    fn open(&self, peer: u32, uri: &str, token: Option<&str>) -> Result<u32, String>;
     /// The peer's `Hello`, before the version goes back. A hook, not a decision.
     fn hello(&self, _peer: u32) {}
+    /// The peer's [`Request::Receive`]: the connection is the handler's from here on, to
+    /// answer and keep, or to refuse and drop.
+    fn receive(&self, _peer: u32, stream: UnixStream) -> io::Result<()> {
+        rpc::write_msg(
+            &stream,
+            &Response::Error("this daemon delivers nothing".to_owned()),
+        )
+    }
 }
 
 /// A file-backed store answers lookups and cannot launch anything.
@@ -35,11 +43,11 @@ impl Handler for PolicyStore {
         Ok((*PolicyStore::lookup(self, uid)).clone())
     }
 
-    fn launch(&self, _peer: u32, _app: &str) -> Result<u32, String> {
+    fn launch(&self, _peer: u32, _app: &str, _token: Option<&str>) -> Result<u32, String> {
         Err("this policy daemon does not launch apps".to_owned())
     }
 
-    fn open(&self, _peer: u32, _uri: &str) -> Result<u32, String> {
+    fn open(&self, _peer: u32, _uri: &str, _token: Option<&str>) -> Result<u32, String> {
         Err("this policy daemon does not launch apps".to_owned())
     }
 
@@ -85,7 +93,7 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
                 Ok(policy) => Response::Policy(policy),
                 Err(err) => Response::Error(err),
             },
-            Request::Launch { app } => match handler.launch(peer, &app) {
+            Request::Launch { app, token } => match handler.launch(peer, &app, token.as_deref()) {
                 Ok(uid) => Response::Launched { uid },
                 Err(err) => Response::Error(err),
             },
@@ -93,10 +101,11 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
                 Ok(apps) => Response::Apps(apps),
                 Err(err) => Response::Error(err),
             },
-            Request::Open { uri } => match handler.open(peer, &uri) {
+            Request::Open { uri, token } => match handler.open(peer, &uri, token.as_deref()) {
                 Ok(uid) => Response::Launched { uid },
                 Err(err) => Response::Error(err),
             },
+            Request::Receive => return handler.receive(peer, stream),
         };
         rpc::write_msg(&stream, &response)?;
     }

@@ -52,13 +52,51 @@ let
   openTest = pkgs.writeShellScript "open-test" ''
     open() {
       ${pkgs.systemd}/bin/busctl --user -- call org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
-        org.freedesktop.portal.OpenURI OpenURI ssa{sv} "" "$1" 0 2>&1
+        org.freedesktop.portal.OpenURI OpenURI ssa{sv} "" "$1" ''${2:-0} 2>&1
     }
     {
       echo "good: $(open 'https://example.com/?from=uid-100011')"
       echo "bad scheme: $(open 'mailto:x@example.com')"
       echo "not a uri: $(open '-https://example.com')"
+      # single-test is single: the first starts it, the second waits in drv-appd for its
+      # shim, the third goes to it running. One process gets all three.
+      echo "single one: $(open 'drvsingle://one')"
+      echo "single two: $(open 'drvsingle://two')"
+      sleep 5
+      echo "single three: $(open 'drvsingle://three' '1 activation_token s tok-from-open-test')"
     } > "$HOME/out/open.txt"
+  '';
+  # A single app (GApplication, as a desktop app would be): logs its start and what it is
+  # asked over org.freedesktop.Application, with the activation token it came with.
+  singleTest = pkgs.writers.writePython3 "single-test" {
+    libraries = [ pkgs.python3Packages.pygobject3 ];
+  } ''
+    import os
+    import sys
+
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio  # noqa: E402
+
+    out = open(os.environ["HOME"] + "/out/single.txt", "a", buffering=1)
+    out.write("started\n")
+
+
+    class App(Gio.Application):
+        def do_before_emit(self, platform_data):
+            token = platform_data.lookup_value("activation-token", None)
+            if token is not None:
+                out.write("token " + token.get_string() + "\n")
+            Gio.Application.do_before_emit(self, platform_data)
+
+
+    app = App(application_id="dev.drv.SingleTest",
+              flags=Gio.ApplicationFlags.HANDLES_OPEN)
+    app.connect("open", lambda a, files, n, hint: [
+        out.write("open " + f.get_uri() + "\n") for f in files])
+    app.connect("activate", lambda a: out.write("activate\n"))
+    app.hold()
+    sys.exit(app.run(sys.argv))
   '';
   # The FIDO door through the shim, as linux-credentials' portal API, on the VM's emulated
   # CanoKey (nix/dev-vm.nix): a credential made with hmac-secret (`hmacCreateSecret`, the
@@ -372,6 +410,12 @@ in
       # Records: the person is asked at the shell; Mod+Shift+Esc ends it.
       mic-test = { uid = 100010; run = mkApp { exec = [ "${micTest}" ]; state = [ "out" ]; }; audio = true; };
       open-test = { uid = 100011; run = mkApp { bus = true; exec = [ "${openTest}" ]; state = [ "out" ]; }; };
+      single-test = {
+        uid = 100017;
+        run = mkApp { bus = true; exec = [ "${singleTest}" ]; state = [ "out" ]; };
+        opens = [ "drvsingle" ];
+        single = "dev.drv.SingleTest";
+      };
       fido-test = { uid = 100015; run = mkApp { bus = true; exec = [ "${fidoTest}" ]; state = [ "out" ]; }; autostart = true; menu = false; fido = [ "app:dev.drv.FidoTest" "https://*" ]; };
       ssh-test = {
         uid = 100014; autostart = true; menu = false; network = true; nix = true;

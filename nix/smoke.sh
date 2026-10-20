@@ -186,6 +186,17 @@ expect "https went to chromium" '"chromium" \(uid 100005\) opens "https://exampl
 expect "mailto refused" 'no app opens mailto: URIs'
 expect "junk refused" 'drv-dbus-shim: OpenURI: "-https://example.com" is not a URI'
 
+echo "== a single app"
+F=/var/lib/drv-apps/100017/out/single.txt
+file_has "the first open started it with the URI" $F '^open drvsingle://one$'
+file_has "the second, while it started, waited for its shim" $F '^open drvsingle://two$'
+expect "in drv-appd" '"single-test" \(uid 100017\) receives; 1 waited'
+file_has "the third went to it running, with the opener's token" $F '^token tok-from-open-test$'
+file_has "and its URI" $F '^open drvsingle://three$'
+mark; menu single; sleep 3
+file_has "the menu activates it" $F '^activate$'
+n=$($SSH "grep -c '^started$' $F"); [ "$n" = 1 ] && echo "PASS one process: started $n time" || fail "single-test started $n times"
+
 echo "== LibreOffice"
 # Its pickers are Qt's portal dialogs: the chooser opens notes/todo.txt writable (the manifest's
 # `edits`), Save writes it in place, and Save As gets a writable grant for a new /todo.txt (both

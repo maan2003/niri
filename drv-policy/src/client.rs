@@ -78,17 +78,18 @@ impl PolicyClient {
 
     /// Asks the daemon to start the named app; returns the UID it runs as. A daemon-side
     /// refusal (unknown app, no spawner) comes back as an error too.
-    pub fn launch(&mut self, app: String) -> io::Result<u32> {
-        match self.request(&Request::Launch { app })? {
+    pub fn launch(&mut self, app: String, token: Option<String>) -> io::Result<u32> {
+        match self.request(&Request::Launch { app, token })? {
             Response::Launched { uid } => Ok(uid),
             Response::Error(err) => Err(io::Error::other(err)),
             other => Err(unexpected("launch", other)),
         }
     }
 
-    /// Open `uri` with its manifest handler; only a launch channel answers.
-    pub fn open(&mut self, uri: String) -> io::Result<u32> {
-        match self.request(&Request::Open { uri })? {
+    /// Open `uri` with its manifest handler, `token` being the opener's xdg-activation
+    /// token.
+    pub fn open(&mut self, uri: String, token: Option<String>) -> io::Result<u32> {
+        match self.request(&Request::Open { uri, token })? {
             Response::Launched { uid } => Ok(uid),
             Response::Error(err) => Err(io::Error::other(err)),
             other => Err(unexpected("open", other)),
@@ -127,6 +128,22 @@ impl PolicyClient {
                 res
             }
         }
+    }
+}
+
+/// A shim's side of [`Request::Receive`]: connects to the daemon at `path` and asks for the
+/// peer uid's deliveries. Returns the bus name they are for and the connection, on which
+/// [`Delivery`](rpc::Delivery)s arrive (with no timeout: they come when they come) and each
+/// is answered with `Result<(), String>`. An app that is not `single` is refused.
+pub fn receive(path: &PathBuf) -> io::Result<(String, UnixStream)> {
+    let stream = open(path)?;
+    match roundtrip(&stream, &Request::Receive)? {
+        Response::Receiving { name } => {
+            stream.set_read_timeout(None)?;
+            Ok((name, stream))
+        }
+        Response::Error(err) => Err(io::Error::new(io::ErrorKind::PermissionDenied, err)),
+        other => Err(unexpected("receive", other)),
     }
 }
 

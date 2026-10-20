@@ -3264,7 +3264,10 @@ impl Niri {
             warn!("cannot launch {app:?}: no launch channel from the supervisor (yet)");
             return;
         };
-        match launcher.launch(app.clone()) {
+        // A key binding is the person asking: the window (a new one, or the running one of a
+        // `single` app) may come forward.
+        let token = self.activation_state.create_external_token(None).0.as_str().to_owned();
+        match launcher.launch(app.clone(), Some(token)) {
             Ok(uid) => info!("launched {app:?} as uid {uid}"),
             Err(err) => warn!("error launching {app:?}: {err}"),
         }

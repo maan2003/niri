@@ -102,6 +102,10 @@ fn run(args: Args) -> anyhow::Result<()> {
     bus.request_name(NOTIFICATIONS_NAME)?;
     bus.request_name(PORTAL_NAME)?;
     bus.request_name(CREDENTIALS_NAME)?;
+    {
+        let (bus, appd) = (bus.clone(), args.appd.clone());
+        std::thread::spawn(move || receive(&bus, &appd));
+    }
 
     let shim = Arc::new(Shim {
         bus,
@@ -927,11 +931,14 @@ impl Shim {
         let (_parent, uri, options): (String, String, HashMap<String, OwnedValue>) =
             msg.body().deserialize().context("OpenURI arguments")?;
         let handle = handle_for(msg, &caller, &options, "handle_token");
+        // The opener's xdg-activation token (version 4's option; older apps send none): the
+        // handler's window may come forward with it.
+        let token = options.get("activation_token").cloned().and_then(|v| String::try_from(v).ok());
         self.bus.send(&Message::method_return(hdr)?.build(&ObjectPath::try_from(handle.as_str())?)?)?;
         let shim = self.clone();
         std::thread::spawn(move || {
             let opened = PolicyClient::connect(shim.paths.appd.clone())
-                .and_then(|mut appd| appd.open(uri.clone()));
+                .and_then(|mut appd| appd.open(uri.clone(), token));
             let code = match opened {
                 Ok(uid) => {
                     drv_os::say!("drv-dbus-shim: {uri:?} opens as uid {uid}");
@@ -997,6 +1004,90 @@ impl Shim {
             other => error(hdr, UNKNOWN_METHOD, format!("no {other} on {NOTIFICATIONS_NAME}"))?,
         }))
     }
+}
+
+// ---------------------------------------------------------------- deliveries
+
+const APPLICATION: &str = "org.freedesktop.Application";
+/// How long the app may take to own its name, from its start to the first delivery's
+/// call, or between calls.
+const APPEARS: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A `single` app's deliveries (`drv_policy::rpc::Delivery`): drv-appd sends this uid's
+/// opens and launches here once it runs, and they go to the app as
+/// `org.freedesktop.Application` calls on its well-known name, in order, as the desktop
+/// entry spec's D-Bus activation has them. Each is answered to drv-appd once queued, not
+/// once the app has it: the app may still be starting. An app that is not `single` is
+/// refused, and nothing comes.
+fn receive(bus: &Connection, appd: &Path) {
+    let (name, stream) = match drv_policy::client::receive(&appd.to_owned()) {
+        Ok(got) => got,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            if *TRACE {
+                drv_os::say!("drv-dbus-shim: no deliveries: {err}");
+            }
+            return;
+        }
+        Err(err) => {
+            drv_os::say!("drv-dbus-shim: asking drv-appd for deliveries: {err}");
+            return;
+        }
+    };
+    let (queue, deliveries) = std::sync::mpsc::channel::<drv_policy::rpc::Delivery>();
+    let caller = bus.clone();
+    let to = name.clone();
+    std::thread::spawn(move || {
+        for delivery in deliveries {
+            if let Err(err) = call_app(&caller, &to, &delivery) {
+                drv_os::say!("drv-dbus-shim: {delivery:?} to {to}: {err:#}");
+            }
+        }
+    });
+    loop {
+        let delivery = match drv_policy::rpc::read_msg::<drv_policy::rpc::Delivery>(&stream) {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                drv_os::say!("drv-dbus-shim: drv-appd's deliveries ended: {err}");
+                return;
+            }
+        };
+        let taken = queue.send(delivery).map_err(|_| "the caller thread is gone".to_owned());
+        if drv_policy::rpc::write_msg(&stream, &taken).is_err() {
+            return;
+        }
+    }
+}
+
+/// One delivery, as a call to the app on `name`, once it owns it.
+fn call_app(bus: &Connection, name: &str, delivery: &drv_policy::rpc::Delivery) -> anyhow::Result<()> {
+    let dbus = zbus::blocking::fdo::DBusProxy::new(bus)?;
+    let bus_name = zbus::names::BusName::try_from(name)?;
+    let deadline = std::time::Instant::now() + APPEARS;
+    while !dbus.name_has_owner(bus_name.clone())? {
+        if std::time::Instant::now() > deadline {
+            bail!("nothing owns {name} after {APPEARS:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let path = application_path(name);
+    let platform_data = |token: &Option<String>| -> HashMap<&'static str, Value<'static>> {
+        token.iter().map(|t| ("activation-token", Value::from(t.clone()))).collect()
+    };
+    match delivery {
+        drv_policy::rpc::Delivery::Open { uris, token } => {
+            bus.call_method(Some(name), path.as_str(), Some(APPLICATION), "Open", &(uris, platform_data(token)))?
+        }
+        drv_policy::rpc::Delivery::Activate { token } => {
+            bus.call_method(Some(name), path.as_str(), Some(APPLICATION), "Activate", &(platform_data(token),))?
+        }
+    };
+    Ok(())
+}
+
+/// The object path of `org.freedesktop.Application` for an app id: `/` and the name with
+/// dots as slashes and dashes as underscores (the desktop entry spec).
+fn application_path(name: &str) -> String {
+    format!("/{}", name.replace('.', "/").replace('-', "_"))
 }
 
 /// The WebAuthn JSON of a credentials request: `options["public_key"]`, a string.
