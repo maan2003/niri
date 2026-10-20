@@ -1,0 +1,40 @@
+{"run_id":"1792517722-187421240","line":139,"new":{"module_name":"niri__tests__binds","snapshot_name":"combos","metadata":{"source":"src/tests/binds.rs","assertion_line":139,"expression":"run(c, \"+LWIN +LCTL +LatQ -LatQ -LCTL -LWIN\")"},"snapshot":"+LWIN 133 XK_Super_L\n+LCTL  37 XK_Control_L\n+AD01  24 XK_q\n-AD01  24 XK_q\n-LCTL  37 XK_Control_L\n-LWIN 133 XK_Super_L"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+LWIN 133 XK_Super_L\n    surface key pressed: 125\n    surface modifiers: depressed=64, latched=0, locked=0, group=0\n+LCTL  37 XK_Control_L\n    surface key pressed: 29\n    surface modifiers: depressed=68, latched=0, locked=0, group=0\n+AD01  24 XK_q\n    niri test-action\n-AD01  24 XK_q\n-LCTL  37 XK_Control_L\n    surface key released: 29\n    surface modifiers: depressed=64, latched=0, locked=0, group=0\n-LWIN 133 XK_Super_L\n    surface key released: 125\n    surface modifiers: depressed=0, latched=0, locked=0, group=0"}}
+{"run_id":"1792517722-187421240","line":429,"new":{"module_name":"niri__tests__binds","snapshot_name":"layouts","metadata":{"source":"src/tests/binds.rs","assertion_line":429,"expression":"run(c, \"+LALT -LALT +LatQ -LatQ\")"},"snapshot":"+LALT  64 XK_ISO_Next_Group\n-LALT  64 XK_ISO_Next_Group\n+AD01  24 XK_Cyrillic_shorti\n-AD01  24 XK_Cyrillic_shorti"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+LALT  64 XK_ISO_Next_Group\n    surface key pressed: 56\n    surface modifiers: depressed=0, latched=0, locked=0, group=1\n-LALT  64 XK_ISO_Next_Group\n    surface key released: 56\n+AD01  24 XK_Cyrillic_shorti\n    niri test-action\n-AD01  24 XK_Cyrillic_shorti"}}
+{"run_id":"1792517722-187421240","line":350,"new":{"module_name":"niri__tests__binds","snapshot_name":"inhibiting","metadata":{"source":"src/tests/binds.rs","assertion_line":350,"expression":"run_f(&mut f, id, &surface, \"+LatQ -LatQ\")"},"snapshot":"+AD01  24 XK_q\n-AD01  24 XK_q"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+AD01  24 XK_q\n    surface key pressed: 16\n-AD01  24 XK_q\n    surface key released: 16"}}
+{"run_id":"1792517789-672650538","line":429,"new":{"module_name":"niri__tests__binds","snapshot_name":"layouts","metadata":{"source":"src/tests/binds.rs","assertion_line":429,"expression":"run(c, \"+LALT -LALT +LatQ -LatQ\")"},"snapshot":"+LALT  64 XK_ISO_Next_Group\n-LALT  64 XK_ISO_Next_Group\n+AD01  24 XK_Cyrillic_shorti\n-AD01  24 XK_Cyrillic_shorti"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+LALT  64 XK_ISO_Next_Group\n    surface key pressed: 56\n    surface modifiers: depressed=0, latched=0, locked=0, group=1\n-LALT  64 XK_ISO_Next_Group\n    surface key released: 56\n+AD01  24 XK_Cyrillic_shorti\n    niri test-action\n-AD01  24 XK_Cyrillic_shorti"}}
+{"run_id":"1792517789-672650538","line":350,"new":{"module_name":"niri__tests__binds","snapshot_name":"inhibiting","metadata":{"source":"src/tests/binds.rs","assertion_line":350,"expression":"run_f(&mut f, id, &surface, \"+LatQ -LatQ\")"},"snapshot":"+AD01  24 XK_q\n-AD01  24 XK_q"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+AD01  24 XK_q\n    surface key pressed: 16\n-AD01  24 XK_q\n    surface key released: 16"}}
+{"run_id":"1792517789-672650538","line":139,"new":{"module_name":"niri__tests__binds","snapshot_name":"combos","metadata":{"source":"src/tests/binds.rs","assertion_line":139,"expression":"run(c, \"+LWIN +LCTL +LatQ -LatQ -LCTL -LWIN\")"},"snapshot":"+LWIN 133 XK_Super_L\n+LCTL  37 XK_Control_L\n+AD01  24 XK_q\n-AD01  24 XK_q\n-LCTL  37 XK_Control_L\n-LWIN 133 XK_Super_L"},"old":{"module_name":"niri__tests__binds","metadata":{},"snapshot":"+LWIN 133 XK_Super_L\n    surface key pressed: 125\n    surface modifiers: depressed=64, latched=0, locked=0, group=0\n+LCTL  37 XK_Control_L\n    surface key pressed: 29\n    surface modifiers: depressed=68, latched=0, locked=0, group=0\n+AD01  24 XK_q\n    niri test-action\n-AD01  24 XK_q\n-LCTL  37 XK_Control_L\n    surface key released: 29\n    surface modifiers: depressed=64, latched=0, locked=0, group=0\n-LWIN 133 XK_Super_L\n    surface key released: 125\n    surface modifiers: depressed=0, latched=0, locked=0, group=0"}}
+{"run_id":"1792517833-143979228","line":353,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":432,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":142,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":364,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":374,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":386,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":395,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":407,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":164,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":447,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":189,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":487,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":218,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":241,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":267,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":293,"new":null,"old":null}
+{"run_id":"1792517833-143979228","line":315,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":353,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":364,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":374,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":386,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":395,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":407,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":142,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":432,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":164,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":447,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":189,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":487,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":218,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":241,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":267,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":293,"new":null,"old":null}
+{"run_id":"1792517872-128543706","line":315,"new":null,"old":null}
