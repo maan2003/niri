@@ -96,8 +96,8 @@
             # find it by rev; fetch it by hash instead.
             outputHashes = {
               "vello_gpu-0.3.0" = "sha256-cuyniT7bLB/lyI9AIg+WQ6iQo0UDIZ/QIyz0yu+j6vk=";
-              "smithay-0.7.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
-              "smithay-drm-extras-0.1.0" = "sha256-VZFM7pV/fcOYnP0437x3lB0lDGxZ5b3DLXuhfltccUo=";
+              "smithay-0.7.0" = "sha256-UJg+txTg9tEcFgat3K4KcWT/uaAXNzXbX6s7pZgtuJw=";
+              "smithay-drm-extras-0.1.0" = "sha256-UJg+txTg9tEcFgat3K4KcWT/uaAXNzXbX6s7pZgtuJw=";
               "libwebauthn-0.10.0" = "sha256-u7BpzfW8CJshZZgjXssIy9eoWzmj2ZMYFgh8d9luEAc=";
             };
           };
