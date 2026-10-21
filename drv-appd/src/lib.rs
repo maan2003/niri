@@ -7,17 +7,16 @@
 //! Android's PackageManager plus ActivityManager, in one small process with its own UID.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use std::{fmt, io};
 
 use drv_policy::daemon::{self, Handler};
 use drv_policy::forker::{self, Launch};
-use drv_policy::rpc::{Delivery, Response};
-use drv_policy::{rpc, AppPolicy, Global, Grant};
+use drv_policy::rpc::Delivery;
+use drv_policy::{rpc, seq, AppPolicy, Global, Grant};
 use serde::{Deserialize, Serialize};
 
 /// `appd.json`.
@@ -215,74 +214,15 @@ fn bus_name(name: &str) -> bool {
         })
 }
 
-/// How long a `single` app may take from its start to its shim's `Receive`. Opens meanwhile
-/// wait for it; after this, the start is taken to have failed and the next open starts it
-/// again.
-const STARTUP: Duration = Duration::from_secs(30);
-
-/// How long a shim may take to take a delivery on. It answers once queued, not once the app
-/// has it, so this is short: the openers' own clients give up after two seconds.
-const DELIVERY: Duration = Duration::from_secs(1);
-
-/// A `single` app's instance, from its start to its shim's hang-up.
-enum Instance {
-    /// Started then; its shim has not asked for deliveries yet. What comes meanwhile waits.
-    Starting {
-        since: Instant,
-        waiting: Vec<Delivery>,
-    },
-    /// Its shim's connection: deliveries go down it one at a time, each answered. Its
-    /// closing is the app's exit.
-    Running(Arc<Mutex<UnixStream>>),
-}
-
-/// Why a delivery did not get through.
-enum Undelivered {
-    /// The shim is gone (so the app is): start it instead.
-    Gone(io::Error),
-    /// The shim refused it, or did not answer in time.
-    Failed(String),
-}
-
-/// One delivery down a shim's connection, and its answer.
-fn deliver(stream: &UnixStream, delivery: &Delivery) -> Result<(), Undelivered> {
-    let gone = |err: io::Error| match err.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-            // A late answer would be taken for the next one's: this line is done.
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            Undelivered::Failed(format!("the shim did not answer within {DELIVERY:?}"))
-        }
-        _ => Undelivered::Gone(err),
-    };
-    stream.set_write_timeout(Some(DELIVERY)).map_err(gone)?;
-    stream.set_read_timeout(Some(DELIVERY)).map_err(gone)?;
-    rpc::write_msg(stream, delivery).map_err(gone)?;
-    match rpc::read_msg::<Result<(), String>>(stream).map_err(gone)? {
-        Ok(()) => Ok(()),
-        Err(err) => Err(Undelivered::Failed(format!("the shim refused it: {err}"))),
-    }
-}
-
-/// Whether a shim's connection is still up: nothing to read (it never speaks unasked) and
-/// no hang-up.
-fn alive(stream: &UnixStream) -> bool {
-    use rustix::event::{poll, PollFd, PollFlags};
-    let mut fds = [PollFd::new(stream, PollFlags::IN)];
-    matches!(
-        poll(&mut fds, Some(&rustix::event::Timespec::default())),
-        Ok(0)
-    )
-}
-
-/// Whatever actually creates processes: the spawner's channel, or a stub in tests.
-/// What forks for us: drv-forker over the channel, or a recorder in tests.
+/// What forks for us: drv-forker over the channel, or a recorder in tests. `deliveries` is
+/// the app's end of its deliveries line, which `launch.deliveries` says it carries.
 pub trait Forker: Send + Sync {
-    fn launch(&self, launch: &Launch) -> Result<u32, String>;
+    fn launch(&self, launch: &Launch, deliveries: Option<BorrowedFd<'_>>) -> Result<u32, String>;
 }
 
 impl Forker for forker::Channel {
-    fn launch(&self, launch: &Launch) -> Result<u32, String> {
-        forker::Channel::launch(self, launch)
+    fn launch(&self, launch: &Launch, deliveries: Option<BorrowedFd<'_>>) -> Result<u32, String> {
+        forker::Channel::launch(self, launch, deliveries)
             .map(|_| launch.uid)
             .map_err(|e| format!("forker: {e}"))
     }
@@ -294,8 +234,10 @@ pub struct Appd {
     /// Environment every launched app gets first: `PATH` and friends from our own environment.
     base_env: Vec<(String, String)>,
     autostarted: std::sync::Once,
-    /// The `single` apps started, by uid.
-    instances: Mutex<HashMap<u32, Instance>>,
+    /// Our ends of the deliveries lines of the `single` apps started, by uid: the app holds
+    /// the other end for as long as its namespace lives. Non-blocking: a delivery never
+    /// waits on an app. Under this lock too: starting one, so two opens start it once.
+    lines: Mutex<HashMap<u32, OwnedFd>>,
 }
 
 impl Appd {
@@ -305,7 +247,7 @@ impl Appd {
             forker,
             base_env,
             autostarted: std::sync::Once::new(),
-            instances: Mutex::new(HashMap::new()),
+            lines: Mutex::new(HashMap::new()),
         }
     }
 
@@ -331,133 +273,53 @@ impl Appd {
         Ok(uid)
     }
 
-    /// Starts `app`, unless it is `single` and started already: then the URI (or, without
-    /// one, an activation) goes to the instance. One that is starting gets it once its shim
-    /// asks; one whose shim is gone is started again.
+    /// Starts `app`, unless it is `single` and runs: then the URI (or, without one, an
+    /// activation) goes down its line, and its shim passes it on. A line that hung up is an
+    /// app that exited: it is started again.
     fn run(&self, app: &AppConfig, uri: Option<&str>, token: Option<&str>) -> Result<u32, String> {
         let token = token.filter(|t| rpc::activation_token(t));
         if app.single.is_none() {
-            return self.start(app, uri, token);
+            return self.start(app, uri, token, None);
         }
         if let Some(uri) = uri {
             check_opens(app, uri)?;
         }
-        let token_ = token.map(str::to_owned);
-        let delivery = match uri {
-            Some(uri) => Delivery::Open {
-                uris: vec![uri.to_owned()],
-                token: token_,
-            },
-            None => Delivery::Activate { token: token_ },
-        };
-        let mut instances = self.instances.lock().unwrap();
-        match instances.get_mut(&app.uid) {
-            Some(Instance::Starting { since, waiting }) if since.elapsed() < STARTUP => {
-                // A launch while it starts: its window is coming anyway.
-                if matches!(delivery, Delivery::Open { .. }) {
-                    waiting.push(delivery);
+        let mut lines = self.lines.lock().unwrap();
+        if let Some(line) = lines.get(&app.uid) {
+            let delivery = match uri {
+                Some(uri) => Delivery::Open {
+                    uris: vec![uri.to_owned()],
+                    token: token.map(str::to_owned),
+                },
+                None => Delivery::Activate {
+                    token: token.map(str::to_owned),
+                },
+            };
+            match seq::send(line, &delivery, &[]) {
+                Ok(()) => {
+                    drv_os::say!("drv-appd: {:?} runs: delivered {delivery:?}", app.name);
+                    return Ok(app.uid);
                 }
-                return Ok(app.uid);
-            }
-            Some(Instance::Starting { waiting, .. }) => {
-                drv_os::say!(
-                    "drv-appd: {:?} never asked for deliveries ({} lost); starting it again",
-                    app.name,
-                    waiting.len()
-                );
-            }
-            Some(Instance::Running(conn)) => {
-                let conn = conn.clone();
-                // Not under the map's lock: one stuck shim must not hold up every app.
-                drop(instances);
-                let delivered = deliver(&conn.lock().unwrap(), &delivery);
-                match delivered {
-                    Ok(()) => return Ok(app.uid),
-                    Err(Undelivered::Failed(err)) => {
-                        drv_os::say!("drv-appd: delivering to {:?}: {err}", app.name);
-                        let mut instances = self.instances.lock().unwrap();
-                        if matches!(instances.get(&app.uid), Some(Instance::Running(c)) if Arc::ptr_eq(c, &conn))
-                            && !alive(&conn.lock().unwrap())
-                        {
-                            instances.remove(&app.uid);
-                        }
-                        return Err(format!("{:?} runs but did not take it: {err}", app.name));
-                    }
-                    Err(Undelivered::Gone(err)) => {
-                        drv_os::say!("drv-appd: {:?} has exited ({err}); starting it", app.name);
-                        instances = self.instances.lock().unwrap();
-                        // Someone else may have started it again meanwhile.
-                        match instances.get(&app.uid) {
-                            Some(Instance::Running(c)) if Arc::ptr_eq(c, &conn) => {}
-                            None => {}
-                            Some(_) => {
-                                drop(instances);
-                                return self.run(app, uri, token);
-                            }
-                        }
-                    }
+                Err(err) if gone(&err) => {
+                    drv_os::say!("drv-appd: {:?} has exited; starting it", app.name);
+                    lines.remove(&app.uid);
                 }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    return Err(format!(
+                        "{:?} runs but has not read what it was sent; not sending more",
+                        app.name
+                    ));
+                }
+                Err(err) => return Err(format!("delivering to {:?}: {err}", app.name)),
             }
-            None => {}
         }
-        let uid = self.start(app, uri, token)?;
-        instances.insert(
-            uid,
-            Instance::Starting {
-                since: Instant::now(),
-                waiting: Vec::new(),
-            },
-        );
+        let (ours, theirs) =
+            drv_os::fds::seqpacket_pair().map_err(|e| format!("a deliveries line: {e}"))?;
+        rustix::io::ioctl_fionbio(&ours, true).map_err(|e| format!("a deliveries line: {e}"))?;
+        let uid = self.start(app, uri, token, Some(theirs.as_fd()))?;
+        // Ours only once it started: a failed start leaves nothing to deliver to.
+        lines.insert(uid, ours);
         Ok(uid)
-    }
-
-    /// A shim's `Receive`: its connection becomes `peer`'s instance, and what waited for it
-    /// goes down it first.
-    fn take_receiver(&self, peer: u32, stream: UnixStream) -> io::Result<()> {
-        let refuse = |err: String| rpc::write_msg(&stream, &Response::Error(err));
-        let Some(app) = self.by_uid(peer) else {
-            return refuse(format!("uid {peer} is not an app"));
-        };
-        let Some(name) = app.single.clone() else {
-            return refuse(format!(
-                "{:?} is not single; nothing is delivered to it",
-                app.name
-            ));
-        };
-        let mut instances = self.instances.lock().unwrap();
-        let waiting = match instances.remove(&peer) {
-            Some(Instance::Running(old)) if alive(&old.lock().unwrap()) => {
-                instances.insert(peer, Instance::Running(old));
-                drop(instances);
-                return refuse(format!("{:?} already has a receiver", app.name));
-            }
-            Some(Instance::Starting { waiting, .. }) => waiting,
-            Some(Instance::Running(_)) | None => Vec::new(),
-        };
-        rpc::write_msg(&stream, &Response::Receiving { name })?;
-        let conn = Arc::new(Mutex::new(stream));
-        // Ours until the waiting ones are down it: they go first.
-        let line = conn.lock().unwrap();
-        instances.insert(peer, Instance::Running(conn.clone()));
-        drop(instances);
-        drv_os::say!(
-            "drv-appd: {:?} (uid {peer}) receives; {} waited",
-            app.name,
-            waiting.len()
-        );
-        for delivery in waiting {
-            match deliver(&line, &delivery) {
-                Ok(()) => {}
-                Err(Undelivered::Failed(err)) => {
-                    drv_os::say!("drv-appd: delivering to {:?}: {err}", app.name)
-                }
-                Err(Undelivered::Gone(err)) => {
-                    drv_os::say!("drv-appd: delivering to {:?}: {err}", app.name);
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 
     fn by_uid(&self, uid: u32) -> Option<&AppConfig> {
@@ -496,6 +358,7 @@ impl Appd {
         app: &AppConfig,
         uri: Option<&str>,
         token: Option<&str>,
+        deliveries: Option<BorrowedFd<'_>>,
     ) -> Result<u32, String> {
         let mut argv = app
             .exec
@@ -509,6 +372,9 @@ impl Appd {
         if let Some(token) = token.filter(|t| rpc::activation_token(t)) {
             env.push(("XDG_ACTIVATION_TOKEN".to_owned(), token.to_owned()));
         }
+        if let Some(name) = &app.single {
+            env.push((drv_os::fds::SINGLE_ENV.to_owned(), name.clone()));
+        }
         let launch = Launch {
             uid: app.uid,
             argv,
@@ -519,8 +385,9 @@ impl Appd {
             folders: app.folders.clone(),
             jit: app.jit,
             userns: app.userns,
+            deliveries: deliveries.is_some(),
         };
-        self.forker.launch(&launch)?;
+        self.forker.launch(&launch, deliveries)?;
         Ok(app.uid)
     }
 
@@ -554,6 +421,14 @@ impl Appd {
             }
         });
     }
+}
+
+/// A send that found the app's end closed: the app is gone.
+fn gone(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+    )
 }
 
 /// `app` is its scheme's handler, as the manifest says.
@@ -599,11 +474,6 @@ impl Handler for Appd {
             return Err(format!("uid {peer} is not an app; it opens nothing"));
         };
         self.open_for(&format!("{} (uid {peer})", app.name), uri, token)
-    }
-
-    /// A `single` app's shim, asking for its deliveries.
-    fn receive(&self, peer: u32, stream: UnixStream) -> io::Result<()> {
-        self.take_receiver(peer, stream)
     }
 }
 
@@ -653,11 +523,22 @@ mod tests {
 
     use super::*;
 
-    struct Recorder(Mutex<Vec<Launch>>);
+    /// The launches, and each launched app's end of its deliveries line (the app's
+    /// namespace, as far as drv-appd can tell: dropping it is the app exiting).
+    struct Recorder(Mutex<Vec<Launch>>, Mutex<Vec<Option<OwnedFd>>>);
 
     impl Forker for Recorder {
-        fn launch(&self, launch: &Launch) -> Result<u32, String> {
+        fn launch(
+            &self,
+            launch: &Launch,
+            deliveries: Option<BorrowedFd<'_>>,
+        ) -> Result<u32, String> {
+            assert_eq!(launch.deliveries, deliveries.is_some());
             self.0.lock().unwrap().push(launch.clone());
+            self.1
+                .lock()
+                .unwrap()
+                .push(deliveries.map(|fd| fd.try_clone_to_owned().unwrap()));
             Ok(1)
         }
     }
@@ -678,7 +559,7 @@ mod tests {
         )
         .unwrap();
         check_config(&config).unwrap();
-        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new()), Mutex::new(Vec::new())));
         let id = Arc::new(Appd::new(
             config,
             recorder.clone(),
@@ -805,32 +686,6 @@ mod tests {
         assert!(check_config(&config).unwrap_err().contains("lowercase"));
     }
 
-    /// A shim on `uid`'s `Receive`: what it is delivered comes out of the channel, each
-    /// answered `Ok`. The stream returned is its end, to shut down as the app exiting.
-    fn shim(id: &Arc<Appd>, uid: u32) -> (UnixStream, std::sync::mpsc::Receiver<Delivery>) {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        let end = ours.try_clone().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            match rpc::read_msg::<Response>(&ours) {
-                Ok(Response::Receiving { name }) => assert_eq!(name, "dev.rho.Gui"),
-                other => panic!("receive answered {other:?}"),
-            }
-            while let Ok(delivery) = rpc::read_msg::<Delivery>(&ours) {
-                tx.send(delivery).unwrap();
-                if rpc::write_msg(&ours, &Ok::<(), String>(())).is_err() {
-                    break;
-                }
-            }
-        });
-        id.receive(uid, theirs).unwrap();
-        (end, rx)
-    }
-
-    fn got(rx: &std::sync::mpsc::Receiver<Delivery>) -> Delivery {
-        rx.recv_timeout(Duration::from_secs(2)).expect("a delivery")
-    }
-
     fn open(uri: &str, token: Option<&str>) -> Delivery {
         Delivery::Open {
             uris: vec![uri.to_owned()],
@@ -838,47 +693,63 @@ mod tests {
         }
     }
 
+    /// What is waiting on launch `i`'s line, without blocking: the app has not read it.
+    fn waiting(recorder: &Recorder, i: usize) -> Vec<Delivery> {
+        let ends = recorder.1.lock().unwrap();
+        let end = ends[i].as_ref().expect("a single app gets a line");
+        rustix::io::ioctl_fionbio(end, true).unwrap();
+        std::iter::from_fn(|| seq::recv::<Delivery>(end).ok().map(|(d, _)| d)).collect()
+    }
+
     #[test]
     fn a_single_app_that_runs_is_handed_the_uri_not_started_again() {
         let (id, recorder) = identity();
         let launches = || recorder.0.lock().unwrap().len();
-        // Not running: started with the URI, as any handler.
+        // Not running: started with the URI, as any handler, and with its line.
         assert_eq!(id.open(100042, "rho://a", None), Ok(100102));
         assert_eq!(
             recorder.0.lock().unwrap()[0].argv,
             vec!["rho-gui", "rho://a"]
         );
-        // Starting: the next one waits for its shim, and is no second process.
+        let get = |k: &str| {
+            recorder.0.lock().unwrap()[0]
+                .env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("DRV_SINGLE").as_deref(), Some("dev.rho.Gui"));
+        // Right after the start, before anything in the app reads: no second process, and
+        // the line holds it until the shim does.
         assert_eq!(id.open(100042, "rho://b", Some("t1")), Ok(100102));
-        // A launch meanwhile is nothing: the window is coming.
-        assert_eq!(launcher(&id).launch(5, "rho", Some("t0")), Ok(100102));
-        assert_eq!(launches(), 1);
-        let (end, rx) = shim(&id, 100102);
-        assert_eq!(got(&rx), open("rho://b", Some("t1")));
-        // Running: straight to the shim.
-        assert_eq!(id.open(100042, "rho://c", None), Ok(100102));
-        assert_eq!(got(&rx), open("rho://c", None));
         assert_eq!(launcher(&id).launch(5, "rho", Some("t2")), Ok(100102));
+        assert_eq!(launches(), 1);
         assert_eq!(
-            got(&rx),
-            Delivery::Activate {
-                token: Some("t2".to_owned())
-            }
+            waiting(&recorder, 0),
+            vec![
+                open("rho://b", Some("t1")),
+                Delivery::Activate {
+                    token: Some("t2".to_owned())
+                }
+            ]
         );
-        // Still the scheme check: rho opens rho: URIs only.
+        // Still the scheme check: rho opens rho: URIs only, and firefox gets no line.
         assert!(id.open(100042, "https://x", None).is_ok());
         assert_eq!(recorder.0.lock().unwrap()[1].argv[0], "firefox");
-        assert!(rx.try_recv().is_err());
-        assert_eq!(launches(), 2);
-        // The app exits (its shim with it): the next open starts it again, with that URI.
-        end.shutdown(std::net::Shutdown::Both).unwrap();
-        drop(rx);
+        assert!(recorder.1.lock().unwrap()[1].is_none());
+        assert!(waiting(&recorder, 0).is_empty());
+        // The app exits (its namespace, and the line with it): the next open starts it again,
+        // with that URI and a new line.
+        recorder.1.lock().unwrap()[0] = None;
         assert_eq!(id.open(100042, "rho://d", None), Ok(100102));
         assert_eq!(launches(), 3);
         assert_eq!(
             recorder.0.lock().unwrap()[2].argv,
             vec!["rho-gui", "rho://d"]
         );
+        assert_eq!(id.open(100042, "rho://e", None), Ok(100102));
+        assert_eq!(waiting(&recorder, 2), vec![open("rho://e", None)]);
+        assert_eq!(launches(), 3);
     }
 
     #[test]
@@ -888,47 +759,46 @@ mod tests {
         assert_eq!(id.open(100102, "https://b", None), Ok(100042));
         assert_eq!(launcher(&id).launch(5, "firefox", None), Ok(100042));
         assert_eq!(recorder.0.lock().unwrap().len(), 3);
-        // And its shim is told so: nothing is delivered to it.
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        id.receive(100042, theirs).unwrap();
-        match rpc::read_msg::<Response>(&ours).unwrap() {
-            Response::Error(err) => assert!(err.contains("not single"), "{err}"),
-            other => panic!("{other:?}"),
-        }
+        assert!(recorder.1.lock().unwrap().iter().all(Option::is_none));
+        assert!(recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|l| !l.deliveries && !l.env.iter().any(|(k, _)| k == "DRV_SINGLE")));
     }
 
     #[test]
-    fn a_single_app_that_never_receives_is_started_again_after_a_while() {
-        let (id, recorder) = identity();
-        assert!(id.open(100042, "rho://a", None).is_ok());
-        assert!(id.open(100042, "rho://b", None).is_ok());
-        assert_eq!(recorder.0.lock().unwrap().len(), 1);
-        if let Some(Instance::Starting { since, .. }) =
-            id.instances.lock().unwrap().get_mut(&100102)
-        {
-            *since -= STARTUP + Duration::from_secs(1);
+    fn a_single_app_whose_start_failed_is_started_by_the_next_open() {
+        struct Failing(Mutex<u32>);
+        impl Forker for Failing {
+            fn launch(&self, _: &Launch, _: Option<BorrowedFd<'_>>) -> Result<u32, String> {
+                *self.0.lock().unwrap() += 1;
+                Err("forker: down".to_owned())
+            }
         }
-        assert!(id.open(100042, "rho://c", None).is_ok());
-        assert_eq!(recorder.0.lock().unwrap().len(), 2);
-        assert_eq!(
-            recorder.0.lock().unwrap()[1].argv,
-            vec!["rho-gui", "rho://c"]
-        );
-    }
-
-    #[test]
-    fn a_running_instance_keeps_its_receiver() {
         let (id, _) = identity();
-        assert!(launcher(&id).launch(5, "rho", None).is_ok());
-        let (_end, rx) = shim(&id, 100102);
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        id.receive(100102, theirs).unwrap();
-        match rpc::read_msg::<Response>(&ours).unwrap() {
-            Response::Error(err) => assert!(err.contains("already"), "{err}"),
-            other => panic!("{other:?}"),
-        }
+        let failing = Arc::new(Failing(Mutex::new(0)));
+        let id = Appd::new(id.config.clone(), failing.clone(), Vec::new());
+        assert!(id.open(100042, "rho://a", None).is_err());
+        assert!(id.open(100042, "rho://b", None).is_err());
+        assert_eq!(*failing.0.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn an_app_that_does_not_read_is_not_sent_more_forever() {
+        let (id, _recorder) = identity();
         assert!(id.open(100042, "rho://a", None).is_ok());
-        assert_eq!(got(&rx), open("rho://a", None));
+        let long = format!("rho://{}", "x".repeat(8000));
+        let mut refused = None;
+        for i in 0..10_000 {
+            if let Err(err) = id.open(100042, &long, None) {
+                refused = Some((i, err));
+                break;
+            }
+        }
+        let (_, err) = refused.expect("a full line is refused, not waited on");
+        assert!(err.contains("has not read"), "{err}");
     }
 
     #[test]

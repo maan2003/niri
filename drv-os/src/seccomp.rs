@@ -331,6 +331,14 @@ impl Allowlist {
         )
     }
 
+    /// Making connected pairs of one address family (`AF_UNIX`).
+    pub fn socketpair(&mut self, family: c_int) -> io::Result<&mut Self> {
+        self.allow_when(
+            SYS_socketpair,
+            vec![Cond::new(0, Len::Dword, Op::Eq, family as u64).map_err(err)?],
+        )
+    }
+
     /// Connecting to Unix sockets by path (nothing over the network).
     pub fn connect_unix(&mut self) -> io::Result<&mut Self> {
         self.socket(AF_UNIX)?;

@@ -7,7 +7,8 @@
 //! from the store, the links at fixed places (`/bin/sh`), the person's folders. Then it puts
 //! itself under the app's Landlock rules (the forker already put on the syscall denylist and
 //! MDWE), forks the app and
-//! stays as PID 1 of its namespace: reaps, passes signals on, ends with the app's status.
+//! stays as PID 1 of its namespace: reaps, passes signals on, ends with the app's status. A
+//! `single` app's deliveries line it holds all that time, so the line ends with the app.
 //!
 //! Everything it does is said by the app's run file (`services.drv.mkApp` writes it): an
 //! executable in the store whose first line names this program as its interpreter and whose
@@ -139,6 +140,16 @@ fn run(name: &str, args: Run) -> Result<Infallible, String> {
     let mut fds = drv_os::fds::take().map_err(|e| format!("fds from the forker: {e}"))?;
     // The forker hands the host's resolver to a networked app and to no other.
     let resolv = fds.file("resolv").ok();
+    // A `single` app's deliveries line: held here, as PID 1, for as long as the namespace
+    // lives (drv-appd takes its hang-up for the app's exit), and inherited by the command,
+    // which is told its number. One fd, not close-on-exec, never closed: its lifetime is
+    // this process's.
+    let deliveries = fds
+        .socket(drv_os::fds::DELIVERIES, drv_os::fds::Kind::SeqPacket)
+        .ok()
+        .map(|fd| rustix::io::dup(&fd).map(std::os::fd::IntoRawFd::into_raw_fd))
+        .transpose()
+        .map_err(|e| format!("the deliveries line: {e}"))?;
     // 1. The directories of the run, in the root tmpfs the forker left us.
     make_dir("/tmp", 0o1777)?;
     make_dir("/etc", 0o755)?;
@@ -242,6 +253,7 @@ fn run(name: &str, args: Run) -> Result<Infallible, String> {
                 .envs(&args.env)
                 .env("HOME", &home)
                 .env("XDG_RUNTIME_DIR", RUNTIME)
+                .envs(deliveries.map(|fd| (drv_os::fds::DELIVERIES_ENV, fd.to_string())))
                 .current_dir(&home)
                 .exec();
             drv_os::say!("drv-init: exec {}: {err}", args.command[0]);

@@ -102,9 +102,10 @@ fn run(args: Args) -> anyhow::Result<()> {
     bus.request_name(NOTIFICATIONS_NAME)?;
     bus.request_name(PORTAL_NAME)?;
     bus.request_name(CREDENTIALS_NAME)?;
-    {
-        let (bus, appd) = (bus.clone(), args.appd.clone());
-        std::thread::spawn(move || receive(&bus, &appd));
+    // Taken before the app runs, so it neither inherits the line nor reads that it has one.
+    if let Some((line, name)) = deliveries()? {
+        let bus = bus.clone();
+        std::thread::spawn(move || receive(&bus, line, &name));
     }
 
     let shim = Arc::new(Shim {
@@ -1013,47 +1014,40 @@ const APPLICATION: &str = "org.freedesktop.Application";
 /// call, or between calls.
 const APPEARS: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A `single` app's deliveries (`drv_policy::rpc::Delivery`): drv-appd sends this uid's
-/// opens and launches here once it runs, and they go to the app as
-/// `org.freedesktop.Application` calls on its well-known name, in order, as the desktop
-/// entry spec's D-Bus activation has them. Each is answered to drv-appd once queued, not
-/// once the app has it: the app may still be starting. An app that is not `single` is
-/// refused, and nothing comes.
-fn receive(bus: &Connection, appd: &Path) {
-    let (name, stream) = match drv_policy::client::receive(&appd.to_owned()) {
-        Ok(got) => got,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            if *TRACE {
-                drv_os::say!("drv-dbus-shim: no deliveries: {err}");
-            }
-            return;
-        }
-        Err(err) => {
-            drv_os::say!("drv-dbus-shim: asking drv-appd for deliveries: {err}");
-            return;
-        }
+/// A `single` app's deliveries line, from drv-init, and the bus name to deliver to, both
+/// from drv-appd. Close-on-exec from here on, and out of the environment: the app gets
+/// neither. None for an app that is not `single`.
+fn deliveries() -> anyhow::Result<Option<(OwnedFd, String)>> {
+    use std::os::fd::FromRawFd as _;
+    let fd = std::env::var_os(drv_os::fds::DELIVERIES_ENV);
+    let name = std::env::var(drv_os::fds::SINGLE_ENV).ok();
+    std::env::remove_var(drv_os::fds::DELIVERIES_ENV);
+    std::env::remove_var(drv_os::fds::SINGLE_ENV);
+    let (Some(fd), Some(name)) = (fd, name) else {
+        return Ok(None);
     };
-    let (queue, deliveries) = std::sync::mpsc::channel::<drv_policy::rpc::Delivery>();
-    let caller = bus.clone();
-    let to = name.clone();
-    std::thread::spawn(move || {
-        for delivery in deliveries {
-            if let Err(err) = call_app(&caller, &to, &delivery) {
-                drv_os::say!("drv-dbus-shim: {delivery:?} to {to}: {err:#}");
-            }
-        }
-    });
+    let raw: i32 = fd.to_str().and_then(|s| s.parse().ok()).filter(|n| *n > 2).context("the deliveries fd")?;
+    // SAFETY: drv-init put the line on this number for us, and nothing else here uses it.
+    let line = unsafe { OwnedFd::from_raw_fd(raw) };
+    rustix::io::fcntl_setfd(&line, rustix::io::FdFlags::CLOEXEC).context("the deliveries fd")?;
+    Ok(Some((line, name)))
+}
+
+/// A `single` app's deliveries (`drv_policy::rpc::Delivery`): drv-appd sends this app's
+/// opens and launches down `line` while it runs, and they go to the app as
+/// `org.freedesktop.Application` calls on `name`, in order, as the desktop entry spec's
+/// D-Bus activation has them. What comes before the app owns the name waits for it.
+fn receive(bus: &Connection, line: OwnedFd, name: &str) {
     loop {
-        let delivery = match drv_policy::rpc::read_msg::<drv_policy::rpc::Delivery>(&stream) {
-            Ok(delivery) => delivery,
+        let delivery = match seq::recv::<drv_policy::rpc::Delivery>(&line) {
+            Ok((delivery, _)) => delivery,
             Err(err) => {
                 drv_os::say!("drv-dbus-shim: drv-appd's deliveries ended: {err}");
                 return;
             }
         };
-        let taken = queue.send(delivery).map_err(|_| "the caller thread is gone".to_owned());
-        if drv_policy::rpc::write_msg(&stream, &taken).is_err() {
-            return;
+        if let Err(err) = call_app(bus, name, &delivery) {
+            drv_os::say!("drv-dbus-shim: {delivery:?} to {name}: {err:#}");
         }
     }
 }

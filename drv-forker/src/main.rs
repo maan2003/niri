@@ -5,7 +5,8 @@
 //! mount namespace with a root tmpfs the app owns, the few mounts into it (the store, the
 //! device and sysfs views, proc, the doors, the app's state, the person's folders it is given),
 //! the cgroup, the UID switch, the syscall denylist and MDWE, and
-//! the exec of the command (the app's run file, so drv-init), which as the app makes the
+//! the exec of the command (the app's run file, so drv-init, with the resolver for a
+//! networked app and the deliveries line of a `single` one), which as the app makes the
 //! rest of the root and takes its Landlock rules.
 //! No config files, no policy, no idea what an "app" is beyond the request type: drv-appd is
 //! the brain; a bug here is reachable only through it. Zygote on Android has the same shape.
@@ -120,7 +121,8 @@ impl Forker {
             if !ready[0] {
                 continue;
             }
-            let (bytes, _fds) = match seq::recv_bytes(&channel) {
+            // The fds that came with it stay ours until the fork; the child hands them on.
+            let (bytes, fds) = match seq::recv_bytes(&channel) {
                 Ok(r) => r,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return err("channel", e),
@@ -147,7 +149,7 @@ impl Forker {
                 continue;
             }
             if pid == 0 {
-                let response = match self.child(&channel, &bytes) {
+                let response = match self.child(&channel, &bytes, fds) {
                     Ok(never) => match never {},
                     Err(e) => Response::Error(e),
                 };
@@ -166,7 +168,12 @@ impl Forker {
     /// and the three features that are mounts), then the namespace and its root, then the
     /// switch; argv and env are touched only once the process is the app. Returns only an
     /// error; success is exec.
-    fn child(&self, channel: &OwnedFd, bytes: &[u8]) -> Result<Infallible, String> {
+    fn child(
+        &self,
+        channel: &OwnedFd,
+        bytes: &[u8],
+        mut fds: Vec<OwnedFd>,
+    ) -> Result<Infallible, String> {
         // 1. Handles on everything of the host's we will need. A handle taken before the
         // unshare stays valid in the new namespace; nothing can be cloned from there after.
         let host_net = rustix::fs::open(
@@ -219,6 +226,23 @@ impl Forker {
         if launch.argv.is_empty() {
             return Err("empty argv".into());
         }
+        // The one fd a launch may carry: the app's end of its deliveries line, a socket it
+        // can only read from. Anything else is refused.
+        let deliveries = match (launch.deliveries, fds.len()) {
+            (false, 0) => None,
+            (true, 1) => {
+                let fd = fds.pop().unwrap();
+                let seqpacket = rustix::net::sockopt::socket_domain(&fd)
+                    .is_ok_and(|d| d == rustix::net::AddressFamily::UNIX)
+                    && rustix::net::sockopt::socket_type(&fd)
+                        .is_ok_and(|t| t == rustix::net::SocketType::SEQPACKET);
+                if !seqpacket {
+                    return Err("the deliveries fd is not a unix seqpacket socket".into());
+                }
+                Some(fd)
+            }
+            (said, n) => return Err(format!("{n} fds with the request (deliveries: {said})")),
+        };
         // The person's folders, cloned from the host now (nothing can be after the unshare)
         // and idmapped: the tree's owner (drv-files, read off the base directory) is the app
         // inside. One namespace holds the mapping for all of them.
@@ -401,10 +425,19 @@ impl Forker {
         let exe = which(&launch.argv[0], &path)
             .ok_or_else(|| format!("{}: not found in PATH", launch.argv[0]))?;
         let mut placed = Vec::new();
+        let mut handed = Vec::new();
         if launch.network {
-            let resolv = resolv.ok_or("no resolv.conf on the host")?;
-            let (fd_env, fds) = drv_os::fds::handoff(&[("resolv", resolv.as_fd())])
-                .map_err(|e| format!("resolv: {e}"))?;
+            handed.push((
+                "resolv",
+                resolv.as_ref().ok_or("no resolv.conf on the host")?.as_fd(),
+            ));
+        }
+        if let Some(fd) = &deliveries {
+            handed.push((drv_os::fds::DELIVERIES, fd.as_fd()));
+        }
+        if !handed.is_empty() {
+            let (fd_env, fds) =
+                drv_os::fds::handoff(&handed).map_err(|e| format!("the app's fds: {e}"))?;
             env.extend(fd_env);
             // A copy above the target, so the dup2 below is never a same-fd no-op (which
             // would keep close-on-exec set).

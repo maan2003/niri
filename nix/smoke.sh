@@ -189,8 +189,8 @@ expect "junk refused" 'drv-dbus-shim: OpenURI: "-https://example.com" is not a U
 echo "== a single app"
 F=/var/lib/drv-apps/100017/out/single.txt
 file_has "the first open started it with the URI" $F '^open drvsingle://one$'
-file_has "the second, while it started, waited for its shim" $F '^open drvsingle://two$'
-expect "in drv-appd" '"single-test" \(uid 100017\) receives; 1 waited'
+file_has "the second, sent before it read, waited on its line" $F '^open drvsingle://two$'
+expect "and was no second start" '"single-test" runs: delivered Open \{ uris: \["drvsingle://two"\]'
 file_has "the third went to it running, with the opener's token" $F '^token tok-from-open-test$'
 file_has "and its URI" $F '^open drvsingle://three$'
 mark; menu single; sleep 3

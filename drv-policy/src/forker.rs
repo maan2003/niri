@@ -1,10 +1,11 @@
 //! The channel between drv-appd and drv-forker: a socketpair the supervisor made before
 //! forking both (fd `channel` on both sides), so nothing else can reach it. Requests and
 //! replies in lock step on [`seq`](crate::seq). The forker knows nothing about apps: what it
-//! gets here is what it does. Apps get no fds: nothing forked here holds authority.
+//! gets here is what it does. Apps get no fds of authority: the one fd a launch may carry
+//! is the app's end of its deliveries line, which it can only read.
 
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,12 @@ pub struct Launch {
     /// refused them by the syscall filter.
     #[serde(default)]
     pub userns: bool,
+    /// The request carries one fd, a `SOCK_SEQPACKET` socket: the app's end of the line
+    /// drv-appd delivers to a running `single` app on. The app gets it as fd
+    /// `deliveries` (`drv_os::fds::DELIVERIES`). Without this, a request with an fd is
+    /// refused.
+    #[serde(default)]
+    pub deliveries: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,15 +72,17 @@ impl Channel {
         Self(Mutex::new(sock))
     }
 
-    fn call(&self, request: &Request) -> io::Result<Response> {
+    fn call(&self, request: &Request, fds: &[BorrowedFd<'_>]) -> io::Result<Response> {
         let sock = self.0.lock().unwrap();
-        seq::send(&*sock, request, &[])?;
+        seq::send(&*sock, request, fds)?;
         let (response, _) = seq::recv(&*sock)?;
         Ok(response)
     }
 
-    pub fn launch(&self, launch: &Launch) -> io::Result<()> {
-        match self.call(&Request::Launch(launch.clone()))? {
+    /// `deliveries` goes with it as the app's fd, which `launch.deliveries` must say.
+    pub fn launch(&self, launch: &Launch, deliveries: Option<BorrowedFd<'_>>) -> io::Result<()> {
+        let fds: Vec<_> = deliveries.into_iter().collect();
+        match self.call(&Request::Launch(launch.clone()), &fds)? {
             Response::Forked => Ok(()),
             Response::Error(err) => Err(io::Error::other(err)),
         }

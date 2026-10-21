@@ -131,22 +131,6 @@ impl PolicyClient {
     }
 }
 
-/// A shim's side of [`Request::Receive`]: connects to the daemon at `path` and asks for the
-/// peer uid's deliveries. Returns the bus name they are for and the connection, on which
-/// [`Delivery`](rpc::Delivery)s arrive (with no timeout: they come when they come) and each
-/// is answered with `Result<(), String>`. An app that is not `single` is refused.
-pub fn receive(path: &PathBuf) -> io::Result<(String, UnixStream)> {
-    let stream = open(path)?;
-    match roundtrip(&stream, &Request::Receive)? {
-        Response::Receiving { name } => {
-            stream.set_read_timeout(None)?;
-            Ok((name, stream))
-        }
-        Response::Error(err) => Err(io::Error::new(io::ErrorKind::PermissionDenied, err)),
-        other => Err(unexpected("receive", other)),
-    }
-}
-
 fn unexpected(what: &str, response: Response) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,

@@ -48,6 +48,8 @@ fn run(args: Args) -> Result<(), String> {
     if drv_os::seccomp::enabled() {
         let mut allow = drv_os::seccomp::Allowlist::base().map_err(|e| e.to_string())?;
         allow.accept();
+        // A `single` app's deliveries line, made before its start.
+        allow.socketpair(libc::AF_UNIX).map_err(|e| e.to_string())?;
         allow.apply("drv-appd").map_err(|e| e.to_string())?;
         drv_os::say!("drv-appd: seccomp: syscall allowlist applied");
     }

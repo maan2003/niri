@@ -15,6 +15,17 @@ use std::os::unix::net::UnixListener;
 
 use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
+/// The name of the fd a `single` app is started with: its end of the line drv-appd delivers
+/// opens and launches on while it runs (`drv_policy::rpc::Delivery`). The forker hands it
+/// to drv-init under this name; drv-init keeps it for as long as the app's namespace lives,
+/// so drv-appd sees the line hang up exactly when the app is gone, and passes it on to its
+/// command as the fd number in [`DELIVERIES_ENV`].
+pub const DELIVERIES: &str = "deliveries";
+/// The variable that names the deliveries fd's number in the app's command (the shim).
+pub const DELIVERIES_ENV: &str = "DRV_DELIVERIES";
+/// The variable with the bus name a `single` app owns, for the shim to deliver to.
+pub const SINGLE_ENV: &str = "DRV_SINGLE";
+
 /// The first passed fd, as systemd defines it.
 pub const FIRST_FD: i32 = 3;
 pub const ENV_FDS: &str = "LISTEN_FDS";

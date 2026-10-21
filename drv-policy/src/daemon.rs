@@ -23,14 +23,6 @@ pub trait Handler: Send + Sync {
     fn open(&self, peer: u32, uri: &str, token: Option<&str>) -> Result<u32, String>;
     /// The peer's `Hello`, before the version goes back. A hook, not a decision.
     fn hello(&self, _peer: u32) {}
-    /// The peer's [`Request::Receive`]: the connection is the handler's from here on, to
-    /// answer and keep, or to refuse and drop.
-    fn receive(&self, _peer: u32, stream: UnixStream) -> io::Result<()> {
-        rpc::write_msg(
-            &stream,
-            &Response::Error("this daemon delivers nothing".to_owned()),
-        )
-    }
 }
 
 /// A file-backed store answers lookups and cannot launch anything.
@@ -105,7 +97,6 @@ pub fn serve_connection(stream: UnixStream, peer: u32, handler: &dyn Handler) ->
                 Ok(uid) => Response::Launched { uid },
                 Err(err) => Response::Error(err),
             },
-            Request::Receive => return handler.receive(peer, stream),
         };
         rpc::write_msg(&stream, &response)?;
     }

@@ -46,16 +46,12 @@ pub enum Request {
         uri: String,
         token: Option<String>,
     },
-    /// From an app's shim, on the public socket: this connection is where the opens and
-    /// launches of the peer's uid go from now on, as [`Delivery`]s, while it stays open.
-    /// Only a `single` app's; the answer is [`Response::Receiving`] and then the daemon
-    /// speaks first.
-    Receive,
 }
 
-/// What drv-appd sends down a shim's [`Request::Receive`] connection. The shim answers each
-/// with `Result<(), String>` once it has taken it on, and passes it to the app as
-/// `org.freedesktop.Application` calls on its bus.
+/// What drv-appd sends a running `single` app, on the line it made for it before the fork
+/// (the app's fd `deliveries` (`drv_os::fds::DELIVERIES`), a `SOCK_SEQPACKET` socket, one
+/// [`seq`](crate::seq) message each, never answered). The shim reads them and passes them to
+/// the app as `org.freedesktop.Application` calls on its bus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Delivery {
     Open {
@@ -104,11 +100,6 @@ pub enum Response {
     },
     /// The launchable app names, in manifest order.
     Apps(Vec<String>),
-    /// The shim's [`Request::Receive`] is taken: deliveries follow, for the app that owns
-    /// this bus name (its desktop app id).
-    Receiving {
-        name: String,
-    },
     /// The request was understood and refused (unknown app, not allowed, spawner down, ...).
     Error(String),
 }
