@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use smithay::reexports::drm::control::Mode as DrmMode;
 
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// A cached compositor UI surface. Text is shaped in the core; only paint and positioned
 /// glyphs cross the wire. Colors are straight sRGB RGBA; the result is premultiplied RGBA8.
@@ -657,6 +657,8 @@ pub enum Request {
     /// Reply: `DeviceRemoved`.
     RemoveDevice {
         dev: DevId,
+        /// The seat no longer reports this device, rather than configuration ignoring it.
+        physically_removed: bool,
     },
     /// Session lost: stop touching the devices.
     PauseDevices,

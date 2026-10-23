@@ -437,9 +437,12 @@ impl Server {
                 };
                 Event::DeviceAdded { render_node, caps }
             }
-            Request::RemoveDevice { dev } => {
+            Request::RemoveDevice {
+                dev,
+                physically_removed,
+            } => {
                 let mut renderer_dropped = false;
-                if let Some((token, was_renderer)) = drm.remove_device(dev) {
+                if let Some((token, was_renderer)) = drm.remove_device(dev, physically_removed)? {
                     if let Some(token) = token {
                         self.loop_handle.remove(token);
                     }
@@ -507,7 +510,7 @@ impl Server {
                 Event::Ack
             }
             Request::ClearOutputs => {
-                drm.clear_outputs();
+                drm.clear_outputs()?;
                 Event::Ack
             }
             Request::SetDebugTint { enable } => {

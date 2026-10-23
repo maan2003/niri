@@ -59,7 +59,7 @@ use crate::gpu::protocol::{
 };
 use crate::gpu::record::Recorder;
 use crate::gpu::remote::{DmabufAllocator, RemoteRenderer};
-use crate::niri::{client_allows, Niri, RedrawState, State};
+use crate::niri::{client_allows, Niri, OutputRenderElements, RedrawState, State};
 use crate::render_helpers::blend::{BlendSpace, DEFAULT_REFERENCE_LUMINANCE};
 use crate::render_helpers::debug::draw_damage;
 use crate::render_helpers::{RenderCtx, RenderTarget};
@@ -143,6 +143,9 @@ struct Surface {
     recorder: Recorder,
     /// Geometry the GPU process currently has for this output.
     geometry: Option<OutputGeometry>,
+    // The current scanout may still read client buffers after its first vblank.
+    // Retire these only when a replacement frame reaches vblank or the output stops.
+    current_elements: Vec<OutputRenderElements<RemoteRenderer>>,
     vblank_frame: Option<tracy_client::Frame>,
     vblank_frame_name: tracy_client::FrameName,
 }
@@ -153,6 +156,9 @@ pub struct TtyOutputState(pub OutputRef);
 
 struct PendingFrame {
     output: Output,
+    // Keep Wayland buffer release guards alive while the asynchronous GPU request runs.
+    // A RemoteTexture or DMA-buf fd alone does not prevent client buffer reuse.
+    elements: Vec<OutputRenderElements<RemoteRenderer>>,
     /// Filled in when the GPU reports the frame was submitted for scanout.
     feedback: Option<OutputPresentationFeedback>,
 }
@@ -550,8 +556,10 @@ impl Tty {
                         .copied()
                         .collect::<Vec<_>>();
 
-                    for node in removed_devices {
-                        device_list.remove(&node.dev_id());
+                    let (unplugged, ignored): (Vec<_>, Vec<_>) = removed_devices
+                        .into_iter()
+                        .partition(|node| !device_list.contains_key(&node.dev_id()));
+                    for node in unplugged {
                         self.device_removed(node.dev_id(), niri);
                     }
 
@@ -562,6 +570,13 @@ impl Tty {
                         .force_disable_connectors_on_resume;
                     if let Err(err) = self.request_ack(Request::ResumeDevices { force_disable }) {
                         warn!("error activating DRM devices: {err:?}");
+                    }
+
+                    // Present but ignored cards need active DRM handles to disable
+                    // their planes before client buffers can be released.
+                    for node in ignored {
+                        device_list.remove(&node.dev_id());
+                        self.device_removed(node.dev_id(), niri);
                     }
 
                     for node in remained_devices {
@@ -905,22 +920,32 @@ impl Tty {
         };
 
         let outputs: Vec<OutputRef> = device.connectors.values().map(|c| c.info.output).collect();
-        for output in outputs {
-            self.connector_disconnected(niri, output);
-        }
-
+        // The seat's device list distinguishes unplug from a config-only removal.
+        let physically_removed = !self.seat_devices.contains_key(&device_id);
         // Only the GPU process knows which device hosts the renderer.
-        let renderer_dropped = match self.request(Request::RemoveDevice { dev: device_id }) {
+        let renderer_dropped = match self.request(Request::RemoveDevice {
+            dev: device_id,
+            physically_removed,
+        }) {
             Ok(Event::DeviceRemoved { renderer_dropped }) => renderer_dropped,
             Ok(other) => {
                 warn!("unexpected reply to RemoveDevice: {other:?}");
+                if !physically_removed {
+                    return;
+                }
                 false
             }
             Err(err) => {
                 warn!("error removing device in GPU process: {err:?}");
+                if !physically_removed {
+                    return;
+                }
                 false
             }
         };
+        for output in outputs {
+            self.connector_disconnected(niri, output);
+        }
         let device = self.devices.remove(&node).unwrap();
 
         if renderer_dropped && self.renderer_ready {
@@ -1115,6 +1140,7 @@ impl Tty {
             failed_color_state: None,
             recorder: Recorder::default(),
             geometry: None,
+            current_elements: Vec::new(),
             vblank_frame: None,
             vblank_frame_name,
         });
@@ -1161,9 +1187,14 @@ impl Tty {
         if disable_in_gpu {
             if let Err(err) = self.request_ack(Request::DisableOutput { output: output_ref }) {
                 warn!("error disabling output in GPU process: {err:?}");
+                // The GPU may still use the old scanout. Preserve its release guards.
+                self.find_connector(output_ref).unwrap().surface = Some(surface);
+                return;
             }
         }
 
+        self.pending_frames
+            .retain(|_, pending| pending.output != surface.output);
         niri.remove_output(&surface.output);
     }
 
@@ -1253,6 +1284,14 @@ impl Tty {
         };
 
         if let Some(pending) = frame.and_then(|frame| self.pending_frames.remove(&frame)) {
+            // A later flip also retires frames whose vblank was lost during a mode change.
+            let frame = frame.unwrap();
+            self.pending_frames
+                .retain(|id, older| older.output != output || *id > frame);
+            // This flip retires the PREVIOUS frame, not the one just presented.
+            if let Some(surface) = self.find_surface(output_ref) {
+                surface.current_elements = pending.elements;
+            }
             if let Some(mut feedback) = pending.feedback {
                 let refresh = match refresh_interval {
                     Some(refresh) => {
@@ -1272,11 +1311,6 @@ impl Tty {
                 feedback.presented::<_, smithay::utils::Monotonic>(time, refresh, sequence, flags);
             }
         }
-        // Frames whose vblank never came (mode change, output gone) would pile up otherwise.
-        if self.pending_frames.len() > 64 {
-            self.pending_frames.clear();
-        }
-
         output_state.last_drm_sequence = Some(sequence as u32);
         output_state.frame_clock.presented(presentation_time);
 
@@ -1502,6 +1536,7 @@ impl Tty {
             frame_id,
             PendingFrame {
                 output: output.clone(),
+                elements,
                 feedback: None,
             },
         );
@@ -1864,6 +1899,17 @@ impl Tty {
         }
         if let Err(err) = self.request_ack(Request::ClearOutputs) {
             warn!("error clearing outputs: {err:?}");
+            return;
+        }
+        // The blocking KMS clear retired every plane and cancelled pending flips.
+        // No VBlank will arrive for those frames while the monitors are off.
+        self.pending_frames.clear();
+        for device in self.devices.values_mut() {
+            for connector in device.connectors.values_mut() {
+                if let Some(surface) = &mut connector.surface {
+                    surface.current_elements.clear();
+                }
+            }
         }
     }
 
@@ -1921,11 +1967,9 @@ impl Tty {
             return;
         }
 
-        let ignored_nodes = self.compute_ignored_nodes();
-        if ignored_nodes == self.ignored_nodes {
-            return;
-        }
-        self.ignored_nodes = ignored_nodes;
+        // Reconcile even when the setting is unchanged: a previous plane-disable
+        // failure may have left an ignored device alive for buffer safety.
+        self.ignored_nodes = self.compute_ignored_nodes();
 
         let mut device_list = self.seat_devices.clone();
 

@@ -289,11 +289,33 @@ impl DrmState {
 
     /// Returns the device's event source token and whether it hosted the renderer, in which
     /// case the caller must drop the renderer too.
-    pub fn remove_device(&mut self, dev: DevId) -> Option<(Option<RegistrationToken>, bool)> {
+    pub fn remove_device(
+        &mut self,
+        dev: DevId,
+        physically_removed: bool,
+    ) -> anyhow::Result<Option<(Option<RegistrationToken>, bool)>> {
+        if let Some(device) = self.devices.get(&dev).filter(|_| !physically_removed) {
+            // Configuration can remove a card that is still scanning out. Its
+            // client-buffer guards cannot be retired until every plane is off.
+            let mut failure = None;
+            for surface in device.surfaces.values() {
+                if let Err(err) = surface
+                    .compositor
+                    .surface()
+                    .disable()
+                    .context("disabling output of removed device")
+                {
+                    failure.get_or_insert(err);
+                }
+            }
+            if let Some(err) = failure {
+                return Err(err);
+            }
+        }
         let device = self.devices.remove(&dev);
         let render_only = self.render_only.remove(&dev);
         if device.is_none() && !render_only {
-            return None;
+            return Ok(None);
         }
         let was_renderer = self.renderer_dev == Some(dev);
         if was_renderer {
@@ -301,15 +323,7 @@ impl DrmState {
             self.renderer_node = None;
             self.renderer_gbm = None;
         }
-        if let Some(device) = &device {
-            // The card may still be present but disabled by configuration.
-            for surface in device.surfaces.values() {
-                if let Err(err) = surface.compositor.surface().disable() {
-                    debug!("error disabling output of removed device: {err:?}");
-                }
-            }
-        }
-        Some((device.map(|d| d.token), was_renderer))
+        Ok(Some((device.map(|d| d.token), was_renderer)))
     }
 
     pub fn pause(&mut self) {
@@ -640,12 +654,16 @@ impl DrmState {
     pub fn disable_output(&mut self, output: OutputRef) -> anyhow::Result<()> {
         let crtc = crtc_handle(output.crtc)?;
         let device = self.device(output.dev)?;
-        if let Some(surface) = device.surfaces.remove(&crtc) {
-            // Paused session: the next VT owner resets the CRTC anyway.
-            if let Err(err) = surface.compositor.surface().disable() {
-                debug!("error disabling CRTC: {err:?}");
-            }
+        if let Some(surface) = device.surfaces.get(&crtc) {
+            // The core releases client buffers after our acknowledgement. Do not
+            // acknowledge or forget the plane state if KMS still uses those buffers.
+            surface
+                .compositor
+                .surface()
+                .disable()
+                .context("disabling CRTC")?;
         }
+        device.surfaces.remove(&crtc);
         Ok(())
     }
 
@@ -750,13 +768,18 @@ impl DrmState {
         }
     }
 
-    pub fn clear_outputs(&mut self) {
+    pub fn clear_outputs(&mut self) -> anyhow::Result<()> {
+        let mut failure = None;
         for device in self.devices.values_mut() {
             for surface in device.surfaces.values_mut() {
-                if let Err(err) = surface.compositor.clear() {
-                    warn!("error clearing drm surface: {err:?}");
+                if let Err(err) = surface.compositor.clear().context("clearing DRM surface") {
+                    failure.get_or_insert(err);
                 }
             }
+        }
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
         }
     }
 
