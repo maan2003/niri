@@ -164,7 +164,7 @@ struct Args {
     /// `NAME=VALUE` in the media keys service's environment. Repeatable; it gets nothing else.
     #[arg(long = "keys-env")]
     keys_env: Vec<String>,
-    /// System user PipeWire and WirePlumber run as (group audio for the sound devices).
+    /// System user PipeWire runs as (group audio for the sound devices).
     #[arg(long)]
     pipewire_user: String,
     /// PipeWire's command line, whitespace-separated (`pipewire`).
@@ -185,6 +185,10 @@ struct Args {
     /// it cannot make, so an empty one is made here. Repeatable.
     #[arg(long = "pipewire-socket")]
     pipewire_sockets: Vec<PathBuf>,
+    /// System user WirePlumber runs as (group audio for the sound devices, and the group
+    /// that reaches PipeWire's sockets).
+    #[arg(long)]
+    wireplumber_user: String,
     /// WirePlumber's command line, whitespace-separated (`wireplumber -p main-systemwide`).
     #[arg(long)]
     wireplumber_exec: String,
@@ -382,7 +386,7 @@ fn supervise(args: Args) -> Result<(), String> {
         )?,
         wireplumber: service(
             "wireplumber",
-            &args.pipewire_user,
+            &args.wireplumber_user,
             &args.wireplumber_exec,
             &args.wireplumber_env,
             &args.wireplumber_dirs,
