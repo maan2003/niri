@@ -219,6 +219,8 @@ let
     # The ssh agent's door: open for the grant (hello), shut otherwise (gpu-probe).
     SSH_AUTH_SOCK=''${SSH_AUTH_SOCK:-/run/drv/agent} ${pkgs.openssh}/bin/ssh-add -l > agent.txt 2>&1 || echo "rc: $?" >> agent.txt
     ${pkgs.pipewire}/bin/pw-cli info 0 > pipewire.txt 2>&1 || echo "pw-cli failed: $?" >> pipewire.txt
+    # The apps' door is world-connectable; without `audio` it lets in nothing.
+    ${pkgs.coreutils}/bin/timeout 10 ${pkgs.pipewire}/bin/pw-dump -r /run/drv/audio > door.txt 2>&1 || echo "pw-dump: $?" >> door.txt
     ${pkgs.wayland-utils}/bin/wayland-info > globals.txt 2> wayland-info.err
     # The person's folder, if this app has one: writable, and ours by uid inside.
     if [ -d "$HOME/Shared" ]; then

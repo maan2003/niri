@@ -194,6 +194,10 @@ struct Args {
     /// `NAME=VALUE` in WirePlumber's environment. Repeatable; it gets nothing else.
     #[arg(long = "wireplumber-env")]
     wireplumber_env: Vec<String>,
+    /// `PATH:MODE` (octal): a directory WirePlumber owns (its state: volumes, default
+    /// devices), created before it starts.
+    #[arg(long = "wireplumber-dir")]
+    wireplumber_dirs: Vec<String>,
     /// System user drv-files (file chooser and documents mount) runs as.
     #[arg(long)]
     files_user: String,
@@ -381,7 +385,7 @@ fn supervise(args: Args) -> Result<(), String> {
             &args.pipewire_user,
             &args.wireplumber_exec,
             &args.wireplumber_env,
-            &[],
+            &args.wireplumber_dirs,
             &[],
             &args.wireplumber_expose,
         )?,

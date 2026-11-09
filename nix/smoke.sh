@@ -13,7 +13,7 @@ echo "== waiting for ssh"
 wait_ssh
 
 echo "== the set"
-for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-agent drv-fido drv-keys drv-forker drv-appd; do
+for m in compositor-gpu compositor drv-seatd drv-authd drv-shell drv-files drv-cast drv-agent drv-fido drv-keys drv-forker drv-appd pipewire wireplumber; do
   expect "member $m" "drv-supervisor: $m running as uid [0-9]+"
 done
 count "set started once" "drv-supervisor: compositor running as uid" 1
@@ -85,6 +85,7 @@ others=$($SSH cat $H/ps.txt | tail -n +2 | grep -v '^app-hel'); [ -z "$others" ]
 file_has "no user namespace" $H/userns.txt 'Operation not permitted'
 $SSH grep -q cpuinfo $H/proc.txt && fail "proc beyond the pid entries" || echo "PASS proc is the pid entries only"
 file_has "no PipeWire without audio" $H/pipewire.txt 'failed to connect|Host is down'
+$SSH grep -q 'PipeWire:Interface:Node' $H/door.txt && fail "the apps' PipeWire door shows a node to an app without audio" || echo "PASS the apps' PipeWire door shows it no node"
 hidden='zwlr_layer_shell|ext_session_lock|screencopy|image_copy_capture|image_capture_source|output_management|output_power|foreign_toplevel|virtual_pointer|virtual_keyboard|security_context|gamma_control|input_method|ext_transient_seat|zwlr_data_control|ext_data_control'
 leaked=$($SSH cat $H/globals.txt | grep -oE "interface: '[a-z_0-9]+'" | grep -E "$hidden")
 [ -z "$leaked" ] && echo "PASS no privileged globals" || fail "privileged globals: $leaked"
@@ -176,6 +177,16 @@ key ret; sleep 4               # allow
 expect "camera granted on capture" 'drv-cast: chromium \(uid 100005\) may use the camera'
 key meta_l-shift-esc; sleep 3
 expect "revoke took the camera" 'drv-cast: chromium \(uid 100005\) loses the camera'
+
+echo "== audio (chromium's page plays a bell on a loop)"
+PW="PIPEWIRE_RUNTIME_DIR=/run/pipewire pw-dump"
+dump=$($SSH "$PW" 2>&1)
+grep -q '"pipewire.sec.uid": 100005' <<<"$dump" && echo "PASS chromium's client is in PipeWire" || fail "no client of uid 100005 in PipeWire"
+grep -q '"media.class": "Stream/Output/Audio"' <<<"$dump" && echo "PASS and plays a stream" || fail "no audio output stream"
+mark
+door=$($SSH "timeout 10 pw-dump -r /run/drv/audio" 2>&1)
+grep -q 'PipeWire:Interface:Node' <<<"$door" && fail "root sees nodes through the apps' door" || echo "PASS root sees no node through the apps' door"
+expect "and WirePlumber says why" 'is uid 0, not an audio app'"'"'s: nothing'
 
 echo "== OpenURI"
 $SSH rm -f /var/lib/drv-apps/100011/out/open.txt
