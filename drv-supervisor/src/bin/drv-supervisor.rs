@@ -164,6 +164,36 @@ struct Args {
     /// `NAME=VALUE` in the media keys service's environment. Repeatable; it gets nothing else.
     #[arg(long = "keys-env")]
     keys_env: Vec<String>,
+    /// System user PipeWire and WirePlumber run as (group audio for the sound devices).
+    #[arg(long)]
+    pipewire_user: String,
+    /// PipeWire's command line, whitespace-separated (`pipewire`).
+    #[arg(long)]
+    pipewire_exec: String,
+    /// An entry under `/run` PipeWire sees (its sockets' lock files). Repeatable.
+    #[arg(long = "pipewire-expose")]
+    pipewire_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in PipeWire's environment. Repeatable; it gets nothing else.
+    #[arg(long = "pipewire-env")]
+    pipewire_env: Vec<String>,
+    /// A capability PipeWire keeps, by name (`sys_nice` for its realtime threads). Repeatable.
+    #[arg(long = "pipewire-cap")]
+    pipewire_caps: Vec<String>,
+    /// A socket PipeWire serves, bound here and world-connectable: who gets in is its
+    /// directory's mode or, for the apps' door, PipeWire's access rules on the peer UID.
+    /// PipeWire takes the fd by its path (`LISTEN_FDS`); it still locks `PATH.lock`, which
+    /// it cannot make, so an empty one is made here. Repeatable.
+    #[arg(long = "pipewire-socket")]
+    pipewire_sockets: Vec<PathBuf>,
+    /// WirePlumber's command line, whitespace-separated (`wireplumber -p main-systemwide`).
+    #[arg(long)]
+    wireplumber_exec: String,
+    /// An entry under `/run` WirePlumber sees (PipeWire's sockets). Repeatable.
+    #[arg(long = "wireplumber-expose")]
+    wireplumber_expose: Vec<PathBuf>,
+    /// `NAME=VALUE` in WirePlumber's environment. Repeatable; it gets nothing else.
+    #[arg(long = "wireplumber-env")]
+    wireplumber_env: Vec<String>,
     /// System user drv-files (file chooser and documents mount) runs as.
     #[arg(long)]
     files_user: String,
@@ -241,6 +271,8 @@ struct Set {
     agent: Service,
     fido: Service,
     keys: Service,
+    pipewire: Service,
+    wireplumber: Service,
 }
 
 fn supervise(args: Args) -> Result<(), String> {
@@ -335,6 +367,24 @@ fn supervise(args: Args) -> Result<(), String> {
             &[],
             &args.keys_expose,
         )?,
+        pipewire: service(
+            "pipewire",
+            &args.pipewire_user,
+            &args.pipewire_exec,
+            &args.pipewire_env,
+            &[],
+            &args.pipewire_caps,
+            &args.pipewire_expose,
+        )?,
+        wireplumber: service(
+            "wireplumber",
+            &args.pipewire_user,
+            &args.wireplumber_exec,
+            &args.wireplumber_env,
+            &[],
+            &[],
+            &args.wireplumber_expose,
+        )?,
         forker: service(
             "drv-forker",
             &args.forker_user,
@@ -371,6 +421,11 @@ fn supervise(args: Args) -> Result<(), String> {
         agent: listen(&args.agent_socket)?,
         fido: listen_seqpacket(&args.fido_socket)?,
         apps: listen(&args.apps_socket)?,
+        pipewire: args
+            .pipewire_sockets
+            .iter()
+            .map(|path| listen_locked(path))
+            .collect::<Result<_, _>>()?,
     };
 
     // A set that keeps dying is not restarted for good: drv-seatd takes the VT on every start,
@@ -423,6 +478,30 @@ struct Doors {
     agent: UnixListener,
     fido: UnixListener,
     apps: UnixListener,
+    /// PipeWire's sockets, named by their file names.
+    pipewire: Vec<(String, UnixListener)>,
+}
+
+/// Like `listen`, for PipeWire: the fd's name is the socket's file name, and `PATH.lock` is
+/// there, empty, for PipeWire to open read-only and lock.
+fn listen_locked(path: &Path) -> Result<(String, UnixListener), String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("{}: no file name", path.display()))?
+        .to_owned();
+    let listener = listen(path)?;
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock)
+        .map_err(|e| format!("{}: {e}", Path::new(&lock).display()))?;
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("chmod {}: {e}", Path::new(&lock).display()))?;
+    Ok((name, listener))
 }
 
 /// Like `listen`, a `SOCK_SEQPACKET` listener.
@@ -557,7 +636,7 @@ fn start_set(
         &'static str,
         &Service,
         Vec<(&str, std::os::fd::BorrowedFd<'_>)>,
-    ); 12] = [
+    ); 14] = [
         (
             "drv-seatd",
             &set.seatd,
@@ -666,6 +745,17 @@ fn start_set(
             &set.keys,
             vec![("compositor", l.compositor_keys.1.as_fd())],
         ),
+        // Last: everything that talks to PipeWire waits in its sockets' backlogs until then.
+        (
+            "pipewire",
+            &set.pipewire,
+            doors
+                .pipewire
+                .iter()
+                .map(|(name, l)| (name.as_str(), l.as_fd()))
+                .collect(),
+        ),
+        ("wireplumber", &set.wireplumber, vec![]),
     ];
     let mut children: Group = Vec::new();
     for (name, service, fds) in members {

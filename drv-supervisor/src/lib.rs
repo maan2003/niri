@@ -151,6 +151,7 @@ pub fn capability(name: &str) -> Result<CapabilitySet, String> {
         "sys_ptrace" => CapabilitySet::SYS_PTRACE,
         "sys_admin" => CapabilitySet::SYS_ADMIN,
         "sys_tty_config" => CapabilitySet::SYS_TTY_CONFIG,
+        "sys_nice" => CapabilitySet::SYS_NICE,
         "mknod" => CapabilitySet::MKNOD,
         other => return Err(format!("unknown capability {other:?}")),
     })
