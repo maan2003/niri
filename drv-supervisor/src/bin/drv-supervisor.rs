@@ -493,10 +493,11 @@ fn listen_locked(path: &Path) -> Result<(String, UnixListener), String> {
     let listener = listen(path)?;
     let mut lock = path.as_os_str().to_owned();
     lock.push(".lock");
+    // Ours afresh, like the socket: one left by a PipeWire that bound for itself is its own.
+    let _ = fs::remove_file(&lock);
     fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .open(&lock)
         .map_err(|e| format!("{}: {e}", Path::new(&lock).display()))?;
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o644))
