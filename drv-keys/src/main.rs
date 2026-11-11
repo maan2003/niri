@@ -21,7 +21,7 @@ struct Args {
     /// Volume step, in percent.
     #[arg(long, default_value_t = 5)]
     volume_step: u32,
-    /// Brightness step, in percent of the panel's maximum.
+    /// Brightness step, in percent of the perceived level (see `brightness_step`).
     #[arg(long, default_value_t = 5)]
     brightness_step: u64,
     /// The backlight never goes below this raw value: dark, not off.
@@ -123,16 +123,52 @@ fn brightness(args: &Args, direction: i64) -> Result<(), String> {
         seen = true;
         let max = read_number(&panel.join("max_brightness"))?;
         let now = read_number(&panel.join("brightness"))?;
-        let step = (max * args.brightness_step / 100).max(1);
-        let want = if direction > 0 {
-            now.saturating_add(step).min(max)
-        } else {
-            now.saturating_sub(step).max(args.brightness_floor.min(max))
-        };
+        let want = brightness_step(now, max, args.brightness_step, args.brightness_floor, direction);
         std::fs::write(panel.join("brightness"), want.to_string())
             .map_err(|e| format!("{}: {e}", panel.display()))?;
     }
     if seen { Ok(()) } else { Err("no backlight".to_owned()) }
+}
+
+/// Brightness is perceived roughly as a power of the panel's value (brightnessctl's `-e`):
+/// the step is in percent of `(now / max) ^ (1 / 4)`, so the dark end gets small steps and
+/// the bright end large ones. Each press moves at least one raw unit, never below the floor.
+const EXPONENT: f64 = 4.0;
+
+fn brightness_step(now: u64, max: u64, step: u64, floor: u64, direction: i64) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    let floor = floor.min(max);
+    let level = (now.min(max) as f64 / max as f64).powf(1.0 / EXPONENT);
+    let level = (level + direction.signum() as f64 * step as f64 / 100.0).clamp(0.0, 1.0);
+    let mut want = (level.powf(EXPONENT) * max as f64).round() as u64;
+    if direction > 0 && want <= now {
+        want = now + 1;
+    } else if direction < 0 && want >= now {
+        want = now.saturating_sub(1);
+    }
+    want.clamp(floor, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::brightness_step;
+
+    #[test]
+    fn steps_are_exponential() {
+        // max 500 (the M2 Air's panel): 5% of the perceived level from full is 500*0.95^4.
+        assert_eq!(brightness_step(500, 500, 5, 2, -1), 407);
+        // From the dark end the step is small, but at least one unit.
+        assert_eq!(brightness_step(2, 500, 5, 2, 1), 4);
+        assert_eq!(brightness_step(3, 500, 5, 2, -1), 2);
+        // Never below the floor, never above max.
+        assert_eq!(brightness_step(2, 500, 5, 2, -1), 2);
+        assert_eq!(brightness_step(499, 500, 5, 2, 1), 500);
+        // Up then down comes back to where it started (away from the floor).
+        let up = brightness_step(100, 500, 5, 2, 1);
+        assert_eq!(brightness_step(up, 500, 5, 2, -1), 100);
+    }
 }
 
 fn read_number(path: &Path) -> Result<u64, String> {
