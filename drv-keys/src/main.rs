@@ -56,20 +56,43 @@ fn main() {
             }
         };
         let result = match line.as_str() {
-            "volume up" => volume(&args, &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%+", args.volume_step))),
-            "volume down" => volume(&args, &["set-volume", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%-", args.volume_step))),
-            "volume mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], None),
-            "mic mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"], None),
-            "brightness up" => brightness(&args, 1),
-            "brightness down" => brightness(&args, -1),
+            "volume up" => step_volume(&args, &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%+", args.volume_step))),
+            "volume down" => step_volume(&args, &["set-volume", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%-", args.volume_step))),
+            "volume mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], None).map(|()| None),
+            "mic mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"], None).map(|()| None),
+            "brightness up" => brightness(&args, 1).map(|()| None),
+            "brightness down" => brightness(&args, -1).map(|()| None),
             other => Err(format!("not a key: {other:?}")),
         };
         match result {
-            Ok(()) => drv_os::say!("drv-keys: {line}"),
+            Ok(Some(change)) => drv_os::say!("drv-keys: {line}: {change}"),
+            Ok(None) => drv_os::say!("drv-keys: {line}"),
             Err(err) => drv_os::say!("drv-keys: {line}: {err}"),
         }
     }
     // The compositor closed its end: the set is going down.
+}
+
+/// A volume step, and what the sink says before and after (`0.50 -> 0.45`): a sink whose
+/// device sets the volume itself (Bluetooth's absolute volume) may answer with another.
+fn step_volume(args: &Args, wpctl_args: &[&str], step: Option<String>) -> Result<Option<String>, String> {
+    let before = get_volume(args);
+    volume(args, wpctl_args, step)?;
+    let after = get_volume(args);
+    Ok(Some(format!("{before} -> {after}")))
+}
+
+/// `wpctl get-volume`'s answer for the default sink (`Volume: 0.45`, maybe `[MUTED]`).
+fn get_volume(args: &Args) -> String {
+    let Some(wpctl) = args.wpctl.as_ref() else { return "?".to_owned() };
+    match Command::new(wpctl).args(["get-volume", "@DEFAULT_AUDIO_SINK@"]).output() {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .trim_start_matches("Volume: ")
+            .to_owned(),
+        Ok(out) => format!("? ({})", out.status),
+        Err(e) => format!("? ({e})"),
+    }
 }
 
 fn volume(args: &Args, wpctl_args: &[&str], step: Option<String>) -> Result<(), String> {
