@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use drv_os::fds::Kind;
@@ -47,6 +48,7 @@ fn main() {
             process::exit(1);
         }
     };
+    let mut last: Last = None;
     for line in BufReader::new(compositor).lines() {
         let line = match line {
             Ok(line) => line,
@@ -56,8 +58,8 @@ fn main() {
             }
         };
         let result = match line.as_str() {
-            "volume up" => step_volume(&args, &["set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%+", args.volume_step))),
-            "volume down" => step_volume(&args, &["set-volume", "@DEFAULT_AUDIO_SINK@"], Some(format!("{}%-", args.volume_step))),
+            "volume up" => step_volume(&args, &mut last, 1.0),
+            "volume down" => step_volume(&args, &mut last, -1.0),
             "volume mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], None).map(|()| None),
             "mic mute" => volume(&args, &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"], None).map(|()| None),
             "brightness up" => brightness(&args, 1).map(|()| None),
@@ -73,26 +75,45 @@ fn main() {
     // The compositor closed its end: the set is going down.
 }
 
-/// A volume step, and what the sink says before and after (`0.50 -> 0.45`): a sink whose
-/// device sets the volume itself (Bluetooth's absolute volume) may answer with another.
-fn step_volume(args: &Args, wpctl_args: &[&str], step: Option<String>) -> Result<Option<String>, String> {
-    let before = get_volume(args);
-    volume(args, wpctl_args, step)?;
-    let after = get_volume(args);
-    Ok(Some(format!("{before} -> {after}")))
+/// The burst a volume step belongs to: presses this close together step from the volume the
+/// last one set, not from what the sink reports. A Bluetooth sink with absolute volume answers
+/// late (AVRCP) and rounded to its own levels, so reading it back mid-burst moves the volume
+/// back, or not at all.
+const BURST: Duration = Duration::from_millis(1500);
+
+/// The volume the last step set, and when.
+type Last = Option<(Instant, f64)>;
+
+/// One step up or down of the default sink, as an absolute volume (wpctl's cubic scale, like
+/// `get-volume`), up to 1.0. Says what it started from, what it set and what the sink says.
+fn step_volume(args: &Args, last: &mut Last, direction: f64) -> Result<Option<String>, String> {
+    let reported = get_volume(args)?;
+    let base = match *last {
+        Some((at, set)) if at.elapsed() < BURST => set,
+        _ => reported,
+    };
+    let want = (base + direction * args.volume_step as f64 / 100.0).clamp(0.0, 1.0);
+    let want = (want * 100.0).round() / 100.0;
+    volume(args, &["set-volume", "@DEFAULT_AUDIO_SINK@"], Some(format!("{want:.2}")))?;
+    *last = Some((Instant::now(), want));
+    Ok(Some(format!("{base:.2} -> {want:.2} (the sink said {reported:.2})")))
 }
 
-/// `wpctl get-volume`'s answer for the default sink (`Volume: 0.45`, maybe `[MUTED]`).
-fn get_volume(args: &Args) -> String {
-    let Some(wpctl) = args.wpctl.as_ref() else { return "?".to_owned() };
-    match Command::new(wpctl).args(["get-volume", "@DEFAULT_AUDIO_SINK@"]).output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .trim_start_matches("Volume: ")
-            .to_owned(),
-        Ok(out) => format!("? ({})", out.status),
-        Err(e) => format!("? ({e})"),
+/// The default sink's volume (`wpctl get-volume`: `Volume: 0.45`, maybe `[MUTED]` after it).
+fn get_volume(args: &Args) -> Result<f64, String> {
+    let wpctl = args.wpctl.as_ref().ok_or("no wpctl")?;
+    let out = Command::new(wpctl)
+        .args(["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .output()
+        .map_err(|e| format!("{}: {e}", wpctl.display()))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(format!("wpctl get-volume: {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim()));
     }
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| format!("wpctl get-volume: {:?}", text.trim()))
 }
 
 fn volume(args: &Args, wpctl_args: &[&str], step: Option<String>) -> Result<(), String> {
